@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from wcwidth import wcswidth
 
-from agent_runtime.harness import RuntimeState
+from agent_runtime.harness import RuntimeStore, tool_ops, turn_ops
 from agent_runtime.streaming.events import (
     ItemDeltaKind,
     ItemStatus,
@@ -41,13 +41,23 @@ def test_safe_terminal_text_removes_ansi_and_unsafe_controls() -> None:
 @pytest.mark.anyio
 async def test_web_failure_shows_actionable_message_without_raw_payload(capsys):
     display = TerminalToolEventDisplay(width=100)
-    await display.emit(item_completed(
-        turn_id="t", item_id="s", item_kind=TurnItemKind.TOOL, status=ItemStatus.FAILED,
-        error="RAW provider error",
-        data={"result": {"tool_name": "web_search", "error_code": "web_search_blocked",
-                         "error_message": "RAW provider error", "structured_content": {
-                             "error_code": "web_search_blocked", "error_message": "RAW provider error"}}},
-    ))
+    await display.emit(
+        item_completed(
+            turn_id="t",
+            item_id="s",
+            item_kind=TurnItemKind.TOOL,
+            status=ItemStatus.FAILED,
+            error="RAW provider error",
+            data={
+                "result": {
+                    "tool_name": "web_search",
+                    "error_code": "web_search_blocked",
+                    "error_message": "RAW provider error",
+                    "structured_content": {"error_code": "web_search_blocked", "error_message": "RAW provider error"},
+                }
+            },
+        )
+    )
     output = capsys.readouterr().out
     assert "搜索服务暂时限制访问" in output
     assert "RAW provider error" not in output
@@ -227,14 +237,16 @@ async def test_renderer_projects_default_and_verbose_results_without_mutation(
         "metadata": {},
     }
     database = tmp_path / "rollout.sqlite3"
-    async with (await RuntimeState.open(database)) as store:
-        thread = store.create_thread(workspace=tmp_path)
-        turn = store.start_turn(
+    async with await RuntimeStore.open(database) as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="read",
             binding_manifest={"model_id": "test-model"},
         )
-        stored = store.record_tool_result(
+        stored = tool_ops.record_tool_result(
+            store,
             turn_id=turn.turn_id,
             operation_id=None,
             result=payload,
@@ -273,10 +285,8 @@ async def test_renderer_projects_default_and_verbose_results_without_mutation(
     assert "line 0" in verbose_output
     assert "line 11" in verbose_output
     assert "/verbose 查看完整结果" not in verbose_output
-    async with (await RuntimeState.open(database)) as reopened:
-        persisted = next(
-            item for item in reopened.list_items(turn.turn_id) if item.item_id == stored.item_id
-        )
+    async with await RuntimeStore.open(database) as reopened:
+        persisted = next(item for item in reopened.list_items(turn.turn_id) if item.item_id == stored.item_id)
     assert dict(persisted.payload) == durable_before
 
 
@@ -438,9 +448,7 @@ async def test_renderer_uses_actual_width_below_twenty_cells(
             data={
                 "result": {
                     "tool_name": "read_file",
-                    "structured_content": {
-                        "lines": [f"value {index}" for index in range(20)]
-                    },
+                    "structured_content": {"lines": [f"value {index}" for index in range(20)]},
                 }
             },
         )
@@ -572,21 +580,39 @@ async def test_interactive_activity_collapses_and_keeps_details(monkeypatch, cap
     display = TerminalToolEventDisplay(width=100, interactive=True, clock=lambda: clock[0])
     monkeypatch.setattr(display, "_start_live", lambda: None)
     display.begin_turn()
-    await display.emit(item_delta(
-        turn_id="t", item_id="r", item_kind=TurnItemKind.REASONING,
-        delta_kind=ItemDeltaKind.REASONING, delta="private reasoning text",
-    ))
+    await display.emit(
+        item_delta(
+            turn_id="t",
+            item_id="r",
+            item_kind=TurnItemKind.REASONING,
+            delta_kind=ItemDeltaKind.REASONING,
+            delta="private reasoning text",
+        )
+    )
     assert "思考中" in display.activity_text()
-    await display.emit(item_started(
-        turn_id="t", item_id="edit", item_kind=TurnItemKind.TOOL,
-        data={"tool_name": "apply_patch", "input_preview": "file_path='demo.py'"},
-    ))
+    await display.emit(
+        item_started(
+            turn_id="t",
+            item_id="edit",
+            item_kind=TurnItemKind.TOOL,
+            data={"tool_name": "apply_patch", "input_preview": "file_path='demo.py'"},
+        )
+    )
     event = item_completed(
-        turn_id="t", item_id="edit", item_kind=TurnItemKind.TOOL,
+        turn_id="t",
+        item_id="edit",
+        item_kind=TurnItemKind.TOOL,
         status=ItemStatus.SUCCESS,
-        data={"result": {"tool_name": "apply_patch", "structured_content": {
-            "file_path": "demo.py", "created": True,
-        }, "metadata": {"file_path": "demo.py", "diff": "--- /dev/null\n+++ demo.py\n@@ -0,0 +1 @@\n+print(1)"}}},
+        data={
+            "result": {
+                "tool_name": "apply_patch",
+                "structured_content": {
+                    "file_path": "demo.py",
+                    "created": True,
+                },
+                "metadata": {"file_path": "demo.py", "diff": "--- /dev/null\n+++ demo.py\n@@ -0,0 +1 @@\n+print(1)"},
+            }
+        },
     )
     await display.emit(event)
     await display.emit(event)
@@ -613,13 +639,27 @@ async def test_details_retains_command_middle_in_both_modes(monkeypatch, capsys,
     monkeypatch.setattr(display, "_start_live", lambda: None)
     display.set_verbose(verbose)
     display.begin_turn()
-    await display.emit(item_started(turn_id="t", item_id="c", item_kind=TurnItemKind.COMMAND,
-                                   data={"tool_name": "run_command"}))
-    await display.emit(item_delta(turn_id="t", item_id="c", item_kind=TurnItemKind.COMMAND,
-                                 delta_kind=ItemDeltaKind.COMMAND_STDOUT,
-                                 delta="\n".join(f"unique-line-{i:02}" for i in range(20)) + "\n"))
-    await display.emit(item_completed(turn_id="t", item_id="c", item_kind=TurnItemKind.COMMAND,
-                                     status=ItemStatus.SUCCESS, data={"result": {"tool_name": "run_command"}}))
+    await display.emit(
+        item_started(turn_id="t", item_id="c", item_kind=TurnItemKind.COMMAND, data={"tool_name": "run_command"})
+    )
+    await display.emit(
+        item_delta(
+            turn_id="t",
+            item_id="c",
+            item_kind=TurnItemKind.COMMAND,
+            delta_kind=ItemDeltaKind.COMMAND_STDOUT,
+            delta="\n".join(f"unique-line-{i:02}" for i in range(20)) + "\n",
+        )
+    )
+    await display.emit(
+        item_completed(
+            turn_id="t",
+            item_id="c",
+            item_kind=TurnItemKind.COMMAND,
+            status=ItemStatus.SUCCESS,
+            data={"result": {"tool_name": "run_command"}},
+        )
+    )
     display.finish()
     capsys.readouterr()
     display.show_details()
@@ -633,10 +673,12 @@ def test_resume_preserves_activity_details_and_active_elapsed(monkeypatch, capsy
     display = TerminalToolEventDisplay(interactive=True, clock=lambda: now[0])
     monkeypatch.setattr(display, "_start_live", lambda: None)
     display.begin_turn()
-    display._render_diff({
-        "file_path": "notes.md",
-        "diff": "--- a/notes.md\n+++ b/notes.md\n@@ -1 +1 @@\n----\n+++value",
-    })
+    display._render_diff(
+        {
+            "file_path": "notes.md",
+            "diff": "--- a/notes.md\n+++ b/notes.md\n@@ -1 +1 @@\n----\n+++value",
+        }
+    )
     now[0] = 2.0
     display.finish()
     first = capsys.readouterr().out
@@ -675,12 +717,24 @@ async def test_whitespace_only_model_steps_do_not_print_or_count_as_answer(capsy
 @pytest.mark.parametrize("name", ["run_command", "manage_command"])
 async def test_running_command_is_shown_as_running_with_handle(capsys, name):
     display = TerminalToolEventDisplay(width=100)
-    await display.emit(item_completed(
-        turn_id="t", item_id="session-call", item_kind=TurnItemKind.TOOL, status=ItemStatus.SUCCESS,
-        data={"result": {"tool_name": name, "structured_content": {
-            "status": "running", "session_id": "cmd_live", "exit_code": None,
-        }}},
-    ))
+    await display.emit(
+        item_completed(
+            turn_id="t",
+            item_id="session-call",
+            item_kind=TurnItemKind.TOOL,
+            status=ItemStatus.SUCCESS,
+            data={
+                "result": {
+                    "tool_name": name,
+                    "structured_content": {
+                        "status": "running",
+                        "session_id": "cmd_live",
+                        "exit_code": None,
+                    },
+                }
+            },
+        )
+    )
     output = capsys.readouterr().out
     assert "→ " + name in output
     assert "运行中" in output and "cmd_live" in output
@@ -690,27 +744,40 @@ async def test_running_command_is_shown_as_running_with_handle(capsys, name):
 @pytest.mark.anyio
 async def test_effective_request_settings_stay_in_status_across_turns(capsys):
     from agent_runtime.streaming.events import EventType, StreamEvent
+
     display = TerminalToolEventDisplay(width=120)
-    event = StreamEvent(type=EventType.BUDGET_UPDATE, turn_id='turn', data={
-        'purpose': 'agent_step', 'effective_settings': {'revision': 1, 'reasoning_effort': 'high',
-            'max_output_tokens': 65536, 'requested_output_tokens': 98304,
-            'output_constraints': ['model_max_output_tokens']},
-    })
+    event = StreamEvent(
+        type=EventType.BUDGET_UPDATE,
+        turn_id="turn",
+        data={
+            "purpose": "agent_step",
+            "effective_settings": {
+                "revision": 1,
+                "reasoning_effort": "high",
+                "max_output_tokens": 65536,
+                "requested_output_tokens": 98304,
+                "output_constraints": ["model_max_output_tokens"],
+            },
+        },
+    )
     await display.emit(event)
-    assert capsys.readouterr().out == ''
-    first, _ = display.status_lines('demo')
-    assert 'high' in first and '65,536' in first
+    assert capsys.readouterr().out == ""
+    first, _ = display.status_lines("demo")
+    assert "high" in first and "65,536" in first
     display.begin_turn()
-    assert display.status_lines('demo')[0] == first
+    assert display.status_lines("demo")[0] == first
     await display.emit(event)
     display.finish()
-    assert capsys.readouterr().out == ''
+    assert capsys.readouterr().out == ""
     display.show_context_status()
     details = capsys.readouterr().out
-    assert '98,304' in details and '模型上限' in details
-    display.update_request_settings({
-        "preferences": {"reasoning_effort": "medium"}, "model_defaults": {"max_output_tokens": 8192},
-    })
+    assert "98,304" in details and "模型上限" in details
+    display.update_request_settings(
+        {
+            "preferences": {"reasoning_effort": "medium"},
+            "model_defaults": {"max_output_tokens": 8192},
+        }
+    )
     display.show_context_status()
     assert "high" not in capsys.readouterr().out
 
@@ -721,20 +788,32 @@ async def test_status_separates_request_context_from_authoritative_turn_usage(ca
     from agent_runtime.streaming.events import EventType, StreamEvent
 
     display = TerminalToolEventDisplay(interactive=False)
-    display.update_request_settings({
-        "preferences": {"reasoning_effort": "high", "max_output_tokens": None},
-        "model_defaults": {"reasoning_effort": "medium", "max_output_tokens": 8192},
-    })
+    display.update_request_settings(
+        {
+            "preferences": {"reasoning_effort": "high", "max_output_tokens": None},
+            "model_defaults": {"reasoning_effort": "medium", "max_output_tokens": 8192},
+        }
+    )
     assert "high" in display.status_lines("demo")[0]
     assert "待报告" in display.status_lines("demo")[1]
-    await display.emit(StreamEvent(type=EventType.BUDGET_UPDATE, turn_id="t", data={
-        "purpose": "agent_step",
-        "context_projection": {"input_tokens": 1200, "max_input_tokens": 10000,
-                               "count_source": "tokenizer_estimate"},
-        "budget_status": {"cost_remaining_micros": 999},
-    }))
-    usage = AgentUsage(input_tokens=4000, output_tokens=500, total_tokens=4500,
-                       cache_read_input_tokens=3000, reasoning_tokens=100)
+    await display.emit(
+        StreamEvent(
+            type=EventType.BUDGET_UPDATE,
+            turn_id="t",
+            data={
+                "purpose": "agent_step",
+                "context_projection": {
+                    "input_tokens": 1200,
+                    "max_input_tokens": 10000,
+                    "count_source": "tokenizer_estimate",
+                },
+                "budget_status": {"cost_remaining_micros": 999},
+            },
+        )
+    )
+    usage = AgentUsage(
+        input_tokens=4000, output_tokens=500, total_tokens=4500, cache_read_input_tokens=3000, reasoning_tokens=100
+    )
     display.update_usage(usage)
     display.update_usage(usage)  # Replaying a cumulative result must not add it twice.
     settings, tokens = display.status_lines("demo")
@@ -763,19 +842,28 @@ def test_status_reports_unknown_cache_and_partial_usage_without_assuming_zero():
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(("source", "label", "approximate"), [
-    ("utf8_bytes_conservative", "字节估算", True),
-    ("tiktoken:cl100k_base", "本地分词", False),
-    ("external_counter", "外部计数", False),
-])
+@pytest.mark.parametrize(
+    ("source", "label", "approximate"),
+    [
+        ("utf8_bytes_conservative", "字节估算", True),
+        ("tiktoken:cl100k_base", "本地分词", False),
+        ("external_counter", "外部计数", False),
+    ],
+)
 async def test_context_status_identifies_count_source(source, label, approximate):
     from agent_runtime.streaming.events import EventType, StreamEvent
 
     display = TerminalToolEventDisplay(interactive=False)
-    await display.emit(StreamEvent(type=EventType.BUDGET_UPDATE, turn_id="t", data={
-        "purpose": "agent_step",
-        "context_projection": {"input_tokens": 1234, "max_input_tokens": 10000, "count_source": source},
-    }))
+    await display.emit(
+        StreamEvent(
+            type=EventType.BUDGET_UPDATE,
+            turn_id="t",
+            data={
+                "purpose": "agent_step",
+                "context_projection": {"input_tokens": 1234, "max_input_tokens": 10000, "count_source": source},
+            },
+        )
+    )
     first, _ = display.status_lines("demo")
     assert label in first and ("≈" in first) is approximate
 
@@ -785,8 +873,18 @@ async def test_incomplete_model_attempt_is_visible_without_failing_completed_out
     from agent_runtime.streaming.events import EventType, StreamEvent
 
     display = TerminalToolEventDisplay(interactive=False)
-    await display.emit(StreamEvent(type=EventType.MODEL_ATTEMPT_UPDATED, turn_id="turn", data={
-        "operation_id": "operation", "attempt_id": "attempt", "generation": 1,
-        "status": "completed", "response_status": "incomplete", "incomplete_reason": "max_output_tokens",
-    }))
+    await display.emit(
+        StreamEvent(
+            type=EventType.MODEL_ATTEMPT_UPDATED,
+            turn_id="turn",
+            data={
+                "operation_id": "operation",
+                "attempt_id": "attempt",
+                "generation": 1,
+                "status": "completed",
+                "response_status": "incomplete",
+                "incomplete_reason": "max_output_tokens",
+            },
+        )
+    )
     assert "未完成" in capsys.readouterr().out

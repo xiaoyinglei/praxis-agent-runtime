@@ -6,7 +6,7 @@ from threading import Barrier
 
 import pytest
 
-from agent_runtime.harness import RuntimeState
+from agent_runtime.harness import RuntimeStore, model_ops, turn_ops
 from agent_runtime.harness.protocol import HarnessModelResponse
 
 
@@ -16,9 +16,10 @@ def test_two_processes_share_one_logical_model_operation_and_only_one_dispatches
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RuntimeState.open_sync(database) as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    with RuntimeStore.open_sync(database) as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="answer once",
             binding_manifest={"model_id": "test-model"},
@@ -26,8 +27,9 @@ def test_two_processes_share_one_logical_model_operation_and_only_one_dispatches
     prepared = Barrier(2)
 
     def compete(worker_id: str) -> tuple[str, str]:
-        with RuntimeState.open_sync(database) as store:
-            operation = store.prepare_model_operation(
+        with RuntimeStore.open_sync(database) as store:
+            operation = model_ops.prepare_model_operation(
+                store,
                 turn_id=turn.turn_id,
                 request_hash="request-hash",
                 context_hash="context-hash",
@@ -37,7 +39,7 @@ def test_two_processes_share_one_logical_model_operation_and_only_one_dispatches
             )
             prepared.wait()
             try:
-                store.dispatch_model_attempt(operation.operation_id, worker_id=worker_id)
+                model_ops.dispatch_model_attempt(store, operation.operation_id, worker_id=worker_id)
             except RuntimeError:
                 return operation.operation_id, "lost"
             return operation.operation_id, "dispatched"
@@ -47,14 +49,15 @@ def test_two_processes_share_one_logical_model_operation_and_only_one_dispatches
 
     assert len({operation_id for operation_id, _ in outcomes}) == 1
     assert sorted(status for _, status in outcomes) == ["dispatched", "lost"]
-    with RuntimeState.open_sync(database) as verifier:
+    with RuntimeStore.open_sync(database) as verifier:
         [operation] = verifier.list_model_operations(turn.turn_id)
         [attempt] = verifier.list_model_attempts(operation.operation_id)
         assert operation.status == "dispatched"
         assert attempt.status == "dispatched"
         assert attempt.claim_owner in {"model-worker-a", "model-worker-b"}
         with pytest.raises(RuntimeError, match="conflicting payload"):
-            verifier.prepare_model_operation(
+            model_ops.prepare_model_operation(
+                verifier,
                 turn_id=turn.turn_id,
                 request_hash="different-request-hash",
                 context_hash="context-hash",
@@ -71,14 +74,16 @@ def test_fresh_store_recovers_expired_model_dispatch_and_fences_late_response(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RuntimeState.open_sync(database) as first:
-        thread = first.create_thread(workspace=workspace)
-        turn = first.start_turn(
+    with RuntimeStore.open_sync(database) as first:
+        thread = turn_ops.create_thread(first, workspace=workspace)
+        turn = turn_ops.start_turn(
+            first,
             thread_id=thread.thread_id,
             user_message="answer once",
             binding_manifest={"model_id": "test-model"},
         )
-        operation = first.prepare_model_operation(
+        operation = model_ops.prepare_model_operation(
+            first,
             turn_id=turn.turn_id,
             request_hash="request-hash",
             context_hash="context-hash",
@@ -86,19 +91,22 @@ def test_fresh_store_recovers_expired_model_dispatch_and_fences_late_response(
             wire_hash="wire-hash",
             request_ref={"input_revision": 1, "request_id": "request-1"},
         )
-        attempt = first.dispatch_model_attempt(
+        attempt = model_ops.dispatch_model_attempt(
+            first,
             operation.operation_id,
             worker_id="model-worker-a",
             now=100.0,
             lease_seconds=5.0,
         )
 
-    with RuntimeState.open_sync(database) as restarted:
-        recovered = restarted.expire_model_attempt_dispatch(
+    with RuntimeStore.open_sync(database) as restarted:
+        recovered = model_ops.expire_model_attempt_dispatch(
+            restarted,
             operation_id=operation.operation_id,
             now=106.0,
         )
-        late = restarted.complete_model_attempt(
+        late = model_ops.complete_model_attempt(
+            restarted,
             operation_id=operation.operation_id,
             attempt_id=attempt.attempt_id,
             generation=attempt.generation,
@@ -112,10 +120,7 @@ def test_fresh_store_recovers_expired_model_dispatch_and_fences_late_response(
         assert late is False
         assert restarted.read_turn(turn.turn_id).status == "interrupted"
         assert restarted.read_thread(thread.thread_id).active_turn_id == turn.turn_id
-        assert not any(
-            item.kind == "model_response"
-            for item in restarted.list_items(turn.turn_id)
-        )
+        assert not any(item.kind == "model_response" for item in restarted.list_items(turn.turn_id))
         assert restarted.verify().valid is True
 
 
@@ -124,14 +129,16 @@ def test_completion_past_lease_boundary_commits_while_takeover_has_not_run(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="answer past the lease boundary",
             binding_manifest={"model_id": "test-model"},
         )
-        operation = store.prepare_model_operation(
+        operation = model_ops.prepare_model_operation(
+            store,
             turn_id=turn.turn_id,
             request_hash="request-hash",
             context_hash="context-hash",
@@ -139,14 +146,16 @@ def test_completion_past_lease_boundary_commits_while_takeover_has_not_run(
             wire_hash="wire-hash",
             request_ref={"input_revision": 1, "request_id": "request-1"},
         )
-        attempt = store.dispatch_model_attempt(
+        attempt = model_ops.dispatch_model_attempt(
+            store,
             operation.operation_id,
             worker_id="model-worker-a",
             now=100.0,
             lease_seconds=5.0,
         )
 
-        accepted = store.complete_model_attempt(
+        accepted = model_ops.complete_model_attempt(
+            store,
             operation_id=operation.operation_id,
             attempt_id=attempt.attempt_id,
             generation=attempt.generation,

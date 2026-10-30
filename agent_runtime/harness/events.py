@@ -13,7 +13,7 @@ from agent_runtime.harness.protocol import (
     restore_model_response,
 )
 from agent_runtime.harness.records import RolloutRecord
-from agent_runtime.harness.state import RuntimeState
+from agent_runtime.harness.runtime_store import RuntimeStore
 from agent_runtime.modeling.contracts import context_capacity_policy
 from agent_runtime.streaming.events import (
     EventType,
@@ -59,6 +59,7 @@ _SUPPRESSED_ITEM_KINDS = frozenset(
         "completion_feedback",
         "context_compaction",
         "context_summary_response",
+        "compaction_job",
         "context_message",
         "verification",
         "tool_continuation",
@@ -68,6 +69,9 @@ _SUPPRESSED_ITEM_KINDS = frozenset(
 )
 _SUPPRESSED_RECORD_TYPES = frozenset(
     {
+        "execution_protocol_adopted",
+        "response_handling_decided",
+        "tool_batch_admitted",
         "thread_created",
         "session_settings_updated",
         "thread_forked",
@@ -140,7 +144,7 @@ RolloutEvent = ReplayEvent
 
 
 async def commit_and_publish[T](
-    store: RuntimeState,
+    store: RuntimeStore,
     operation: Callable[[], T],
     dispatcher: TurnEventDispatcher | None,
 ) -> T:
@@ -156,11 +160,15 @@ async def commit_and_publish[T](
 class RolloutEventReader:
     """Read independent Thread tails or one global record-id tail."""
 
-    def __init__(self, store: RuntimeState) -> None:
+    def __init__(self, store: RuntimeStore) -> None:
         self._store = store
 
     def read(
-        self, thread_id: str, *, after: str | None = None, limit: int | None = None,
+        self,
+        thread_id: str,
+        *,
+        after: str | None = None,
+        limit: int | None = None,
     ) -> tuple[ReplayEvent, ...]:
         if not isinstance(thread_id, str) or not thread_id:
             raise ValueError("thread_id must be non-empty")
@@ -173,7 +181,9 @@ class RolloutEventReader:
         projected: list[tuple[RolloutRecord, StreamEvent]] = []
         while sequence < last.thread_sequence and (limit is None or len(projected) < limit):
             records = self._store.list_record_tail(
-                thread_id, after_thread_sequence=sequence, through_thread_sequence=last.thread_sequence,
+                thread_id,
+                after_thread_sequence=sequence,
+                through_thread_sequence=last.thread_sequence,
                 limit=256 if limit is None else min(256, limit - len(projected)),
             )
             if not records:
@@ -183,7 +193,10 @@ class RolloutEventReader:
         return self._wrap_events(projected)
 
     def read_global(
-        self, *, after_record_id: int = 0, limit: int | None = None,
+        self,
+        *,
+        after_record_id: int = 0,
+        limit: int | None = None,
     ) -> tuple[ReplayEvent, ...]:
         self._validate_limit(limit)
         if isinstance(after_record_id, bool) or not isinstance(after_record_id, int):
@@ -194,7 +207,8 @@ class RolloutEventReader:
         projected: list[tuple[RolloutRecord, StreamEvent]] = []
         while after_record_id < last and (limit is None or len(projected) < limit):
             records = self._store.list_global_records(
-                after_record_id=after_record_id, through_record_id=last,
+                after_record_id=after_record_id,
+                through_record_id=last,
                 limit=256 if limit is None else min(256, limit - len(projected)),
             )
             if not records:
@@ -213,7 +227,8 @@ class RolloutEventReader:
             ReplayEvent(
                 event=replace(event, sequence=index, timestamp_ms=record.committed_at_ms),
                 cursor=self._encode(thread_id=record.thread_id, sequence=record.thread_sequence),
-                record_id=record.record_id, thread_sequence=record.thread_sequence,
+                record_id=record.record_id,
+                thread_sequence=record.thread_sequence,
             )
             for index, (record, event) in enumerate(projected, start=1)
         )
@@ -234,7 +249,7 @@ class RolloutEventReader:
     def _project_records(self, records: tuple[RolloutRecord, ...]) -> tuple[tuple[RolloutRecord, StreamEvent], ...]:
         projected: list[tuple[RolloutRecord, StreamEvent]] = []
         for record in records:
-            if record.payload_schema_version not in {1, 2, 3}:
+            if record.payload_schema_version not in {1, 2, 3, 4}:
                 raise RuntimeError(f"unsupported event record schema: {record.payload_schema_version}")
             self._validate_public_item_ids(record)
             current = self._legacy_event_record(record) if record.payload_schema_version < 3 else record
@@ -259,19 +274,31 @@ class RolloutEventReader:
             payload = {**start.payload, **payload}
         kind = payload.get("kind")
         if kind == "agent_message" and record.producer == "runtime" and record.turn_id is not None:
-            completion = (record if record.record_type == "item_completed"
-                          else self._store.read_event_reference("item_completed", str(item_id)))
-            if completion is not None and self._store.find_model_response_item(
-                record.turn_id, completion.payload.get("payload", {}).get("text"),
-            ) is not None:
+            completion = (
+                record
+                if record.record_type == "item_completed"
+                else self._store.read_event_reference("item_completed", str(item_id))
+            )
+            if (
+                completion is not None
+                and self._store.find_model_response_item(
+                    record.turn_id,
+                    completion.payload.get("payload", {}).get("text"),
+                )
+                is not None
+            ):
                 return None
-        if (kind in {"model_response", "model_reasoning", "model_plan"}
-                and payload.get("public_item_id") is None and record.producer != "migration"):
+        if (
+            kind in {"model_response", "model_reasoning", "model_plan"}
+            and payload.get("public_item_id") is None
+            and record.producer != "migration"
+        ):
             attempt = self._store.read_event_reference("model_attempt_completed", str(item_id))
             if attempt is not None:
                 channel = {"model_response": "agent_message", "model_reasoning": "reasoning", "model_plan": "plan"}
                 payload["public_item_id"] = derive_model_public_item_id(
-                    turn_id=record.turn_id or "", model_attempt_id=str(attempt.payload["attempt_id"]),
+                    turn_id=record.turn_id or "",
+                    model_attempt_id=str(attempt.payload["attempt_id"]),
                     channel=channel[str(kind)],
                 )
         if record.record_type == "tool_operation_claimed" or kind == "tool_result":
@@ -291,22 +318,28 @@ class RolloutEventReader:
                 payload.setdefault("tool_call_id", prepared.payload["tool_call_id"])
                 if payload.get("public_item_id") is None:
                     claim = self._store.read_event_reference(
-                        "tool_operation_claimed", operation_id, at_record_id=record.record_id,
+                        "tool_operation_claimed",
+                        operation_id,
+                        at_record_id=record.record_id,
                     )
                     if claim is not None:
                         payload["public_item_id"] = derive_operation_public_item_id(
-                            turn_id=record.turn_id or "", operation_id=operation_id,
+                            turn_id=record.turn_id or "",
+                            operation_id=operation_id,
                             attempt_generation=int(claim.payload["claim_generation"]),
                         )
                 if record.record_type == "item_completed" and payload.get("status") is None:
                     outcome = self._store.read_event_reference(
-                        "tool_operation_outcome_committed", operation_id, at_record_id=record.record_id,
+                        "tool_operation_outcome_committed",
+                        operation_id,
+                        at_record_id=record.record_id,
                     )
                     outcome_payload = outcome.payload if outcome is not None else prepared.payload
                     if "status" not in outcome_payload:
                         raise RuntimeError("legacy tool result has no canonical execution outcome")
                     status, error = _tool_completion_status(
-                        str(outcome_payload["status"]), outcome_payload.get("error_code"),
+                        str(outcome_payload["status"]),
+                        outcome_payload.get("error_code"),
                     )
                     payload.update(status=status.value, error=error)
         return replace(record, payload=payload)
@@ -330,11 +363,16 @@ class RolloutEventReader:
             public_item_id = record.payload.get("public_item_id")
             if not isinstance(public_item_id, str) or record.turn_id is None or not isinstance(operation_id, str):
                 raise RuntimeError("claimed tool operation is missing public identity")
-            return (item_started(
-                turn_id=record.turn_id, item_id=public_item_id,
-                item_kind=TurnItemKind.COMMAND if record.payload["tool_name"] == "run_command" else TurnItemKind.TOOL,
-                data={key: record.payload[key] for key in ("operation_id", "tool_call_id", "tool_name")},
-            ),)
+            return (
+                item_started(
+                    turn_id=record.turn_id,
+                    item_id=public_item_id,
+                    item_kind=TurnItemKind.COMMAND
+                    if record.payload["tool_name"] == "run_command"
+                    else TurnItemKind.TOOL,
+                    data={key: record.payload[key] for key in ("operation_id", "tool_call_id", "tool_name")},
+                ),
+            )
         if record.record_type == "item_started":
             if kind in _SUPPRESSED_ITEM_KINDS or kind in {"tool_result", "command_execution"}:
                 return ()
@@ -346,23 +384,38 @@ class RolloutEventReader:
                 if record.turn_id is None:
                     raise RuntimeError("tool result is missing turn identity")
                 status, error = _record_item_status(record.payload)
-                return (item_completed(
-                    turn_id=record.turn_id, item_id=public_item_id,
-                    item_kind=(TurnItemKind.COMMAND
-                               if record.payload["tool_name"] == "run_command" else TurnItemKind.TOOL),
-                    status=status, data={"result": record.payload.get("payload", {})}, error=error,
-                ),)
+                return (
+                    item_completed(
+                        turn_id=record.turn_id,
+                        item_id=public_item_id,
+                        item_kind=(
+                            TurnItemKind.COMMAND if record.payload["tool_name"] == "run_command" else TurnItemKind.TOOL
+                        ),
+                        status=status,
+                        data={"result": record.payload.get("payload", {})},
+                        error=error,
+                    ),
+                )
             result = record.payload.get("payload")
-            if (operation_id is None and record.turn_id is not None and isinstance(item_id, str)
-                    and isinstance(result, Mapping) and result.get("is_error") is True
-                    and isinstance(result.get("tool_name"), str) and isinstance(result.get("tool_call_id"), str)):
-                return (item_completed(
-                    turn_id=record.turn_id, item_id=item_id,
-                    item_kind=TurnItemKind.COMMAND if result["tool_name"] == "run_command" else TurnItemKind.TOOL,
-                    status=ItemStatus.FAILED,
-                    error=str(result.get("error_message") or result.get("error_code") or "tool rejected"),
-                    data={"result": dict(result), "execution_started": False},
-                ),)
+            if (
+                operation_id is None
+                and record.turn_id is not None
+                and isinstance(item_id, str)
+                and isinstance(result, Mapping)
+                and result.get("is_error") is True
+                and isinstance(result.get("tool_name"), str)
+                and isinstance(result.get("tool_call_id"), str)
+            ):
+                return (
+                    item_completed(
+                        turn_id=record.turn_id,
+                        item_id=item_id,
+                        item_kind=TurnItemKind.COMMAND if result["tool_name"] == "run_command" else TurnItemKind.TOOL,
+                        status=ItemStatus.FAILED,
+                        error=str(result.get("error_message") or result.get("error_code") or "tool rejected"),
+                        data={"result": dict(result), "execution_started": False},
+                    ),
+                )
             return ()
         if record.record_type == "item_completed":
             if not isinstance(item_id, str) or not isinstance(kind, str):
@@ -371,17 +424,27 @@ class RolloutEventReader:
             if kind == "model_request":
                 request_ref = payload.get("request_ref", {})
                 projection = request_ref.get("context_projection", {})
-                if (isinstance(request_ref.get("effective_settings"), Mapping) or (
+                if isinstance(request_ref.get("effective_settings"), Mapping) or (
                     projection.get("policy_revision") == "context-capacity-v2"
                     and context_capacity_policy(request_ref.get("step_snapshot", {}).get("binding_manifest", {}))
                     is not None
-                )):
-                    return (StreamEvent(type=EventType.BUDGET_UPDATE, turn_id=record.turn_id or "", data={
-                        "purpose": request_ref.get("purpose"), "context_projection": dict(projection),
-                        "budget_status": request_ref.get("budget_status", {}),
-                        **({"effective_settings": dict(request_ref["effective_settings"])}
-                           if isinstance(request_ref.get("effective_settings"), Mapping) else {}),
-                    }),)
+                ):
+                    return (
+                        StreamEvent(
+                            type=EventType.BUDGET_UPDATE,
+                            turn_id=record.turn_id or "",
+                            data={
+                                "purpose": request_ref.get("purpose"),
+                                "context_projection": dict(projection),
+                                "budget_status": request_ref.get("budget_status", {}),
+                                **(
+                                    {"effective_settings": dict(request_ref["effective_settings"])}
+                                    if isinstance(request_ref.get("effective_settings"), Mapping)
+                                    else {}
+                                ),
+                            },
+                        ),
+                    )
             if kind in _SUPPRESSED_ITEM_KINDS or kind == "command_execution":
                 return ()
             return (self._project_item_completed(record, kind=kind),)
@@ -396,72 +459,151 @@ class RolloutEventReader:
         data: dict[str, Any]
         event_type: EventType
         if record.record_type in {
-            "tool_operation_prepared", "tool_operation_status_changed", "tool_operation_start_rejected",
-            "tool_operation_claim_expired", "tool_operation_result_missing", "tool_operation_superseded",
-            "tool_operation_outcome_committed", "tool_operation_reconciled",
+            "tool_operation_prepared",
+            "tool_operation_status_changed",
+            "tool_operation_start_rejected",
+            "tool_operation_claim_expired",
+            "tool_operation_result_missing",
+            "tool_operation_superseded",
+            "tool_operation_outcome_committed",
+            "tool_operation_reconciled",
         }:
             event_type = EventType.TOOL_OPERATION_UPDATED
-            data = {key: payload[key] for key in (
-                "operation_id", "tool_call_id", "tool_name", "request_id", "status", "reason", "error_code",
-                "claim_generation", "attempt_count", "requires_reconciliation", "committed_execution_status",
-                "reconciler_revision", "duration_ms",
-            ) if key in payload}
+            data = {
+                key: payload[key]
+                for key in (
+                    "operation_id",
+                    "tool_call_id",
+                    "tool_name",
+                    "request_id",
+                    "status",
+                    "reason",
+                    "error_code",
+                    "claim_generation",
+                    "attempt_count",
+                    "requires_reconciliation",
+                    "committed_execution_status",
+                    "reconciler_revision",
+                    "duration_ms",
+                )
+                if key in payload
+            }
             data["transition"] = record.record_type.removeprefix("tool_operation_")
         elif record.record_type in _MODEL_ATTEMPT_TRANSITIONS:
             event_type = EventType.MODEL_ATTEMPT_UPDATED
-            data = {key: payload[key] for key in (
-                "operation_id", "attempt_id", "generation", "previous_attempt_id",
-                "provider_response_id", "usage", "reason", "error_type", "error_message",
-                "response_status", "incomplete_reason", "stop_reason",
-            ) if key in payload}
+            data = {
+                key: payload[key]
+                for key in (
+                    "operation_id",
+                    "attempt_id",
+                    "generation",
+                    "previous_attempt_id",
+                    "provider_response_id",
+                    "usage",
+                    "reason",
+                    "error_type",
+                    "error_message",
+                    "response_status",
+                    "incomplete_reason",
+                    "stop_reason",
+                )
+                if key in payload
+            }
             data["status"] = _MODEL_ATTEMPT_TRANSITIONS[record.record_type]
         elif record.record_type == "interaction_requested":
             event_type = EventType.INTERACTION_REQUESTED
             data = {key: payload[key] for key in ("request_id", "kind", "operation_id", "request") if key in payload}
         elif record.record_type in {"interaction_resolved", "approval_invalidated"}:
-            event_type = (EventType.INTERACTION_RESOLVED if record.record_type == "interaction_resolved"
-                          else EventType.INTERACTION_INVALIDATED)
-            data = {key: payload[key] for key in (
-                "request_id", "kind", "operation_id", "version", "reason", "approval_status",
-            ) if key in payload}
+            event_type = (
+                EventType.INTERACTION_RESOLVED
+                if record.record_type == "interaction_resolved"
+                else EventType.INTERACTION_INVALIDATED
+            )
+            data = {
+                key: payload[key]
+                for key in (
+                    "request_id",
+                    "kind",
+                    "operation_id",
+                    "version",
+                    "reason",
+                    "approval_status",
+                )
+                if key in payload
+            }
             response = payload.get("response", {})
             if isinstance(response, Mapping) and response.get("decision") in {"approve", "deny", "cancel"}:
                 data["decision"] = response["decision"]
             action = response.get("action") if isinstance(response, Mapping) else None
             if action in {"abort", "recheck"}:
                 data["action"] = action
-            data["status"] = ("invalidated" if record.record_type == "approval_invalidated"
-                              or payload.get("approval_status") == "invalidated" or action == "recheck"
-                              else "cancelled" if action == "abort"
-                              or isinstance(response, Mapping) and response.get("cancelled") is True
-                              else "resolved")
+            data["status"] = (
+                "invalidated"
+                if record.record_type == "approval_invalidated"
+                or payload.get("approval_status") == "invalidated"
+                or action == "recheck"
+                else "cancelled"
+                if action == "abort" or isinstance(response, Mapping) and response.get("cancelled") is True
+                else "resolved"
+            )
         elif record.record_type == "item_started" and payload.get("kind") == "context_compaction":
             event_type = EventType.CONTEXT_COMPACTION_STARTED
             data = {"compaction_id": payload.get("item_id")}
         elif record.record_type == "item_completed" and payload.get("kind") == "context_compaction":
             event_type = EventType.CONTEXT_COMPACTION_COMPLETED
             body = payload.get("payload", {})
-            data = {key: body[key] for key in (
-                "context_version", "covered_item_ids", "covered_item_refs", "covered_sequence_ranges",
-                "capacity_diagnostics", "preserved_item_ids", "source_revision", "algorithm_revision",
-                "reason", "error",
-            ) if key in body}
-            data.update(compaction_id=payload.get("item_id"),
-                        status="completed" if payload.get("status", "success") == "success" else payload["status"])
+            data = {
+                key: body[key]
+                for key in (
+                    "context_version",
+                    "covered_item_ids",
+                    "covered_item_refs",
+                    "covered_sequence_ranges",
+                    "capacity_diagnostics",
+                    "preserved_item_ids",
+                    "source_revision",
+                    "algorithm_revision",
+                    "reason",
+                    "error",
+                )
+                if key in body
+            }
+            data.update(
+                compaction_id=payload.get("item_id"),
+                status="completed" if payload.get("status", "success") == "success" else payload["status"],
+            )
         elif record.record_type == "item_completed" and payload.get("kind") == "completion_decision":
             event_type = EventType.COMPLETION_DECIDED
             body = payload.get("payload", {})
-            data = {key: body[key] for key in (
-                "proposal_item_id", "action", "reason", "validation_status", "validation_scope", "reason_code",
-            ) if key in body}
+            data = {
+                key: body[key]
+                for key in (
+                    "proposal_item_id",
+                    "action",
+                    "reason",
+                    "validation_status",
+                    "validation_scope",
+                    "reason_code",
+                )
+                if key in body
+            }
             data.setdefault("validation_status", "not_evaluated")
         elif record.record_type == "item_completed" and payload.get("kind") == "verification":
             event_type = EventType.VERIFICATION_COMPLETED
             body = payload.get("payload", {})
-            data = {key: body[key] for key in (
-                "operation_id", "tool_call_id", "arguments_digest", "source_result_item_id",
-                "verification_kind", "verifier", "verified_resources",
-            ) if key in body}
+            data = {
+                key: body[key]
+                for key in (
+                    "operation_id",
+                    "tool_call_id",
+                    "arguments_digest",
+                    "source_result_item_id",
+                    "verification_kind",
+                    "verifier",
+                    "verified_resources",
+                )
+                if key in body
+            }
         else:
             return None
         if not record.turn_id:
@@ -480,28 +622,46 @@ class RolloutEventReader:
             if policy is not None:
                 envelope = binding.get("binding", binding)
                 definition = envelope.get("definition", envelope)
-                event = replace(event, data={**event.data,
-                    "context_capacity_policy": policy.model_dump(mode="json"),
-                    "model_context_tokens": definition.get("context_window_tokens", "unknown"),
-                })
+                event = replace(
+                    event,
+                    data={
+                        **event.data,
+                        "context_capacity_policy": policy.model_dump(mode="json"),
+                        "model_context_tokens": definition.get("context_window_tokens", "unknown"),
+                    },
+                )
             return event
         if record.record_type == "turn_paused":
             if turn_id is None:
                 raise RuntimeError("turn_paused record is missing turn_id")
             reason = record.payload.get("reason", "interaction_required")
             event = turn_paused(turn_id, reason=str(reason))
-            return replace(event, data={**event.data, **{
-                key: record.payload[key] for key in ("request_id", "operation_id", "attempt_id")
-                if key in record.payload
-            }})
+            return replace(
+                event,
+                data={
+                    **event.data,
+                    **{
+                        key: record.payload[key]
+                        for key in ("request_id", "operation_id", "attempt_id")
+                        if key in record.payload
+                    },
+                },
+            )
         if record.record_type == "turn_resumed":
             if turn_id is None:
                 raise RuntimeError("turn_resumed record is missing turn_id")
             event = turn_resumed(turn_id)
-            return replace(event, data={**event.data, **{
-                key: record.payload[key] for key in ("request_id", "operation_id", "attempt_id")
-                if key in record.payload
-            }})
+            return replace(
+                event,
+                data={
+                    **event.data,
+                    **{
+                        key: record.payload[key]
+                        for key in ("request_id", "operation_id", "attempt_id")
+                        if key in record.payload
+                    },
+                },
+            )
         if record.record_type == "turn_cancellation_requested":
             if turn_id is None:
                 raise RuntimeError("turn_cancellation_requested record is missing turn_id")
@@ -567,9 +727,7 @@ class RolloutEventReader:
             iteration=_iteration(record.payload),
             data=_public_output_data(record) if kind == "model_output" else None,
             parent_item_id=(
-                str(record.payload["parent_item_id"])
-                if isinstance(record.payload.get("parent_item_id"), str)
-                else None
+                str(record.payload["parent_item_id"]) if isinstance(record.payload.get("parent_item_id"), str) else None
             ),
         )
 
@@ -852,9 +1010,18 @@ def _public_output_data(record: RolloutRecord) -> dict[str, Any]:
     output = body.get("output", record.payload.get("output", {}))
     if not isinstance(output, Mapping):
         raise RuntimeError("model output snapshot is malformed")
-    data = {key: output[key] for key in (
-        "output_id", "content", "tool_call_id", "tool_name", "arguments", "argument_error",
-    ) if key in output}
+    data = {
+        key: output[key]
+        for key in (
+            "output_id",
+            "content",
+            "tool_call_id",
+            "tool_name",
+            "arguments",
+            "argument_error",
+        )
+        if key in output
+    }
     data["output_id"] = record.payload["output_id"]
     data["output_kind"] = record.payload["output_kind"]
     if record.payload["output_kind"] == "tool_call":

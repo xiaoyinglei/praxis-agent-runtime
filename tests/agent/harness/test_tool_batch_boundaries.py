@@ -1,13 +1,15 @@
 """Batch admission and feedback contracts, independent of task/tool names."""
+
 from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 
 import pytest
 
-from agent_runtime.harness import HarnessModelResponse, ModelToolCall, Session
+from agent_runtime.harness import HarnessModelResponse, ModelToolCall, Session, tool_ops
 from agent_runtime.tools.tool import InterruptBehavior, ResolvedToolUse, ToolEffect, ToolTarget
 from tests.agent.harness.test_parallel_tool_orchestrator import _setup
 from tests.agent.harness.test_tool_orchestrator import AcceptToolAnswer, ToolThenAnswerModel, _read_tool
@@ -32,22 +34,32 @@ async def test_write_observation_belongs_to_admitted_runner(tmp_path: Path, same
             await written.wait()
         return {"text": "ok"}
 
-    store, turn, orchestrator, calls = await asyncio.to_thread(_setup,
-        tmp_path, run, context_changes={"allow_write_tools": True},
+    store, turn, orchestrator, calls = await asyncio.to_thread(
+        _setup,
+        tmp_path,
+        run,
+        context_changes={"allow_write_tools": True},
         tool_changes={
             "static_effects": frozenset({ToolEffect.WRITE_WORKSPACE}),
             "resolve_use": lambda args: ResolvedToolUse(
                 effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
-                targets=(ToolTarget(kind="workspace_path", value=str(
-                    target if same_target or args["path"] == "0" else other)),),
+                targets=(
+                    ToolTarget(
+                        kind="workspace_path", value=str(target if same_target or args["path"] == "0" else other)
+                    ),
+                ),
             ),
         },
     )
     from agent_runtime.tools.permissions import ToolExecutionContext
 
-    orchestrator.update_execution_context(ToolExecutionContext(
-        workspace_root=workspace, cwd=workspace, allow_write_tools=True,
-    ))
+    orchestrator.update_execution_context(
+        ToolExecutionContext(
+            workspace_root=workspace,
+            cwd=workspace,
+            allow_write_tools=True,
+        )
+    )
     with store:
         first, second = await orchestrator.execute_batch(turn_id=turn.turn_id, calls=calls[:2])
         assert not first.is_error and not second.is_error
@@ -62,7 +74,10 @@ async def test_write_observation_belongs_to_admitted_runner(tmp_path: Path, same
 @pytest.mark.parametrize("parallel,limit", [(True, 1), (True, 2), (False, 2)])
 @pytest.mark.parametrize("cancel_count", [1, 2])
 async def test_finish_current_cancellation_preserves_results_and_stops_admission(
-    tmp_path: Path, parallel, limit, cancel_count,
+    tmp_path: Path,
+    parallel,
+    limit,
+    cancel_count,
 ):
     started = []
     ready = asyncio.Event()
@@ -76,8 +91,11 @@ async def test_finish_current_cancellation_preserves_results_and_stops_admission
         await finish.wait()
         return {"text": args["path"]}
 
-    store, turn, orchestrator, calls = await asyncio.to_thread(_setup,
-        tmp_path, run, context_changes={"max_parallel_calls": limit},
+    store, turn, orchestrator, calls = await asyncio.to_thread(
+        _setup,
+        tmp_path,
+        run,
+        context_changes={"max_parallel_calls": limit},
         tool_changes={"interrupt_behavior": InterruptBehavior.FINISH_CURRENT, "concurrency_safe": parallel},
     )
     with store:
@@ -101,7 +119,9 @@ async def test_finish_current_cancellation_preserves_results_and_stops_admission
 @pytest.mark.anyio
 @pytest.mark.parametrize("stable_order", [False, True])
 async def test_provider_group_uses_frozen_order_while_ledger_keeps_completion_order(
-    tmp_path: Path, monkeypatch, stable_order,
+    tmp_path: Path,
+    monkeypatch,
+    stable_order,
 ):
     if not stable_order:
         from agent_runtime.harness.services import SessionBindingProvider
@@ -127,21 +147,30 @@ async def test_provider_group_uses_frozen_order_while_ledger_keeps_completion_or
     class Model(ToolThenAnswerModel):
         async def dispatch(self, prepared, *, event_sink=None):
             if len(self.requests) == 1:
-                return HarnessModelResponse.from_parts(text="", provider_response_id="batch", usage={}, tool_calls=(
-                    ModelToolCall(id="slow", name="read_file", arguments={"path": "0"}),
-                    ModelToolCall(id="fast", name="read_file", arguments={"path": "1"}),
-                ))
+                return HarnessModelResponse.from_parts(
+                    text="",
+                    provider_response_id="batch",
+                    usage={},
+                    tool_calls=(
+                        ModelToolCall(id="slow", name="read_file", arguments={"path": "0"}),
+                        ModelToolCall(id="fast", name="read_file", arguments={"path": "1"}),
+                    ),
+                )
             return await super().dispatch(prepared)
 
     model = Model()
     async with await Session.open(
-        database=tmp_path / "session.db", workspace=tmp_path, model=model,
-        completion_gate=AcceptToolAnswer(), tools={"read_file": replace(_read_tool(workspace=tmp_path), run=run)},
+        database=tmp_path / "session.db",
+        workspace=tmp_path,
+        model=model,
+        completion_gate=AcceptToolAnswer(),
+        tools={"read_file": replace(_read_tool(workspace=tmp_path), run=run)},
     ) as session:
         result = await session.submit("inspect independent records")
         assert result.status == "done"
-        ledger_ids = [i.payload["tool_call_id"] for i in session.store.list_items(result.turn_id)
-                      if i.kind == "tool_result"]
+        ledger_ids = [
+            i.payload["tool_call_id"] for i in session.store.list_items(result.turn_id) if i.kind == "tool_result"
+        ]
         assert ledger_ids == ["fast", "slow"]
         expected = ["slow", "fast"] if stable_order else ["fast", "slow"]
         assert [m.tool_call_id for m in model.requests[-1].messages if m.role == "tool"] == expected
@@ -191,7 +220,9 @@ async def test_cancellation_after_claim_before_runner_commits_known_cancelled_re
 @pytest.mark.parametrize("approval", [False, True])
 @pytest.mark.parametrize("finish_current", [False, True])
 async def test_cancel_and_reopen_retains_results_without_repeating_approved_or_finished_tools(
-    tmp_path: Path, approval, finish_current,
+    tmp_path: Path,
+    approval,
+    finish_current,
 ):
     from agent_runtime.tools.permissions import ToolExecutionContext
 
@@ -220,14 +251,27 @@ async def test_cancel_and_reopen_retains_results_without_repeating_approved_or_f
             return HarnessModelResponse.from_parts(text="README was read", provider_response_id="done", usage={})
 
     database = tmp_path / "session.db"
-    tool = replace(_read_tool(workspace=tmp_path), run=run, concurrency_safe=False,
-                   interrupt_behavior=InterruptBehavior.FINISH_CURRENT if finish_current else InterruptBehavior.CANCEL)
-    context = ToolExecutionContext(workspace_root=tmp_path, cwd=tmp_path,
+    tool = replace(
+        _read_tool(workspace=tmp_path),
+        run=run,
+        concurrency_safe=False,
+        interrupt_behavior=InterruptBehavior.FINISH_CURRENT if finish_current else InterruptBehavior.CANCEL,
+    )
+    context = ToolExecutionContext(
+        workspace_root=tmp_path,
+        cwd=tmp_path,
         require_confirmation_for=frozenset({"read_file"}) if approval else frozenset(),
-        approved_tool_call_ids=frozenset({"call-1", "call-2"}) if approval else frozenset())
+        approved_tool_call_ids=frozenset({"call-1", "call-2"}) if approval else frozenset(),
+    )
     first_model = Model()
-    async with await Session.open(database=database, workspace=tmp_path, model=first_model,
-        completion_gate=AcceptToolAnswer(), tools={"read_file": tool}, tool_execution_context=context) as session:
+    async with await Session.open(
+        database=database,
+        workspace=tmp_path,
+        model=first_model,
+        completion_gate=AcceptToolAnswer(),
+        tools={"read_file": tool},
+        tool_execution_context=context,
+    ) as session:
         thread_id = session.thread_id
         if approval:
             paused = await session.submit("inspect independent records")
@@ -249,14 +293,23 @@ async def test_cancel_and_reopen_retains_results_without_repeating_approved_or_f
         assert session.store.verify().valid
 
     model = Model()
-    async with await Session.open(database=database, workspace=tmp_path, thread_id=thread_id, model=model,
-        completion_gate=AcceptToolAnswer(), tools={"read_file": tool}, tool_execution_context=context) as reopened:
+    async with await Session.open(
+        database=database,
+        workspace=tmp_path,
+        thread_id=thread_id,
+        model=model,
+        completion_gate=AcceptToolAnswer(),
+        tools={"read_file": tool},
+        tool_execution_context=context,
+    ) as reopened:
         result = await reopened.resume(turn_id, action="continue")
         assert result.status == "done"
         assert started == ["0", "1", "2"]
         assert len(model.requests) == 1 and model.requests[0].step == 2
         assert [m.tool_call_id for m in model.requests[0].messages if m.role == "tool"] == [
-            "call-0", "call-1", "call-2",
+            "call-0",
+            "call-1",
+            "call-2",
         ]
         assert reopened.store.verify().valid
 
@@ -280,14 +333,24 @@ async def test_call_failure_does_not_cancel_independent_siblings(tmp_path: Path,
 
     store, turn, original, calls = await asyncio.to_thread(_setup, tmp_path, run)
     tool = replace(original._tools["read_file"], timeout_seconds=0.03)
-    orchestrator = ToolOrchestrator(store=store, tools={"read_file": tool}, execution_context=ToolExecutionContext(
-        workspace_root=tmp_path, cwd=tmp_path, max_parallel_calls=2,
-        denied_tool_call_ids=frozenset({"call-1"}) if failure == "denied" else frozenset(),
-    ))
+    orchestrator = ToolOrchestrator(
+        store=store,
+        tools={"read_file": tool},
+        execution_context=ToolExecutionContext(
+            workspace_root=tmp_path,
+            cwd=tmp_path,
+            max_parallel_calls=2,
+            denied_tool_call_ids=frozenset({"call-1"}) if failure == "denied" else frozenset(),
+        ),
+    )
     if failure == "arguments":
         calls = (calls[0], replace(calls[1], argument_error="bad JSON"), calls[2])
-    expected = {"arguments": "invalid_arguments", "denied": "tool_denied", "exception": "runner_failed",
-                "timeout": "timeout_cancelled"}[failure]
+    expected = {
+        "arguments": "invalid_arguments",
+        "denied": "tool_denied",
+        "exception": "runner_failed",
+        "timeout": "timeout_cancelled",
+    }[failure]
     with store:
         results = await orchestrator.execute_batch(turn_id=turn.turn_id, calls=calls)
         assert [r.tool_call_id for r in results] == [c.tool_call_id for c in calls]
@@ -326,13 +389,21 @@ async def test_cancel_during_completed_runner_output_collection_preserves_durabl
         return {"text": "done"}
 
     monkeypatch.setattr(executor_module, "workspace_tree_sha256", snapshot)
-    store, turn, orchestrator, calls = await asyncio.to_thread(_setup, tmp_path, run, tool_changes={
-        "static_effects": frozenset({ToolEffect.WRITE_WORKSPACE}),
-        "resolve_use": lambda args: ResolvedToolUse(effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
-            targets=(ToolTarget(kind="workspace_path", value=str(workspace / "result.txt")),)),
-    })
-    orchestrator.update_execution_context(ToolExecutionContext(workspace_root=workspace, cwd=workspace,
-                                                              allow_write_tools=True))
+    store, turn, orchestrator, calls = await asyncio.to_thread(
+        _setup,
+        tmp_path,
+        run,
+        tool_changes={
+            "static_effects": frozenset({ToolEffect.WRITE_WORKSPACE}),
+            "resolve_use": lambda args: ResolvedToolUse(
+                effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+                targets=(ToolTarget(kind="workspace_path", value=str(workspace / "result.txt")),),
+            ),
+        },
+    )
+    orchestrator.update_execution_context(
+        ToolExecutionContext(workspace_root=workspace, cwd=workspace, allow_write_tools=True)
+    )
     with store:
         task = asyncio.create_task(orchestrator.execute_batch(turn_id=turn.turn_id, calls=calls))
         try:
@@ -410,14 +481,16 @@ async def test_result_commit_fault_stops_batch_and_drains_started_sibling(tmp_pa
     store, turn, orchestrator, calls = await asyncio.to_thread(
         _setup, tmp_path, run, context_changes={"max_parallel_calls": 2}
     )
-    original_commit = store.commit_tool_operation_result
+    original_commit = partial(tool_ops.commit_tool_operation_result, store)
 
     def fail_one_commit(**kwargs):
         if store.read_tool_operation(kwargs["operation_id"]).tool_call_id == "call-0":
             raise OSError("injected storage failure")
         return original_commit(**kwargs)
 
-    monkeypatch.setattr(store, "commit_tool_operation_result", fail_one_commit)
+    monkeypatch.setattr(
+        tool_ops, "commit_tool_operation_result", lambda _store, *args, **kwargs: (fail_one_commit)(*args, **kwargs)
+    )
     with store:
         with pytest.raises(ToolResultCommitError):
             await orchestrator.execute_batch(turn_id=turn.turn_id, calls=calls)

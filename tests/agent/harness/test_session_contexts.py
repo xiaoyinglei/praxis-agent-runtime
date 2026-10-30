@@ -6,10 +6,11 @@ from agent_runtime.harness import (
     DeliveryCompletionGate,
     ModelMessage,
     RolloutContextManager,
-    RuntimeState,
+    RuntimeStore,
     StepContext,
     TurnContext,
-    TurnExecutor,
+    TurnRunner,
+    turn_ops,
 )
 
 
@@ -37,18 +38,29 @@ class _ChangingRouter:
 
 
 def test_session_captures_one_immutable_request_view_per_step(tmp_path: Path, monkeypatch) -> None:
-    clocks = iter((
-        {"current_time": "2031-12-31T23:59:59+00:00", "current_date": "2031-12-31",
-         "timezone": "UTC", "utc_offset": "+00:00"},
-        {"current_time": "2032-01-01T00:00:01+00:00", "current_date": "2032-01-01",
-         "timezone": "UTC", "utc_offset": "+00:00"},
-    ))
+    clocks = iter(
+        (
+            {
+                "current_time": "2031-12-31T23:59:59+00:00",
+                "current_date": "2031-12-31",
+                "timezone": "UTC",
+                "utc_offset": "+00:00",
+            },
+            {
+                "current_time": "2032-01-01T00:00:01+00:00",
+                "current_date": "2032-01-01",
+                "timezone": "UTC",
+                "utc_offset": "+00:00",
+            },
+        )
+    )
     monkeypatch.setattr("agent_runtime.harness.turn.capture_runtime_clock", lambda: next(clocks))
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="inspect the workspace",
             binding_manifest={
@@ -58,7 +70,7 @@ def test_session_captures_one_immutable_request_view_per_step(tmp_path: Path, mo
             },
         )
         router = _ChangingRouter()
-        session = TurnExecutor(
+        session = TurnRunner(
             thread_id=thread.thread_id,
             store=store,
             model=_UnusedModel(),
@@ -98,15 +110,16 @@ def test_session_captures_one_immutable_request_view_per_step(tmp_path: Path, mo
 def test_session_rejects_a_turn_from_another_thread(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        first = store.create_thread(workspace=workspace)
-        second = store.create_thread(workspace=workspace)
-        foreign_turn = store.start_turn(
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        first = turn_ops.create_thread(store, workspace=workspace)
+        second = turn_ops.create_thread(store, workspace=workspace)
+        foreign_turn = turn_ops.start_turn(
+            store,
             thread_id=second.thread_id,
             user_message="foreign",
             binding_manifest={"model_id": "test-model"},
         )
-        session = TurnExecutor(
+        session = TurnRunner(
             thread_id=first.thread_id,
             store=store,
             model=_UnusedModel(),
@@ -119,4 +132,4 @@ def test_session_rejects_a_turn_from_another_thread(tmp_path: Path) -> None:
         except RuntimeError as exc:
             assert "different Session" in str(exc)
         else:
-            raise AssertionError("TurnExecutor accepted a Turn owned by another thread")
+            raise AssertionError("TurnRunner accepted a Turn owned by another thread")

@@ -48,7 +48,27 @@ source_modules =
     agent_runtime.harness.protocol
     agent_runtime.harness.reducer
     agent_runtime.harness.rollout
-    agent_runtime.harness.state
+    agent_runtime.harness.runtime_store
+    agent_runtime.harness.runtime_tx
+    agent_runtime.harness.execution_context
+    agent_runtime.harness.execution_facts
+    agent_runtime.harness.control
+    agent_runtime.harness.context_rendering
+    agent_runtime.harness.context_engine
+    agent_runtime.harness.context_policy
+    agent_runtime.harness.compaction_jobs
+    agent_runtime.harness.model_runner
+    agent_runtime.harness.prepared_requests
+    agent_runtime.harness.artifact_ops
+    agent_runtime.harness.budget_ops
+    agent_runtime.harness.completion_ops
+    agent_runtime.harness.context_ops
+    agent_runtime.harness.facts
+    agent_runtime.harness.memory_ops
+    agent_runtime.harness.model_ops
+    agent_runtime.harness.operation_values
+    agent_runtime.harness.tool_ops
+    agent_runtime.harness.turn_ops
     agent_runtime.harness.tool_orchestrator
     agent_runtime.harness.tool_router
 forbidden_modules =
@@ -74,7 +94,7 @@ source_modules =
     agent_runtime.harness.rollout_integrity
     agent_runtime.harness.rollout_backup
 forbidden_modules =
-    agent_runtime.harness.state
+    agent_runtime.harness.runtime_store
     agent_runtime.harness.protocol
     agent_runtime.harness.session
     agent_runtime.harness.turn

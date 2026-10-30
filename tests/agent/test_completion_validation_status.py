@@ -7,7 +7,7 @@ import pytest
 
 from agent_runtime import Agent
 from agent_runtime.cli import _display_agent_result
-from agent_runtime.harness import CompletionDecision, RuntimeState, Session, TurnResult
+from agent_runtime.harness import CompletionDecision, RuntimeStore, Session, TurnResult, completion_ops, facts, turn_ops
 from agent_runtime.result import AgentResult, AgentUsage
 from agent_runtime.terminal_app import _ConversationOutput
 from agent_runtime.terminal_ui import Conversation
@@ -19,6 +19,7 @@ async def test_false_research_answer_ends_without_becoming_validated(tmp_path, m
     class FalseAnswer(PublicHarnessModel):
         async def dispatch(self, prepared, *, event_sink: object = None):
             from agent_runtime.harness import HarnessModelResponse
+
             return HarnessModelResponse.from_parts(
                 text="The moon is made of cheese.",
                 provider_response_id="false-answer",
@@ -37,7 +38,7 @@ async def test_false_research_answer_ends_without_becoming_validated(tmp_path, m
     replayed = await agent.read_result(result.turn_id)
     assert replayed.validation_status == "not_evaluated"
     assert replayed.validation_scope is None
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         [decision] = [item for item in store.list_items(result.turn_id) if item.kind == "completion_decision"]
         assert decision.payload["validation_status"] == "not_evaluated"
         assert decision.payload["validation_scope"] is None
@@ -53,18 +54,23 @@ def test_legacy_custom_gate_action_does_not_invent_validation(action):
 
 @pytest.mark.parametrize("validation_status", ["not_evaluated", "passed", "failed"])
 def test_canonical_decision_projects_explicit_validation(tmp_path: Path, validation_status):
-    with RuntimeState.open_sync(tmp_path / "projection.sqlite") as store:
-        thread = store.create_thread(workspace=tmp_path)
-        turn = store.start_turn(thread_id=thread.thread_id, user_message="answer", binding_manifest={})
-        proposal = store.record_final_proposal(turn_id=turn.turn_id, answer="answer")
-        store.record_completion_decision(
-            turn_id=turn.turn_id, proposal_item_id=proposal.item_id,
-            action="accept", reason="custom decision",
-            validation_status=validation_status, validation_scope="custom_check",
+    with RuntimeStore.open_sync(tmp_path / "projection.sqlite") as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(store, thread_id=thread.thread_id, user_message="answer", binding_manifest={})
+        proposal = completion_ops.record_final_proposal(store, turn_id=turn.turn_id, answer="answer")
+        completion_ops.record_completion_decision(
+            store,
+            turn_id=turn.turn_id,
+            proposal_item_id=proposal.item_id,
+            action="accept",
+            reason="custom decision",
+            validation_status=validation_status,
+            validation_scope="custom_check",
         )
-        store.complete_turn(turn_id=turn.turn_id, answer="answer")
+        turn_ops.complete_turn(store, turn_id=turn.turn_id, answer="answer")
         result = AgentResult._from_harness(
-            TurnResult(thread_id=thread.thread_id, turn_id=turn.turn_id, answer="answer"), store=store,
+            TurnResult(thread_id=thread.thread_id, turn_id=turn.turn_id, answer="answer"),
+            store=store,
         )
         assert result.validation_status == validation_status
         assert result.validation_scope == "custom_check"
@@ -75,28 +81,41 @@ def test_canonical_decision_projects_explicit_validation(tmp_path: Path, validat
 @pytest.mark.parametrize("legacy_decision", [False, True])
 async def test_read_result_of_old_turn_without_validation_metadata_is_not_evaluated(tmp_path, legacy_decision):
     database = tmp_path / "old.sqlite"
-    async with (await RuntimeState.open(database)) as store:
-        thread = store.create_thread(workspace=tmp_path)
-        turn = store.start_turn(thread_id=thread.thread_id, user_message="old", binding_manifest={})
+    async with await RuntimeStore.open(database) as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(store, thread_id=thread.thread_id, user_message="old", binding_manifest={})
         if legacy_decision:
-            proposal = store.record_final_proposal(turn_id=turn.turn_id, answer="old answer")
+            proposal = completion_ops.record_final_proposal(store, turn_id=turn.turn_id, answer="old answer")
+
             # Replay the historical canonical shape, before validation metadata existed.
             def seed_legacy_decision():
                 with store.persistence.transaction():
-                    store._append_and_reduce(
-                        thread_id=thread.thread_id, turn_id=turn.turn_id,
-                        record_type="item_started", producer="verifier",
+                    facts.append_fact(
+                        store,
+                        thread_id=thread.thread_id,
+                        turn_id=turn.turn_id,
+                        record_type="item_started",
+                        producer="verifier",
                         payload={"item_id": "legacy-decision", "kind": "completion_decision"},
                     )
-                    store._append_and_reduce(
-                        thread_id=thread.thread_id, turn_id=turn.turn_id,
-                        record_type="item_completed", producer="verifier",
-                        payload={"item_id": "legacy-decision", "payload": {
-                            "proposal_item_id": proposal.item_id, "action": "accept", "reason": "legacy",
-                        }},
+                    facts.append_fact(
+                        store,
+                        thread_id=thread.thread_id,
+                        turn_id=turn.turn_id,
+                        record_type="item_completed",
+                        producer="verifier",
+                        payload={
+                            "item_id": "legacy-decision",
+                            "payload": {
+                                "proposal_item_id": proposal.item_id,
+                                "action": "accept",
+                                "reason": "legacy",
+                            },
+                        },
                     )
+
             store.run_sync(seed_legacy_decision)
-        store.complete_turn(turn_id=turn.turn_id, answer="old answer")
+        turn_ops.complete_turn(store, turn_id=turn.turn_id, answer="old answer")
         assert store.verify().valid
     agent = Agent(checkpoint_db=database, workspace_path=tmp_path)
     result = await agent.read_result(turn.turn_id)
@@ -111,8 +130,10 @@ async def test_explicit_failed_gate_preserves_failed_validation_without_an_answe
             return CompletionDecision("fail", "claim contradicted", "failed", "custom_acceptance")
 
     async with await Session.open(
-        database=tmp_path / "failed.sqlite", workspace=tmp_path,
-        model=PublicHarnessModel(), completion_gate=RejectAnswer(),
+        database=tmp_path / "failed.sqlite",
+        workspace=tmp_path,
+        model=PublicHarnessModel(),
+        completion_gate=RejectAnswer(),
     ) as session:
         result = await session.submit("answer")
         assert result.status == "failed"
@@ -126,9 +147,22 @@ async def test_explicit_failed_gate_preserves_failed_validation_without_an_answe
 
 def _done_result():
     return AgentResult(
-        answer="research answer", status="done", files=(), tool_calls=(), evidence=(), citations=(),
-        usage=AgentUsage(), diagnostics=(), turn_id="turn", stop_reason="completed", pause=None,
-        workspace_path=None, groundedness=False, insufficient_evidence=False, plan=None, plan_events=(),
+        answer="research answer",
+        status="done",
+        files=(),
+        tool_calls=(),
+        evidence=(),
+        citations=(),
+        usage=AgentUsage(),
+        diagnostics=(),
+        turn_id="turn",
+        stop_reason="completed",
+        pause=None,
+        workspace_path=None,
+        groundedness=False,
+        insufficient_evidence=False,
+        plan=None,
+        plan_events=(),
     )
 
 
@@ -153,6 +187,7 @@ def test_terminal_chat_retains_validation_when_execution_is_hidden():
 @pytest.mark.parametrize("answer_streamed", [False, True])
 def test_cli_always_names_explicit_validation_and_scope(capsys, validation_status, answer_streamed):
     from dataclasses import replace
+
     result = replace(_done_result(), validation_status=validation_status, validation_scope="workspace_change")
     _display_agent_result(result, verbose=False, answer_streamed=answer_streamed)
     output = capsys.readouterr().out

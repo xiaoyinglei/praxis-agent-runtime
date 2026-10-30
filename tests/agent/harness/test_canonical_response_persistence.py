@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from agent_runtime.harness import RolloutEventReader, RuntimeState
+from agent_runtime.harness import RolloutEventReader, RuntimeStore, model_ops, turn_ops
 from agent_runtime.harness.protocol import HarnessModelResponse, restore_model_response
 from agent_runtime.history import read_chat_messages
 from agent_runtime.modeling.events import ModelOutput
@@ -26,10 +26,11 @@ def test_response_persistence_has_one_ordered_source_and_no_aggregate_events(tmp
         usage={"output_tokens": 12},
         stop_reason="stop",
     )
-    with RuntimeState.open_sync(path) as store:
-        thread = store.create_thread(workspace=tmp_path)
-        turn = store.start_turn(thread_id=thread.thread_id, user_message="fix", binding_manifest={})
-        operation = store.prepare_model_operation(
+    with RuntimeStore.open_sync(path) as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(store, thread_id=thread.thread_id, user_message="fix", binding_manifest={})
+        operation = model_ops.prepare_model_operation(
+            store,
             turn_id=turn.turn_id,
             request_hash="r",
             context_hash="c",
@@ -37,8 +38,9 @@ def test_response_persistence_has_one_ordered_source_and_no_aggregate_events(tmp
             wire_hash="w",
             request_ref={"input_revision": 1, "request_id": "request-1"},
         )
-        attempt = store.dispatch_model_attempt(operation.operation_id, worker_id="worker", lease_seconds=30)
-        assert store.complete_model_attempt(
+        attempt = model_ops.dispatch_model_attempt(store, operation.operation_id, worker_id="worker", lease_seconds=30)
+        assert model_ops.complete_model_attempt(
+            store,
             operation_id=operation.operation_id,
             attempt_id=attempt.attempt_id,
             generation=attempt.generation,
@@ -53,11 +55,11 @@ def test_response_persistence_has_one_ordered_source_and_no_aggregate_events(tmp
             "incomplete_reason",
             "stop_reason",
         }
-        store.complete_turn(turn_id=turn.turn_id, answer=response.text, source_item_id=saved.item_id)
+        turn_ops.complete_turn(store, turn_id=turn.turn_id, answer=response.text, source_item_id=saved.item_id)
         assert store.read_turn_answer(turn.turn_id).item_id == saved.item_id
         assert not any(item.kind == "agent_message" for item in store.list_items(turn.turn_id))
 
-    with RuntimeState.open_sync(path) as store:
+    with RuntimeStore.open_sync(path) as store:
         answer = store.read_turn_answer(turn.turn_id)
         restored = restore_model_response(answer.payload)
         assert restored == response
@@ -85,10 +87,11 @@ def test_internal_summary_uses_outputs_without_public_output_lifecycle(tmp_path:
     response = HarnessModelResponse(
         outputs=(ModelOutput("summary", "text", "retained facts"),), status="incomplete", incomplete_reason="max_tokens"
     )
-    with RuntimeState.open_sync(path) as store:
-        thread = store.create_thread(workspace=tmp_path)
-        turn = store.start_turn(thread_id=thread.thread_id, user_message="fix", binding_manifest={})
-        operation = store.prepare_model_operation(
+    with RuntimeStore.open_sync(path) as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(store, thread_id=thread.thread_id, user_message="fix", binding_manifest={})
+        operation = model_ops.prepare_model_operation(
+            store,
             turn_id=turn.turn_id,
             request_hash="r",
             context_hash="c",
@@ -96,8 +99,9 @@ def test_internal_summary_uses_outputs_without_public_output_lifecycle(tmp_path:
             wire_hash="w",
             request_ref={"input_revision": 1, "request_id": "summary-1", "purpose": "context_summary"},
         )
-        attempt = store.dispatch_model_attempt(operation.operation_id, worker_id="worker", lease_seconds=30)
-        assert store.complete_model_attempt(
+        attempt = model_ops.dispatch_model_attempt(store, operation.operation_id, worker_id="worker", lease_seconds=30)
+        assert model_ops.complete_model_attempt(
+            store,
             operation_id=operation.operation_id,
             attempt_id=attempt.attempt_id,
             generation=attempt.generation,
@@ -113,7 +117,8 @@ def test_internal_summary_uses_outputs_without_public_output_lifecycle(tmp_path:
             for entry in RolloutEventReader(store).read(thread.thread_id)
         )
         record_count = len(store.list_records(thread.thread_id))
-        assert not store.complete_model_attempt(
+        assert not model_ops.complete_model_attempt(
+            store,
             operation_id=operation.operation_id,
             attempt_id=attempt.attempt_id,
             generation=attempt.generation,

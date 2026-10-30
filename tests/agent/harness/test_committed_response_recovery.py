@@ -16,10 +16,13 @@ from agent_runtime.harness import (
     HarnessModelResponse,
     PreparedModelCall,
     RolloutContextManager,
-    RuntimeState,
+    RuntimeStore,
     StaticToolRouter,
     ToolOrchestrator,
-    TurnExecutor,
+    TurnRunner,
+    model_ops,
+    tool_ops,
+    turn_ops,
 )
 from agent_runtime.tools.permissions import ToolExecutionContext
 from agent_runtime.tools.registry import ToolRegistry
@@ -120,11 +123,6 @@ class FrozenBinding:
         return {"model_id": "model-v1", "model_step_budget": 2}
 
 
-class CrashBeforeToolResultStore(RuntimeState):
-    def record_tool_result(self, **_kwargs):  # type: ignore[no-untyped-def]
-        raise RuntimeError("injected crash before ToolResult commit")
-
-
 @pytest.mark.parametrize("result_committed_before_crash", [False, True])
 def test_fresh_runner_consumes_committed_tool_call_without_replaying_model(
     tmp_path: Path,
@@ -139,20 +137,23 @@ def test_fresh_runner_consumes_committed_tool_call_without_replaying_model(
     tools = registry.freeze()
     toolset_revision = toolset_revision_for_tools(tuple(tools.values()))
 
-    with RuntimeState.open_sync(database) as crashed_process:
-        thread = crashed_process.create_thread(workspace=workspace)
-        turn = crashed_process.start_turn(
+    with RuntimeStore.open_sync(database) as crashed_process:
+        thread = turn_ops.create_thread(crashed_process, workspace=workspace)
+        turn = turn_ops.start_turn(
+            crashed_process,
             thread_id=thread.thread_id,
             user_message="read README",
             binding_manifest={"model_id": "model-v1", "model_step_budget": 2},
         )
-        operation = crashed_process.prepare_model_operation(
+        operation = model_ops.prepare_model_operation(
+            crashed_process,
             turn_id=turn.turn_id,
             request_hash="r" * 64,
             context_hash="c" * 64,
             tool_hash=toolset_revision,
             wire_hash="w" * 64,
-            request_ref={"input_revision": 1,
+            request_ref={
+                "input_revision": 1,
                 "request_id": f"{turn.turn_id}:step:1",
                 "toolset_revision": toolset_revision,
                 "exposed_tool_names": ["read_file"],
@@ -162,8 +163,9 @@ def test_fresh_runner_consumes_committed_tool_call_without_replaying_model(
                 },
             },
         )
-        attempt = crashed_process.dispatch_model_attempt(operation.operation_id)
-        assert crashed_process.complete_model_attempt(
+        attempt = model_ops.dispatch_model_attempt(crashed_process, operation.operation_id)
+        assert model_ops.complete_model_attempt(
+            crashed_process,
             operation_id=operation.operation_id,
             attempt_id=attempt.attempt_id,
             generation=attempt.generation,
@@ -211,9 +213,9 @@ def test_fresh_runner_consumes_committed_tool_call_without_replaying_model(
             )
             assert calls == ["README.md"]
 
-    with RuntimeState.open_sync(database) as recovered_process:
+    with RuntimeStore.open_sync(database) as recovered_process:
         model = AnswerAfterRecovery()
-        session = TurnExecutor(
+        session = TurnRunner(
             thread_id=turn.thread_id,
             store=recovered_process,
             model=model,
@@ -230,7 +232,7 @@ def test_fresh_runner_consumes_committed_tool_call_without_replaying_model(
             ),
         )
 
-        result = asyncio.run(session.recover_committed_model_response(turn_id=turn.turn_id))
+        result = asyncio.run(session.drive(action="continue", turn_id=turn.turn_id))
 
         assert result.status == "completed"
         assert calls == ["README.md"], (
@@ -250,6 +252,7 @@ def test_fresh_runner_consumes_committed_tool_call_without_replaying_model(
 
 def test_missing_tool_result_after_runner_success_pauses_for_reconciliation(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -259,20 +262,31 @@ def test_missing_tool_result_after_runner_success_pauses_for_reconciliation(
     registry.register(_read_tool(calls, workspace))
     tools = registry.freeze()
     toolset_revision = toolset_revision_for_tools(tuple(tools.values()))
-    with CrashBeforeToolResultStore.open_sync(database) as crashed_process:
-        thread = crashed_process.create_thread(workspace=workspace)
-        turn = crashed_process.start_turn(
+    original_result = tool_ops.record_tool_result
+
+    def fail_result(store, **kwargs):
+        if store is crashed_process:
+            raise RuntimeError("injected crash before ToolResult commit")
+        return original_result(store, **kwargs)
+
+    monkeypatch.setattr(tool_ops, "record_tool_result", fail_result)
+    with RuntimeStore.open_sync(database) as crashed_process:
+        thread = turn_ops.create_thread(crashed_process, workspace=workspace)
+        turn = turn_ops.start_turn(
+            crashed_process,
             thread_id=thread.thread_id,
             user_message="read once",
             binding_manifest={"model_id": "model-v1", "model_step_budget": 2},
         )
-        model_operation = crashed_process.prepare_model_operation(
+        model_operation = model_ops.prepare_model_operation(
+            crashed_process,
             turn_id=turn.turn_id,
             request_hash="r" * 64,
             context_hash="c" * 64,
             tool_hash=toolset_revision,
             wire_hash="w" * 64,
-            request_ref={"input_revision": 1,
+            request_ref={
+                "input_revision": 1,
                 "request_id": f"{turn.turn_id}:step:1",
                 "toolset_revision": toolset_revision,
                 "exposed_tool_names": ["read_file"],
@@ -282,8 +296,9 @@ def test_missing_tool_result_after_runner_success_pauses_for_reconciliation(
                 },
             },
         )
-        attempt = crashed_process.dispatch_model_attempt(model_operation.operation_id)
-        assert crashed_process.complete_model_attempt(
+        attempt = model_ops.dispatch_model_attempt(crashed_process, model_operation.operation_id)
+        assert model_ops.complete_model_attempt(
+            crashed_process,
             operation_id=model_operation.operation_id,
             attempt_id=attempt.attempt_id,
             generation=attempt.generation,
@@ -333,10 +348,11 @@ def test_missing_tool_result_after_runner_success_pauses_for_reconciliation(
         assert rolled_back_outcome.result_item_id is None
         assert calls == ["README.md"]
 
-    with RuntimeState.open_sync(database) as recovered_process:
+    with RuntimeStore.open_sync(database) as recovered_process:
         [expired_claim] = recovered_process.list_tool_operations(turn.turn_id)
         assert expired_claim.lease_expires_at is not None
-        recovered_process.expire_tool_operation_claim(
+        tool_ops.expire_tool_operation_claim(
+            recovered_process,
             operation_id=expired_claim.operation_id,
             now=expired_claim.lease_expires_at + 1.0,
         )

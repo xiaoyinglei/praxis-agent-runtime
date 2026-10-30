@@ -9,8 +9,10 @@ from agent_runtime.harness import (
     HarnessModelResponse,
     ModelMessage,
     RolloutContextManager,
-    RuntimeState,
-    TurnExecutor,
+    RuntimeStore,
+    TurnRunner,
+    model_ops,
+    turn_ops,
 )
 from agent_runtime.harness.protocol import ContextBudgetExceededError, model_response_payload
 from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
@@ -18,19 +20,19 @@ from tests.agent.harness.test_compaction_consistency import Accept, long_history
 
 
 def test_unfit_fixed_context_spends_no_summary_calls(tmp_path: Path):
-    with RuntimeState.open_sync(tmp_path / "r.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "r.db") as store:
         thread, turn = start(store, tmp_path)
         seed(store, turn_id=turn.turn_id, kind="user_message", payload={"text": "current task constraint " * 500})
         long_history(store, turn)
         model, gateway = model_for()
-        runner = TurnExecutor(
+        runner = TurnRunner(
             thread_id=thread.thread_id,
             store=store,
             model=model,
             context_manager=RolloutContextManager(store, max_total_bytes=5000),
             completion_gate=Accept(),
         )
-        result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
+        result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "failed"
         assert store.read_turn(turn.turn_id).terminal_reason_code == "byte_guard"
         assert not gateway.requests
@@ -56,7 +58,7 @@ def test_summary_output_limit_controls_reservation_and_wire():
 
 def test_summary_is_not_dispatched_with_leftover_output_allowance(tmp_path, monkeypatch):
     """Budget can buy the input, but cannot buy configured output plus continuation."""
-    with RuntimeState.open_sync(tmp_path / "insufficient-summary.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "insufficient-summary.db") as store:
         thread, turn = start(store, tmp_path)
         long_history(store, turn)
         model, gateway = model_for(100000)
@@ -77,11 +79,15 @@ def test_summary_is_not_dispatched_with_leftover_output_allowance(tmp_path, monk
             return summary.input_tokens + floors[-1].resource_request.total_tokens + summary.output_tokens
 
         model.prepare = prepare
-        monkeypatch.setattr("agent_runtime.harness.turn.normal_token_remaining", remaining)
-        runner = TurnExecutor(thread_id=thread.thread_id, store=store, model=model,
-                              context_manager=RolloutContextManager(store, max_total_bytes=5000),
-                              completion_gate=Accept())
-        result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
+        monkeypatch.setattr("agent_runtime.harness.context_engine.normal_token_remaining", remaining)
+        runner = TurnRunner(
+            thread_id=thread.thread_id,
+            store=store,
+            model=model,
+            context_manager=RolloutContextManager(store, max_total_bytes=5000),
+            completion_gate=Accept(),
+        )
+        result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "failed"
         assert store.read_turn(turn.turn_id).terminal_reason_code == "model_token_budget_exhausted"
         assert not gateway.requests
@@ -106,10 +112,10 @@ def test_request_input_limit_can_only_reduce_provider_limit():
 def test_step_output_limits_survive_operation_restore(tmp_path: Path):
     from dataclasses import replace
 
-    with RuntimeState.open_sync(tmp_path / "r.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "r.db") as store:
         thread, turn = start(store, tmp_path)
         model, _ = model_for()
-        runner = TurnExecutor(
+        runner = TurnRunner(
             thread_id=thread.thread_id,
             store=store,
             model=model,
@@ -121,8 +127,9 @@ def test_step_output_limits_survive_operation_restore(tmp_path: Path):
             input_token_limit=4000,
             output_token_limit=37,
         )
-        prepared = asyncio.run(runner._prepare_step(context))
-        operation = store.prepare_model_operation(
+        prepared = asyncio.run(runner._model_runner.prepare(context))
+        operation = model_ops.prepare_model_operation(
+            store,
             turn_id=turn.turn_id,
             request_hash=prepared.request_hash,
             context_hash=prepared.context_hash,
@@ -131,7 +138,7 @@ def test_step_output_limits_survive_operation_restore(tmp_path: Path):
             request_ref=prepared.request_ref,
         )
         restored = runner.restore_step_context(context.turn, operation)
-        reproduced = asyncio.run(runner._prepare_step(restored))
+        reproduced = asyncio.run(runner._model_runner.prepare(restored))
         assert restored.output_token_limit == 37 and restored.input_token_limit == 4000
         assert reproduced.wire_hash == prepared.wire_hash
 
@@ -155,35 +162,38 @@ def test_summary_dispatch_preserves_continuation_headroom_after_reopen(tmp_path:
     from agent_runtime.budget import BudgetLimitExceededError, ResourceUsage
 
     database = tmp_path / "reserve.db"
-    with RuntimeState.open_sync(database) as store:
-        thread = store.create_thread(workspace=tmp_path)
-        turn = store.start_turn(
-            thread_id=thread.thread_id, user_message="test", binding_manifest={"model_token_budget_total": 100}
+    with RuntimeStore.open_sync(database) as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(
+            store, thread_id=thread.thread_id, user_message="test", binding_manifest={"model_token_budget_total": 100}
         )
-        operation = store.prepare_model_operation(
+        operation = model_ops.prepare_model_operation(
+            store,
             turn_id=turn.turn_id,
             request_hash="request",
             context_hash="context",
             tool_hash="tool",
             wire_hash="wire",
-            request_ref={"input_revision": 1,
+            request_ref={
+                "input_revision": 1,
                 "request_id": "summary",
                 "purpose": "context_summary",
                 "compaction_plan": {"continuation_token_reserve": 40},
             },
         )
-    with RuntimeState.open_sync(database) as store:
+    with RuntimeStore.open_sync(database) as store:
         # 51 fits alone but cannot leave 40 of the 90 ordinary tokens available.
         with pytest.raises(BudgetLimitExceededError):
-            store.dispatch_model_attempt(
+            model_ops.dispatch_model_attempt(
+                store,
                 operation.operation_id,
                 resource_request=ResourceUsage(input_tokens=51, model_calls=1),
                 allow_protected_budget=True,
             )
         assert store.read_budget_state(turn.turn_id).reserved.total_tokens == 0
         assert store.list_model_operations(turn.turn_id)[0].status == "prepared"
-        store.dispatch_model_attempt(
-            operation.operation_id, resource_request=ResourceUsage(input_tokens=50, model_calls=1)
+        model_ops.dispatch_model_attempt(
+            store, operation.operation_id, resource_request=ResourceUsage(input_tokens=50, model_calls=1)
         )
         assert store.read_budget_state(turn.turn_id).reserved.total_tokens == 50
         assert store.verify().valid
@@ -193,15 +203,17 @@ def test_unknown_summary_retry_cannot_reset_frozen_call_allowance(tmp_path: Path
     from agent_runtime.budget import BudgetLimitExceededError, ResourceUsage
 
     database = tmp_path / "retry.db"
-    with RuntimeState.open_sync(database) as store:
+    with RuntimeStore.open_sync(database) as store:
         thread, turn = start(store, tmp_path)
-        operation = store.prepare_model_operation(
+        operation = model_ops.prepare_model_operation(
+            store,
             turn_id=turn.turn_id,
             request_hash="request",
             context_hash="context",
             tool_hash="tool",
             wire_hash="wire",
-            request_ref={"input_revision": 1,
+            request_ref={
+                "input_revision": 1,
                 "request_id": "summary",
                 "purpose": "context_summary",
                 "compaction_plan": {
@@ -212,17 +224,17 @@ def test_unknown_summary_retry_cannot_reset_frozen_call_allowance(tmp_path: Path
                 },
             },
         )
-        attempt = store.dispatch_model_attempt(
-            operation.operation_id, resource_request=ResourceUsage(input_tokens=10, model_calls=1)
+        attempt = model_ops.dispatch_model_attempt(
+            store, operation.operation_id, resource_request=ResourceUsage(input_tokens=10, model_calls=1)
         )
-        store.mark_model_attempt_unknown(
-            operation_id=operation.operation_id, attempt_id=attempt.attempt_id, generation=attempt.generation
+        model_ops.mark_model_attempt_unknown(
+            store, operation_id=operation.operation_id, attempt_id=attempt.attempt_id, generation=attempt.generation
         )
-    with RuntimeState.open_sync(database) as store:
-        store.prepare_model_retry(operation.operation_id)
+    with RuntimeStore.open_sync(database) as store:
+        model_ops.prepare_model_retry(store, operation.operation_id)
         with pytest.raises(BudgetLimitExceededError, match="model_calls"):
-            store.dispatch_model_attempt(
-                operation.operation_id, resource_request=ResourceUsage(input_tokens=10, model_calls=1)
+            model_ops.dispatch_model_attempt(
+                store, operation.operation_id, resource_request=ResourceUsage(input_tokens=10, model_calls=1)
             )
         assert len([a for a in store.list_model_attempts(operation.operation_id) if a.status != "prepared"]) == 1
         assert store.verify().valid
@@ -231,18 +243,23 @@ def test_unknown_summary_retry_cannot_reset_frozen_call_allowance(tmp_path: Path
 def test_summary_cannot_consume_continuation_monetary_budget(tmp_path: Path):
     from agent_runtime.budget import BudgetLimitExceededError, ResourceUsage
 
-    with RuntimeState.open_sync(tmp_path / "cost.db") as store:
-        thread = store.create_thread(workspace=tmp_path)
-        turn = store.start_turn(
-            thread_id=thread.thread_id, user_message="test", binding_manifest={"model_cost_budget_total_micros": 100}
+    with RuntimeStore.open_sync(tmp_path / "cost.db") as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(
+            store,
+            thread_id=thread.thread_id,
+            user_message="test",
+            binding_manifest={"model_cost_budget_total_micros": 100},
         )
-        operation = store.prepare_model_operation(
+        operation = model_ops.prepare_model_operation(
+            store,
             turn_id=turn.turn_id,
             request_hash="request",
             context_hash="context",
             tool_hash="tool",
             wire_hash="wire",
-            request_ref={"input_revision": 1,
+            request_ref={
+                "input_revision": 1,
                 "request_id": "summary",
                 "purpose": "context_summary",
                 "compaction_plan": {
@@ -252,8 +269,10 @@ def test_summary_cannot_consume_continuation_monetary_budget(tmp_path: Path):
             },
         )
         with pytest.raises(BudgetLimitExceededError, match="cost_micros"):
-            store.dispatch_model_attempt(
-                operation.operation_id, resource_request=ResourceUsage(input_tokens=10, cost_micros=41, model_calls=1)
+            model_ops.dispatch_model_attempt(
+                store,
+                operation.operation_id,
+                resource_request=ResourceUsage(input_tokens=10, cost_micros=41, model_calls=1),
             )
         assert store.read_budget_state(turn.turn_id).reserved.cost_micros == 0
 
@@ -261,9 +280,7 @@ def test_summary_cannot_consume_continuation_monetary_budget(tmp_path: Path):
 @pytest.mark.parametrize(
     "provider,model_id", [("arbitrary-provider", "arbitrary-model"), ("deepseek", "deepseek-flash")]
 )
-def test_configured_summary_role_is_frozen_for_restart(
-    tmp_path: Path, provider: str, model_id: str
-):
+def test_configured_summary_role_is_frozen_for_restart(tmp_path: Path, provider: str, model_id: str):
     from dataclasses import replace
 
     from agent_runtime.harness import GatewayHarnessModel
@@ -284,9 +301,9 @@ def test_configured_summary_role_is_frozen_for_restart(
             continuation_summary_role="assistant",
         ),
     )
-    with RuntimeState.open_sync(tmp_path / "role.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "role.db") as store:
         thread, turn = start(store, tmp_path)
-        runner = TurnExecutor(
+        runner = TurnRunner(
             thread_id=thread.thread_id,
             store=store,
             model=model,
@@ -305,10 +322,11 @@ def test_configured_summary_role_is_frozen_for_restart(
                 ModelMessage(role="context", body="A new runtime constraint."),
             ),
         )
-        prepared = asyncio.run(runner._prepare_step(context))
+        prepared = asyncio.run(runner._model_runner.prepare(context))
         wire = serialize_openai_request(prepared.dispatch_payload.request).payload
         assert [m["role"] for m in wire["messages"]][-3:] == ["user", "assistant", "user"]
-        operation = store.prepare_model_operation(
+        operation = model_ops.prepare_model_operation(
+            store,
             turn_id=turn.turn_id,
             request_hash=prepared.request_hash,
             context_hash=prepared.context_hash,
@@ -318,12 +336,12 @@ def test_configured_summary_role_is_frozen_for_restart(
         )
         restored = runner.restore_step_context(context.turn, operation)
         assert restored.continuation_summary_role == "assistant"
-        assert asyncio.run(runner._prepare_step(restored)).wire_hash == prepared.wire_hash
+        assert asyncio.run(runner._model_runner.prepare(restored)).wire_hash == prepared.wire_hash
 
 
 def test_oversized_summary_with_tail_reuses_same_generation_without_losing_unseen_input(tmp_path: Path):
 
-    with RuntimeState.open_sync(tmp_path / "tail-budget.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "tail-budget.db") as store:
         thread, turn = start(store, tmp_path)
         long_history(store, turn)
         seed(
@@ -332,10 +350,8 @@ def test_oversized_summary_with_tail_reuses_same_generation_without_losing_unsee
             kind="model_response",
             payload=model_response_payload(
                 HarnessModelResponse.from_parts(
-                    text='read',
-                    tool_calls=(
-                        ModelToolCall(id='last', name='read', arguments={}),
-                    ),
+                    text="read",
+                    tool_calls=(ModelToolCall(id="last", name="read", arguments={}),),
                 )
             ),
         )
@@ -361,10 +377,10 @@ def test_oversized_summary_with_tail_reuses_same_generation_without_losing_unsee
             )
 
         model.dispatch = dispatch
-        runner = TurnExecutor(
+        runner = TurnRunner(
             thread_id=thread.thread_id, store=store, model=model, context_manager=manager, completion_gate=Accept()
         )
-        result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
+        result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "completed"
         assert [p.request_ref["purpose"] for p in dispatched] == ["context_summary", "agent_step"]
         final_messages = manager.build(turn.turn_id)

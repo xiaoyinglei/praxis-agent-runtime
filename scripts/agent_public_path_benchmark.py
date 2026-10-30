@@ -397,11 +397,11 @@ def _approval_is_allowed(
     turn_id: str,
     allowed_effects: frozenset[str],
 ) -> bool:
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
 
     if not checkpoint.is_file():
         return False
-    with RuntimeState.open_sync(checkpoint) as store:
+    with RuntimeStore.open_sync(checkpoint) as store:
         pending = tuple(
             interaction
             for interaction in store.list_interactions(turn_id)
@@ -419,9 +419,9 @@ def _approval_is_allowed(
 
 
 def _workspace_write_attempt_count(checkpoint: Path) -> int:
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
 
-    with RuntimeState.open_sync(checkpoint) as store:
+    with RuntimeStore.open_sync(checkpoint) as store:
         return sum(
             operation.attempt_count
             for operation in store.list_tool_operations()

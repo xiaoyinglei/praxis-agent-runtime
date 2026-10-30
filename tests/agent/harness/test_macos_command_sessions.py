@@ -9,7 +9,7 @@ import pytest
 from typer.testing import CliRunner
 
 from agent_runtime import Agent, cli
-from agent_runtime.harness import HarnessModelResponse, ModelToolCall, RuntimeState
+from agent_runtime.harness import HarnessModelResponse, ModelToolCall, RuntimeStore
 from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel
 
 pytestmark = pytest.mark.skipif(sys.platform != "darwin", reason="requires real macOS Seatbelt")
@@ -29,24 +29,42 @@ class SessionCommandModel(PatchThenAnswerModel):
         request = prepared.dispatch_payload
         results = [json.loads(m.content)["structured_content"] for m in request.messages if m.role == "tool"]
         if not results:
-            call = ModelToolCall(id="launch", name="run_command", arguments={
-                "command": self.command, "working_dir": ".", "timeout_seconds": None,
-                "yield_time_seconds": 0.01, "workspace_write": self.write,
-            })
+            call = ModelToolCall(
+                id="launch",
+                name="run_command",
+                arguments={
+                    "command": self.command,
+                    "working_dir": ".",
+                    "timeout_seconds": None,
+                    "yield_time_seconds": 0.01,
+                    "workspace_write": self.write,
+                },
+            )
         elif results[-1]["status"] == "running":
             if self.premature and self.final_attempts == 0:
                 self.final_attempts += 1
-                return HarnessModelResponse.from_parts(text="premature answer", provider_response_id=None,
-                                            usage={"input_tokens": 3, "output_tokens": 3})
-            call = ModelToolCall(id="wait-" + str(request.step), name="manage_command", arguments={
-                "session_id": results[0]["session_id"], "action": "wait", "wait_seconds": 3,
-            })
+                return HarnessModelResponse.from_parts(
+                    text="premature answer", provider_response_id=None, usage={"input_tokens": 3, "output_tokens": 3}
+                )
+            call = ModelToolCall(
+                id="wait-" + str(request.step),
+                name="manage_command",
+                arguments={
+                    "session_id": results[0]["session_id"],
+                    "action": "wait",
+                    "wait_seconds": 3,
+                },
+            )
         else:
             assert results[-1]["exit_code"] == 0, results[-1]
-            return HarnessModelResponse.from_parts(text="observed terminal result", provider_response_id=None,
-                                        usage={"input_tokens": 3, "output_tokens": 3})
-        return HarnessModelResponse.from_parts(text="", provider_response_id=None, tool_calls=(call,),
-                                    usage={"input_tokens": 3, "output_tokens": 3})
+            return HarnessModelResponse.from_parts(
+                text="observed terminal result",
+                provider_response_id=None,
+                usage={"input_tokens": 3, "output_tokens": 3},
+            )
+        return HarnessModelResponse.from_parts(
+            text="", provider_response_id=None, tool_calls=(call,), usage={"input_tokens": 3, "output_tokens": 3}
+        )
 
 
 @pytest.mark.parametrize("entrypoint", ["sdk", "cli"])
@@ -67,8 +85,15 @@ def test_public_macos_command_lifecycle_approval_and_completion(tmp_path, monkey
     if entrypoint == "sdk":
         agent = Agent(workspace_path=workspace, checkpoint_db=database, enable_workspace_mcp=False)
         monkeypatch.setattr(agent, "_model_factory", model_factory)
-        result = asyncio.run(agent.run("Run command", allow_execute_tools=True, max_steps=6,
-                                       require_workspace_change=write, acceptance_command=command))
+        result = asyncio.run(
+            agent.run(
+                "Run command",
+                allow_execute_tools=True,
+                max_steps=6,
+                require_workspace_change=write,
+                acceptance_command=command,
+            )
+        )
         if write:
             assert result.status == "paused"
             assert not (workspace / "artifact").exists()
@@ -89,22 +114,35 @@ def test_public_macos_command_lifecycle_approval_and_completion(tmp_path, monkey
         monkeypatch.setattr(cli, "_create_agent_facade", create)
         monkeypatch.chdir(workspace)
         runner = CliRunner()
-        result = runner.invoke(cli.agent_app, [
-            "run", "Run command", "--allow-execute-tools", "--max-steps", "6", "--disable-workspace-mcp",
-            "--non-interactive", "--rollout-db", str(database), "--acceptance-command", command,
-            *( ["--require-workspace-change"] if write else []),
-        ])
+        result = runner.invoke(
+            cli.agent_app,
+            [
+                "run",
+                "Run command",
+                "--allow-execute-tools",
+                "--max-steps",
+                "6",
+                "--disable-workspace-mcp",
+                "--non-interactive",
+                "--rollout-db",
+                str(database),
+                "--acceptance-command",
+                command,
+                *(["--require-workspace-change"] if write else []),
+            ],
+        )
         if write:
-            with RuntimeState.open_sync(database) as store:
+            with RuntimeStore.open_sync(database) as store:
                 turn = store.list_turns()[-1]
                 assert turn.status == "paused"
             assert not (workspace / "artifact").exists()
-            result = runner.invoke(cli.agent_app, ["recover", turn.turn_id, "--action", "allow_once",
-                                                  "--rollout-db", str(database)])
+            result = runner.invoke(
+                cli.agent_app, ["recover", turn.turn_id, "--action", "allow_once", "--rollout-db", str(database)]
+            )
         assert result.exit_code == 0, result.output
     if write:
         assert (workspace / "artifact").read_text() == "delayed"
-    with RuntimeState.open_sync(database) as store:
+    with RuntimeStore.open_sync(database) as store:
         turn = store.list_turns()[-1]
         assert turn.status == "completed", turn
         outputs = [i.payload for i in store.list_items(turn.turn_id) if i.kind == "tool_result"]
@@ -137,11 +175,17 @@ def test_public_managed_python_script_entry(tmp_path, monkeypatch, entrypoint):
                 output = results[-1]["structured_content"]
                 assert output["stdout"] == "script-checked\n"
                 assert output["verification"] is None
-                return HarnessModelResponse.from_parts(text="observed script result", provider_response_id=None,
-                                            usage={"input_tokens": 3, "output_tokens": 3})
-            return HarnessModelResponse.from_parts(text="", provider_response_id=None,
+                return HarnessModelResponse.from_parts(
+                    text="observed script result",
+                    provider_response_id=None,
+                    usage={"input_tokens": 3, "output_tokens": 3},
+                )
+            return HarnessModelResponse.from_parts(
+                text="",
+                provider_response_id=None,
                 tool_calls=(ModelToolCall("script", "execute_python", {"script_path": "scripts/check.py"}),),
-                usage={"input_tokens": 3, "output_tokens": 3})
+                usage={"input_tokens": 3, "output_tokens": 3},
+            )
 
     def configure(agent):
         monkeypatch.setattr(agent, "_model_factory", lambda: ScriptModel("unused"))
@@ -156,13 +200,21 @@ def test_public_managed_python_script_entry(tmp_path, monkeypatch, entrypoint):
         original = cli._create_agent_facade
         monkeypatch.setattr(cli, "_create_agent_facade", lambda **kwargs: configure(original(**kwargs)))
         monkeypatch.chdir(workspace)
-        result = CliRunner().invoke(cli.agent_app, [
-            "run", "Run the check script", "--allow-execute-tools", "--disable-workspace-mcp",
-            "--non-interactive", "--rollout-db", str(database),
-        ])
+        result = CliRunner().invoke(
+            cli.agent_app,
+            [
+                "run",
+                "Run the check script",
+                "--allow-execute-tools",
+                "--disable-workspace-mcp",
+                "--non-interactive",
+                "--rollout-db",
+                str(database),
+            ],
+        )
         assert result.exit_code == 0, result.output
         assert "observed script result" in result.output
-    with RuntimeState.open_sync(database) as store:
+    with RuntimeStore.open_sync(database) as store:
         turn = store.list_turns()[-1]
         assert turn.status == "completed"
         [operation] = store.list_tool_operations(turn.turn_id)
@@ -178,12 +230,22 @@ def test_public_pause_closes_job_and_resume_reads_durable_terminal(tmp_path, mon
             if not outputs:
                 return await super().dispatch(prepared, **kwargs)
             if len(outputs) == 1:
-                return HarnessModelResponse.from_parts(text="", provider_response_id=None,
-                    usage={"input_tokens": 3, "output_tokens": 3}, tool_calls=(ModelToolCall(
-                        id="patch", name="apply_patch", arguments={
-                            "file_path": "source", "old_string": "before", "new_string": "after",
-                        },
-                    ),))
+                return HarnessModelResponse.from_parts(
+                    text="",
+                    provider_response_id=None,
+                    usage={"input_tokens": 3, "output_tokens": 3},
+                    tool_calls=(
+                        ModelToolCall(
+                            id="patch",
+                            name="apply_patch",
+                            arguments={
+                                "file_path": "source",
+                                "old_string": "before",
+                                "new_string": "after",
+                            },
+                        ),
+                    ),
+                )
             assert any("Confirmed terminal outcome" in m.content for m in request.messages if m.role == "context")
             return HarnessModelResponse.from_parts(
                 text="The command was cancelled at pause; the approved edit completed.",
@@ -196,12 +258,14 @@ def test_public_pause_closes_job_and_resume_reads_durable_terminal(tmp_path, mon
     (workspace / "source").write_text("before")
     database = tmp_path / "run.db"
     agent = Agent(workspace_path=workspace, checkpoint_db=database, enable_workspace_mcp=False)
+
     def factory():
         return PauseAfterLaunch("printf ready; sleep 60")
+
     monkeypatch.setattr(agent, "_model_factory", factory)
     result = asyncio.run(agent.run("Run, then edit", allow_execute_tools=True, max_steps=5))
     assert result.status == "paused"
-    with RuntimeState.open_sync(database) as store:
+    with RuntimeStore.open_sync(database) as store:
         [terminal] = [i for i in store.list_items(result.turn_id) if i.kind == "tool_continuation"]
         assert terminal.producer == "runtime"
         assert terminal.payload["structured_content"]["status"] == "cancelled"
@@ -221,12 +285,22 @@ async def test_abort_live_session_cancels_job_and_allows_next_command(tmp_path, 
         async def dispatch(self, prepared, **kwargs):
             if not any(m.role == "tool" for m in prepared.dispatch_payload.messages):
                 return await super().dispatch(prepared, **kwargs)
-            return HarnessModelResponse.from_parts(text="", provider_response_id=None,
-                usage={"input_tokens": 3, "output_tokens": 3}, tool_calls=(ModelToolCall(
-                    id="patch", name="apply_patch", arguments={
-                        "file_path": "source", "old_string": "before", "new_string": "after",
-                    },
-                ),))
+            return HarnessModelResponse.from_parts(
+                text="",
+                provider_response_id=None,
+                usage={"input_tokens": 3, "output_tokens": 3},
+                tool_calls=(
+                    ModelToolCall(
+                        id="patch",
+                        name="apply_patch",
+                        arguments={
+                            "file_path": "source",
+                            "old_string": "before",
+                            "new_string": "after",
+                        },
+                    ),
+                ),
+            )
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -244,15 +318,23 @@ async def test_abort_live_session_cancels_job_and_allows_next_command(tmp_path, 
         [terminal] = [i for i in session.store.list_items(paused.turn_id) if i.kind == "tool_continuation"]
         assert terminal.payload["structured_content"]["status"] == "cancelled"
         assert not list((workspace / ".praxis/runtime/scratch").glob("run-command-*"))
-        next_command = await session.tools["run_command"].run({
-            "command": "printf next", "timeout_seconds": None, "yield_time_seconds": 0.01,
-        })
+        next_command = await session.tools["run_command"].run(
+            {
+                "command": "printf next",
+                "timeout_seconds": None,
+                "yield_time_seconds": 0.01,
+            }
+        )
         # Direct Tool.run bypasses the durable orchestrator; acknowledge the
         # host's test commit explicitly before releasing this staged command.
         await session.tools["run_command"].after_commit({}, next_command.model_dump(), "direct_test_operation")
-        next_command = await session.tools["manage_command"].run({
-            "session_id": next_command.session_id, "action": "wait", "wait_seconds": 3,
-        })
+        next_command = await session.tools["manage_command"].run(
+            {
+                "session_id": next_command.session_id,
+                "action": "wait",
+                "wait_seconds": 3,
+            }
+        )
         assert next_command.exit_code == 0 and next_command.stdout == "next"
 
 

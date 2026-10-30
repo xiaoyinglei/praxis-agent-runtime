@@ -2,6 +2,7 @@ from dataclasses import replace
 
 import pytest
 
+from agent_runtime.harness import turn_ops
 from agent_runtime.permission_policy import NetworkPolicy, PermissionPolicy, ToolRule
 from agent_runtime.tools.builtins.shell import create_run_command_tool
 from agent_runtime.tools.permissions import ToolExecutionContext, can_use_tool
@@ -13,7 +14,9 @@ def shell(tmp_path, mode="ask", **policy):
     workspace = open_workspace(tmp_path, create=True)
     tool = create_run_command_tool(workspace)
     context = ToolExecutionContext(
-        workspace_root=workspace.root, cwd=workspace.root, approval_mode=mode,
+        workspace_root=workspace.root,
+        cwd=workspace.root,
+        approval_mode=mode,
         permissions=PermissionPolicy(**policy).resolve(workspace.root),
     )
     return tool, context
@@ -85,11 +88,16 @@ def test_grant_matches_only_bounded_command_family(tmp_path):
     assert decision(tool, granted, working_dir="other") == "ask"
 
 
-@pytest.mark.parametrize("args", [
-    {"command": "printf hello; id"}, {"command": "sh -c 'printf hello'"},
-    {"command": "python -c 'print(1)'"}, {"command": "printf hello", "network": True},
-    {"command": "printf hello", "workspace_write": True},
-])
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"command": "printf hello; id"},
+        {"command": "sh -c 'printf hello'"},
+        {"command": "python -c 'print(1)'"},
+        {"command": "printf hello", "network": True},
+        {"command": "printf hello", "workspace_write": True},
+    ],
+)
 def test_complex_or_elevated_commands_do_not_offer_reusable_grant(tmp_path, args):
     from agent_runtime.approval import command_grant
 
@@ -110,9 +118,18 @@ class CommandModel:
             async def dispatch(self, prepared, *, event_sink=None):
                 response = await super().dispatch(prepared, event_sink=event_sink)
                 if response.tool_calls:
-                    return replace(response, outputs=outputs_from_parts(tool_calls=(ModelToolCall(
-                        id="command-call", name=tool_name, arguments=arguments,
-                    ),)))
+                    return replace(
+                        response,
+                        outputs=outputs_from_parts(
+                            tool_calls=(
+                                ModelToolCall(
+                                    id="command-call",
+                                    name=tool_name,
+                                    arguments=arguments,
+                                ),
+                            )
+                        ),
+                    )
                 return response
 
         return Model()
@@ -127,9 +144,13 @@ async def command_session(tmp_path, *, mode=None, thread_id=None, **arguments):
     registry = ToolRegistry()
     registry.register(tool)
     return await Session.open(
-        database=tmp_path / "rollout.sqlite3", workspace=tmp_path, thread_id=thread_id,
+        database=tmp_path / "rollout.sqlite3",
+        workspace=tmp_path,
+        thread_id=thread_id,
         model=CommandModel({"command": "printf hello", **arguments}),
-        tools=registry.freeze(), completion_gate=AcceptAnswer(), tool_execution_context=context,
+        tools=registry.freeze(),
+        completion_gate=AcceptAnswer(),
+        tool_execution_context=context,
         approval_mode=mode,
     )
 
@@ -197,9 +218,14 @@ async def test_auto_edit_performs_real_file_io(tmp_path):
     calls = []
     registry = ToolRegistry()
     registry.register(_write_tool(tmp_path, calls))
-    async with await Session.open(database=tmp_path / "edit.sqlite3", workspace=tmp_path,
-                                  model=WriteThenAnswerModel(), tools=registry.freeze(),
-                                  completion_gate=AcceptAnswer(), approval_mode="auto") as session:
+    async with await Session.open(
+        database=tmp_path / "edit.sqlite3",
+        workspace=tmp_path,
+        model=WriteThenAnswerModel(),
+        tools=registry.freeze(),
+        completion_gate=AcceptAnswer(),
+        approval_mode="auto",
+    ) as session:
         result = await session.submit("write")
         assert result.status == "done"
         assert calls == ["approved.txt"]
@@ -209,14 +235,19 @@ async def test_auto_edit_performs_real_file_io(tmp_path):
 @pytest.mark.anyio
 async def test_public_sdk_mode_reaches_real_tool_executor(tmp_path, monkeypatch):
     from agent_runtime import Agent
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
 
-    agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "public.sqlite3",
-                  model_session_path=None, enable_workspace_mcp=False, approval_mode="auto")
+    agent = Agent(
+        workspace_path=tmp_path,
+        checkpoint_db=tmp_path / "public.sqlite3",
+        model_session_path=None,
+        enable_workspace_mcp=False,
+        approval_mode="auto",
+    )
     monkeypatch.setattr(agent, "_model_factory", lambda: CommandModel({"command": "printf hello"}))
     result = await agent.run("run bounded command")
     assert result.status == "done"
-    async with (await RuntimeState.open(agent.checkpoint_db)) as store:
+    async with await RuntimeStore.open(agent.checkpoint_db) as store:
         [operation] = store.list_tool_operations(result.turn_id)
         assert operation.status == "succeeded"
         assert store.read_turn(result.turn_id).binding_manifest["tool_execution_policy"]["approval_mode"] == "auto"
@@ -327,12 +358,18 @@ async def test_report_python_write_continues_after_selecting_full_and_persists_m
     workspace = open_workspace(tmp_path, create=True)
     registry = ToolRegistry()
     registry.register(create_execute_python_tool(workspace))
-    arguments = {"code": "from pathlib import Path\nPath('report.md').write_text('sales report')",
-                 "workspace_write": True, "output_paths": ["report.md"]}
+    arguments = {
+        "code": "from pathlib import Path\nPath('report.md').write_text('sales report')",
+        "workspace_write": True,
+        "output_paths": ["report.md"],
+    }
     async with await Session.open(
-        database=tmp_path / "report.sqlite3", workspace=tmp_path,
-        model=CommandModel(arguments, tool_name="execute_python"), tools=registry.freeze(),
-        completion_gate=AcceptAnswer(), approval_mode="auto",
+        database=tmp_path / "report.sqlite3",
+        workspace=tmp_path,
+        model=CommandModel(arguments, tool_name="execute_python"),
+        tools=registry.freeze(),
+        completion_gate=AcceptAnswer(),
+        approval_mode="auto",
     ) as session:
         result = await session.submit("generate report")
         assert result.status == "paused" and not (tmp_path / "report.md").exists()
@@ -403,14 +440,24 @@ async def test_single_run_mode_picker_reaches_public_agent_resume(tmp_path, monk
 
     monkeypatch.setattr(cli, "_is_interactive_terminal", lambda: True)
     monkeypatch.setattr("prompt_toolkit.shortcuts.radiolist_dialog", lambda **kwargs: Dialog())
-    agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "run.sqlite3",
-                  model_session_path=None, enable_workspace_mcp=False, approval_mode="auto")
-    agent._model_factory = lambda: CommandModel({
-        "code": "from pathlib import Path\nPath('report.md').write_text('sales report')",
-        "workspace_write": True, "output_paths": ["report.md"],
-    }, tool_name="execute_python")
-    result = await cli._run_facade_command(agent, task="generate report", files=(),
-                                         max_tokens_total=None, interactive_approval=True)
+    agent = Agent(
+        workspace_path=tmp_path,
+        checkpoint_db=tmp_path / "run.sqlite3",
+        model_session_path=None,
+        enable_workspace_mcp=False,
+        approval_mode="auto",
+    )
+    agent._model_factory = lambda: CommandModel(
+        {
+            "code": "from pathlib import Path\nPath('report.md').write_text('sales report')",
+            "workspace_write": True,
+            "output_paths": ["report.md"],
+        },
+        tool_name="execute_python",
+    )
+    result = await cli._run_facade_command(
+        agent, task="generate report", files=(), max_tokens_total=None, interactive_approval=True
+    )
     assert result.status == "done"
     assert (tmp_path / "report.md").read_text() == "sales report"
     assert agent.approval_mode == "full"
@@ -421,8 +468,9 @@ async def test_single_run_mode_picker_reaches_public_agent_resume(tmp_path, monk
 async def test_recheck_then_network_approval_reuses_operation_without_early_execution(tmp_path, no_permissions):
     async with await command_session(tmp_path, mode="ask", network=True) as session:
         if no_permissions:
-            session.tool_execution_context = replace(session.tool_execution_context,
-                                                     permissions=None, permission_provider=None)
+            session.tool_execution_context = replace(
+                session.tool_execution_context, permissions=None, permission_provider=None
+            )
             session._apply_tool_context()
         result = await session.submit("run")
         [original] = session.store.list_tool_operations(result.turn_id)
@@ -528,8 +576,13 @@ async def test_chat_f4_callback_updates_live_session_and_rechecks_without_extra_
     from agent_runtime import Agent, cli
     from agent_runtime.terminal_app import TerminalChatApp
 
-    agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "chat.sqlite3",
-                  model_session_path=None, enable_workspace_mcp=False, approval_mode="auto")
+    agent = Agent(
+        workspace_path=tmp_path,
+        checkpoint_db=tmp_path / "chat.sqlite3",
+        model_session_path=None,
+        enable_workspace_mcp=False,
+        approval_mode="auto",
+    )
     agent._model_factory = lambda: CommandModel({"command": "printf hello", "workspace_write": True})
 
     class UI(TerminalChatApp):
@@ -553,9 +606,9 @@ async def test_chat_f4_callback_updates_live_session_and_rechecks_without_extra_
     await cli._chat_facade_loop(agent, max_tokens_total=None, _ui=ui)
     assert ui.approvals == 1
     assert ui.approval_mode == agent.approval_mode == "full"
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
 
-    async with (await RuntimeState.open(agent.checkpoint_db, read_only=True)) as store:
+    async with await RuntimeStore.open(agent.checkpoint_db, read_only=True) as store:
         turns = store.list_turns()
         [operation] = store.list_tool_operations(turns[0].turn_id)
         assert operation.status == "succeeded" and operation.attempt_count == 1
@@ -565,17 +618,18 @@ async def test_chat_f4_callback_updates_live_session_and_rechecks_without_extra_
 @pytest.mark.parametrize("before_reopen", [[], ["/permissions mode full"]])
 async def test_chat_reopen_does_not_inherit_another_chats_mode(tmp_path, monkeypatch, before_reopen):
     from agent_runtime import cli
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
     from tests.agent.test_agent_cli_resume import _result
     from tests.agent.test_cli_chat_commands import _model_spec, _SessionFactory
 
     database = tmp_path / "chat.sqlite3"
-    async with (await RuntimeState.open(database)) as store:
-        thread = store.create_thread(workspace=tmp_path)
-        turn = store.start_turn(thread_id=thread.thread_id, user_message="saved ask chat",
-                                binding_manifest={"model_id": None})
-        store.complete_turn(turn_id=turn.turn_id, answer="saved")
-        store.update_session_settings(thread.thread_id, {"tool_execution_policy": {"approval_mode": "ask"}})
+    async with await RuntimeStore.open(database) as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(
+            store, thread_id=thread.thread_id, user_message="saved ask chat", binding_manifest={"model_id": None}
+        )
+        turn_ops.complete_turn(store, turn_id=turn.turn_id, answer="saved")
+        turn_ops.update_session_settings(store, thread.thread_id, {"tool_execution_policy": {"approval_mode": "ask"}})
 
     class Facade(_SessionFactory):
         workspace_path = tmp_path

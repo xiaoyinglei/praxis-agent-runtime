@@ -10,7 +10,7 @@ from pytest import MonkeyPatch
 
 from agent_runtime import cli
 from agent_runtime.core.llm_registry import UnknownModelIdError
-from agent_runtime.harness import RuntimeState
+from agent_runtime.harness import RuntimeStore, turn_ops
 from agent_runtime.models import ModelSpec
 from agent_runtime.result import AgentResult, AgentUsage
 from agent_runtime.streaming.events import ItemStatus, TurnItemKind, item_completed
@@ -53,27 +53,42 @@ async def test_effort_opens_model_supported_picker_without_provider_call(tmp_pat
     from agent_runtime.terminal_app import TerminalChatApp
 
     changes = []
+
     class Facade(_SessionFactory):
         workspace_path = tmp_path
+
         def current_model(self):
-            return replace(_model_spec("test"), reasoning=ReasoningCapabilities(
-                supported_efforts=("low", "high"), default_effort="high", thinking_toggle="thinking"))
+            return replace(
+                _model_spec("test"),
+                reasoning=ReasoningCapabilities(
+                    supported_efforts=("low", "high"), default_effort="high", thinking_toggle="thinking"
+                ),
+            )
+
         def request_settings(self):
-            return {"preferences": {"reasoning_effort": None, "max_output_tokens": None},
-                    "model_defaults": {"reasoning_effort": "high", "max_output_tokens": 4096}}
+            return {
+                "preferences": {"reasoning_effort": None, "max_output_tokens": None},
+                "model_defaults": {"reasoning_effort": "high", "max_output_tokens": 4096},
+            }
+
         def configure_request(self, **options):
             changes.append(options)
+
         async def submit(self, *args, **kwargs):
             pytest.fail("effort picker must not call the model")
+
     class UI(TerminalChatApp):
         commands = iter(["/effort", "/exit"])
+
         async def prompt(self, **kwargs):
             return next(self.commands)
+
         async def choose_menu(self, choices, *, title, current=""):
             assert choices == ["default", "low", "high", "off"]
             assert current == "default"
             assert "思考强度" in title
             return selection
+
     await cli._chat_facade_loop(Facade(), max_tokens_total=None, _ui=UI(model="test", workspace=str(tmp_path)))
     assert changes == ([] if selection is None else [{"reasoning_effort": "low"}])
 
@@ -85,17 +100,23 @@ async def test_chat_dragged_path_becomes_pending_original_file_and_reaches_sessi
     source = tmp_path / "客户 资料.csv"
     source.write_text("name,value\na,1")
     calls = []
+
     class Facade(_SessionFactory):
         workspace_path = tmp_path
+
         def current_model(self):
             return _model_spec("test")
+
         async def submit(self, query, **options):
             calls.append((query, options.get("files")))
             return _result()
+
     class UI(TerminalChatApp):
         commands = iter([str(source).replace(" ", "\\ "), "分析这个文件", "/exit"])
+
         async def prompt(self, **kwargs):
             return next(self.commands)
+
     await cli._chat_facade_loop(Facade(), max_tokens_total=None, _ui=UI(model="test", workspace=str(tmp_path)))
     assert calls == [("分析这个文件", [str(source.resolve())])]
 
@@ -153,6 +174,7 @@ async def test_chat_model_picker_switches_session_without_provider_request(tmp_p
 @pytest.mark.anyio
 async def test_connections_command_reopens_changed_tools_between_turns_with_same_history(tmp_path):
     from agent_runtime.terminal_app import TerminalChatApp
+
     commands = iter(["first", "/connections", "second", "/exit"])
     opened = []
     closed = []
@@ -201,7 +223,6 @@ async def test_connections_command_reopens_changed_tools_between_turns_with_same
     assert opened[1]["previous_turn_id"] == results[0].turn_id
 
 
-
 def _result(*, turn_id: str | None = None, answer: str = "bounded") -> AgentResult:
     return AgentResult(
         answer=answer,
@@ -247,10 +268,13 @@ async def test_search_settings_are_local_and_apply_to_the_next_turn_with_existin
     class Session:
         def __init__(self, index):
             self.index = index
+
         def current_model(self):
             return _model_spec("test")
+
         async def close(self):
             closed.append(self.index)
+
         async def submit(self, query, **kwargs):
             assert query != "/web", "settings must never reach the model"
             submitted.append(query)
@@ -260,8 +284,10 @@ async def test_search_settings_are_local_and_apply_to_the_next_turn_with_existin
         workspace_path = tmp_path
         web_search_provider = original_provider
         web_search_key_file = key if original_provider else None
+
         def current_model(self):
             return _model_spec("test")
+
         @asynccontextmanager
         async def session(self, **options):
             opened.append((self.web_search_provider, self.web_search_key_file, options))
@@ -269,10 +295,12 @@ async def test_search_settings_are_local_and_apply_to_the_next_turn_with_existin
 
     class UI(TerminalChatApp):
         commands = iter(["first", "/web", "search", "/exit"])
+
         async def prompt(self, **kwargs):
             if not opened:
                 assert self.display.search_configuration_required is (original_provider is None)
             return next(self.commands)
+
         async def setup_search(self, model, *, provider="deepseek", key_file=None):
             assert model.id == "test"
             assert provider == (original_provider or "deepseek")
@@ -296,8 +324,12 @@ async def test_search_setup_preserves_the_latest_session_model_in_a_real_chat(tm
     from agent_runtime.web_config import WebConfiguration
     from tests.agent.harness.test_public_agent_cutover import PublicHarnessModel
 
-    agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "chat.sqlite", model_session_path=None,
-                  enable_workspace_mcp=False)
+    agent = Agent(
+        workspace_path=tmp_path,
+        checkpoint_db=tmp_path / "chat.sqlite",
+        model_session_path=None,
+        enable_workspace_mcp=False,
+    )
     monkeypatch.setattr(agent, "_model_factory", lambda: PublicHarnessModel())
     selected = []
     open_session = agent.session
@@ -311,10 +343,13 @@ async def test_search_setup_preserves_the_latest_session_model_in_a_real_chat(tm
     monkeypatch.setattr(agent, "session", record_session)
 
     class UI(TerminalChatApp):
-        commands = iter(["/model switch deepseek-flash", "first", "/model switch deepseek-v4-pro",
-                         "/web", "second", "/exit"])
+        commands = iter(
+            ["/model switch deepseek-flash", "first", "/model switch deepseek-v4-pro", "/web", "second", "/exit"]
+        )
+
         async def prompt(self, **kwargs):
             return next(self.commands)
+
         async def setup_search(self, model, **kwargs):
             assert model.id == "deepseek-v4-pro"
             return WebConfiguration(None, None, "configuration")
@@ -332,14 +367,16 @@ async def test_chat_slash_commands_do_not_reach_the_agent(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "agent.sqlite"
-    async with (await RuntimeState.open(database)) as store:
-        thread = store.create_thread(workspace=workspace)
-        previous = store.start_turn(
+    async with await RuntimeStore.open(database) as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        previous = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="first",
             binding_manifest={"model_id": "fake-model"},
         )
-        previous = store.complete_turn(
+        previous = turn_ops.complete_turn(
+            store,
             turn_id=previous.turn_id,
             answer="first answer",
         )
@@ -388,8 +425,9 @@ def test_ordinary_chat_shows_validation_status_and_scope(capsys):
     assert "not_evaluated" in output and "任务验收尚未评估" in output
     cli._display_agent_result(result, verbose=True)
     assert "not_evaluated" in capsys.readouterr().out
-    cli._display_agent_result(replace(result, validation_status="passed", validation_scope="workspace_change"),
-                              verbose=False)
+    cli._display_agent_result(
+        replace(result, validation_status="passed", validation_scope="workspace_change"), verbose=False
+    )
     output = capsys.readouterr().out
     assert "passed" in output and "工作区修改" in output
 
@@ -478,9 +516,7 @@ async def test_verbose_command_expands_subsequent_turn_tool_results(
                     data={
                         "result": {
                             "tool_name": "read_file",
-                            "structured_content": {
-                                "lines": [f"line {index}" for index in range(12)]
-                            },
+                            "structured_content": {"lines": [f"line {index}" for index in range(12)]},
                         }
                     },
                 )
@@ -577,7 +613,8 @@ async def test_model_switch_after_completed_turn_keeps_history_and_changes_next_
     )
 
     assert [(message, model) for message, model, _ in calls] == [
-        ("remember cobalt", "model-a"), ("what did I say?", "model-b"),
+        ("remember cobalt", "model-a"),
+        ("what did I say?", "model-b"),
     ]
     assert calls[0][2] is calls[1][2]
 
@@ -688,15 +725,21 @@ async def test_live_ui_cancel_cleans_turn_and_can_submit_again(tmp_path):
         async def submit(self, message, *, event_sink):
             calls.append(message)
             if message == "slow":
-                await event_sink.emit(item_started(turn_id="slow-turn", item_id="cmd",
-                                                  item_kind=TurnItemKind.COMMAND,
-                                                  data={"tool_name": "run_command", "input_preview": "sleep 10"}))
+                await event_sink.emit(
+                    item_started(
+                        turn_id="slow-turn",
+                        item_id="cmd",
+                        item_kind=TurnItemKind.COMMAND,
+                        data={"tool_name": "run_command", "input_preview": "sleep 10"},
+                    )
+                )
                 started.set()
                 await asyncio.Event().wait()
             return _result(answer="second answer")
 
         async def resume(self, turn_id, action, **kwargs):
             from dataclasses import replace
+
             calls.append((turn_id, action))
             assert kwargs["event_sink"].activity_text().startswith("正在停止")
             return replace(_result(turn_id=turn_id), status="failed", stop_reason="cancelled")
@@ -704,7 +747,7 @@ async def test_live_ui_cancel_cleans_turn_and_can_submit_again(tmp_path):
     async def wait_for(predicate):
         async with asyncio.timeout(3):
             while not predicate():
-                await asyncio.sleep(.01)
+                await asyncio.sleep(0.01)
 
     with create_pipe_input() as pipe:
         ui = TerminalChatApp(model="fake-model", workspace=str(tmp_path), input=pipe, output=DummyOutput())
@@ -725,6 +768,7 @@ async def test_live_ui_cancel_cleans_turn_and_can_submit_again(tmp_path):
             if not task.done():
                 task.cancel()
                 from contextlib import suppress
+
                 with suppress(asyncio.CancelledError):
                     await task
         assert calls == ["slow", ("slow-turn", "abort"), "next"]
@@ -762,7 +806,7 @@ async def test_live_ui_approval_validates_choice_and_resumes_same_turn(tmp_path)
     async def wait_for(predicate):
         async with asyncio.timeout(3):
             while not predicate():
-                await asyncio.sleep(.01)
+                await asyncio.sleep(0.01)
 
     with create_pipe_input() as pipe:
         ui = TerminalChatApp(model="fake-model", workspace=str(tmp_path), input=pipe, output=DummyOutput())
@@ -772,7 +816,7 @@ async def test_live_ui_approval_validates_choice_and_resumes_same_turn(tmp_path)
             pipe.send_text("run\r")
             await wait_for(lambda: ui.status == "等待确认" and ui.waiting)
             pipe.send_text("Y")  # Shortcut cannot authorize an option that was not offered.
-            await asyncio.sleep(.05)
+            await asyncio.sleep(0.05)
             assert calls == []
             pipe.send_text("N")
             await wait_for(lambda: "已拒绝" in ui.view.plain_text() and ui.waiting)
@@ -782,6 +826,7 @@ async def test_live_ui_approval_validates_choice_and_resumes_same_turn(tmp_path)
             if not task.done():
                 task.cancel()
                 from contextlib import suppress
+
                 with suppress(asyncio.CancelledError):
                     await task
         assert calls == [("paused-turn", "deny")]
@@ -817,7 +862,7 @@ async def test_live_ui_clarification_resumes_with_text_instead_of_aborting(tmp_p
     async def wait_for(predicate):
         async with asyncio.timeout(3):
             while not predicate():
-                await asyncio.sleep(.01)
+                await asyncio.sleep(0.01)
 
     with create_pipe_input() as pipe:
         ui = TerminalChatApp(model="fake-model", workspace=str(tmp_path), input=pipe, output=DummyOutput())
@@ -834,19 +879,28 @@ async def test_live_ui_clarification_resumes_with_text_instead_of_aborting(tmp_p
             if not task.done():
                 task.cancel()
                 from contextlib import suppress
+
                 with suppress(asyncio.CancelledError):
                     await task
         assert calls == [("question-turn", "continue", "两年")]
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("kind,options,typed,action,user_input", [
-    ("clarification", (), "两年", "continue", "两年"),
-    ("choice", ("两年", "五年"), "两年", "continue", "两年"),
-    ("tool_approval", ("approve", "deny"), "Y", "approve", None),
-])
+@pytest.mark.parametrize(
+    "kind,options,typed,action,user_input",
+    [
+        ("clarification", (), "两年", "continue", "两年"),
+        ("choice", ("两年", "五年"), "两年", "continue", "两年"),
+        ("tool_approval", ("approve", "deny"), "Y", "approve", None),
+    ],
+)
 async def test_interactive_run_preserves_pause_action_and_text(
-    monkeypatch, kind, options, typed, action, user_input,
+    monkeypatch,
+    kind,
+    options,
+    typed,
+    action,
+    user_input,
 ):
     from dataclasses import replace
 
@@ -865,7 +919,11 @@ async def test_interactive_run_preserves_pause_action_and_text(
 
     monkeypatch.setattr("builtins.input", lambda _: typed)
     result = await cli._run_facade_command(
-        Facade(), task="task", files=(), max_tokens_total=None, interactive_approval=True,
+        Facade(),
+        task="task",
+        files=(),
+        max_tokens_total=None,
+        interactive_approval=True,
     )
     assert result.status == "done"
     assert calls == [("run-turn", action, user_input)]
@@ -885,16 +943,18 @@ async def test_rewind_command_selects_and_restores_checkpoint(tmp_path, confirme
             return _model_spec("test")
 
         async def list_checkpoints(self, *, thread_id=None):
-            return [{
-                "checkpoint_id": "a" * 40,
-                "turn_id": "turn_1",
-                "trigger": "pre_write",
-                "tree_sha256": None,
-                "changed_file_count": 2,
-                "wall_time": 1760000000.0,
-                "sequence": 3,
-                "turn_input": "修复超时处理",
-            }]
+            return [
+                {
+                    "checkpoint_id": "a" * 40,
+                    "turn_id": "turn_1",
+                    "trigger": "pre_write",
+                    "tree_sha256": None,
+                    "changed_file_count": 2,
+                    "wall_time": 1760000000.0,
+                    "sequence": 3,
+                    "turn_input": "修复超时处理",
+                }
+            ]
 
         async def rewind(self, checkpoint_id):
             rewound.append(checkpoint_id)
@@ -917,7 +977,9 @@ async def test_rewind_command_selects_and_restores_checkpoint(tmp_path, confirme
             return choices[0]
 
     await cli._chat_facade_loop(
-        Facade(), max_tokens_total=None, _ui=UI(model="test", workspace=str(tmp_path)),
+        Facade(),
+        max_tokens_total=None,
+        _ui=UI(model="test", workspace=str(tmp_path)),
     )
     assert rewound == (["a" * 40] if confirmed else [])
 
@@ -948,14 +1010,17 @@ async def test_commit_command_previews_and_delivers(tmp_path, confirmed):
             pytest.fail("/commit must not call the model")
 
         async def commit_status(self):
-            return {"branch": "master", "changed": ["?? a.txt"], "changed_file_count": 1,
-                    "preview_id": "approved-commit"}
+            return {
+                "branch": "master",
+                "changed": ["?? a.txt"],
+                "changed_file_count": 1,
+                "preview_id": "approved-commit",
+            }
 
         async def commit(self, message, *, branch_name=None, expected_preview_id=None):
             assert expected_preview_id == "approved-commit"
             committed.append(message)
-            return {"commit_id": "b" * 40, "branch": "praxis/x",
-                    "changed_file_count": 1, "created_branch": True}
+            return {"commit_id": "b" * 40, "branch": "praxis/x", "changed_file_count": 1, "created_branch": True}
 
     class UI(TerminalChatApp):
         commands = iter(["/commit 修复超时处理", "/exit"])
@@ -968,7 +1033,9 @@ async def test_commit_command_previews_and_delivers(tmp_path, confirmed):
             return "确认提交" if confirmed else "取消"
 
     await cli._chat_facade_loop(
-        Facade(), max_tokens_total=None, _ui=UI(model="test", workspace=str(repo)),
+        Facade(),
+        max_tokens_total=None,
+        _ui=UI(model="test", workspace=str(repo)),
     )
     assert committed == (["修复超时处理"] if confirmed else [])
 
@@ -999,7 +1066,9 @@ async def test_commit_command_reports_clean_workspace(tmp_path):
             return next(self.commands)
 
     await cli._chat_facade_loop(
-        Facade(), max_tokens_total=None, _ui=UI(model="test", workspace=str(tmp_path)),
+        Facade(),
+        max_tokens_total=None,
+        _ui=UI(model="test", workspace=str(tmp_path)),
     )
 
 
@@ -1021,17 +1090,19 @@ async def test_pull_command_previews_and_publishes(tmp_path, confirmed):
 
         async def pull_request_status(self):
             return {
-                "branch": "praxis/x", "remote_url": "git@github.com:o/r.git",
-                "base_branch": "main", "commit_subjects": ["fix: timeout"],
-                "changed_paths": ["a.py", "b.py"], "uncommitted_count": 2,
+                "branch": "praxis/x",
+                "remote_url": "git@github.com:o/r.git",
+                "base_branch": "main",
+                "commit_subjects": ["fix: timeout"],
+                "changed_paths": ["a.py", "b.py"],
+                "uncommitted_count": 2,
                 "open_pull_request_url": None,
                 "preview_id": "approved-pr",
             }
 
         async def open_pull_request(self, *, title=None, body=None, base_branch=None, expected_preview_id=None):
             published.append(title)
-            return {"url": "https://github.com/o/r/pull/7", "branch": "praxis/x",
-                    "created": True}
+            return {"url": "https://github.com/o/r/pull/7", "branch": "praxis/x", "created": True}
 
     class UI(TerminalChatApp):
         commands = iter(["/pull 修复超时", "/exit"])
@@ -1044,7 +1115,9 @@ async def test_pull_command_previews_and_publishes(tmp_path, confirmed):
             return "确认推送并创建" if confirmed else "取消"
 
     await cli._chat_facade_loop(
-        Facade(), max_tokens_total=None, _ui=UI(model="test", workspace=str(tmp_path)),
+        Facade(),
+        max_tokens_total=None,
+        _ui=UI(model="test", workspace=str(tmp_path)),
     )
     assert published == (["修复超时"] if confirmed else [])
 
@@ -1066,17 +1139,19 @@ async def test_pull_command_with_title_skips_hint(tmp_path):
 
         async def pull_request_status(self):
             return {
-                "branch": "praxis/x", "remote_url": "git@github.com:o/r.git",
-                "base_branch": "main", "commit_subjects": ["fix: timeout"],
-                "changed_paths": ["a.py"], "uncommitted_count": 0,
+                "branch": "praxis/x",
+                "remote_url": "git@github.com:o/r.git",
+                "base_branch": "main",
+                "commit_subjects": ["fix: timeout"],
+                "changed_paths": ["a.py"],
+                "uncommitted_count": 0,
                 "open_pull_request_url": "https://github.com/o/r/pull/3",
                 "preview_id": "approved-pr",
             }
 
         async def open_pull_request(self, *, title=None, body=None, base_branch=None, expected_preview_id=None):
             published.append(title)
-            return {"url": "https://github.com/o/r/pull/3", "branch": "praxis/x",
-                    "created": False}
+            return {"url": "https://github.com/o/r/pull/3", "branch": "praxis/x", "created": False}
 
     class UI(TerminalChatApp):
         commands = iter(["/pull 修复超时", "/exit"])
@@ -1088,7 +1163,9 @@ async def test_pull_command_with_title_skips_hint(tmp_path):
             return "确认推送并创建"
 
     await cli._chat_facade_loop(
-        Facade(), max_tokens_total=None, _ui=UI(model="test", workspace=str(tmp_path)),
+        Facade(),
+        max_tokens_total=None,
+        _ui=UI(model="test", workspace=str(tmp_path)),
     )
     assert published == ["修复超时"]
 
@@ -1103,16 +1180,15 @@ def _ci_checks_facade(tmp_path, submitted, overall, checks=None, failure_logs=No
             return _model_spec("test")
 
         def request_settings(self):
-            return {"preferences": {"reasoning_effort": None, "max_output_tokens": None},
-                    "model_defaults": {}}
+            return {"preferences": {"reasoning_effort": None, "max_output_tokens": None}, "model_defaults": {}}
 
         async def submit(self, *args, **kwargs):
             submitted.append(args[0] if args else kwargs.get("task"))
             return _result(turn_id="ci-turn")
 
-        async def pull_request_checks(self, branch=None, *,
-                                      include_failure_logs=False, wait_seconds=0.0,
-                                      poll_interval_seconds=20.0):
+        async def pull_request_checks(
+            self, branch=None, *, include_failure_logs=False, wait_seconds=0.0, poll_interval_seconds=20.0
+        ):
             return {
                 "branch": branch or "praxis/x",
                 "overall": overall,
@@ -1139,11 +1215,14 @@ def _ci_checks_facade(tmp_path, submitted, overall, checks=None, failure_logs=No
 async def test_checks_command_reports_success_without_submitting(tmp_path):
     submitted = []
     facade_class, ui_class = _ci_checks_facade(
-        tmp_path, submitted, "pass",
+        tmp_path,
+        submitted,
+        "pass",
         checks=[{"name": "build", "state": "pass", "workflow": "CI", "link": "u"}],
     )
     await cli._chat_facade_loop(
-        facade_class(), max_tokens_total=None,
+        facade_class(),
+        max_tokens_total=None,
         _ui=ui_class(model="test", workspace=str(tmp_path)),
     )
     assert submitted == []
@@ -1154,7 +1233,9 @@ async def test_checks_command_reports_success_without_submitting(tmp_path):
 async def test_checks_failure_can_be_handed_to_agent(tmp_path, confirmed):
     submitted = []
     facade_class, ui_class = _ci_checks_facade(
-        tmp_path, submitted, "fail",
+        tmp_path,
+        submitted,
+        "fail",
         checks=[
             {"name": "build", "state": "pass", "workflow": "CI", "link": "u"},
             {"name": "test", "state": "fail", "workflow": "CI", "link": "u"},
@@ -1172,7 +1253,9 @@ async def test_checks_failure_can_be_handed_to_agent(tmp_path, confirmed):
 
     ui.choose_menu = choose_menu
     await cli._chat_facade_loop(
-        facade_class(), max_tokens_total=None, _ui=ui,
+        facade_class(),
+        max_tokens_total=None,
+        _ui=ui,
     )
     if confirmed:
         assert len(submitted) == 1

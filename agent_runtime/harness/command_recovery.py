@@ -1,9 +1,10 @@
 """Model-free host controls for ledger-authorized detached commands."""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal
 
-from agent_runtime.harness.state import RuntimeState
+from agent_runtime.harness.runtime_store import RuntimeStore
 from agent_runtime.harness.tool_orchestrator import ToolOrchestrator
 from agent_runtime.permission_policy import ResolvedPermissions
 from agent_runtime.tools.builtins.command_sessions import DurableCommandSessions, ManageCommandInput
@@ -18,7 +19,7 @@ if TYPE_CHECKING:
 
 async def cancel_commands(agent: Agent, turn_id: str) -> None:
     """Abort must reconcile detached processes before declaring the Turn cancelled."""
-    async with await RuntimeState.open(agent._harness_database(), read_only=True) as store:
+    async with await RuntimeStore.open(agent._harness_database(), read_only=True) as store:
         keys = []
         for operation in await store.run_async(store.list_tool_operations, turn_id):
             if operation.tool_name != "run_command" or operation.status != "succeeded" or not operation.result_item_id:
@@ -26,20 +27,36 @@ async def cancel_commands(agent: Agent, turn_id: str) -> None:
             output = (await store.run_async(store.read_item, operation.result_item_id)).payload.get(
                 "structured_content", {}
             )
-            if (isinstance(output.get("session_id"), str) and isinstance(output.get("request_digest"), str)
-                    and output.get("status") == "running"):
+            if (
+                isinstance(output.get("session_id"), str)
+                and isinstance(output.get("request_digest"), str)
+                and output.get("status") == "running"
+            ):
                 keys.append(output["session_id"])
     for key in keys:
         await manage_command(agent, turn_id, key, action="cancel")
 
 
-async def manage_command(agent: Agent, turn_id: str, session_id: str, *,
-                         action: Literal["status", "wait", "cancel", "read"] = "status",
-                         wait_seconds: float = 10, stream: Literal["stdout", "stderr"] = "stdout",
-                         offset: int = 0, max_bytes: int = 16000) -> RunCommandOutput:
-    request = ManageCommandInput(session_id=session_id, action=action, wait_seconds=wait_seconds,
-                                 stream=stream, offset=offset, max_bytes=max_bytes)
-    async with await RuntimeState.open(agent._harness_database()) as store:
+async def manage_command(
+    agent: Agent,
+    turn_id: str,
+    session_id: str,
+    *,
+    action: Literal["status", "wait", "cancel", "read"] = "status",
+    wait_seconds: float = 10,
+    stream: Literal["stdout", "stderr"] = "stdout",
+    offset: int = 0,
+    max_bytes: int = 16000,
+) -> RunCommandOutput:
+    request = ManageCommandInput(
+        session_id=session_id,
+        action=action,
+        wait_seconds=wait_seconds,
+        stream=stream,
+        offset=offset,
+        max_bytes=max_bytes,
+    )
+    async with await RuntimeStore.open(agent._harness_database()) as store:
         if not (await store.run_async(store.verify)).valid:
             raise RuntimeError("Rollout integrity check failed")
         turn = await store.run_async(store.read_turn, turn_id)
@@ -65,10 +82,15 @@ async def manage_command(agent: Agent, turn_id: str, session_id: str, *,
                 result = await owner.manage(session_id, action=request.action, wait_seconds=request.wait_seconds)
             if result.status != "running" and result.session_id == session_id:
                 normalized = _normalize_command_output(result)
-                await orchestrator.close_continuation(ToolContinuation(owner, session_id, "observe", True), {
-                    "structured_content": result.model_dump(mode="json"), "is_error": normalized.is_error,
-                    "error_code": normalized.error_code, "error_message": normalized.error_message,
-                })
+                await orchestrator.close_continuation(
+                    ToolContinuation(owner, session_id, "observe", True),
+                    {
+                        "structured_content": result.model_dump(mode="json"),
+                        "is_error": normalized.is_error,
+                        "error_code": normalized.error_code,
+                        "error_message": normalized.error_message,
+                    },
+                )
             return result
         finally:
             await owner.detach()

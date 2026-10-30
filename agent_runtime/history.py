@@ -11,7 +11,7 @@ from urllib.parse import urlsplit, urlunsplit
 from agent_runtime.core.runtime_diagnostics import redact_sensitive_text
 from agent_runtime.harness.protocol import item_text, restore_model_response
 from agent_runtime.harness.records import ItemSnapshot
-from agent_runtime.harness.state import RuntimeState
+from agent_runtime.harness.runtime_store import RuntimeStore
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,7 +30,7 @@ def list_chat_sessions(database: Path, *, workspace: Path) -> tuple[ChatSessionS
     if not database.exists():
         return ()
     expected_workspace = workspace.expanduser().resolve()
-    with RuntimeState.open_sync(database, read_only=True) as store:
+    with RuntimeStore.open_sync(database, read_only=True) as store:
         sessions = []
         for thread in store.list_threads():
             if Path(thread.workspace).resolve() != expected_workspace:
@@ -43,28 +43,43 @@ def list_chat_sessions(database: Path, *, workspace: Path) -> tuple[ChatSessionS
                 continue
             if turns[0].binding_manifest.get("memory_maintenance"):
                 continue
-            first = next((item.payload.get("text") for item in store.list_items(turns[0].turn_id)
-                          if item.kind == "user_message"), "")
+            first = next(
+                (
+                    item.payload.get("text")
+                    for item in store.list_items(turns[0].turn_id)
+                    if item.kind == "user_message"
+                ),
+                "",
+            )
             latest = store.read_turn(thread.active_turn_id or thread.head_turn_id or turns[-1].turn_id)
             record = store.last_record(thread.thread_id)
             model_id = thread.settings.get("model_id") or latest.binding_manifest.get("model_id")
-            sessions.append(ChatSessionSummary(
-                thread.thread_id, " ".join(str(first).split())[:100],
-                record.committed_at_ms if record else 0, latest.status,
-                thread.head_turn_id, thread.active_turn_id, model_id if isinstance(model_id, str) else None,
-            ))
+            sessions.append(
+                ChatSessionSummary(
+                    thread.thread_id,
+                    " ".join(str(first).split())[:100],
+                    record.committed_at_ms if record else 0,
+                    latest.status,
+                    thread.head_turn_id,
+                    thread.active_turn_id,
+                    model_id if isinstance(model_id, str) else None,
+                )
+            )
         return tuple(sorted(sessions, key=lambda session: session.updated_at_ms, reverse=True))
 
 
 def read_chat_messages(
-    database: Path, *, thread_id: str, workspace: Path,
+    database: Path,
+    *,
+    thread_id: str,
+    workspace: Path,
 ) -> tuple[tuple[str, str], ...]:
     """Replay saved human/assistant text, including fork ancestors and no tool results.
 
     Original Items survive context compaction. Incomplete output is not
     presented as a finished assistant answer.
     """
-    with RuntimeState.open_sync(database, read_only=True) as store:
+    with RuntimeStore.open_sync(database, read_only=True) as store:
         thread = store.read_thread(thread_id)
         if Path(thread.workspace).resolve() != workspace.expanduser().resolve():
             raise ValueError("会话属于其他工作区")
@@ -72,10 +87,12 @@ def read_chat_messages(
         if anchor is None:
             return ()
         items = store.list_conversation_items(anchor)
-        committed_responses = {operation.response_item_id: operation for turn_id in {item.turn_id for item in items}
-                               for operation in store.list_model_operations(turn_id)
-                               if operation.status == "completed"
-                               and operation.request_ref.get("purpose") != "context_summary"}
+        committed_responses = {
+            operation.response_item_id: operation
+            for turn_id in {item.turn_id for item in items}
+            for operation in store.list_model_operations(turn_id)
+            if operation.status == "completed" and operation.request_ref.get("purpose") != "context_summary"
+        }
         messages = []
         for item in items:
             if item.status != "completed":
@@ -87,8 +104,11 @@ def read_chat_messages(
                 messages.append(("user", text))
                 if "input_revision" in item.payload:
                     status = store.turn_input_status(item.item_id)
-                    label = {"pending": "已接收 · 待生效", "applied": "已生效（已进入模型请求）",
-                             "unconsumed": "本次执行已结束，补充尚未生效"}[status]
+                    label = {
+                        "pending": "已接收 · 待生效",
+                        "applied": "已生效（已进入模型请求）",
+                        "unconsumed": "本次执行已结束，补充尚未生效",
+                    }[status]
                     messages.append(("notice", f"补充 {item.item_id}：{label}"))
             elif item.kind == "agent_message":
                 messages.append(("answer", text))
@@ -100,8 +120,12 @@ def read_chat_messages(
                 # Reading retained facts grants no execution authority. Only
                 # explicit valid revisions participate in supersession filtering.
                 revision = operation.request_ref.get("input_revision")
-                if (not response.tool_calls and type(revision) is int and revision > 0
-                        and revision < store.user_input_revision(item.turn_id)):
+                if (
+                    not response.tool_calls
+                    and type(revision) is int
+                    and revision > 0
+                    and revision < store.user_input_revision(item.turn_id)
+                ):
                     continue  # Retained in the ledger, superseded as a completion.
                 messages.append(("answer", text))
         return tuple(messages)
@@ -111,7 +135,7 @@ def list_history_turns(database: Path, *, limit: int = 20) -> list[dict[str, Any
     """List recent Turn identities and statuses without prompts or arguments."""
 
     _validate_limit(limit)
-    with RuntimeState.open_sync(database, read_only=True) as store:
+    with RuntimeStore.open_sync(database, read_only=True) as store:
         return [
             {
                 "thread_id": turn.thread_id,
@@ -135,7 +159,7 @@ def read_history(
     """Locate canonical ToolResults; omit tool arguments, content and arbitrary metadata."""
 
     _validate_limit(limit)
-    with RuntimeState.open_sync(database, read_only=True) as store:
+    with RuntimeStore.open_sync(database, read_only=True) as store:
         items: tuple[ItemSnapshot, ...]
         if item_id is not None:
             items = (store.read_item(item_id),)
@@ -181,13 +205,23 @@ def _result_row(item: ItemSnapshot) -> dict[str, Any]:
     }
     diagnostic = metadata.get("diagnostic")
     if isinstance(diagnostic, Mapping):
-        row["diagnostic"] = _fields(diagnostic, (
-            "stage", "exception_type", "message", "traceback_truncated", "turn_id", "tool_call_id", "operation_id",
-        ))
+        row["diagnostic"] = _fields(
+            diagnostic,
+            (
+                "stage",
+                "exception_type",
+                "message",
+                "traceback_truncated",
+                "turn_id",
+                "tool_call_id",
+                "operation_id",
+            ),
+        )
         frames = diagnostic.get("traceback")
         if isinstance(frames, (tuple, list)):
-            row["diagnostic"]["traceback"] = [_fields(frame, ("filename", "lineno", "function"))
-                                               for frame in frames[-12:]]
+            row["diagnostic"]["traceback"] = [
+                _fields(frame, ("filename", "lineno", "function")) for frame in frames[-12:]
+            ]
     structured = payload.get("structured_content")
     if payload.get("tool_name") in {"web_fetch", "web_search"} and isinstance(structured, Mapping):
         row["web"] = _web_details(structured)
@@ -197,8 +231,11 @@ def _result_row(item: ItemSnapshot) -> dict[str, Any]:
 def _fields(value: object, names: tuple[str, ...]) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         return {}
-    return {key: (item[:512] if isinstance(item, str) else item)
-            for key in names if key in value and isinstance(item := value[key], (str, int, float, bool, type(None)))}
+    return {
+        key: (item[:512] if isinstance(item, str) else item)
+        for key in names
+        if key in value and isinstance(item := value[key], (str, int, float, bool, type(None)))
+    }
 
 
 def _safe_url(value: object) -> str:
@@ -217,30 +254,56 @@ def _safe_url(value: object) -> str:
 
 
 def _web_details(value: Mapping[str, Any]) -> dict[str, Any]:
-    details = _fields(value, (
-        "source_id", "static_source_id", "diagnostics_source_id", "fetched_at", "content_hash", "render_mode",
-        "failure_stage", "failure_origin", "network_bytes",
-    ))
+    details = _fields(
+        value,
+        (
+            "source_id",
+            "static_source_id",
+            "diagnostics_source_id",
+            "fetched_at",
+            "content_hash",
+            "render_mode",
+            "failure_stage",
+            "failure_origin",
+            "network_bytes",
+        ),
+    )
     if "url" in value:
         details["url"] = _safe_url(value["url"])
     if isinstance(budget := value.get("request_budget"), Mapping):
-        details["request_budget"] = _fields(budget, (
-            "limit", "used", "remaining", "unit", "in_flight_counted", "item_id", "reservation_item_id",
-            "last_reservation_item_id", "unknown_attempts_counted",
-        ))
+        details["request_budget"] = _fields(
+            budget,
+            (
+                "limit",
+                "used",
+                "remaining",
+                "unit",
+                "in_flight_counted",
+                "item_id",
+                "reservation_item_id",
+                "last_reservation_item_id",
+                "unknown_attempts_counted",
+            ),
+        )
     if isinstance(render := value.get("render_diagnostics"), Mapping):
-        projected = _fields(render, ("requests", "wire_bytes", "decoded_bytes", "dom_bytes", "snapshot_available",
-                                    "failed_resources_omitted"))
+        projected = _fields(
+            render,
+            ("requests", "wire_bytes", "decoded_bytes", "dom_bytes", "snapshot_available", "failed_resources_omitted"),
+        )
         for key in ("limits", "remaining", "blocked_actions", "skipped_resources", "resource_failures"):
             if isinstance(counts := render.get(key), Mapping):
-                projected[key] = {str(name)[:120]: count for name, count in list(counts.items())[:32]
-                                  if isinstance(count, (int, float, bool))}
+                projected[key] = {
+                    str(name)[:120]: count
+                    for name, count in list(counts.items())[:32]
+                    if isinstance(count, (int, float, bool))
+                }
         if isinstance(timeouts := render.get("load_timeouts"), (tuple, list)):
             projected["load_timeouts"] = [item[:80] for item in timeouts[:16] if isinstance(item, str)]
         if isinstance(resources := render.get("failed_resources"), (tuple, list)):
             projected["failed_resources"] = [
                 {**_fields(resource, ("method", "resource_type", "reason")), "url": _safe_url(resource.get("url"))}
-                for resource in resources[:16] if isinstance(resource, Mapping)
+                for resource in resources[:16]
+                if isinstance(resource, Mapping)
             ]
         details["render_diagnostics"] = projected
     if isinstance(comparison := value.get("comparison"), Mapping):

@@ -10,6 +10,7 @@ import os
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 from uuid import uuid4
@@ -17,6 +18,7 @@ from uuid import uuid4
 from agent_runtime.approval import ApprovalMode, CommandGrant
 from agent_runtime.budget import ResourceUsage
 from agent_runtime.core.generation_settings import ModelRequestPreferences
+from agent_runtime.harness import artifact_ops, budget_ops, memory_ops, turn_ops
 from agent_runtime.harness.context import validate_tool_history
 from agent_runtime.harness.events import commit_and_publish
 from agent_runtime.harness.ownership import (
@@ -38,16 +40,15 @@ from agent_runtime.harness.protocol import (
     TurnResult,
 )
 from agent_runtime.harness.records import ItemSnapshot
-from agent_runtime.harness.recovery import recovery_plan
+from agent_runtime.harness.runtime_store import RuntimeStore
 from agent_runtime.harness.services import (
     SessionBindingProvider,
     _tool_execution_policy_snapshot,
     configure_services,
     restore_tool_policy,
 )
-from agent_runtime.harness.state import RuntimeState
 from agent_runtime.harness.tool_orchestrator import ToolOrchestrator, current_tool_binding
-from agent_runtime.harness.turn import TurnExecutor
+from agent_runtime.harness.turn import TurnRunner
 from agent_runtime.permission_policy import NetworkPolicy, PermissionPolicy, ResolvedPermissions
 from agent_runtime.result import AgentResult
 from agent_runtime.streaming.sink import TurnEventDispatcher
@@ -79,7 +80,7 @@ class Session:
     """
 
     tool_execution_context: ToolExecutionContext
-    store: RuntimeState
+    store: RuntimeStore
     database: Path
     workspace_path: Path
     thread_id: str
@@ -126,6 +127,7 @@ class Session:
             return False
         from agent_runtime.runtime.mcp import resolve_product_mcp_config
         from agent_runtime.runtime.mcp_catalog import catalog_revision
+
         path = resolve_product_mcp_config(self.workspace_path)
         return path != self._mcp_config_path or (
             path is not None and catalog_revision(path) != self._mcp_catalog_revision
@@ -167,11 +169,12 @@ class Session:
             self.database = Path(database)
             self.workspace_path = Path(workspace).resolve()
             self._stack.enter_context(workspace_owner(self.workspace_path))
-            self.store = await self._stack.enter_async_context(await RuntimeState.open(self.database))
+            self.store = await self._stack.enter_async_context(await RuntimeStore.open(self.database))
             if sum(value is not None for value in (previous_turn_id, frozen_turn_id, thread_id)) > 1:
                 raise ValueError("choose one conversation anchor")
             integrity = await self.store.run_async(
-                self.store.validate_conversation, thread_id=thread_id,
+                self.store.validate_conversation,
+                thread_id=thread_id,
                 turn_id=frozen_turn_id or previous_turn_id,
             )
             if not integrity.valid:
@@ -185,14 +188,17 @@ class Session:
             state = await self.store.run_async(self.store.read_memory_state, self.workspace_path)
             self._memory_control_version = state.get("control_version", 0)
             self.memory_config = configured_memory or MemoryConfig(
-                use_memories=state["use_memories"], generate_memories=state["generate_memories"],
+                use_memories=state["use_memories"],
+                generate_memories=state["generate_memories"],
             )
             self._background_memory = _background_memory
             if frozen_turn_id is not None:
                 original = (await self.store.run_async(self.store.read_turn, frozen_turn_id)).binding_manifest
-                self.memory_config = self.memory_config.model_copy(update={
-                    "use_memories": "memory_snapshot" in original,
-                })
+                self.memory_config = self.memory_config.model_copy(
+                    update={
+                        "use_memories": "memory_snapshot" in original,
+                    }
+                )
             anchor = frozen_turn_id or previous_turn_id
             if anchor is not None:
                 turn = await self.store.run_async(self.store.read_turn, anchor)
@@ -203,14 +209,15 @@ class Session:
                     if turn.status not in {"completed", "failed", "cancelled"}:
                         raise RuntimeError("non-terminal predecessor must be resumed, cancelled, or abandoned")
                     if thread.head_turn_id != previous_turn_id:
-                        thread = await self.store.run_async(self.store.fork_thread, from_turn_id=previous_turn_id)
+                        thread = await self.store.run_async(
+                            partial(turn_ops.fork_thread, self.store), from_turn_id=previous_turn_id
+                        )
                 thread_id = thread.thread_id
                 if frozen_turn_id is not None:
                     binding = turn.binding_manifest
                     if binding.get("legacy_resume_compatible") is False:
                         raise RuntimeError("incompatible legacy Turn cannot resume; abort the Turn explicitly")
-                    if (agent is not None
-                            and binding.get("mcp_policy", {}).get("workspace_discovery_enabled") is False):
+                    if agent is not None and binding.get("mcp_policy", {}).get("workspace_discovery_enabled") is False:
                         # Reconcile the frozen capability before discovery can
                         # read configuration or open any server resources.
                         agent.enable_workspace_mcp = False
@@ -226,9 +233,12 @@ class Session:
                 thread = await self.store.run_async(self.store.read_thread, thread_id)
                 if Path(thread.workspace).resolve() != self.workspace_path:
                     raise RuntimeError("thread belongs to a different workspace security domain")
-                if (configured_memory is None and frozen_turn_id is None
-                        and "memory_use_allowed" in thread.settings
-                        and thread.settings.get("memory_control_version") == self._memory_control_version):
+                if (
+                    configured_memory is None
+                    and frozen_turn_id is None
+                    and "memory_use_allowed" in thread.settings
+                    and thread.settings.get("memory_control_version") == self._memory_control_version
+                ):
                     self.memory_config = MemoryConfig(
                         use_memories=thread.settings["memory_use_allowed"],
                         generate_memories=thread.settings["memory_generation_allowed"],
@@ -247,10 +257,16 @@ class Session:
                     allow_execute_tools=service_options.pop("allow_execute_tools", False),
                     allow_web_tools=service_options.pop("allow_web_tools", False),
                     initial_tool_context=service_options.get("tool_execution_context"),
-                    saved_tool_policy=(thread.settings.get("tool_execution_policy")
-                                       if thread_id is not None and not explicit_tool_context else None),
-                    discovery_ceiling=(original.get("tool_execution_policy", {}).get("permissions")
-                                       if frozen_turn_id is not None else None),
+                    saved_tool_policy=(
+                        thread.settings.get("tool_execution_policy")
+                        if thread_id is not None and not explicit_tool_context
+                        else None
+                    ),
+                    discovery_ceiling=(
+                        original.get("tool_execution_policy", {}).get("permissions")
+                        if frozen_turn_id is not None
+                        else None
+                    ),
                 )
                 service_options.update(resource_options)
             if model is None:
@@ -265,7 +281,11 @@ class Session:
             self.thread_id = (
                 thread_id
                 if thread_id is not None
-                else (await self.store.run_async(self.store.create_thread, workspace=self.workspace_path)).thread_id
+                else (
+                    await self.store.run_async(
+                        partial(turn_ops.create_thread, self.store), workspace=self.workspace_path
+                    )
+                ).thread_id
             )
             thread = await self.store.run_async(self.store.read_thread, self.thread_id)
             self.head_turn_id = thread.head_turn_id
@@ -274,28 +294,35 @@ class Session:
             if settings:
                 if not explicit_tool_context:
                     self.tool_execution_context = restore_tool_policy(
-                        self.tool_execution_context, settings["tool_execution_policy"], restore_session_grants=True,
+                        self.tool_execution_context,
+                        settings["tool_execution_policy"],
+                        restore_session_grants=True,
                     )
                 if self.model_control_plane is not None and settings.get("model_id"):
                     self.model_control_plane.state = replace(
                         self.model_control_plane.state,
                         current_model_id=settings["model_id"],
                         selection_requester=settings["model_selection_requester"],
-                        request_preferences={key: ModelRequestPreferences.model_validate(value)
-                                             for key, value in settings.get("request_preferences", {}).items()},
+                        request_preferences={
+                            key: ModelRequestPreferences.model_validate(value)
+                            for key, value in settings.get("request_preferences", {}).items()
+                        },
                         request_settings_revision=settings.get("request_settings_revision", 0),
                     )
                 self._apply_tool_context()
                 if explicit_tool_context:
                     (await self.store.run_async(self._persist_settings))
-                elif (configured_memory is not None
-                      or settings.get("memory_control_version") != self._memory_control_version):
+                elif (
+                    configured_memory is not None
+                    or settings.get("memory_control_version") != self._memory_control_version
+                ):
                     (await self.store.run_async(self._persist_settings))
             else:
                 (await self.store.run_async(self._persist_settings))
             saved_mode = settings.get("tool_execution_policy", {}).get("approval_mode")
-            selected_mode = (approval_mode if approval_mode is not None
-                             else saved_mode if not explicit_tool_context else None)
+            selected_mode = (
+                approval_mode if approval_mode is not None else saved_mode if not explicit_tool_context else None
+            )
             if selected_mode is not None:
                 if approval_mode == "ask":
                     (
@@ -389,9 +416,11 @@ class Session:
 
         def pause_cancelled() -> None:
             with self.store.persistence.transaction():
-                self.store.request_turn_cancellation(turn_id=active, reason="Session execution task was cancelled")
+                turn_ops.request_turn_cancellation(
+                    self.store, turn_id=active, reason="Session execution task was cancelled"
+                )
                 if self.store.read_turn(active).status == "running":
-                    self.store.pause_turn(turn_id=active, reason="Execution task was cancelled")
+                    turn_ops.pause_turn(self.store, turn_id=active, reason="Execution task was cancelled")
 
         executor = await self.store.run_async(self._executor)
         await executor._commit(pause_cancelled)
@@ -431,8 +460,8 @@ class Session:
                     finally:
                         self._active_task = None
 
-    def _executor(self) -> TurnExecutor:
-        executor = TurnExecutor(
+    def _executor(self) -> TurnRunner:
+        executor = TurnRunner(
             thread_id=self.thread_id,
             store=self.store,
             model=self.model,
@@ -478,7 +507,8 @@ class Session:
                 )
                 if pending or unsafe:
                     raise ConversationRecoveryRequiredError(
-                        "上次操作的结果尚未确认，输入未发送；核对前不会自动重跑。可用 /new 开始其他聊天。")
+                        "上次操作的结果尚未确认，输入未发送；核对前不会自动重跑。可用 /new 开始其他聊天。"
+                    )
                 if (await self.store.run_async(self.store.read_turn, active)).status not in {"paused", "interrupted"}:
                     raise ConversationBusyError("旧任务尚无可安全结束的中断记录；请先核对原执行状态。")
                 try:
@@ -489,7 +519,7 @@ class Session:
                     ) from error
                 if self._cancel_live_commands is not None:
                     await self._cancel_live_commands()
-                await executor._commit(lambda: self.store.cancel_turn(turn_id=active))
+                await executor._commit(lambda: turn_ops.cancel_turn(self.store, turn_id=active))
             if self.model_control_plane is not None and self.current_model().id != self._ready_model_id:
                 await self._bootstrap_model_provider()
             input_files: tuple[dict[str, object], ...] = ()
@@ -530,7 +560,9 @@ class Session:
                         continue
                     if "scope_id" not in old:
                         scope_id = await self.store.run_async(
-                            thread_memory_scope, self.store, previous_turn.thread_id,
+                            thread_memory_scope,
+                            self.store,
+                            previous_turn.thread_id,
                         )
                         if scope_id is not None:
                             old = {**old, "scope_id": scope_id}
@@ -557,7 +589,11 @@ class Session:
                 and result.status in {"completed", "failed", "cancelled"}
                 and (await self.store.run_async(self.store.read_thread, self.thread_id)).parent_thread_id is None
             ):
-                (await self.store.run_async(self.store.enqueue_memory_job, self.workspace_path, self.thread_id))
+                (
+                    await self.store.run_async(
+                        partial(memory_ops.enqueue_memory_job, self.store), self.workspace_path, self.thread_id
+                    )
+                )
             return await self.store.run_async(
                 AgentResult._from_harness, result, store=self.store, files=tuple(files or ())
             )
@@ -574,9 +610,9 @@ class Session:
         self._agent._input_read_files = tuple(dict.fromkeys((*previous_files, *selected)))
         try:
             permissions = previous.permissions
-            self.tool_execution_context = replace(previous, permissions=(
-                None if permissions is None else permissions.with_read_files(selected)
-            ))
+            self.tool_execution_context = replace(
+                previous, permissions=(None if permissions is None else permissions.with_read_files(selected))
+            )
             for path in selected:
                 if not self.permissions().path_access(path):
                     raise PermissionError(self.permissions().path_reason(path))
@@ -596,6 +632,7 @@ class Session:
         the active submit task to cancel work. Text never grants tool approval.
         """
         self._ensure_open()
+
         def receive() -> ItemSnapshot:
             previous = self.tool_execution_context
             previous_files = () if self._agent is None else self._agent._input_read_files
@@ -606,8 +643,12 @@ class Session:
                     if self.store.read_thread(self.thread_id).active_turn_id != expected_turn_id:
                         raise RuntimeError("expected Turn is no longer active; input was not accepted")
                     values = self.attach_files(files) if files else ()
-                    return self.store.receive_turn_input(
-                        thread_id=self.thread_id, turn_id=expected_turn_id, text=text, input_files=values,
+                    return turn_ops.receive_turn_input(
+                        self.store,
+                        thread_id=self.thread_id,
+                        turn_id=expected_turn_id,
+                        text=text,
+                        input_files=values,
                     )
             except BaseException:
                 self.tool_execution_context = previous
@@ -640,20 +681,28 @@ class Session:
             return {"status": "disabled", "maintenance_turn_ids": []}
         identity = f"turn_{uuid4().hex}"
         binding = await self.store.run_async(self.binding_provider.snapshot, thread_id=self.thread_id, turn_id=identity)
-        return await update_memory(self.store, workspace=self.workspace_path, model=self.model,
-                                   binding=binding, exclude_thread_id=self.thread_id,
-                                   prepare_binding=self._prepare_step_binding)
+        return await update_memory(
+            self.store,
+            workspace=self.workspace_path,
+            model=self.model,
+            binding=binding,
+            exclude_thread_id=self.thread_id,
+            prepare_binding=self._prepare_step_binding,
+        )
 
     @staticmethod
     async def run_memory_turn(
-        store: RuntimeState, model: BoundHarnessModel, turn_id: str,
-        *, prepare_binding: Callable[[Mapping[str, Any]], Awaitable[None]] | None = None,
+        store: RuntimeStore,
+        model: BoundHarnessModel,
+        turn_id: str,
+        *,
+        prepare_binding: Callable[[Mapping[str, Any]], Awaitable[None]] | None = None,
     ) -> TurnResult:
         """Compose a tool-free maintenance Turn through the same execution owner."""
         from agent_runtime.harness.context import RolloutContextManager
 
         executor = await store.run_async(
-            lambda: TurnExecutor(
+            lambda: TurnRunner(
                 thread_id=store.read_turn(turn_id).thread_id,
                 store=store,
                 model=model,
@@ -663,7 +712,7 @@ class Session:
                 prepare_binding=prepare_binding,
             )
         )
-        return await executor.run_turn((await store.run_async(executor.restore_turn_context, turn_id)), start_step=1)
+        return await executor.drive((await store.run_async(executor.restore_turn_context, turn_id)), start_step=1)
 
     def delete_memory(self, key: str) -> dict[str, Any]:
         """Delete a committed workspace memory; existing Turn snapshots stay unchanged."""
@@ -702,7 +751,10 @@ class Session:
         return self.model_control_plane.request_settings()
 
     def configure_request(
-        self, *, reasoning_effort: str | None = None, max_output_tokens: int | str | None = None,
+        self,
+        *,
+        reasoning_effort: str | None = None,
+        max_output_tokens: int | str | None = None,
     ) -> dict[str, Any]:
         """Persist a user change before the next request captures its settings."""
         self._ensure_open()
@@ -710,7 +762,9 @@ class Session:
             raise RuntimeError("Session has no model control plane")
         previous = copy.deepcopy(self.model_control_plane.state)
         settings = self.model_control_plane.configure_request(
-            reasoning_effort=reasoning_effort, max_output_tokens=max_output_tokens, persist=False,
+            reasoning_effort=reasoning_effort,
+            max_output_tokens=max_output_tokens,
+            persist=False,
         )
         try:
             self._persist_settings()
@@ -720,7 +774,8 @@ class Session:
         return settings
 
     def _persist_settings(self) -> None:
-        self.store.update_session_settings(
+        turn_ops.update_session_settings(
+            self.store,
             self.thread_id,
             {
                 "model_id": None
@@ -729,11 +784,17 @@ class Session:
                 "model_selection_requester": (
                     None if self.model_control_plane is None else self.model_control_plane.state.selection_requester
                 ),
-                "request_preferences": ({} if self.model_control_plane is None else {
-                    key: value.model_dump() for key, value in self.model_control_plane.state.request_preferences.items()
-                }),
-                "request_settings_revision": (0 if self.model_control_plane is None else
-                                              self.model_control_plane.state.request_settings_revision),
+                "request_preferences": (
+                    {}
+                    if self.model_control_plane is None
+                    else {
+                        key: value.model_dump()
+                        for key, value in self.model_control_plane.state.request_preferences.items()
+                    }
+                ),
+                "request_settings_revision": (
+                    0 if self.model_control_plane is None else self.model_control_plane.state.request_settings_revision
+                ),
                 "tool_execution_policy": _tool_execution_policy_snapshot(self.tool_execution_context),
                 "input_read_files": [] if self._agent is None else list(self._agent._input_read_files),
                 "memory_generation_allowed": self.memory_config.generate_memories,
@@ -742,8 +803,9 @@ class Session:
             },
             expected_request_revision=self._persisted_request_revision,
         )
-        self._persisted_request_revision = (0 if self.model_control_plane is None else
-                                            self.model_control_plane.state.request_settings_revision)
+        self._persisted_request_revision = (
+            0 if self.model_control_plane is None else self.model_control_plane.state.request_settings_revision
+        )
 
     def _apply_tool_context(self) -> None:
         if self.tool_orchestrator is not None:
@@ -766,9 +828,13 @@ class Session:
         try:
             from agent_runtime.permission_policy import load_permission_policy
 
-            effective = (self._agent.effective_permissions() if self._agent is not None else
-                         policy.resolve(self.workspace_path) if isinstance(policy, PermissionPolicy) else
-                         load_permission_policy(policy, self.workspace_path))
+            effective = (
+                self._agent.effective_permissions()
+                if self._agent is not None
+                else policy.resolve(self.workspace_path)
+                if isinstance(policy, PermissionPolicy)
+                else load_permission_policy(policy, self.workspace_path)
+            )
             self.tool_execution_context = replace(previous, permissions=effective)
             self._persist_settings()
         except BaseException:
@@ -899,31 +965,40 @@ class Session:
         workspace = open_workspace(agent._workspace_path(), create=True)
         # Discovery can invoke permission providers before service assembly.
         self.tool_execution_context = ToolExecutionContext(
-            workspace_root=workspace.root, cwd=workspace.root,
-            allow_write_tools=allow_write_tools, allow_execute_tools=allow_execute_tools,
-            allow_web_tools=allow_web_tools, permissions=agent.effective_permissions(),
+            workspace_root=workspace.root,
+            cwd=workspace.root,
+            allow_write_tools=allow_write_tools,
+            allow_execute_tools=allow_execute_tools,
+            allow_web_tools=allow_web_tools,
+            permissions=agent.effective_permissions(),
             permission_provider=agent.effective_permissions,
         )
         if initial_tool_context is not None:
-            if (initial_tool_context.workspace_root is not None
-                    and Path(initial_tool_context.workspace_root).resolve() != workspace.root):
+            if (
+                initial_tool_context.workspace_root is not None
+                and Path(initial_tool_context.workspace_root).resolve() != workspace.root
+            ):
                 raise ValueError("tool context belongs to a different workspace security domain")
             current = self.tool_execution_context.effective_permissions
             assert current is not None
             supplied = initial_tool_context.effective_permissions
+
             def current_permissions() -> ResolvedPermissions:
                 live = agent.effective_permissions()
                 supplied_live = initial_tool_context.effective_permissions
                 return live if supplied_live is None else live.intersection(supplied_live)
 
             self.tool_execution_context = replace(
-                initial_tool_context, workspace_root=workspace.root,
+                initial_tool_context,
+                workspace_root=workspace.root,
                 permissions=current if supplied is None else current.intersection(supplied),
                 permission_provider=current_permissions,
             )
         elif saved_tool_policy is not None:
             self.tool_execution_context = restore_tool_policy(
-                self.tool_execution_context, saved_tool_policy, restore_session_grants=True,
+                self.tool_execution_context,
+                saved_tool_policy,
+                restore_session_grants=True,
             )
         workspace.permission_provider = self._resource_permissions
         self.model_control_plane = agent._get_model_control_plane()
@@ -956,16 +1031,20 @@ class Session:
 
         async def close_command_sessions(*, close: bool = True) -> None:
             from agent_runtime.tools.builtins.shell import _normalize_command_output
+
             outcomes = await (command_sessions.close_results() if close else command_sessions.cancel_results())
             for continuation, output in outcomes:
                 if self.tool_orchestrator is not None:
                     normalized = _normalize_command_output(output)
-                    await self.tool_orchestrator.close_continuation(continuation, {
-                        "structured_content": output.model_dump(mode="json"),
-                        "is_error": normalized.is_error,
-                        "error_code": normalized.error_code,
-                        "error_message": normalized.error_message,
-                    })
+                    await self.tool_orchestrator.close_continuation(
+                        continuation,
+                        {
+                            "structured_content": output.model_dump(mode="json"),
+                            "is_error": normalized.is_error,
+                            "error_code": normalized.error_code,
+                            "error_message": normalized.error_message,
+                        },
+                    )
 
         async def cancel_live_commands() -> None:
             await close_command_sessions(close=False)
@@ -986,17 +1065,23 @@ class Session:
             if self._resource_permissions().network_decision(url) == "deny":
                 raise PublicWebError("network_policy_denied", "destination denied by current permission policy")
 
-        web_client = (PublicWebClient(proxy_url=agent.web_proxy_url, no_proxy=agent.web_no_proxy,
-                                     authorize_url=authorize_web_url)
-                      if agent.web_proxy_url is not None else PublicWebClient(authorize_url=authorize_web_url))
+        web_client = (
+            PublicWebClient(proxy_url=agent.web_proxy_url, no_proxy=agent.web_no_proxy, authorize_url=authorize_web_url)
+            if agent.web_proxy_url is not None
+            else PublicWebClient(authorize_url=authorize_web_url)
+        )
         self._stack.push_async_callback(web_client.aclose)
 
         def save_web_source(content: bytes) -> str:
             turn_id = current_tool_turn_id()
             if turn_id is None:
                 raise RuntimeError("web source requires an active tool Turn")
-            return self.store.commit_artifact(
-                turn_id=turn_id, content=content, media_type=WEB_SOURCE_MEDIA_TYPE, name="web-source.json",
+            return artifact_ops.commit_artifact(
+                self.store,
+                turn_id=turn_id,
+                content=content,
+                media_type=WEB_SOURCE_MEDIA_TYPE,
+                name="web-source.json",
             ).artifact_id
 
         def load_web_source(source_id: str) -> bytes:
@@ -1018,49 +1103,64 @@ class Session:
                 return 0
             attempts = 0
             for operation in self.store.list_tool_operations(turn_id):
-                if (operation.tool_name not in {"web_search", "web_fetch"}
-                        or "network" not in operation.effects or not operation.attempt_count):
+                if (
+                    operation.tool_name not in {"web_search", "web_fetch"}
+                    or "network" not in operation.effects
+                    or not operation.attempt_count
+                ):
                     continue
                 if operation.result_item_id:
                     payload = self.store.read_item(operation.result_item_id).payload
                     metadata = payload.get("metadata", {})
-                    if (metadata.get("web_cache_hit") is True
-                            or metadata.get("web_request_attempted") is False):
+                    if metadata.get("web_cache_hit") is True or metadata.get("web_request_attempted") is False:
                         # Only the last attempt is known not to have reached the
                         # network; earlier recovered attempts remain unknown.
                         attempts += max(0, operation.attempt_count - 1)
                         continue
                 # Current running attempts have not reserved network yet. Previous
                 # attempts and unknown outcomes after recovery count conservatively.
-                attempts += (max(0, operation.attempt_count - 1)
-                             if operation.status == "running" and operation.claim_owner == self.worker_id
-                             else operation.attempt_count)
+                attempts += (
+                    max(0, operation.attempt_count - 1)
+                    if operation.status == "running" and operation.claim_owner == self.worker_id
+                    else operation.attempt_count
+                )
             return attempts
 
         def web_budget_status() -> dict[str, Any]:
             limit = current_web_limits().turn_requests
             usage = self.store.read_resource_usage(
-                current_tool_turn_id(), "public_web_requests", initial_used=persisted_web_attempts(),
+                current_tool_turn_id(),
+                "public_web_requests",
+                initial_used=persisted_web_attempts(),
             )
             attempts = usage["used"]
-            return {"limit": limit, "used": min(attempts, limit), "remaining": max(0, limit - attempts),
-                    "unit": "network_tool_attempts", "unknown_attempts_counted": True,
-                    "last_reservation_item_id": usage["item_id"]}
+            return {
+                "limit": limit,
+                "used": min(attempts, limit),
+                "remaining": max(0, limit - attempts),
+                "unit": "network_tool_attempts",
+                "unknown_attempts_counted": True,
+                "last_reservation_item_id": usage["item_id"],
+            }
 
         def check_web_budget() -> None:
             limit = current_web_limits().turn_requests
             try:
                 # Commit a unit before network I/O; the SQLite transaction also
                 # serializes separate Sessions/processes sharing this Turn.
-                self.store.reserve_resource_unit(
-                    current_tool_turn_id(), "public_web_requests", limit=limit,
+                budget_ops.reserve_resource_unit(
+                    self.store,
+                    current_tool_turn_id(),
+                    "public_web_requests",
+                    limit=limit,
                     initial_used=persisted_web_attempts(),
                 )
             except ValueError as error:
                 if str(error) != "resource_limit_exceeded":
                     raise
                 raise PublicWebError(
-                    "web_request_budget_exceeded", f"This Turn permits {limit} web request attempts.",
+                    "web_request_budget_exceeded",
+                    f"This Turn permits {limit} web request attempts.",
                 ) from None
 
         def saved_fetch_failure(url: str, mode: str) -> dict[str, Any] | None:
@@ -1069,7 +1169,8 @@ class Session:
             items = self.store.list_items(current_tool_turn_id())
             arguments = {
                 item.payload.get("tool_call_id"): item.payload.get("arguments")
-                for item in items if item.kind == "tool_call" and item.payload.get("tool_name") == "web_fetch"
+                for item in items
+                if item.kind == "tool_call" and item.payload.get("tool_name") == "web_fetch"
             }
             for item in reversed(items):
                 if item.kind != "tool_result" or item.payload.get("tool_name") != "web_fetch":
@@ -1090,8 +1191,10 @@ class Session:
                 # The newest acquisition supersedes older failure evidence, including explicit refresh.
                 if not isinstance(output, dict) or not output.get("error_code"):
                     return None
-                return {**output, "failure_origin": {"item_id": item.item_id,
-                                                     "tool_call_id": str(item.payload.get("tool_call_id"))}}
+                return {
+                    **output,
+                    "failure_origin": {"item_id": item.item_id, "tool_call_id": str(item.payload.get("tool_call_id"))},
+                }
             return None
 
         web_tools = create_web_tools(
@@ -1154,11 +1257,17 @@ class Session:
                 workspace_root=workspace.root,
                 trust_workspace=False,
             )
-            mcp_tools = await self._stack.enter_async_context(open_trusted_product_mcp_tools(
-                config_path, trust=trust, permissions=policy, permission_provider=mcp_permissions,
-                lazy=True,
-            ))
+            mcp_tools = await self._stack.enter_async_context(
+                open_trusted_product_mcp_tools(
+                    config_path,
+                    trust=trust,
+                    permissions=policy,
+                    permission_provider=mcp_permissions,
+                    lazy=True,
+                )
+            )
             from agent_runtime.runtime.mcp_catalog import catalog_revision
+
             self._mcp_config_path = config_path
             self._mcp_catalog_revision = catalog_revision(config_path)
             mcp_trust_binding = {
@@ -1230,105 +1339,26 @@ class Session:
             turn = await self.store.run_async(self.store.read_turn, turn_id)
             if turn.thread_id != self.thread_id:
                 raise RuntimeError("Turn belongs to a different Session")
-            if action != "abort" and turn.status in {"running", "paused", "interrupted"}:
-                await self.store.run_async(self.store.validate_turn_model_requests, turn_id)
-            if (
-                expected_request_id is not None
-                and (await self.store.run_async(recovery_plan, self.store, turn_id)).request_id != expected_request_id
-            ):
-                raise ValueError("recovery request changed; inspect current state before responding")
-            executor = await self.store.run_async(self._executor)
-            if turn.status in {"running", "paused", "interrupted"}:
-                await executor._commit(lambda: recover_owner_loss(self.store, turn_id, abort=action == "abort"))
-                if action in {"continue", "retry"} and self._command_sessions is not None:
-                    assert self.tool_orchestrator is not None
-                    while await self.tool_orchestrator.reconcile_command_observation(self._command_sessions, turn_id):
-                        await executor._commit(lambda: recover_owner_loss(self.store, turn_id))
-            turn = await self.store.run_async(self.store.read_turn, turn_id)
-            if action == "abort":
-                if self._cancel_live_commands is not None:
-                    await self._cancel_live_commands()
-                plan = await self.store.run_async(recovery_plan, self.store, turn_id)
-                if not plan.accepts("abort"):
-                    raise ConversationRecoveryRequiredError(f"取消未完成：{plan.reason_code}；请先核对执行状态。")
-                cancelled = await executor._commit(lambda: self.store.cancel_turn(turn_id=turn_id))
-                return await self.store.run_async(
-                    AgentResult._from_harness,
-                    TurnResult(thread_id=self.thread_id, turn_id=turn_id, answer=None, status=cancelled.status),
-                    store=self.store,
-                )
-            pending = await self.store.run_async(
-                lambda: tuple(item for item in self.store.list_interactions(turn_id) if item.status == "pending")
-            )
             if files:
-                if not pending and (
-                    await self.store.run_async(
-                        lambda: any(op.status == "unknown" for op in self.store.list_model_operations(turn_id))
-                    )
-                ):
+                pending = await self.store.run_async(
+                    lambda: any(i.status == "pending" for i in self.store.list_interactions(turn_id))
+                )
+                unknown = await self.store.run_async(
+                    lambda: any(op.status == "unknown" for op in self.store.list_model_operations(turn_id))
+                )
+                if not pending and unknown:
                     raise ValueError("重试旧请求不能附加新文件；请将附件作为新消息发送。")
                 await self.steer("补充输入文件，请结合当前任务读取。", expected_turn_id=turn_id, files=files)
-            plan = await self.store.run_async(recovery_plan, self.store, turn_id)
-            if plan.route == "reconcile" and action in {"continue", "retry"}:
-                return await self.store.run_async(
-                    AgentResult._from_harness,
-                    TurnResult(
-                        thread_id=self.thread_id,
-                        turn_id=turn_id,
-                        answer=None,
-                        status=turn.status,
-                        interaction_id=plan.request_id,
-                    ),
-                    store=self.store,
-                )
-            if plan.route == "resume_cancelled" and plan.accepts(action):
-                await executor._commit(lambda: self.store.resume_cancelled_turn(turn_id=turn_id))
-                plan = await self.store.run_async(recovery_plan, self.store, turn_id)
-            if not plan.accepts(action):
-                raise RuntimeError(f"resume action {action!r} is unavailable: {plan.reason_code}; "
-                                 f"available actions: {', '.join(plan.actions) or 'none'}")
-            if plan.route == "approval_resolved":
-                internal = await executor.resume(
-                    turn_id=turn_id, decision="approve" if action == "allow_once" else action,
-                )
-            elif plan.route == "approval":
-                decision = {"allow_once": "approve", "approve": "approve", "allow_session": "approve",
-                            "deny": "deny", "recheck": "recheck"}.get(action, "deny")
-                internal = await executor.resume(
-                    turn_id=turn_id, decision=decision,
-                    on_session_grant=self._add_approval_grant if action == "allow_session" else None,
-                )
-            elif plan.route == "input":
-                if user_input is None:
-                    raise ValueError(f"{pending[0].kind} resume requires action=continue and user_input")
-                assert plan.request_id is not None
-                internal = await executor.respond_interaction(
-                    turn_id=turn_id, request_id=plan.request_id, response=user_input,
-                )
-            elif plan.route == "retry_model":
-                internal = await executor.retry_unknown_model(turn_id=turn_id)
-            elif plan.route == "approved_ready":
-                internal = await executor.resume(turn_id=turn_id, decision="approve")
-            elif plan.route == "committed_response":
-                internal = await executor.recover_committed_model_response(turn_id=turn_id)
-            elif plan.route == "prepared_model":
-                internal = await executor.recover_prepared_model(turn_id=turn_id)
-            elif plan.route == "context_overflow":
-                internal = await executor.run_turn(
-                    (await self.store.run_async(executor.restore_turn_context, turn_id)),
-                    start_step=(await self.store.run_async(executor.agent_step_count, turn_id)),
-                )
-            elif plan.route == "input_superseded":
-                internal = await executor.run_turn(
-                    (await self.store.run_async(executor.restore_turn_context, turn_id)),
-                    start_step=(await self.store.run_async(executor.agent_step_count, turn_id)) + 1,
-                )
-            elif plan.route == "first_dispatch":
-                internal = await executor.run_turn(
-                    (await self.store.run_async(executor.restore_turn_context, turn_id)), start_step=1
-                )
-            else:
-                raise RuntimeError("resume action does not match the Turn's durable pending state")
+            runner = await self.store.run_async(self._executor)
+            internal = await runner.drive(
+                turn_id=turn_id,
+                action=action,
+                user_input=user_input,
+                expected_request_id=expected_request_id,
+                on_session_grant=self._add_approval_grant,
+                command_sessions=self._command_sessions,
+                cancel_live_commands=self._cancel_live_commands,
+            )
             return await self.store.run_async(AgentResult._from_harness, internal, store=self.store)
 
     async def run_child(
@@ -1377,9 +1407,14 @@ class Session:
             child_options = {
                 **self._service_options,
                 "model_binding": source_binding,
-                "tool_execution_context": replace(restore_tool_policy(
-                    self.tool_execution_context, policy_value, restore_session_grants=True,
-                ), command_grants=()),
+                "tool_execution_context": replace(
+                    restore_tool_policy(
+                        self.tool_execution_context,
+                        policy_value,
+                        restore_session_grants=True,
+                    ),
+                    command_grants=(),
+                ),
             }
             # Borrow providers through the source binding, independent of the parent's next selection.
             await self._prepare_step_binding(source_binding)
@@ -1389,7 +1424,7 @@ class Session:
             if parent_turn_id is None:
                 (
                     await self.store.run_async(
-                        self.store.create_thread, workspace=self.workspace_path, thread_id=thread_id
+                        partial(turn_ops.create_thread, self.store), workspace=self.workspace_path, thread_id=thread_id
                     )
                 )
                 binding["budget_root_turn_id"] = turn_id
@@ -1403,7 +1438,7 @@ class Session:
                     raise RuntimeError("subagent parent Turn must still be running in this Session")
                 (
                     await self.store.run_async(
-                        self.store.start_budgeted_child_turn,
+                        partial(budget_ops.start_budgeted_child_turn, self.store),
                         parent_turn_id=parent_turn_id,
                         child_thread_id=thread_id,
                         child_turn_id=turn_id,
@@ -1431,13 +1466,17 @@ class Session:
                             binding_manifest=binding,
                         )
                     else:
-                        result = await executor.run_turn(
+                        result = await executor.drive(
                             (await child.store.run_async(executor.restore_turn_context, turn_id)), start_step=1
                         )
                 if parent_turn_id is not None and result.status in {"completed", "failed", "cancelled"}:
                     state = await self.store.run_async(self.store.read_budget_state, turn_id)
                     if state.reserved + state.uncertain + state.child_reserved == ResourceUsage():
-                        (await self.store.run_async(self.store.settle_child_budget, child_turn_id=turn_id))
+                        (
+                            await self.store.run_async(
+                                partial(budget_ops.settle_child_budget, self.store), child_turn_id=turn_id
+                            )
+                        )
                 return result
         finally:
             self._child_calls.pop(task)

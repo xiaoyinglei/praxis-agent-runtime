@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+from functools import partial
 
 import pytest
 
-from agent_runtime.harness import HarnessModelResponse, PreparedModelCall, RuntimeState, Session
+from agent_runtime.harness import HarnessModelResponse, PreparedModelCall, RuntimeStore, Session, memory_ops, turn_ops
 
 
 class MemoryModel:
@@ -27,9 +28,14 @@ class MemoryModel:
         request = self.requests[-1]
         if request.purpose == "memory_extract":
             source = json.loads(request.messages[-1].content.split("\nDATA:\n", 1)[1])
-            self.extracted = [{"key": "environment", "title": "Python environment",
-                               "text": "Use uv for this workspace.",
-                               "source_item_ids": [source[0]["item_id"]]}]
+            self.extracted = [
+                {
+                    "key": "environment",
+                    "title": "Python environment",
+                    "text": "Use uv for this workspace.",
+                    "source_item_ids": [source[0]["item_id"]],
+                }
+            ]
             text = json.dumps({"entries": self.extracted})
         elif request.purpose == "memory_consolidate":
             data = json.loads(request.messages[-1].content.split("\nDATA:\n", 1)[1])
@@ -43,10 +49,14 @@ class MemoryModel:
 
 
 def seed(store, workspace, *, text="Use uv for Python commands.", contributes=True):
-    thread = store.create_thread(workspace=workspace)
-    turn = store.start_turn(thread_id=thread.thread_id, user_message=text,
-                            binding_manifest={"memory_generation_allowed": contributes})
-    store.complete_turn(turn_id=turn.turn_id, answer="acknowledged")
+    thread = turn_ops.create_thread(store, workspace=workspace)
+    turn = turn_ops.start_turn(
+        store,
+        thread_id=thread.thread_id,
+        user_message=text,
+        binding_manifest={"memory_generation_allowed": contributes},
+    )
+    turn_ops.complete_turn(store, turn_id=turn.turn_id, answer="acknowledged")
     return thread, turn
 
 
@@ -56,26 +66,31 @@ async def test_memory_update_is_durable_and_an_independent_chat_uses_a_frozen_sn
 
     database = tmp_path / "r.db"
     model = MemoryModel()
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         seed(store, tmp_path)
         result = await update_memory(store, workspace=tmp_path, model=model, binding={"model_id": "test"})
         assert result["status"] == "updated"
         assert len(model.requests) == 2
         assert all(not request.tools for request in model.requests)
         assert store.verify().valid
-        assert (await update_memory(store, workspace=tmp_path, model=model, binding={})) ["status"] == "unchanged"
+        assert (await update_memory(store, workspace=tmp_path, model=model, binding={}))["status"] == "unchanged"
         assert len(model.requests) == 2
     async with await Session.open(
-        database=database, workspace=tmp_path, model=model,
-        memory=MemoryConfig(generate_memories=False), require_workspace_change=False,
+        database=database,
+        workspace=tmp_path,
+        model=model,
+        memory=MemoryConfig(generate_memories=False),
+        require_workspace_change=False,
     ) as session:
         reply = await session.submit("new independent chat")
         snapshot = session.store.read_turn(reply.turn_id).binding_manifest["memory_snapshot"]
         assert snapshot["entries"][0] == {"key": "environment", "title": "Python environment"}
         detail = session.store.read_memory_state(tmp_path, version=snapshot["version"])["entries"][0]
         assert detail["text"] == "Use uv for this workspace."
-        assert any("Python environment" in m.content and m.content.startswith("Cross-chat memory (")
-                   for m in model.requests[-1].messages)
+        assert any(
+            "Python environment" in m.content and m.content.startswith("Cross-chat memory (")
+            for m in model.requests[-1].messages
+        )
         frozen = json.dumps(snapshot)
         session.delete_memory("environment")
         assert json.dumps(session.store.read_turn(reply.turn_id).binding_manifest["memory_snapshot"]) == frozen
@@ -90,10 +105,10 @@ async def test_workspace_isolation_contribution_control_and_delete_does_not_resu
     other = tmp_path / "other"
     other.mkdir()
     model = MemoryModel()
-    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
+    async with await RuntimeStore.open(tmp_path / "r.db") as store:
         seed(store, tmp_path, contributes=False)
         seed(store, other)
-        assert (await update_memory(store, workspace=tmp_path, model=model, binding={})) ["status"] == "unchanged"
+        assert (await update_memory(store, workspace=tmp_path, model=model, binding={}))["status"] == "unchanged"
         seed(store, tmp_path)
         await update_memory(store, workspace=tmp_path, model=model, binding={})
         assert memory_snapshot(store, other)["entries"] == []
@@ -108,7 +123,7 @@ async def test_failed_consolidation_preserves_previous_memory_and_records_failur
     from agent_runtime.harness.memory import memory_snapshot, update_memory
 
     model = MemoryModel()
-    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
+    async with await RuntimeStore.open(tmp_path / "r.db") as store:
         seed(store, tmp_path)
         await update_memory(store, workspace=tmp_path, model=model, binding={})
         before = memory_snapshot(store, tmp_path)
@@ -135,7 +150,7 @@ async def test_model_cannot_forge_memory_source_ids(tmp_path):
                 usage={},
             )
 
-    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
+    async with await RuntimeStore.open(tmp_path / "r.db") as store:
         seed(store, tmp_path)
         result = await update_memory(store, workspace=tmp_path, model=ForgingModel(), binding={})
         assert result["status"] == "failed"
@@ -153,8 +168,9 @@ def test_sdk_inspection_reports_explicit_controls_without_creating_database(tmp_
     from agent_runtime import Agent, MemoryConfig
 
     database = tmp_path / "not-created.sqlite"
-    agent = Agent(workspace_path=tmp_path, checkpoint_db=database,
-                  memory=MemoryConfig(use_memories=True, generate_memories=False))
+    agent = Agent(
+        workspace_path=tmp_path, checkpoint_db=database, memory=MemoryConfig(use_memories=True, generate_memories=False)
+    )
     status = agent.memories()
     assert status["use_memories"] is True and status["generate_memories"] is False
     assert status["entries"] == [] and not database.exists()
@@ -173,12 +189,12 @@ async def test_concurrent_maintenance_claims_only_one_worker(tmp_path):
             return await super().dispatch(prepared, event_sink=event_sink)
 
     database = tmp_path / "r.db"
-    async with (await RuntimeState.open(database)) as first, (await RuntimeState.open(database)) as second:
+    async with await RuntimeStore.open(database) as first, await RuntimeStore.open(database) as second:
         seed(first, tmp_path)
         worker = asyncio.create_task(update_memory(first, workspace=tmp_path, model=WaitingModel(), binding={}))
         await entered.wait()
         contender = MemoryModel()
-        assert (await update_memory(second, workspace=tmp_path, model=contender, binding={})) ["status"] == "busy"
+        assert (await update_memory(second, workspace=tmp_path, model=contender, binding={}))["status"] == "busy"
         assert contender.requests == []
         release.set()
         assert (await worker)["status"] == "updated"
@@ -191,28 +207,43 @@ async def test_read_memory_uses_frozen_entries_and_cannot_read_raw_other_chat_it
     from agent_runtime.tools.permissions import ToolExecutionContext
     from agent_runtime.tools.tool import ToolCall, ToolCallOrigin
 
-    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
+    async with await RuntimeStore.open(tmp_path / "r.db") as store:
         seed(store, tmp_path)
         await update_memory(store, workspace=tmp_path, model=MemoryModel(), binding={})
-        thread = store.create_thread(workspace=tmp_path)
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
         snapshot = memory_snapshot(store, tmp_path)
-        turn = store.start_turn(thread_id=thread.thread_id, user_message="recall",
-                                binding_manifest={"memory_snapshot": snapshot})
+        turn = turn_ops.start_turn(
+            store, thread_id=thread.thread_id, user_message="recall", binding_manifest={"memory_snapshot": snapshot}
+        )
         tool = create_memory_tool(store)
-        executor = ToolOrchestrator(store=store, tools={"read_memory": tool},
-                                   execution_context=ToolExecutionContext(workspace_root=tmp_path, cwd=tmp_path))
+        executor = ToolOrchestrator(
+            store=store,
+            tools={"read_memory": tool},
+            execution_context=ToolExecutionContext(workspace_root=tmp_path, cwd=tmp_path),
+        )
         delete_memory(store, tmp_path, "environment")
-        output = await executor.execute(turn_id=turn.turn_id, call=ToolCall(
-            tool_call_id="recall-1", tool_name="read_memory", arguments={"key": "environment"},
-            origin=ToolCallOrigin(request_id="r", toolset_revision="v", exposed_tool_names=("read_memory",))))
+        output = await executor.execute(
+            turn_id=turn.turn_id,
+            call=ToolCall(
+                tool_call_id="recall-1",
+                tool_name="read_memory",
+                arguments={"key": "environment"},
+                origin=ToolCallOrigin(request_id="r", toolset_revision="v", exposed_tool_names=("read_memory",)),
+            ),
+        )
         assert not output.is_error
         result = json.loads(output.content[0].data["text"])
         assert result["version"] == snapshot["version"]
         assert result["entries"][0]["text"] == "Use uv for this workspace."
-        invalid = await executor.execute(turn_id=turn.turn_id, call=ToolCall(
-            tool_call_id="recall-2", tool_name="read_memory",
-            arguments={"item_id": snapshot["entries"][0]["source_item_ids"][0]},
-            origin=ToolCallOrigin(request_id="r", toolset_revision="v", exposed_tool_names=("read_memory",))))
+        invalid = await executor.execute(
+            turn_id=turn.turn_id,
+            call=ToolCall(
+                tool_call_id="recall-2",
+                tool_name="read_memory",
+                arguments={"item_id": snapshot["entries"][0]["source_item_ids"][0]},
+                origin=ToolCallOrigin(request_id="r", toolset_revision="v", exposed_tool_names=("read_memory",)),
+            ),
+        )
         assert invalid.is_error
 
 
@@ -229,7 +260,7 @@ def test_memory_cli_status_is_readonly_and_controls_are_independent(tmp_path):
     assert not database.exists()
     result = runner.invoke(agent_app, ["memory", "configure", "--use", "--no-generate", *common])
     assert result.exit_code == 0, result.output
-    with RuntimeState.open_sync(database, read_only=True) as store:
+    with RuntimeStore.open_sync(database, read_only=True) as store:
         state = store.read_memory_state(tmp_path)
         assert state["use_memories"] and not state["generate_memories"]
 
@@ -240,13 +271,13 @@ async def test_long_history_is_consumed_in_complete_batches_across_reopens(tmp_p
 
     database = tmp_path / "r.db"
     model = MemoryModel()
-    async with (await RuntimeState.open(database)) as store:
-        thread, turn = seed(store, tmp_path, text="中文 and escaped \"data\" " * 5000)
+    async with await RuntimeStore.open(database) as store:
+        thread, turn = seed(store, tmp_path, text='中文 and escaped "data" ' * 5000)
         original = next(i for i in store.list_items(turn.turn_id) if i.kind == "user_message")
         expected = json.dumps(dict(original.payload), ensure_ascii=False)
     fragments = []
     for _ in range(20):
-        async with (await RuntimeState.open(database)) as store:
+        async with await RuntimeStore.open(database) as store:
             result = await update_memory(store, workspace=tmp_path, model=model, binding={})
         assert result["status"] == "updated"
         request = next(r for r in reversed(model.requests) if r.purpose == "memory_extract")
@@ -258,11 +289,15 @@ async def test_long_history_is_consumed_in_complete_batches_across_reopens(tmp_p
     else:
         pytest.fail("source must make bounded progress")
     assert len(fragments) > 1 and "".join(fragments) == expected
-    async with (await RuntimeState.open(database)) as store:
-        assert (await update_memory(store, workspace=tmp_path, model=model, binding={})) ["status"] == "unchanged"
-        later = store.start_turn(thread_id=thread.thread_id, user_message="new allowed fact",
-                                 binding_manifest={"memory_generation_allowed": True})
-        store.complete_turn(turn_id=later.turn_id, answer="acknowledged")
+    async with await RuntimeStore.open(database) as store:
+        assert (await update_memory(store, workspace=tmp_path, model=model, binding={}))["status"] == "unchanged"
+        later = turn_ops.start_turn(
+            store,
+            thread_id=thread.thread_id,
+            user_message="new allowed fact",
+            binding_manifest={"memory_generation_allowed": True},
+        )
+        turn_ops.complete_turn(store, turn_id=later.turn_id, answer="acknowledged")
         await update_memory(store, workspace=tmp_path, model=model, binding={})
     request = next(r for r in reversed(model.requests) if r.purpose == "memory_extract")
     assert "new allowed fact" in request.messages[-1].content
@@ -277,7 +312,7 @@ async def test_snapshot_failure_returns_diagnostic_without_phantom_turn_cleanup(
         def snapshot(self, **identity):
             raise ValueError("cannot bind model")
 
-    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
+    async with await RuntimeStore.open(tmp_path / "r.db") as store:
         seed(store, tmp_path)
         result = await update_memory(store, workspace=tmp_path, model=BrokenSnapshot(), binding={})
         assert result["status"] == "failed"
@@ -291,19 +326,29 @@ async def test_reopened_chat_obeys_new_workspace_controls_without_extracting_dis
 
     database = tmp_path / "r.db"
     model = MemoryModel()
-    async with await Session.open(database=database, workspace=tmp_path, model=model,
-                                  memory=MemoryConfig(use_memories=False, generate_memories=False),
-                                  require_workspace_change=False) as session:
+    async with await Session.open(
+        database=database,
+        workspace=tmp_path,
+        model=model,
+        memory=MemoryConfig(use_memories=False, generate_memories=False),
+        require_workspace_change=False,
+    ) as session:
         await session.submit("private old turn")
         thread_id = session.thread_id
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         configure_memory(store, tmp_path, MemoryConfig())
-    async with await Session.open(database=database, workspace=tmp_path, model=model, thread_id=thread_id,
-                                  _background_memory=False, require_workspace_change=False) as session:
+    async with await Session.open(
+        database=database,
+        workspace=tmp_path,
+        model=model,
+        thread_id=thread_id,
+        _background_memory=False,
+        require_workspace_change=False,
+    ) as session:
         assert session.memory_config.generate_memories
         assert session.store.read_thread(thread_id).settings["memory_generation_allowed"]
         await session.submit("new allowed turn")
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         result = await update_memory(store, workspace=tmp_path, model=model, binding={})
         assert result["status"] == "updated"
     extraction = next(r for r in model.requests if r.purpose == "memory_extract")
@@ -320,7 +365,7 @@ async def test_memory_maintenance_runs_the_existing_model_ready_hook(tmp_path):
     async def ready(binding):
         calls.append(binding["maintenance_purpose"])
 
-    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
+    async with await RuntimeStore.open(tmp_path / "r.db") as store:
         seed(store, tmp_path)
         result = await update_memory(store, workspace=tmp_path, model=MemoryModel(), binding={}, prepare_binding=ready)
         assert result["status"] == "updated"
@@ -336,13 +381,25 @@ async def test_later_correction_replaces_the_previous_entry(tmp_path):
             request = self.requests[-1]
             if request.purpose == "memory_extract":
                 data = json.loads(request.messages[-1].content.split("\nDATA:\n", 1)[1])
-                return HarnessModelResponse.from_parts(text=json.dumps({"entries": [{
-                    "key": "environment", "title": "Command runner", "text": data[0]["payload"]["text"],
-                    "source_item_ids": [data[0]["item_id"]],
-                }]}), provider_response_id=None, usage={})
+                return HarnessModelResponse.from_parts(
+                    text=json.dumps(
+                        {
+                            "entries": [
+                                {
+                                    "key": "environment",
+                                    "title": "Command runner",
+                                    "text": data[0]["payload"]["text"],
+                                    "source_item_ids": [data[0]["item_id"]],
+                                }
+                            ]
+                        }
+                    ),
+                    provider_response_id=None,
+                    usage={},
+                )
             return await super().dispatch(prepared, event_sink=event_sink)
 
-    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
+    async with await RuntimeStore.open(tmp_path / "r.db") as store:
         seed(store, tmp_path, text="Use pip.")
         model = CorrectionModel()
         await update_memory(store, workspace=tmp_path, model=model, binding={})
@@ -360,13 +417,14 @@ async def test_memory_budget_rejects_dispatch_before_provider_call(tmp_path):
 
     class OverBudget(MemoryModel):
         def prepare(self, request):
-            return PreparedModelCall("r", "c", "t", "w", {},
-                                     resource_request=ResourceUsage(input_tokens=MEMORY_TOKEN_BUDGET + 1))
+            return PreparedModelCall(
+                "r", "c", "t", "w", {}, resource_request=ResourceUsage(input_tokens=MEMORY_TOKEN_BUDGET + 1)
+            )
 
         async def dispatch(self, *args, **kwargs):
             pytest.fail("provider must not be called above the maintenance budget")
 
-    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
+    async with await RuntimeStore.open(tmp_path / "r.db") as store:
         seed(store, tmp_path)
         result = await update_memory(store, workspace=tmp_path, model=OverBudget(), binding={})
         assert result["status"] == "failed"
@@ -384,7 +442,7 @@ async def test_cancelled_provider_outcome_is_not_reissued_and_other_sources_can_
             entered.set()
             await asyncio.Event().wait()
 
-    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
+    async with await RuntimeStore.open(tmp_path / "r.db") as store:
         seed(store, tmp_path)
         task = asyncio.create_task(update_memory(store, workspace=tmp_path, model=SlowModel(), binding={}))
         await entered.wait()
@@ -413,7 +471,7 @@ async def test_metadata_only_model_snapshot_gets_maintenance_identity(tmp_path):
         assert binding["thread_id"].startswith("thread_")
         assert binding["turn_id"].startswith("turn_")
 
-    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
+    async with await RuntimeStore.open(tmp_path / "r.db") as store:
         seed(store, tmp_path)
         result = await update_memory(store, workspace=tmp_path, model=MetadataOnly(), binding={}, prepare_binding=ready)
         assert result["status"] == "updated"
@@ -425,17 +483,27 @@ async def test_terminal_chat_enqueues_durable_work_for_next_session(tmp_path):
 
     database = tmp_path / "r.db"
     model = MemoryModel()
-    async with await Session.open(database=database, workspace=tmp_path, model=model,
-                                  memory=MemoryConfig(), _background_memory=False,
-                                  require_workspace_change=False) as first:
+    async with await Session.open(
+        database=database,
+        workspace=tmp_path,
+        model=model,
+        memory=MemoryConfig(),
+        _background_memory=False,
+        require_workspace_change=False,
+    ) as first:
         await first.submit("Remember a stable project convention")
         source_thread = first.thread_id
-    async with (await RuntimeState.open(database, read_only=True)) as store:
+    async with await RuntimeStore.open(database, read_only=True) as store:
         jobs = store.read_memory_jobs(tmp_path)
         assert jobs[source_thread]["status"] == "pending"
-    async with await Session.open(database=database, workspace=tmp_path, model=model,
-                                  memory=MemoryConfig(), _background_memory=False,
-                                  require_workspace_change=False) as second:
+    async with await Session.open(
+        database=database,
+        workspace=tmp_path,
+        model=model,
+        memory=MemoryConfig(),
+        _background_memory=False,
+        require_workspace_change=False,
+    ) as second:
         result = await second.refresh_memory()
         assert result["status"] == "updated"
         assert second.store.read_memory_jobs(tmp_path)[source_thread]["status"] == "done"
@@ -449,29 +517,53 @@ async def test_index_is_bounded_and_details_use_the_frozen_version(tmp_path):
     from agent_runtime.tools.tool import ToolCall, ToolCallOrigin
 
     database = tmp_path / "r.db"
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         source, turn = seed(store, tmp_path)
         source_id = store.list_items(turn.turn_id)[0].item_id
         state = store.read_memory_state(tmp_path)
-        state["entries"] = [{"key": f"topic-{n}", "title": f"Topic {n}", "text": f"private detail {n}",
-                             "source_item_ids": [source_id], "sources": {source_id: source.thread_id}}
-                            for n in range(45)]
-        store.commit_memory_state(tmp_path, expected_version=0, state=state)
-    async with await Session.open(database=database, workspace=tmp_path, model=MemoryModel(),
-                                  memory=MemoryConfig(generate_memories=False),
-                                  require_workspace_change=False) as session:
+        state["entries"] = [
+            {
+                "key": f"topic-{n}",
+                "title": f"Topic {n}",
+                "text": f"private detail {n}",
+                "source_item_ids": [source_id],
+                "sources": {source_id: source.thread_id},
+            }
+            for n in range(45)
+        ]
+        memory_ops.commit_memory_state(store, tmp_path, expected_version=0, state=state)
+    async with await Session.open(
+        database=database,
+        workspace=tmp_path,
+        model=MemoryModel(),
+        memory=MemoryConfig(generate_memories=False),
+        require_workspace_change=False,
+    ) as session:
         reply = await session.submit("retrieve an old topic")
         snapshot = session.store.read_turn(reply.turn_id).binding_manifest["memory_snapshot"]
         assert snapshot["total_entries"] == 45 and len(snapshot["entries"]) <= 32
         assert "private detail" not in json.dumps(snapshot)
         session.delete_memory("topic-0")
-        frozen_turn = session.store.start_turn(thread_id=session.thread_id, user_message="frozen read",
-                                              binding_manifest={"memory_snapshot": snapshot})
-        orchestrator = ToolOrchestrator(store=session.store, tools={"read_memory": create_memory_tool(session.store)},
-                                       execution_context=ToolExecutionContext(workspace_root=tmp_path, cwd=tmp_path))
-        output = await orchestrator.execute(turn_id=frozen_turn.turn_id, call=ToolCall(
-            tool_call_id="frozen-detail", tool_name="read_memory", arguments={"query": "private detail 0"},
-            origin=ToolCallOrigin(request_id="r", toolset_revision="v", exposed_tool_names=("read_memory",))))
+        frozen_turn = turn_ops.start_turn(
+            session.store,
+            thread_id=session.thread_id,
+            user_message="frozen read",
+            binding_manifest={"memory_snapshot": snapshot},
+        )
+        orchestrator = ToolOrchestrator(
+            store=session.store,
+            tools={"read_memory": create_memory_tool(session.store)},
+            execution_context=ToolExecutionContext(workspace_root=tmp_path, cwd=tmp_path),
+        )
+        output = await orchestrator.execute(
+            turn_id=frozen_turn.turn_id,
+            call=ToolCall(
+                tool_call_id="frozen-detail",
+                tool_name="read_memory",
+                arguments={"query": "private detail 0"},
+                origin=ToolCallOrigin(request_id="r", toolset_revision="v", exposed_tool_names=("read_memory",)),
+            ),
+        )
         assert not output.is_error
         payload = json.loads(output.content[0].data["text"])
         assert payload["entries"][0]["text"] == "private detail 0"
@@ -484,18 +576,29 @@ async def test_old_size_skip_is_migrated_without_reextracting_normal_processed_h
 
     from agent_runtime.harness.memory import MAX_SOURCE_BYTES, update_memory
 
-    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
+    async with await RuntimeStore.open(tmp_path / "r.db") as store:
         thread, turn = seed(store, tmp_path, text="big" * 20000)
         turns = store.list_turns(thread.thread_id)
-        revision = hashlib.sha256(json.dumps({
-            "turns": [(t.turn_id, t.applied_thread_sequence) for t in turns],
-            "source_byte_limit": MAX_SOURCE_BYTES,
-        }, sort_keys=True).encode()).hexdigest()
+        revision = hashlib.sha256(
+            json.dumps(
+                {
+                    "turns": [(t.turn_id, t.applied_thread_sequence) for t in turns],
+                    "source_byte_limit": MAX_SOURCE_BYTES,
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
         state = store.read_memory_state(tmp_path)
         state["processed"][thread.thread_id] = revision
-        state["skipped_sources"] = [{"thread_id": thread.thread_id, "revision": revision,
-                                     "reason": "source_bytes_exceeded", "limit": MAX_SOURCE_BYTES}]
-        store.commit_memory_state(tmp_path, expected_version=0, state=state)
+        state["skipped_sources"] = [
+            {
+                "thread_id": thread.thread_id,
+                "revision": revision,
+                "reason": "source_bytes_exceeded",
+                "limit": MAX_SOURCE_BYTES,
+            }
+        ]
+        memory_ops.commit_memory_state(store, tmp_path, expected_version=0, state=state)
         result = await update_memory(store, workspace=tmp_path, model=MemoryModel(), binding={})
         assert result["status"] == "updated" and result["has_more"]
         assert store.read_memory_state(tmp_path)["skipped_sources"] == []
@@ -507,19 +610,25 @@ def test_expired_worker_cannot_publish_cursor_or_mutate_job(tmp_path):
 
     from agent_runtime.harness.protocol import ContextSourceChangedError
 
-    with RuntimeState.open_sync(tmp_path / "r.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "r.db") as store:
         thread, _ = seed(store, tmp_path)
-        old = store.claim_memory_job(tmp_path, owner="old", now=time.time() - 10, lease_seconds=1)
-        new = store.claim_memory_job(tmp_path, owner="new", now=time.time(), lease_seconds=300)
+        old = memory_ops.claim_memory_job(store, tmp_path, owner="old", now=time.time() - 10, lease_seconds=1)
+        new = memory_ops.claim_memory_job(store, tmp_path, owner="new", now=time.time(), lease_seconds=300)
         assert old is not None and new is not None
-        job = store.write_memory_job(tmp_path, thread.thread_id, {"status": "running"}, claim=new)
+        job = memory_ops.write_memory_job(store, tmp_path, thread.thread_id, {"status": "running"}, claim=new)
         with pytest.raises(ContextSourceChangedError):
-            store.write_memory_job(tmp_path, thread.thread_id, {"status": "done"}, claim=old)
+            memory_ops.write_memory_job(store, tmp_path, thread.thread_id, {"status": "done"}, claim=old)
         with pytest.raises(ContextSourceChangedError):
-            store.commit_memory_state(tmp_path, expected_version=0,
-                                      state={**store.read_memory_state(tmp_path), "source_cursors": {"bad": 1}},
-                                      claim=old, job_thread_id=thread.thread_id,
-                                      job_state={"status": "done"}, job_revision=job["revision"])
+            memory_ops.commit_memory_state(
+                store,
+                tmp_path,
+                expected_version=0,
+                state={**store.read_memory_state(tmp_path), "source_cursors": {"bad": 1}},
+                claim=old,
+                job_thread_id=thread.thread_id,
+                job_state={"status": "done"},
+                job_revision=job["revision"],
+            )
         assert store.read_memory_state(tmp_path)["version"] == 0
         assert store.read_memory_jobs(tmp_path)[thread.thread_id] == job
 
@@ -530,15 +639,18 @@ async def test_completed_extraction_is_reused_after_cancel_before_consolidation_
 
     database = tmp_path / "r.db"
     entered = asyncio.Event()
+
     async def ready(binding):
         if binding["maintenance_purpose"] == "memory_consolidate":
             entered.set()
             await asyncio.Event().wait()
+
     first = MemoryModel()
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         thread, _ = seed(store, tmp_path)
-        worker = asyncio.create_task(update_memory(store, workspace=tmp_path, model=first, binding={},
-                                                  prepare_binding=ready))
+        worker = asyncio.create_task(
+            update_memory(store, workspace=tmp_path, model=first, binding={}, prepare_binding=ready)
+        )
         await entered.wait()
         worker.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -546,7 +658,7 @@ async def test_completed_extraction_is_reused_after_cancel_before_consolidation_
         assert store.read_memory_jobs(tmp_path)[thread.thread_id]["status"] == "pending"
         assert store.read_memory_state(tmp_path)["version"] == 0
     second = MemoryModel()
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         result = await update_memory(store, workspace=tmp_path, model=second, binding={})
         assert result["status"] == "updated"
         assert [r.purpose for r in second.requests] == ["memory_consolidate"]
@@ -554,9 +666,11 @@ async def test_completed_extraction_is_reused_after_cancel_before_consolidation_
 
 
 def test_version_zero_never_falls_back_to_current_memory(tmp_path):
-    with RuntimeState.open_sync(tmp_path / "r.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "r.db") as store:
         state = store.read_memory_state(tmp_path)
-        store.commit_memory_state(tmp_path, expected_version=0, state={**state, "entries": [{"key": "new"}]})
+        memory_ops.commit_memory_state(
+            store, tmp_path, expected_version=0, state={**state, "entries": [{"key": "new"}]}
+        )
         assert store.read_memory_state(tmp_path, version=0)["entries"] == []
         with pytest.raises(KeyError):
             store.read_memory_state(tmp_path, version=98765)
@@ -567,17 +681,24 @@ async def test_completed_extraction_recovers_across_candidate_cache_crash_window
     from agent_runtime.harness.memory import update_memory
 
     database = tmp_path / "r.db"
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         seed(store, tmp_path)
-        write = store.write_memory_job
+        write = partial(memory_ops.write_memory_job, store)
+
         def crash_before_cache(*args, **kwargs):
             if "candidates" in args[2]:
                 raise asyncio.CancelledError()
             return write(*args, **kwargs)
-        monkeypatch.setattr(store, "write_memory_job", crash_before_cache)
-        with pytest.raises(asyncio.CancelledError):
-            await update_memory(store, workspace=tmp_path, model=MemoryModel(), binding={})
-    async with (await RuntimeState.open(database)) as store:
+
+        # The injected crash belongs to this connection; the reopened Store must
+        # use the real module operation rather than a closure over a closed DB.
+        with monkeypatch.context() as crash_patch:
+            crash_patch.setattr(
+                memory_ops, "write_memory_job", lambda _store, *args, **kwargs: (crash_before_cache)(*args, **kwargs)
+            )
+            with pytest.raises(asyncio.CancelledError):
+                await update_memory(store, workspace=tmp_path, model=MemoryModel(), binding={})
+    async with await RuntimeStore.open(database) as store:
         model = MemoryModel()
         assert (await update_memory(store, workspace=tmp_path, model=model, binding={}))["status"] == "updated"
         assert [r.purpose for r in model.requests] == ["memory_consolidate"]
@@ -593,13 +714,13 @@ async def test_exhausted_batch_does_not_block_other_sources_or_reset_its_budget(
                 text="bad JSON", provider_response_id=None, usage={"input_tokens": 12000, "output_tokens": 0}
             )
 
-    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
+    async with await RuntimeStore.open(tmp_path / "r.db") as store:
         blocked, _ = seed(store, tmp_path)
         safe, _ = seed(store, tmp_path, text="later safe convention")
         first = await update_memory(store, workspace=tmp_path, model=InvalidModel(), binding={})
         assert first["status"] == "failed"
         job = store.read_memory_jobs(tmp_path)[blocked.thread_id]
-        store.write_memory_job(tmp_path, blocked.thread_id, {**job, "retry_after": 0})
+        memory_ops.write_memory_job(store, tmp_path, blocked.thread_id, {**job, "retry_after": 0})
         second = await update_memory(store, workspace=tmp_path, model=InvalidModel(), binding={})
         assert second["status"] == "budget_exhausted"
         failed_turns = store.read_memory_jobs(tmp_path)[blocked.thread_id]["turn_ids"]
@@ -613,14 +734,21 @@ async def test_exhausted_batch_does_not_block_other_sources_or_reset_its_budget(
 async def test_new_topic_preserves_a_bank_larger_than_navigation_capacity(tmp_path):
     from agent_runtime.harness.memory import update_memory
 
-    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
+    async with await RuntimeStore.open(tmp_path / "r.db") as store:
         source, turn = seed(store, tmp_path)
         source_id = store.list_items(turn.turn_id)[0].item_id
-        originals = [{"key": f"topic-{n}", "title": f"Topic {n}", "text": f"stable original {n}",
-                      "source_item_ids": [source_id], "sources": {source_id: source.thread_id}}
-                     for n in range(45)]
+        originals = [
+            {
+                "key": f"topic-{n}",
+                "title": f"Topic {n}",
+                "text": f"stable original {n}",
+                "source_item_ids": [source_id],
+                "sources": {source_id: source.thread_id},
+            }
+            for n in range(45)
+        ]
         state = store.read_memory_state(tmp_path)
-        store.commit_memory_state(tmp_path, expected_version=0, state={**state, "entries": originals})
+        memory_ops.commit_memory_state(store, tmp_path, expected_version=0, state={**state, "entries": originals})
         result = await update_memory(store, workspace=tmp_path, model=MemoryModel(), binding={})
         assert result["status"] == "updated"
         entries = store.read_memory_state(tmp_path)["entries"]
@@ -638,20 +766,24 @@ async def test_exhausted_memory_batch_stays_blocked_but_new_source_revision_can_
                 text="bad JSON", provider_response_id=None, usage={"input_tokens": 12000, "output_tokens": 0}
             )
 
-    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
+    async with await RuntimeStore.open(tmp_path / "r.db") as store:
         source, _ = seed(store, tmp_path, text="old material " * (5000 if large_old_source else 1))
         for attempt in range(2):
             result = await update_memory(store, workspace=tmp_path, model=InvalidModel(), binding={})
             assert result["status"] == ("failed" if attempt == 0 else "budget_exhausted")
             job = store.read_memory_jobs(tmp_path)[source.thread_id]
             if attempt == 0:
-                store.write_memory_job(tmp_path, source.thread_id, {**job, "retry_after": 0})
+                memory_ops.write_memory_job(store, tmp_path, source.thread_id, {**job, "retry_after": 0})
         valid = MemoryModel()
         assert (await update_memory(store, workspace=tmp_path, model=valid, binding={}))["status"] == "budget_exhausted"
         assert valid.requests == []
-        new_turn = store.start_turn(thread_id=source.thread_id, user_message="A newly verified reusable convention.",
-                                    binding_manifest={"memory_generation_allowed": True})
-        store.complete_turn(turn_id=new_turn.turn_id, answer="verified")
+        new_turn = turn_ops.start_turn(
+            store,
+            thread_id=source.thread_id,
+            user_message="A newly verified reusable convention.",
+            binding_manifest={"memory_generation_allowed": True},
+        )
+        turn_ops.complete_turn(store, turn_id=new_turn.turn_id, answer="verified")
         result = await update_memory(store, workspace=tmp_path, model=valid, binding={})
         assert result["status"] == "updated"
         assert [request.purpose for request in valid.requests] == ["memory_extract", "memory_consolidate"]
@@ -663,8 +795,12 @@ async def test_exhausted_memory_batch_stays_blocked_but_new_source_revision_can_
             assert result["status"] == "updated"
         assert not result.get("has_more")
         new_user_item = next(item.item_id for item in store.list_items(new_turn.turn_id) if item.kind == "user_message")
-        extracted_sources = [record["item_id"] for request in valid.requests if request.purpose == "memory_extract"
-                             for record in json.loads(request.messages[-1].content.split("\nDATA:\n", 1)[1])]
+        extracted_sources = [
+            record["item_id"]
+            for request in valid.requests
+            if request.purpose == "memory_extract"
+            for record in json.loads(request.messages[-1].content.split("\nDATA:\n", 1)[1])
+        ]
         assert new_user_item in extracted_sources
         exhausted = store.read_memory_jobs(tmp_path)[source.thread_id]["exhausted_batches"]
         assert exhausted[0]["turn_ids"] == job["turn_ids"]
@@ -683,13 +819,17 @@ async def test_appending_history_cannot_refund_the_same_failed_memory_batch(tmp_
                 text="bad JSON", provider_response_id=None, usage={"input_tokens": 12000, "output_tokens": 0}
             )
 
-    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
+    async with await RuntimeStore.open(tmp_path / "r.db") as store:
         source, _ = seed(store, tmp_path, text="unchanged first batch " * 5000)
         assert (await update_memory(store, workspace=tmp_path, model=InvalidModel(), binding={}))["status"] == "failed"
         previous = store.read_memory_jobs(tmp_path)[source.thread_id]
-        later = store.start_turn(thread_id=source.thread_id, user_message="appended beyond the first batch",
-                                 binding_manifest={"memory_generation_allowed": True})
-        store.complete_turn(turn_id=later.turn_id, answer="done")
+        later = turn_ops.start_turn(
+            store,
+            thread_id=source.thread_id,
+            user_message="appended beyond the first batch",
+            binding_manifest={"memory_generation_allowed": True},
+        )
+        turn_ops.complete_turn(store, turn_id=later.turn_id, answer="done")
         second = await update_memory(store, workspace=tmp_path, model=InvalidModel(), binding={})
         assert second["status"] == "budget_exhausted"
         current = store.read_memory_jobs(tmp_path)[source.thread_id]

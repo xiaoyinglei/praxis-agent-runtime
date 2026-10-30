@@ -5,16 +5,18 @@ from pathlib import Path
 import pytest
 
 from agent_runtime.budget import BudgetLimitExceededError, ReservationStatus, ResourceUsage
+from agent_runtime.harness import model_ops, turn_ops
 from agent_runtime.harness.protocol import HarnessModelResponse
-from agent_runtime.harness.state import RuntimeState
+from agent_runtime.harness.runtime_store import RuntimeStore
 
 
-def _store(tmp_path: Path, *, tokens: int = 100) -> tuple[RuntimeState, str]:
+def _store(tmp_path: Path, *, tokens: int = 100) -> tuple[RuntimeStore, str]:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    store = RuntimeState.open_sync(tmp_path / "rollout.sqlite")
-    thread = store.create_thread(workspace=workspace)
-    turn = store.start_turn(
+    store = RuntimeStore.open_sync(tmp_path / "rollout.sqlite")
+    thread = turn_ops.create_thread(store, workspace=workspace)
+    turn = turn_ops.start_turn(
+        store,
         thread_id=thread.thread_id,
         user_message="test",
         binding_manifest={"model_token_budget_total": tokens},
@@ -22,8 +24,9 @@ def _store(tmp_path: Path, *, tokens: int = 100) -> tuple[RuntimeState, str]:
     return store, turn.turn_id
 
 
-def _prepare(store: RuntimeState, turn_id: str, request_id: str):
-    return store.prepare_model_operation(
+def _prepare(store: RuntimeStore, turn_id: str, request_id: str):
+    return model_ops.prepare_model_operation(
+        store,
         turn_id=turn_id,
         request_hash=f"request:{request_id}",
         context_hash=f"context:{request_id}",
@@ -41,7 +44,8 @@ def test_dispatch_reserves_budget_atomically(tmp_path: Path) -> None:
     store, turn_id = _store(tmp_path, tokens=50)
     operation = _prepare(store, turn_id, "r1")
 
-    attempt = store.dispatch_model_attempt(
+    attempt = model_ops.dispatch_model_attempt(
+        store,
         operation.operation_id,
         resource_request=_request(40),
     )
@@ -58,10 +62,10 @@ def test_second_dispatch_cannot_oversubscribe_turn(tmp_path: Path) -> None:
     store, turn_id = _store(tmp_path, tokens=50)
     first = _prepare(store, turn_id, "r1")
     second = _prepare(store, turn_id, "r2")
-    store.dispatch_model_attempt(first.operation_id, resource_request=_request(40))
+    model_ops.dispatch_model_attempt(store, first.operation_id, resource_request=_request(40))
 
     with pytest.raises(BudgetLimitExceededError):
-        store.dispatch_model_attempt(second.operation_id, resource_request=_request(20))
+        model_ops.dispatch_model_attempt(store, second.operation_id, resource_request=_request(20))
 
     assert store.list_model_attempts(second.operation_id)[0].status == "prepared"
     assert store.read_budget_state(turn_id).reserved.total_tokens == 40
@@ -70,12 +74,14 @@ def test_second_dispatch_cannot_oversubscribe_turn(tmp_path: Path) -> None:
 def test_completed_attempt_settles_actual_usage(tmp_path: Path) -> None:
     store, turn_id = _store(tmp_path, tokens=50)
     operation = _prepare(store, turn_id, "r1")
-    attempt = store.dispatch_model_attempt(
+    attempt = model_ops.dispatch_model_attempt(
+        store,
         operation.operation_id,
         resource_request=_request(30),
     )
 
-    accepted = store.complete_model_attempt(
+    accepted = model_ops.complete_model_attempt(
+        store,
         operation_id=operation.operation_id,
         attempt_id=attempt.attempt_id,
         generation=attempt.generation,
@@ -98,12 +104,14 @@ def test_completed_attempt_settles_actual_usage(tmp_path: Path) -> None:
 def test_actual_usage_is_not_truncated_to_reservation(tmp_path: Path) -> None:
     store, turn_id = _store(tmp_path, tokens=30)
     operation = _prepare(store, turn_id, "r1")
-    attempt = store.dispatch_model_attempt(
+    attempt = model_ops.dispatch_model_attempt(
+        store,
         operation.operation_id,
         resource_request=_request(20),
     )
 
-    store.complete_model_attempt(
+    model_ops.complete_model_attempt(
+        store,
         operation_id=operation.operation_id,
         attempt_id=attempt.attempt_id,
         generation=attempt.generation,
@@ -120,11 +128,13 @@ def test_actual_usage_is_not_truncated_to_reservation(tmp_path: Path) -> None:
 def test_unknown_attempt_remains_budget_exposure_across_retry(tmp_path: Path) -> None:
     store, turn_id = _store(tmp_path, tokens=50)
     operation = _prepare(store, turn_id, "r1")
-    attempt = store.dispatch_model_attempt(
+    attempt = model_ops.dispatch_model_attempt(
+        store,
         operation.operation_id,
         resource_request=_request(30),
     )
-    store.mark_model_attempt_unknown(
+    model_ops.mark_model_attempt_unknown(
+        store,
         operation_id=operation.operation_id,
         attempt_id=attempt.attempt_id,
         generation=attempt.generation,
@@ -137,9 +147,10 @@ def test_unknown_attempt_remains_budget_exposure_across_retry(tmp_path: Path) ->
     assert state.uncertain.total_tokens == 30
     assert store.read_budget_reservation(attempt.attempt_id).status is ReservationStatus.UNKNOWN
 
-    store.prepare_model_retry(operation.operation_id)
+    model_ops.prepare_model_retry(store, operation.operation_id)
     with pytest.raises(BudgetLimitExceededError):
-        store.dispatch_model_attempt(
+        model_ops.dispatch_model_attempt(
+            store,
             operation.operation_id,
             resource_request=_request(30),
         )
@@ -148,11 +159,13 @@ def test_unknown_attempt_remains_budget_exposure_across_retry(tmp_path: Path) ->
 def test_preflight_rejection_releases_reservation(tmp_path: Path) -> None:
     store, turn_id = _store(tmp_path, tokens=50)
     operation = _prepare(store, turn_id, "r1")
-    attempt = store.dispatch_model_attempt(
+    attempt = model_ops.dispatch_model_attempt(
+        store,
         operation.operation_id,
         resource_request=_request(30),
     )
-    store.reject_model_attempt(
+    model_ops.reject_model_attempt(
+        store,
         operation_id=operation.operation_id,
         attempt_id=attempt.attempt_id,
         generation=attempt.generation,
@@ -168,11 +181,13 @@ def test_preflight_rejection_releases_reservation(tmp_path: Path) -> None:
 def test_projection_rebuild_preserves_budget_accounting(tmp_path: Path) -> None:
     store, turn_id = _store(tmp_path, tokens=100)
     operation = _prepare(store, turn_id, "r1")
-    attempt = store.dispatch_model_attempt(
+    attempt = model_ops.dispatch_model_attempt(
+        store,
         operation.operation_id,
         resource_request=_request(30),
     )
-    store.mark_model_attempt_unknown(
+    model_ops.mark_model_attempt_unknown(
+        store,
         operation_id=operation.operation_id,
         attempt_id=attempt.attempt_id,
         generation=attempt.generation,

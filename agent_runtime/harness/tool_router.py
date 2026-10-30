@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from agent_runtime.harness.protocol import ModelMessage
-from agent_runtime.harness.state import RuntimeState
+from agent_runtime.harness.runtime_store import RuntimeStore
 from agent_runtime.tools.tool import Tool
 
 
@@ -36,7 +36,7 @@ class DurableToolRouter:
     def __init__(
         self,
         *,
-        store: RuntimeState,
+        store: RuntimeStore,
         tools: Mapping[str, Tool],
         resident_names: tuple[str, ...],
         discoverable_names: tuple[str, ...],
@@ -86,11 +86,7 @@ class DurableToolRouter:
             if not isinstance(proposed, (list, tuple)):
                 continue
             for name in proposed:
-                if (
-                    isinstance(name, str)
-                    and name in discoverable
-                    and name not in active
-                ):
+                if isinstance(name, str) and name in discoverable and name not in active:
                     active.append(name)
         selected_names = (*self._resident_names, *active)
         return tuple(self._tools[name] for name in selected_names)

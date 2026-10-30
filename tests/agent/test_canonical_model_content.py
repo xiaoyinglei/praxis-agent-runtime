@@ -27,7 +27,13 @@ def test_message_has_one_body_and_derives_text_and_calls_without_losing_order() 
     assert message.content == "beforeafter"
     assert message.tool_calls[0].id == "c"
     assert message.outputs == outputs
-    assert {field.name for field in fields(message)} == {"role", "body", "tool_call_id", "context_category"}
+    assert {field.name for field in fields(message)} == {
+        "role",
+        "body",
+        "tool_call_id",
+        "context_category",
+        "runtime_metadata",
+    }
     payload = model_message_payload(message)
     assert "content" not in payload and "outputs" not in payload and "tool_calls" not in payload
     assert restore_model_message(model_message_payload(message)) == message
@@ -78,14 +84,21 @@ def test_wire_projection_includes_each_body_once_and_keeps_private_replay_metada
     from agent_runtime.modeling.openai_wire import serialize_openai_request
 
     marker = "visible-answer-sentinel"
-    message = ModelMessage(role="assistant", body=(
-        ModelOutput("text", "text", marker, provider_data={"signature": "private-signature-sentinel"}),
-    ))
+    message = ModelMessage(
+        role="assistant",
+        body=(ModelOutput("text", "text", marker, provider_data={"signature": "private-signature-sentinel"}),),
+    )
     context = build_stable_context(instructions=("Inspect.",), frozen_run_context=(), initial_user_task="inspect")
-    request = build_model_request(request_id="request", context=context.append_message(message), selected_tools=(),
-                                  settings=ModelSettings(model="test"))
-    for wire in (render_local_agent_request(request, provider="mlx").prompt,
-                 serialize_openai_request(request).serialized_json):
+    request = build_model_request(
+        request_id="request",
+        context=context.append_message(message),
+        selected_tools=(),
+        settings=ModelSettings(model="test"),
+    )
+    for wire in (
+        render_local_agent_request(request, provider="mlx").prompt,
+        serialize_openai_request(request).serialized_json,
+    ):
         assert wire.count(marker) == 1
         assert "private-signature-sentinel" not in wire
     assert message.outputs[0].provider_data["signature"] == "private-signature-sentinel"

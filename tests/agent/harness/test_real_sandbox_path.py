@@ -140,11 +140,7 @@ async def test_candidate_sdk_runs_retained_command_tool_in_real_seatbelt(
         result = await runtime.submit("verify Seatbelt")
 
         assert result.status == "done"
-        [tool_result] = [
-            item
-            for item in runtime.store.list_items(result.turn_id)
-            if item.kind == "tool_result"
-        ]
+        [tool_result] = [item for item in runtime.store.list_items(result.turn_id) if item.kind == "tool_result"]
         output = tool_result.payload["structured_content"]
         assert output["stdout"] == "seatbelt-harness-ok"
         assert output["execution_mode"] == "restricted_sandbox"
@@ -189,14 +185,8 @@ async def test_real_seatbelt_workspace_write_requires_durable_approval(
 
         assert resumed.turn_id == paused.turn_id
         assert resumed.status == "done"
-        assert (workspace.root / "approved.txt").read_text(encoding="utf-8") == (
-            "approved-by-seatbelt"
-        )
-        [tool_result] = [
-            item
-            for item in runtime.store.list_items(resumed.turn_id)
-            if item.kind == "tool_result"
-        ]
+        assert (workspace.root / "approved.txt").read_text(encoding="utf-8") == ("approved-by-seatbelt")
+        [tool_result] = [item for item in runtime.store.list_items(resumed.turn_id) if item.kind == "tool_result"]
         metadata = tool_result.payload["metadata"]
         assert metadata["runtime_workspace_write"] is True
         assert metadata["workspace_tree_changed"] is True

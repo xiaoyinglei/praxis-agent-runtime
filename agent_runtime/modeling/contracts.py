@@ -66,6 +66,20 @@ def context_capacity_policy(binding: Mapping[str, object]) -> ContextCapacityPol
     return None if raw is None else ContextCapacityPolicy.model_validate(raw)
 
 
+def context_working_limit(binding: Mapping[str, object]) -> int | None:
+    """Read the soft target from the same frozen definition as hard admission."""
+    envelope = binding.get("binding", binding)
+    if not isinstance(envelope, Mapping):
+        return None
+    definition = envelope.get("definition", envelope)
+    if not isinstance(definition, Mapping):
+        return None
+    value = definition.get("auto_compact_token_limit")
+    if value is not None and (type(value) is not int or value < 1):
+        raise ValueError("auto_compact_token_limit must be a positive integer")
+    return value
+
+
 class LLMUsage(BaseModel):
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
@@ -232,10 +246,7 @@ DEFAULT_LLM_STAGE_BUDGETS: dict[LLMCallStage, LLMStageBudget] = {
 def parse_llm_stage_budgets(
     raw: object,
 ) -> dict[LLMCallStage, LLMStageBudget]:
-    parsed = {
-        stage: budget.model_copy()
-        for stage, budget in DEFAULT_LLM_STAGE_BUDGETS.items()
-    }
+    parsed = {stage: budget.model_copy() for stage, budget in DEFAULT_LLM_STAGE_BUDGETS.items()}
     if not isinstance(raw, Mapping):
         return parsed
     for raw_stage, raw_budget in raw.items():

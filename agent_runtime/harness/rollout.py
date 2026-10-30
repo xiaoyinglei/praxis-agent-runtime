@@ -81,7 +81,7 @@ def _store_operation[**P, T](method: Callable[P, T]) -> Callable[P, T]:
 class RolloutStore:
     """Own SQLite, append-only facts, projection I/O and immutable blob storage.
 
-    No Turn, approval, budget or tool decisions live here. Use RuntimeState for
+    No Turn, approval, budget or tool decisions live here. Use RuntimeStore for
     those operations. No-argument construction performs no I/O.
     """
 
@@ -151,6 +151,8 @@ class RolloutStore:
             self._connection.execute("PRAGMA foreign_keys = ON")
             self._connection.execute("PRAGMA journal_mode = WAL")
             self._create_schema()
+            self._upgrade_budget_reservation_sources()
+            self._ensure_writer_protocol()
         self._columns = {
             table: {row["name"] for row in self._connection.execute(f"PRAGMA table_info({table})")} | {"rowid"}
             for table in _PROJECTIONS
@@ -418,7 +420,10 @@ class RolloutStore:
 
     @_store_operation
     def install_blob(
-        self, content: bytes | Path, *, expected_sha256: str | None = None,
+        self,
+        content: bytes | Path,
+        *,
+        expected_sha256: str | None = None,
         fault_injector: Callable[[str], None] | None = None,
     ) -> tuple[str, int]:
         """Copy, hash and install an immutable blob under the reference/GC lock.
@@ -433,7 +438,8 @@ class RolloutStore:
         if not isinstance(content, (bytes, Path)):
             raise TypeError("artifact content must be bytes or a Path")
         if expected_sha256 is not None and (
-            not isinstance(expected_sha256, str) or len(expected_sha256) != 64
+            not isinstance(expected_sha256, str)
+            or len(expected_sha256) != 64
             or any(character not in "0123456789abcdef" for character in expected_sha256)
         ):
             raise ValueError("expected_sha256 must be a lowercase SHA-256 hex digest")
@@ -559,7 +565,7 @@ class RolloutStore:
         failures and return actual progress rather than imply rollback restored it.
         Database/lock failures still raise; no files are touched before BEGIN.
         """
-        if (isinstance(min_age_seconds, bool) or not math.isfinite(min_age_seconds) or min_age_seconds <= 0):
+        if isinstance(min_age_seconds, bool) or not math.isfinite(min_age_seconds) or min_age_seconds <= 0:
             raise ValueError("artifact GC min_age_seconds must be a finite positive number")
         removed: list[str] = []
         errors: list[str] = []
@@ -901,7 +907,7 @@ class RolloutStore:
                 record_uuid, thread_id, turn_id, thread_sequence, record_type,
                 payload_schema_version, producer, payload_json, payload_hash,
                 created_at, committed_at_ms
-            ) VALUES (?, ?, ?, ?, ?, 3, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 f"record_{uuid4().hex}",
@@ -909,6 +915,7 @@ class RolloutStore:
                 turn_id,
                 sequence,
                 record_type,
+                4,
                 producer,
                 payload_json,
                 payload_hash,
@@ -951,7 +958,11 @@ class RolloutStore:
                 (
                     "items",
                     "item_id",
-                    (record.payload.get("item_id"), record.payload.get("answer_item_id")),
+                    (
+                        record.payload.get("item_id"),
+                        record.payload.get("answer_item_id"),
+                        record.payload.get("response_item_id"),
+                    ),
                     _item_row_payload,
                 ),
                 (
@@ -1459,6 +1470,50 @@ class RolloutStore:
                 ),
             )
 
+    def _ensure_writer_protocol(self) -> None:
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._connection.execute("""INSERT INTO store_metadata(key, value)
+                VALUES ('minimum_writer_schema', '4') ON CONFLICT(key) DO UPDATE SET
+                value = CAST(MAX(CAST(value AS INTEGER), 4) AS TEXT)""")
+            required = int(
+                self._connection.execute(
+                    "SELECT value FROM store_metadata WHERE key='minimum_writer_schema'"
+                ).fetchone()[0]
+            )
+            if required > 4:
+                raise RuntimeError(f"runtime writer schema {required} requires a newer version")
+            self._connection.execute("""CREATE TRIGGER IF NOT EXISTS rollout_writer_protocol_guard
+                BEFORE INSERT ON rollout_records
+                WHEN NEW.payload_schema_version < CAST((SELECT value FROM store_metadata
+                    WHERE key='minimum_writer_schema') AS INTEGER)
+                BEGIN SELECT RAISE(ABORT, 'runtime writer protocol requires upgrade'); END""")
+            self._connection.execute("COMMIT")
+        except BaseException:
+            self._rollback_quietly()
+            raise
+
+    def _upgrade_budget_reservation_sources(self) -> None:
+        refs = tuple(self._connection.execute("PRAGMA foreign_key_list(budget_reservations)"))
+        if not any(row[2] in {"model_operations", "model_attempts"} for row in refs):
+            return
+        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._connection.execute("""CREATE TABLE budget_reservations_general (
+                reservation_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL REFERENCES threads(thread_id),
+                turn_id TEXT NOT NULL REFERENCES turns(turn_id),
+                scope_id TEXT NOT NULL, operation_id TEXT NOT NULL, attempt_id TEXT NOT NULL UNIQUE,
+                reserved_json TEXT NOT NULL, actual_json TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL,
+                applied_thread_sequence INTEGER NOT NULL, reducer_version INTEGER NOT NULL)""")
+            self._connection.execute("INSERT INTO budget_reservations_general SELECT * FROM budget_reservations")
+            self._connection.execute("DROP TABLE budget_reservations")
+            self._connection.execute("ALTER TABLE budget_reservations_general RENAME TO budget_reservations")
+            self._connection.execute("COMMIT")
+        except BaseException:
+            self._rollback_quietly()
+            raise
+
     def _create_schema(self) -> None:
         self._connection.executescript(
             """
@@ -1586,8 +1641,8 @@ class RolloutStore:
                 thread_id TEXT NOT NULL REFERENCES threads(thread_id),
                 turn_id TEXT NOT NULL REFERENCES turns(turn_id),
                 scope_id TEXT NOT NULL,
-                operation_id TEXT NOT NULL REFERENCES model_operations(operation_id),
-                attempt_id TEXT NOT NULL REFERENCES model_attempts(attempt_id),
+                operation_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
                 reserved_json TEXT NOT NULL,
                 actual_json TEXT NOT NULL DEFAULT '{}',
                 status TEXT NOT NULL,
@@ -1902,7 +1957,9 @@ def _open_artifact_content(content: bytes | Path) -> Iterator[BinaryIO]:
         yield stream
         after = os.fstat(stream.fileno())
         if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
-            after.st_size, after.st_mtime_ns, after.st_ctime_ns,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
         ):
             raise RuntimeError("artifact source changed during copy")
 

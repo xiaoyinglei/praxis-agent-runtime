@@ -87,10 +87,7 @@ def test_gate_rejects_missing_failure_duplicate_and_non_exactly_once_effect() ->
     results.pop()
     results[0]["status"] = "failed"
     crash_result = next(
-        result
-        for result in results
-        if result["scenario_id"] == "crash_recovery"
-        and result["repetition"] == 1
+        result for result in results if result["scenario_id"] == "crash_recovery" and result["repetition"] == 1
     )
     crash_result["side_effect_count"] = 2
     results.append(dict(results[2]))
@@ -158,7 +155,7 @@ def test_direct_scenario_uses_public_cli_and_verifies_the_real_workspace_diff(
 def test_approval_scenario_must_pause_then_resume_the_same_public_turn(
     tmp_path: Path,
 ) -> None:
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
 
     module = _load_module()
     fake_agent = tmp_path / "fake_approval_agent.py"
@@ -166,15 +163,15 @@ def test_approval_scenario_must_pause_then_resume_the_same_public_turn(
         "import sys\n"
         "from pathlib import Path\n"
         f"sys.path.insert(0, {str(ROOT)!r})\n"
-        "from agent_runtime.harness import RuntimeState\n"
+        "from agent_runtime.harness import RuntimeStore, turn_ops, tool_ops\n"
         "checkpoint = Path(sys.argv[sys.argv.index('--checkpoint-db') + 1])\n"
         "if sys.argv[1] == 'run':\n"
         "    assert not Path('approved.txt').exists()\n"
-        "    with RuntimeState.open_sync(checkpoint) as store:\n"
-        "        thread = store.create_thread(workspace=Path.cwd())\n"
-        "        turn = store.start_turn(thread_id=thread.thread_id, user_message='write after approval',\n"
+        "    with RuntimeStore.open_sync(checkpoint) as store:\n"
+        "        thread = turn_ops.create_thread(store, workspace=Path.cwd())\n"
+        "        turn = turn_ops.start_turn(store, thread_id=thread.thread_id, user_message='write after approval',\n"
         "                                binding_manifest={}, turn_id='turn-approval-1')\n"
-        "        store.request_tool_approval(turn_id=turn.turn_id, operation_id='write-1',\n"
+        "        tool_ops.request_tool_approval(store, turn_id=turn.turn_id, operation_id='write-1',\n"
         "            tool_call_id='call-1', tool_name='write_file', arguments_digest='fixture-digest',\n"
         "            execution_revision='fixture-v1', idempotent=False, request={}, effects=('write_workspace',))\n"
         "    print('Turn: turn-approval-1')\n"
@@ -183,17 +180,19 @@ def test_approval_scenario_must_pause_then_resume_the_same_public_turn(
         "assert sys.argv[1:3] == ['recover', 'turn-approval-1']\n"
         "assert sys.argv[sys.argv.index('--action') + 1] == 'allow_once'\n"
         "assert not Path('approved.txt').exists()\n"
-        "with RuntimeState.open_sync(checkpoint) as store:\n"
+        "with RuntimeStore.open_sync(checkpoint) as store:\n"
         "    assert len(store.list_turns()) == 1\n"
         "    assert store.read_turn(sys.argv[2]).status == 'paused'\n"
-        "    store.resolve_tool_approval(turn_id=sys.argv[2], decision='approve')\n"
-        "    operation = store.claim_tool_operation(operation_id='write-1', worker_id='fixture', lease_seconds=30)\n"
+        "    tool_ops.resolve_tool_approval(store, turn_id=sys.argv[2], decision='approve')\n"
+        "    operation = tool_ops.claim_tool_operation(store, operation_id='write-1',\n"
+        "        worker_id='fixture', lease_seconds=30)\n"
         "    Path('approved.txt').write_text('approved-content\\n')\n"
-        "    assert store.commit_tool_operation_result(turn_id=sys.argv[2], operation_id=operation.operation_id,\n"
+        "    assert tool_ops.commit_tool_operation_result(store, turn_id=sys.argv[2],\n"
+        "        operation_id=operation.operation_id,\n"
         "        claim_generation=operation.claim_generation, fencing_token=operation.fencing_token,\n"
         "        status='succeeded', attempt_count=operation.attempt_count, error_code=None,\n"
         "        requires_reconciliation=False, result={'text': 'written'})\n"
-        "    store.complete_turn(turn_id=sys.argv[2], answer='written')\n"
+        "    turn_ops.complete_turn(store, turn_id=sys.argv[2], answer='written')\n"
         "print('Turn: turn-approval-1')\n"
         "print('状态: done')\n",
         encoding="utf-8",
@@ -226,7 +225,7 @@ def test_approval_scenario_must_pause_then_resume_the_same_public_turn(
     assert stdout.count("Turn: turn-approval-1") == 2
     assert "状态: paused" in stdout
     assert "状态: done" in stdout
-    with RuntimeState.open_sync(result_path.parent / "rollout.sqlite3") as store:
+    with RuntimeStore.open_sync(result_path.parent / "rollout.sqlite3") as store:
         assert len(store.list_turns()) == 1
         assert store.read_turn("turn-approval-1").status == "completed"
         [approval] = store.list_approvals("turn-approval-1")
@@ -260,9 +259,7 @@ def test_resume_does_not_approve_a_pause_outside_the_allowed_effects(
         agent_command=("agent",),
         workspace=tmp_path,
         checkpoint=tmp_path / "rollout.sqlite3",
-        allowed_approval_effects=frozenset(
-            {"read_workspace", "write_workspace", "execute_process", "destructive"}
-        ),
+        allowed_approval_effects=frozenset({"read_workspace", "write_workspace", "execute_process", "destructive"}),
     )
 
     assert terminal is paused
@@ -285,10 +282,7 @@ def test_gate_rejects_crash_scenario_when_no_injected_crash_was_observed() -> No
         for repetition in range(1, 4)
     ]
     crash_result = next(
-        result
-        for result in results
-        if result["scenario_id"] == "crash_recovery"
-        and result["repetition"] == 1
+        result for result in results if result["scenario_id"] == "crash_recovery" and result["repetition"] == 1
     )
     crash_result["crash_observed"] = False
 
@@ -343,7 +337,8 @@ def test_coding_fixtures_use_project_tests_and_hidden_acceptance(tmp_path: Path)
 
 
 def test_live_cli_binds_explicit_budgets_and_rechecks_candidate_before_evidence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from types import SimpleNamespace
 
@@ -363,10 +358,16 @@ def test_live_cli_binds_explicit_budgets_and_rechecks_candidate_before_evidence(
         return source
 
     monkeypatch.setattr(module, "verify_candidate", verify)
-    definition = SimpleNamespace(provider_name="example", provider=SimpleNamespace(value="example"),
-                                 model_id="test-model", definition_revision="test-revision")
+    definition = SimpleNamespace(
+        provider_name="example",
+        provider=SimpleNamespace(value="example"),
+        model_id="test-model",
+        definition_revision="test-revision",
+    )
     monkeypatch.setattr(
-        ModelRegistry, "from_env", lambda *_args: SimpleNamespace(get_model_definition=lambda _m: definition),
+        ModelRegistry,
+        "from_env",
+        lambda *_args: SimpleNamespace(get_model_definition=lambda _m: definition),
     )
     monkeypatch.setattr(module, "_resolve_agent_command", lambda _v: ("agent",))
     calls: list[dict[str, object]] = []
@@ -378,10 +379,21 @@ def test_live_cli_binds_explicit_budgets_and_rechecks_candidate_before_evidence(
     monkeypatch.setattr(module, "run_benchmark", run)
     evidence: list[dict[str, object]] = []
     monkeypatch.setattr(module, "_write_release_evidence", lambda **kwargs: evidence.append(kwargs))
-    result = module.main([
-        "run", "--model", "test", "--max-turns", "7", "--timeout-seconds", "19",
-        "--artifacts-root", str(tmp_path / "results"), "--evidence-artifact", "evidence.json",
-    ])
+    result = module.main(
+        [
+            "run",
+            "--model",
+            "test",
+            "--max-turns",
+            "7",
+            "--timeout-seconds",
+            "19",
+            "--artifacts-root",
+            str(tmp_path / "results"),
+            "--evidence-artifact",
+            "evidence.json",
+        ]
+    )
     assert result == 0
     assert calls[0]["max_turns"] == 7
     assert calls[0]["timeout_seconds"] == 19
@@ -390,7 +402,8 @@ def test_live_cli_binds_explicit_budgets_and_rechecks_candidate_before_evidence(
 
 
 def test_process_timeout_is_recordable_and_logged_secrets_are_redacted(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _load_module()
     timed = module._run_process([sys.executable, "-c", "import time; time.sleep(5)"], cwd=tmp_path, timeout_seconds=1)
@@ -398,14 +411,16 @@ def test_process_timeout_is_recordable_and_logged_secrets_are_redacted(
     secret = "test-only-secret-abcdefghijkl"
     monkeypatch.setenv("DEEPSEEK_API_KEY", secret)
     printed = module._run_process(
-        [sys.executable, "-c", "import os; print(os.environ['DEEPSEEK_API_KEY'])"], cwd=tmp_path,
+        [sys.executable, "-c", "import os; print(os.environ['DEEPSEEK_API_KEY'])"],
+        cwd=tmp_path,
     )
     assert printed.returncode == 0
     assert secret not in printed.stdout
 
 
 def test_crash_injection_uses_public_event_sink_after_durable_model_tool_calls(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from types import SimpleNamespace
 
@@ -422,13 +437,22 @@ def test_crash_injection_uses_public_event_sink_after_durable_model_tool_calls(
 
         async def run(self, task, *, max_turns, require_workspace_change, event_sink):
             assert require_workspace_change is True
-            await event_sink.emit(SimpleNamespace(
-                turn_id="turn-injected", type="item_completed", item_kind="agent_message", data={"tool_calls": []},
-            ))
-            await event_sink.emit(SimpleNamespace(
-                turn_id="turn-injected", type="item_completed", item_kind="agent_message",
-                data={"tool_calls": [{"name": "read_file"}]},
-            ))
+            await event_sink.emit(
+                SimpleNamespace(
+                    turn_id="turn-injected",
+                    type="item_completed",
+                    item_kind="agent_message",
+                    data={"tool_calls": []},
+                )
+            )
+            await event_sink.emit(
+                SimpleNamespace(
+                    turn_id="turn-injected",
+                    type="item_completed",
+                    item_kind="agent_message",
+                    data={"tool_calls": [{"name": "read_file"}]},
+                )
+            )
 
     monkeypatch.setattr(agent_runtime, "Agent", EventAgent)
 
@@ -438,8 +462,14 @@ def test_crash_injection_uses_public_event_sink_after_durable_model_tool_calls(
         raise CrashError
 
     monkeypatch.setattr(module.os, "_exit", exit_after_commit)
-    args = SimpleNamespace(model="fake", workspace=tmp_path, checkpoint_db=tmp_path / "rollout.sqlite3",
-                           model_session_path=tmp_path / "model.json", turn_file=tmp_path / "turn.txt",
-                           prompt="read task", max_turns=3)
+    args = SimpleNamespace(
+        model="fake",
+        workspace=tmp_path,
+        checkpoint_db=tmp_path / "rollout.sqlite3",
+        model_session_path=tmp_path / "model.json",
+        turn_file=tmp_path / "turn.txt",
+        prompt="read task",
+        max_turns=3,
+    )
     with pytest.raises(CrashError):
         module._crash_child(args)

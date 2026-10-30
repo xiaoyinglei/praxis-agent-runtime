@@ -4,8 +4,9 @@ from pathlib import Path
 
 import pytest
 
+from agent_runtime.harness import artifact_ops, turn_ops
 from agent_runtime.harness.rollout_integrity import rebuild_store, verify_store
-from agent_runtime.harness.state import RuntimeState
+from agent_runtime.harness.runtime_store import RuntimeStore
 
 
 def _projection_rows(store):
@@ -21,26 +22,35 @@ def _projection_rows(store):
             table: tuple(tuple(row) for row in store._connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid'))
             for table in tables
         }
+
     return store.run_sync(read)
 
 
 def test_rebuild_streams_canonical_rows_and_restores_verified_projections(tmp_path: Path, monkeypatch) -> None:
-    with RuntimeState.open_sync(tmp_path / "store.db") as state:
+    with RuntimeStore.open_sync(tmp_path / "store.db") as state:
         for index in range(3):
-            thread = state.create_thread(workspace=tmp_path)
-            turn = state.start_turn(
+            thread = turn_ops.create_thread(state, workspace=tmp_path)
+            turn = turn_ops.start_turn(
+                state,
                 thread_id=thread.thread_id,
                 user_message=f"turn {index}",
                 binding_manifest={"model_id": "test-model"},
             )
-        state.commit_artifact(
-            turn_id=turn.turn_id, content=b"keep this blob", media_type="text/plain", name="result.txt",
+        artifact_ops.commit_artifact(
+            state,
+            turn_id=turn.turn_id,
+            content=b"keep this blob",
+            media_type="text/plain",
+            name="result.txt",
         )
         store = state.persistence
         expected = _projection_rows(store)
-        store.run_sync(lambda: store._connection.execute(
-            "UPDATE threads SET settings_json = '{\"corrupt\":true}' WHERE thread_id = ?", (thread.thread_id,),
-        ))
+        store.run_sync(
+            lambda: store._connection.execute(
+                "UPDATE threads SET settings_json = '{\"corrupt\":true}' WHERE thread_id = ?",
+                (thread.thread_id,),
+            )
+        )
         connection = store._connection
 
         class StreamingCursor:
@@ -73,15 +83,15 @@ def test_rebuild_streams_canonical_rows_and_restores_verified_projections(tmp_pa
 
 def test_rebuild_refuses_concurrent_commit_without_overwriting_it(tmp_path: Path, monkeypatch) -> None:
     database = tmp_path / "store.db"
-    with RuntimeState.open_sync(database) as state, RuntimeState.open_sync(database) as writer:
-        state.create_thread(workspace=tmp_path)
+    with RuntimeStore.open_sync(database) as state, RuntimeStore.open_sync(database) as writer:
+        turn_ops.create_thread(state, workspace=tmp_path)
         store = state.persistence
         persist = store._persist_projection_state
         concurrent = []
 
         def interleave(*args, **kwargs):
             if not concurrent and kwargs.get("connection") is not None:
-                concurrent.append(writer.create_thread(workspace=tmp_path))
+                concurrent.append(turn_ops.create_thread(writer, workspace=tmp_path))
             return persist(*args, **kwargs)
 
         monkeypatch.setattr(store, "_persist_projection_state", interleave)
@@ -93,13 +103,15 @@ def test_rebuild_refuses_concurrent_commit_without_overwriting_it(tmp_path: Path
 
 
 def test_rebuild_rejects_corrupt_canonical_without_changing_projections(tmp_path: Path) -> None:
-    with RuntimeState.open_sync(tmp_path / "store.db") as state:
-        state.create_thread(workspace=tmp_path)
+    with RuntimeStore.open_sync(tmp_path / "store.db") as state:
+        turn_ops.create_thread(state, workspace=tmp_path)
         store = state.persistence
         before = _projection_rows(store)
-        store.run_sync(lambda: store._connection.execute(
-            "UPDATE rollout_records SET payload_json = '{broken'",
-        ))
+        store.run_sync(
+            lambda: store._connection.execute(
+                "UPDATE rollout_records SET payload_json = '{broken'",
+            )
+        )
         report = verify_store(store)
         assert not report.valid
         assert any("record" in error for error in report.errors)

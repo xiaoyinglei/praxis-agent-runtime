@@ -13,7 +13,7 @@ from agent_runtime.tools.tool import JsonValue
 if TYPE_CHECKING:
     from agent_runtime.harness.protocol import TurnResult
     from agent_runtime.harness.records import ItemSnapshot
-    from agent_runtime.harness.state import RuntimeState
+    from agent_runtime.harness.runtime_store import RuntimeStore
 
 type AgentResultStatus = Literal["done", "paused", "failed"]
 type AgentValidationStatus = Literal["not_evaluated", "passed", "failed"]
@@ -162,7 +162,7 @@ class AgentResult:
         cls,
         result: TurnResult,
         *,
-        store: RuntimeState,
+        store: RuntimeStore,
         files: tuple[str, ...] = (),
     ) -> AgentResult:
         turn = store.read_turn(result.turn_id)
@@ -178,9 +178,14 @@ class AgentResult:
             if attempt.attempt_id in dispatched_ids or attempt.status == "completed"
         )
         usage_values = tuple(attempt.usage for attempt in attempts if attempt.status == "completed")
-        usage_complete = bool(attempts) and len(usage_values) == len(attempts) and all(
-            _optional_usage_sum((usage,), key) is not None
-            for usage in usage_values for key in ("input_tokens", "output_tokens")
+        usage_complete = (
+            bool(attempts)
+            and len(usage_values) == len(attempts)
+            and all(
+                _optional_usage_sum((usage,), key) is not None
+                for usage in usage_values
+                for key in ("input_tokens", "output_tokens")
+            )
         )
         operations = store.list_tool_operations(result.turn_id)
         native_operations = tuple(
@@ -190,8 +195,11 @@ class AgentResult:
         outcomes = tuple(record for record in records if record.record_type == "tool_operation_outcome_committed")
         latency_by_call = {}
         for operation in operations:
-            observed = [record.payload.get("duration_ms") for record in outcomes
-                        if record.payload["operation_id"] == operation.operation_id]
+            observed = [
+                record.payload.get("duration_ms")
+                for record in outcomes
+                if record.payload["operation_id"] == operation.operation_id
+            ]
             latency_by_call[operation.tool_call_id] = (
                 _observed_sum(observed) if len(observed) == operation.attempt_count else None
             )
@@ -199,16 +207,9 @@ class AgentResult:
         mcp_latency = _observed_sum([latency_by_call[op.tool_call_id] for op in mcp_operations])
         native_ids = {op.operation_id for op in native_operations}
         mcp_ids = {op.operation_id for op in mcp_operations}
-        sources = tuple(
-            value
-            for usage in usage_values
-            if isinstance((value := usage.get("usage_source")), str)
-        )
+        sources = tuple(value for usage in usage_values if isinstance((value := usage.get("usage_source")), str))
         items = store.list_items(result.turn_id)
-        decisions = [
-            item for item in items
-            if item.kind == "completion_decision" and item.status == "completed"
-        ]
+        decisions = [item for item in items if item.kind == "completion_decision" and item.status == "completed"]
         decision = decisions[-1].payload if decisions else {}
         validation_status = decision.get("validation_status", "not_evaluated")
         if validation_status not in {"not_evaluated", "passed", "failed"}:
@@ -229,7 +230,8 @@ class AgentResult:
         reconciled_ids = {
             reconciled_result.get("tool_call_id")
             for item in items
-            if item.kind == "tool_reconciliation" and item.producer == "reconciler"
+            if item.kind == "tool_reconciliation"
+            and item.producer == "reconciler"
             and isinstance((reconciled_result := item.payload.get("result")), Mapping)
             and isinstance(reconciled_result.get("tool_call_id"), str)
         }
@@ -246,11 +248,7 @@ class AgentResult:
             if not isinstance(tool_call_id, str) or not isinstance(tool_name, str):
                 continue
             raw_structured = payload.get("structured_content")
-            structured = (
-                None
-                if raw_structured is None
-                else _freeze_json_value(raw_structured)
-            )
+            structured = None if raw_structured is None else _freeze_json_value(raw_structured)
             projected_calls.append(
                 AgentToolCall(
                     tool_call_id=tool_call_id,
@@ -261,39 +259,23 @@ class AgentResult:
                     ),
                     structured_output=structured,
                     is_error=payload.get("is_error") is True,
-                    error_code=(
-                        value
-                        if isinstance((value := payload.get("error_code")), str)
-                        else None
-                    ),
-                    error_message=(
-                        value
-                        if isinstance((value := payload.get("error_message")), str)
-                        else None
-                    ),
+                    error_code=(value if isinstance((value := payload.get("error_code")), str) else None),
+                    error_message=(value if isinstance((value := payload.get("error_message")), str) else None),
                     retryable=payload.get("retryable") is True,
                     truncated=payload.get("truncated") is True,
                     latency_ms=latency_by_call.get(tool_call_id),
                 )
             )
-            if tool_name != "search_knowledge" or not isinstance(
-                raw_structured, Mapping
-            ):
+            if tool_name != "search_knowledge" or not isinstance(raw_structured, Mapping):
                 continue
             raw_evidence = raw_structured.get("results")
-            if isinstance(raw_evidence, Sequence) and not isinstance(
-                raw_evidence, (str, bytes)
-            ):
+            if isinstance(raw_evidence, Sequence) and not isinstance(raw_evidence, (str, bytes)):
                 for value in raw_evidence:
                     if isinstance(value, Mapping):
                         evidence.append(agent_evidence_from_value(value))
-            evidence_by_anchor = {
-                item.citation_anchor: item for item in evidence
-            }
+            evidence_by_anchor = {item.citation_anchor: item for item in evidence}
             raw_citations = raw_structured.get("citations")
-            if isinstance(raw_citations, Sequence) and not isinstance(
-                raw_citations, (str, bytes)
-            ):
+            if isinstance(raw_citations, Sequence) and not isinstance(raw_citations, (str, bytes)):
                 for value in raw_citations:
                     if not isinstance(value, str):
                         continue
@@ -303,9 +285,7 @@ class AgentResult:
                             citation_id=value,
                             evidence_id=("" if source is None else source.evidence_id),
                             record_type=(
-                                "knowledge"
-                                if source is None or source.source_type is None
-                                else source.source_type
+                                "knowledge" if source is None or source.source_type is None else source.source_type
                             ),
                             file_name=(None if source is None else source.file_name),
                             citation_anchor=value,
@@ -315,9 +295,7 @@ class AgentResult:
                     )
         pause: AgentPause | None = None
         pending = tuple(
-            interaction
-            for interaction in store.list_interactions(result.turn_id)
-            if interaction.status == "pending"
+            interaction for interaction in store.list_interactions(result.turn_id) if interaction.status == "pending"
         )
         if len(pending) == 1 and pending[0].kind in {
             "tool_approval",
@@ -344,9 +322,7 @@ class AgentResult:
                     AgentToolSummary(
                         tool_call_id=operation.tool_call_id,
                         tool_name=operation.tool_name,
-                        args_preview=(
-                            "" if arguments is None else str(dict(arguments))[:1000]
-                        ),
+                        args_preview=("" if arguments is None else str(dict(arguments))[:1000]),
                         approval_id=interaction.request_id,
                         risk_level=("high" if effects else "low"),
                         reason=question,
@@ -400,14 +376,10 @@ class AgentResult:
                 AgentDiagnostic(
                     code="model_dispatch_outcome_unknown",
                     component="model",
-                    message=str(
-                        unknown_model_diagnostics[-1].payload["error_message"]
-                    ),
+                    message=str(unknown_model_diagnostics[-1].payload["error_message"]),
                     severity="warning",
                     degraded=True,
-                    error_type=str(
-                        unknown_model_diagnostics[-1].payload["error_type"]
-                    ),
+                    error_type=str(unknown_model_diagnostics[-1].payload["error_type"]),
                 ),
             )
         if rejected_model_diagnostics:
@@ -438,10 +410,7 @@ class AgentResult:
             turn.status == "failed"
             and turn.terminal_reason_code is not None
             and turn.terminal_message is not None
-            and not any(
-                diagnostic.code == turn.terminal_reason_code
-                for diagnostic in projected_diagnostics
-            )
+            and not any(diagnostic.code == turn.terminal_reason_code for diagnostic in projected_diagnostics)
         ):
             projected_diagnostics.insert(
                 0,
@@ -455,8 +424,11 @@ class AgentResult:
             )
         diagnostics = tuple(projected_diagnostics)
         return cls(
-            answer=(result.answer or turn.terminal_message
-                    if turn.terminal_reason_code == "model_step_budget_exhausted" else result.answer),
+            answer=(
+                result.answer or turn.terminal_message
+                if turn.terminal_reason_code == "model_step_budget_exhausted"
+                else result.answer
+            ),
             status={
                 "completed": "done",
                 "paused": "paused",
@@ -469,17 +441,22 @@ class AgentResult:
                 input_tokens=sum(_usage_integer(usage, "input_tokens") for usage in usage_values),
                 output_tokens=sum(_usage_integer(usage, "output_tokens") for usage in usage_values),
                 total_tokens=sum(
-                    _usage_integer(usage, "total_tokens") if "total_tokens" in usage
+                    _usage_integer(usage, "total_tokens")
+                    if "total_tokens" in usage
                     else _usage_integer(usage, "input_tokens") + _usage_integer(usage, "output_tokens")
                     for usage in usage_values
                 ),
                 logical_input_tokens=_optional_usage_sum(usage_values, "logical_input_tokens"),
                 uncached_input_tokens=_optional_usage_sum(usage_values, "uncached_input_tokens"),
                 cache_read_input_tokens=_optional_usage_sum(
-                    usage_values, "cache_read_input_tokens", "cached_input_tokens",
+                    usage_values,
+                    "cache_read_input_tokens",
+                    "cached_input_tokens",
                 ),
                 cache_write_input_tokens=_optional_usage_sum(
-                    usage_values, "cache_write_input_tokens", "cache_write_tokens",
+                    usage_values,
+                    "cache_write_input_tokens",
+                    "cache_write_tokens",
                 ),
                 reasoning_tokens=_optional_usage_sum(usage_values, "reasoning_tokens"),
                 usage_complete=usage_complete,
@@ -488,18 +465,20 @@ class AgentResult:
                 model_latency_ms=_observed_sum([attempt.usage.get("latency_ms") for attempt in attempts]),
                 tool_latency_ms=_observed_sum([native_latency, mcp_latency]),
                 native_calls=sum(op.attempt_count for op in native_operations),
-                native_errors=sum(record.payload["status"] != "succeeded" for record in outcomes
-                                  if record.payload["operation_id"] in native_ids),
+                native_errors=sum(
+                    record.payload["status"] != "succeeded"
+                    for record in outcomes
+                    if record.payload["operation_id"] in native_ids
+                ),
                 native_latency_ms_total=native_latency,
                 mcp_calls=sum(op.attempt_count for op in mcp_operations),
-                mcp_errors=sum(record.payload["status"] != "succeeded" for record in outcomes
-                               if record.payload["operation_id"] in mcp_ids),
-                mcp_latency_ms_total=mcp_latency,
-                usage_source=(
-                    None
-                    if not sources
-                    else sources[0] if len(set(sources)) == 1 else "mixed"
+                mcp_errors=sum(
+                    record.payload["status"] != "succeeded"
+                    for record in outcomes
+                    if record.payload["operation_id"] in mcp_ids
                 ),
+                mcp_latency_ms_total=mcp_latency,
+                usage_source=(None if not sources else sources[0] if len(set(sources)) == 1 else "mixed"),
             ),
             diagnostics=diagnostics,
             turn_id=turn.turn_id,
@@ -526,9 +505,7 @@ def _project_harness_plan(
     plan_items = [
         item
         for item in items
-        if item.kind == "plan_state"
-        and item.status == "completed"
-        and isinstance(item.payload.get("plan"), Mapping)
+        if item.kind == "plan_state" and item.status == "completed" and isinstance(item.payload.get("plan"), Mapping)
     ]
     if not plan_items:
         return None, ()
@@ -588,18 +565,11 @@ def _project_harness_plan(
                 event_id=f"plan_event_{item.item_id}",
                 event_type=event_type,
                 plan_revision=revision,
-                message=(
-                    message
-                    if isinstance(message, str) and message
-                    else "Applied canonical plan transition."
-                ),
-                related_step_id=(
-                    related_step_id if isinstance(related_step_id, str) else None
-                ),
+                message=(message if isinstance(message, str) and message else "Applied canonical plan transition."),
+                related_step_id=(related_step_id if isinstance(related_step_id, str) else None),
                 tool_call_ids=(
                     [str(value) for value in tool_call_ids]
-                    if isinstance(tool_call_ids, Sequence)
-                    and not isinstance(tool_call_ids, (str, bytes))
+                    if isinstance(tool_call_ids, Sequence) and not isinstance(tool_call_ids, (str, bytes))
                     else []
                 ),
             )
@@ -631,8 +601,10 @@ def _optional_usage_sum(values: Sequence[Mapping[str, object]], *keys: str) -> i
 
 
 def _observed_sum(values: Sequence[object]) -> float | None:
-    if any(isinstance(value, bool) or not isinstance(value, (int, float))
-           or not math.isfinite(value) or value < 0 for value in values):
+    if any(
+        isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0
+        for value in values
+    ):
         return None
     return sum(cast(float, value) for value in values)
 

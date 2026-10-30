@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from agent_runtime import Agent
+from agent_runtime.harness import turn_ops
 from tests.agent.harness.test_public_agent_cutover import PublicHarnessModel, assert_answer_event_contract
 
 
@@ -265,7 +266,7 @@ async def test_failed_open_releases_store_and_model_control(tmp_path, monkeypatc
     assert len(planes) == len(stores) == 1
     assert planes[0]._closed
     with pytest.raises(sqlite3.ProgrammingError):
-        stores[0].rows('threads')
+        stores[0].rows("threads")
 
 
 @pytest.mark.anyio
@@ -330,7 +331,7 @@ async def test_one_shot_stream_does_not_drop_buffered_events_after_session_close
 
 @pytest.mark.anyio
 async def test_close_waits_for_direct_child_and_its_budget_settlement(tmp_path):
-    from agent_runtime.harness import RuntimeState, Session
+    from agent_runtime.harness import RuntimeStore, Session
     from tests.agent.harness.test_subagent_budget import AcceptAnswer, BlockingAnswerModel
 
     model = BlockingAnswerModel()
@@ -338,7 +339,8 @@ async def test_close_waits_for_direct_child_and_its_budget_settlement(tmp_path):
     async with await Session.open(
         database=database, workspace=tmp_path, model=model, completion_gate=AcceptAnswer()
     ) as session:
-        parent = session.store.start_turn(
+        parent = turn_ops.start_turn(
+            session.store,
             thread_id=session.thread_id,
             user_message="parent",
             binding_manifest={"model_id": "test-model", "model_token_budget_total": 100},
@@ -369,14 +371,15 @@ async def test_close_waits_for_direct_child_and_its_budget_settlement(tmp_path):
             model.release.set()
             await asyncio.wait_for(asyncio.gather(child, closing, return_exceptions=True), timeout=1)
         result = child.result()
-        async with (await RuntimeState.open(database)) as store:
+        async with await RuntimeStore.open(database) as store:
             assert store.read_child_budget_allocation(result.turn_id)["status"] == "settled"
             assert store.read_budget_state(parent.turn_id).used.total_tokens == 5
 
 
 @pytest.mark.anyio
 async def test_session_open_creates_and_reuses_trust_without_manual_init(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry_path = tmp_path / "user-config" / "models.yaml"
     monkeypatch.setenv("PRAXIS_MODEL_REGISTRY_PATH", str(registry_path))
@@ -396,8 +399,7 @@ async def test_session_open_creates_and_reuses_trust_without_manual_init(
 async def test_command_cleanup_failure_does_not_mask_error_or_block_session_close(tmp_path):
     from agent_runtime.harness import Session
 
-    session = await Session.open(database=tmp_path / "run.db", workspace=tmp_path,
-                                 model=PublicHarnessModel(), tools={})
+    session = await Session.open(database=tmp_path / "run.db", workspace=tmp_path, model=PublicHarnessModel(), tools={})
 
     async def fail_cleanup():
         raise RuntimeError("injected command cleanup failure")

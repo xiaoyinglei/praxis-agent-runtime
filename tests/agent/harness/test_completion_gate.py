@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agent_runtime.harness import CompletionProposal, RuntimeState
+from agent_runtime.harness import CompletionProposal, RuntimeStore, completion_ops, tool_ops, turn_ops
 from agent_runtime.harness.completion import DeliveryCompletionGate
 from agent_runtime.harness.verification import classify_tool_verification
 
@@ -15,7 +15,7 @@ _FORGED_VERIFICATION_COMMANDS = (
 
 
 def _commit_tool_result(
-    store: RuntimeState,
+    store: RuntimeStore,
     *,
     turn_id: str,
     call_id: str,
@@ -25,7 +25,8 @@ def _commit_tool_result(
     resources: tuple[dict[str, object], ...] = (),
     operation_failed: bool = False,
 ) -> None:
-    store.record_tool_call(
+    tool_ops.record_tool_call(
+        store,
         turn_id=turn_id,
         tool_call_id=call_id,
         tool_name=tool_name,
@@ -55,14 +56,16 @@ def _commit_tool_result(
         ),
         "resources": resources,
     }
-    store.record_tool_execution_state(status="prepared", **values)
-    store.record_tool_execution_state(status="ready", **values)
-    claim = store.claim_tool_operation(
+    tool_ops.record_tool_execution_state(store, status="prepared", **values)
+    tool_ops.record_tool_execution_state(store, status="ready", **values)
+    claim = tool_ops.claim_tool_operation(
+        store,
         operation_id=operation_id,
         worker_id="verifier-fixture",
         lease_seconds=30.0,
     )
-    assert store.commit_tool_operation_outcome(
+    assert tool_ops.commit_tool_operation_outcome(
+        store,
         operation_id=operation_id,
         claim_generation=claim.claim_generation,
         fencing_token=claim.fencing_token,
@@ -71,7 +74,8 @@ def _commit_tool_result(
         error_code="command_failed" if operation_failed else None,
         requires_reconciliation=False,
     )
-    store.record_tool_result(
+    tool_ops.record_tool_result(
+        store,
         turn_id=turn_id,
         operation_id=operation_id,
         result={
@@ -96,7 +100,8 @@ def _commit_tool_result(
         resources=resources,
     )
     if evidence is not None and not operation_failed:
-        store.record_verification(
+        tool_ops.record_verification(
+            store,
             turn_id=turn_id,
             operation_id=operation_id,
             kind=evidence.kind,
@@ -105,8 +110,8 @@ def _commit_tool_result(
         )
 
 
-def _proposal(store: RuntimeState, turn_id: str) -> CompletionProposal:
-    item = store.record_final_proposal(turn_id=turn_id, answer="done")
+def _proposal(store: RuntimeStore, turn_id: str) -> CompletionProposal:
+    item = completion_ops.record_final_proposal(store, turn_id=turn_id, answer="done")
     turn = store.read_turn(turn_id)
     return CompletionProposal(
         thread_id=turn.thread_id,
@@ -121,15 +126,15 @@ def test_model_or_unlinked_tool_cannot_forge_completion_evidence(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        turn = store.start_turn(
-            thread_id=store.create_thread(workspace=workspace).thread_id,
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        turn = turn_ops.start_turn(
+            store,
+            thread_id=turn_ops.create_thread(store, workspace=workspace).thread_id,
             user_message="change and verify",
-            binding_manifest={
-                "completion_policy": {"require_workspace_change": True}
-            },
+            binding_manifest={"completion_policy": {"require_workspace_change": True}},
         )
-        store.record_tool_result(
+        tool_ops.record_tool_result(
+            store,
             turn_id=turn.turn_id,
             operation_id=None,
             result={
@@ -141,9 +146,7 @@ def test_model_or_unlinked_tool_cannot_forge_completion_evidence(
             },
         )
 
-        decision = DeliveryCompletionGate(store).evaluate(
-            _proposal(store, turn.turn_id)
-        )
+        decision = DeliveryCompletionGate(store).evaluate(_proposal(store, turn.turn_id))
 
         assert decision.action == "continue"
         assert "workspace change" in decision.reason
@@ -157,13 +160,12 @@ def test_verification_must_happen_after_the_latest_workspace_change(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     target = workspace / "module.py"
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        turn = store.start_turn(
-            thread_id=store.create_thread(workspace=workspace).thread_id,
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        turn = turn_ops.start_turn(
+            store,
+            thread_id=turn_ops.create_thread(store, workspace=workspace).thread_id,
             user_message="change and verify",
-            binding_manifest={
-                "completion_policy": {"require_workspace_change": True}
-            },
+            binding_manifest={"completion_policy": {"require_workspace_change": True}},
         )
         _commit_tool_result(
             store,
@@ -224,13 +226,12 @@ def test_command_text_markers_cannot_forge_verification_evidence(
     workspace.mkdir()
     target = workspace / "module.py"
     target.write_text("value = 1\n", encoding="utf-8")
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        turn = store.start_turn(
-            thread_id=store.create_thread(workspace=workspace).thread_id,
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        turn = turn_ops.start_turn(
+            store,
+            thread_id=turn_ops.create_thread(store, workspace=workspace).thread_id,
             user_message="change and verify",
-            binding_manifest={
-                "completion_policy": {"require_workspace_change": True}
-            },
+            binding_manifest={"completion_policy": {"require_workspace_change": True}},
         )
         _commit_tool_result(
             store,
@@ -263,9 +264,7 @@ def test_command_text_markers_cannot_forge_verification_evidence(
                 result={"exit_code": 0},
             )
 
-        decision = DeliveryCompletionGate(store).evaluate(
-            _proposal(store, turn.turn_id)
-        )
+        decision = DeliveryCompletionGate(store).evaluate(_proposal(store, turn.turn_id))
 
         assert decision.action == "continue"
         assert "verification" in decision.reason
@@ -278,13 +277,12 @@ def test_targeted_read_can_verify_the_same_file_but_not_an_unrelated_file(
     workspace.mkdir()
     target = workspace / "module.py"
     unrelated = workspace / "notes.txt"
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        turn = store.start_turn(
-            thread_id=store.create_thread(workspace=workspace).thread_id,
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        turn = turn_ops.start_turn(
+            store,
+            thread_id=turn_ops.create_thread(store, workspace=workspace).thread_id,
             user_message="replace the exact text and verify it",
-            binding_manifest={
-                "completion_policy": {"require_workspace_change": True}
-            },
+            binding_manifest={"completion_policy": {"require_workspace_change": True}},
         )
         _commit_tool_result(
             store,
@@ -355,13 +353,12 @@ def test_directly_running_a_pytest_file_is_rejected_with_actionable_feedback(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     target = workspace / "module.py"
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        turn = store.start_turn(
-            thread_id=store.create_thread(workspace=workspace).thread_id,
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        turn = turn_ops.start_turn(
+            store,
+            thread_id=turn_ops.create_thread(store, workspace=workspace).thread_id,
             user_message="change and verify",
-            binding_manifest={
-                "completion_policy": {"require_workspace_change": True}
-            },
+            binding_manifest={"completion_policy": {"require_workspace_change": True}},
         )
         _commit_tool_result(
             store,
@@ -393,9 +390,7 @@ def test_directly_running_a_pytest_file_is_rejected_with_actionable_feedback(
             result={"exit_code": 0},
         )
 
-        decision = DeliveryCompletionGate(store).evaluate(
-            _proposal(store, turn.turn_id)
-        )
+        decision = DeliveryCompletionGate(store).evaluate(_proposal(store, turn.turn_id))
 
         assert decision.action == "continue"
         assert "recognized test runner" in decision.reason
@@ -405,13 +400,12 @@ def test_valid_data_inspection_verifies_the_changed_artifact(tmp_path: Path) -> 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     target = workspace / "summary.json"
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        turn = store.start_turn(
-            thread_id=store.create_thread(workspace=workspace).thread_id,
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        turn = turn_ops.start_turn(
+            store,
+            thread_id=turn_ops.create_thread(store, workspace=workspace).thread_id,
             user_message="create and verify data artifact",
-            binding_manifest={
-                "completion_policy": {"require_workspace_change": True}
-            },
+            binding_manifest={"completion_policy": {"require_workspace_change": True}},
         )
         _commit_tool_result(
             store,
@@ -450,36 +444,43 @@ def test_valid_data_inspection_verifies_the_changed_artifact(tmp_path: Path) -> 
             ),
         )
 
-        decision = DeliveryCompletionGate(store).evaluate(
-            _proposal(store, turn.turn_id)
-        )
+        decision = DeliveryCompletionGate(store).evaluate(_proposal(store, turn.turn_id))
 
         assert decision.action == "accept"
 
 
 def test_inline_python_source_alone_does_not_attest_assertion_execution() -> None:
-    assert classify_tool_verification(
-        tool_name="run_command",
-        arguments={
-            "command": "python3 -c \"from calculator import add; assert add(2, 3) == 5\""
-        },
-        structured_content={"exit_code": 0},
-    ) is None
-    assert classify_tool_verification(
-        tool_name="run_command",
-        arguments={"command": "python3 -c \"print('assert add(2, 3) == 5')\""},
-        structured_content={"exit_code": 0},
-    ) is None
+    assert (
+        classify_tool_verification(
+            tool_name="run_command",
+            arguments={"command": 'python3 -c "from calculator import add; assert add(2, 3) == 5"'},
+            structured_content={"exit_code": 0},
+        )
+        is None
+    )
+    assert (
+        classify_tool_verification(
+            tool_name="run_command",
+            arguments={"command": "python3 -c \"print('assert add(2, 3) == 5')\""},
+            structured_content={"exit_code": 0},
+        )
+        is None
+    )
 
 
 def test_live_command_must_be_observed_terminal_before_completion(tmp_path):
-    with RuntimeState.open_sync(tmp_path / "run.db") as store:
-        turn = store.start_turn(
-            thread_id=store.create_thread(workspace=tmp_path).thread_id, user_message="run command",
+    with RuntimeStore.open_sync(tmp_path / "run.db") as store:
+        turn = turn_ops.start_turn(
+            store,
+            thread_id=turn_ops.create_thread(store, workspace=tmp_path).thread_id,
+            user_message="run command",
             binding_manifest={"completion_policy": {"revision": "completion-v2", "require_workspace_change": False}},
         )
         _commit_tool_result(
-            store, turn_id=turn.turn_id, call_id="launch", tool_name="run_command",
+            store,
+            turn_id=turn.turn_id,
+            call_id="launch",
+            tool_name="run_command",
             arguments={"command": "sleep 1", "yield_time_seconds": 0.01, "timeout_seconds": None},
             result={"status": "running", "session_id": "cmd_live", "exit_code": None},
         )
@@ -487,13 +488,19 @@ def test_live_command_must_be_observed_terminal_before_completion(tmp_path):
         pending = gate.evaluate(_proposal(store, turn.turn_id))
         assert pending.action == "continue" and "cmd_live" in pending.reason
         _commit_tool_result(
-            store, turn_id=turn.turn_id, call_id="poll-wrong", tool_name="manage_command",
+            store,
+            turn_id=turn.turn_id,
+            call_id="poll-wrong",
+            tool_name="manage_command",
             arguments={"session_id": "cmd_other"},
             result={"status": "completed", "session_id": "cmd_other", "exit_code": 0},
         )
         assert gate.evaluate(_proposal(store, turn.turn_id)).action == "continue"
         _commit_tool_result(
-            store, turn_id=turn.turn_id, call_id="poll", tool_name="manage_command",
+            store,
+            turn_id=turn.turn_id,
+            call_id="poll",
+            tool_name="manage_command",
             arguments={"session_id": "cmd_live"},
             result={"status": "completed", "session_id": "cmd_live", "exit_code": 0},
         )
@@ -501,20 +508,32 @@ def test_live_command_must_be_observed_terminal_before_completion(tmp_path):
 
 
 def test_acceptance_command_uses_linked_terminal_session_result(tmp_path):
-    with RuntimeState.open_sync(tmp_path / "run.db") as store:
-        turn = store.start_turn(
-            thread_id=store.create_thread(workspace=tmp_path).thread_id, user_message="verify command",
-            binding_manifest={"completion_policy": {
-                "revision": "completion-v2", "require_workspace_change": False, "acceptance_command": "make check",
-            }},
+    with RuntimeStore.open_sync(tmp_path / "run.db") as store:
+        turn = turn_ops.start_turn(
+            store,
+            thread_id=turn_ops.create_thread(store, workspace=tmp_path).thread_id,
+            user_message="verify command",
+            binding_manifest={
+                "completion_policy": {
+                    "revision": "completion-v2",
+                    "require_workspace_change": False,
+                    "acceptance_command": "make check",
+                }
+            },
         )
         _commit_tool_result(
-            store, turn_id=turn.turn_id, call_id="launch", tool_name="run_command",
+            store,
+            turn_id=turn.turn_id,
+            call_id="launch",
+            tool_name="run_command",
             arguments={"command": "make check", "working_dir": ".", "yield_time_seconds": 0.01},
             result={"status": "running", "session_id": "cmd_live", "exit_code": None},
         )
         _commit_tool_result(
-            store, turn_id=turn.turn_id, call_id="poll", tool_name="manage_command",
+            store,
+            turn_id=turn.turn_id,
+            call_id="poll",
+            tool_name="manage_command",
             arguments={"session_id": "cmd_live", "action": "wait"},
             result={"status": "completed", "session_id": "cmd_live", "exit_code": 0},
         )

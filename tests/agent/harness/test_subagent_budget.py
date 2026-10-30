@@ -13,8 +13,10 @@ from agent_runtime.harness import (
     HarnessModelRequest,
     HarnessModelResponse,
     PreparedModelCall,
-    RuntimeState,
+    RuntimeStore,
     Session,
+    budget_ops,
+    turn_ops,
 )
 
 
@@ -86,14 +88,15 @@ class UnknownAnswerModel(SmallAnswerModel):
 
 
 def _running_parent(
-    store: RuntimeState,
+    store: RuntimeStore,
     workspace: Path,
     *,
     token_budget: int,
 ):
-    thread = store.create_thread(workspace=workspace)
+    thread = turn_ops.create_thread(store, workspace=workspace)
     turn_id = "turn-parent"
-    return store.start_turn(
+    return turn_ops.start_turn(
+        store,
         thread_id=thread.thread_id,
         turn_id=turn_id,
         user_message="parent task",
@@ -112,19 +115,22 @@ async def test_completed_child_charges_actual_usage_and_releases_unused_allocati
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
+    async with await RuntimeStore.open(tmp_path / "rollout.sqlite3") as store:
         parent = _running_parent(store, workspace, token_budget=100)
         async with await Session.open(
-            database=tmp_path / "rollout.sqlite3", workspace=workspace, model=SmallAnswerModel(),
-            thread_id=parent.thread_id, completion_gate=AcceptAnswer(), max_steps=4,
+            database=tmp_path / "rollout.sqlite3",
+            workspace=workspace,
+            model=SmallAnswerModel(),
+            thread_id=parent.thread_id,
+            completion_gate=AcceptAnswer(),
+            max_steps=4,
         ) as manager:
-
             child = await manager.run_child(
-                    parent_turn_id=parent.turn_id,
-                    user_message="bounded child",
-                    max_steps=2,
-                    max_tokens_total=60,
-                )
+                parent_turn_id=parent.turn_id,
+                user_message="bounded child",
+                max_steps=2,
+                max_tokens_total=60,
+            )
 
             assert child.status == "completed"
             child_binding = store.read_turn(child.turn_id).binding_manifest
@@ -153,22 +159,35 @@ async def test_child_inherits_frozen_parent_web_limits_with_independent_turn_usa
     class ParentLimitsModel(SmallAnswerModel):
         def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
             assert request.binding_manifest["web_limits"] == limits
-            assert store.reserve_resource_unit(request.turn_id, "public_web_requests", 1)["used"] == 1
+            assert budget_ops.reserve_resource_unit(store, request.turn_id, "public_web_requests", 1)["used"] == 1
             return super().prepare(request)
 
     limits = WebLimits(turn_requests=1, browser_requests=7, browser_network_bytes=2_000_000).model_dump(mode="json")
     database = tmp_path / "rollout.sqlite3"
-    async with (await RuntimeState.open(database)) as store:
-        thread = store.create_thread(workspace=tmp_path)
-        parent = store.start_turn(thread_id=thread.thread_id, user_message="parent", binding_manifest={
-            "model_id": "test-model", "model_step_budget": 8, "model_token_budget_total": 100,
-            "web_limits": limits,
-        })
-        store.reserve_resource_unit(parent.turn_id, "public_web_requests", 1)
-        async with await Session.open(database=database, workspace=tmp_path, model=ParentLimitsModel(),
-                                      thread_id=parent.thread_id, completion_gate=AcceptAnswer()) as manager:
-            child = await manager.run_child(parent_turn_id=parent.turn_id, user_message="child",
-                                            max_steps=2, max_tokens_total=60)
+    async with await RuntimeStore.open(database) as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        parent = turn_ops.start_turn(
+            store,
+            thread_id=thread.thread_id,
+            user_message="parent",
+            binding_manifest={
+                "model_id": "test-model",
+                "model_step_budget": 8,
+                "model_token_budget_total": 100,
+                "web_limits": limits,
+            },
+        )
+        budget_ops.reserve_resource_unit(store, parent.turn_id, "public_web_requests", 1)
+        async with await Session.open(
+            database=database,
+            workspace=tmp_path,
+            model=ParentLimitsModel(),
+            thread_id=parent.thread_id,
+            completion_gate=AcceptAnswer(),
+        ) as manager:
+            child = await manager.run_child(
+                parent_turn_id=parent.turn_id, user_message="child", max_steps=2, max_tokens_total=60
+            )
             assert child.status == "completed"
             assert store.read_turn(child.turn_id).binding_manifest["web_limits"] == limits
             assert store.read_resource_usage(child.turn_id, "public_web_requests")["used"] == 1
@@ -182,14 +201,17 @@ def test_active_child_allocation_prevents_parallel_budget_oversell(
     async def scenario() -> None:
         workspace = tmp_path / "workspace"
         workspace.mkdir()
-        async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
+        async with await RuntimeStore.open(tmp_path / "rollout.sqlite3") as store:
             parent = _running_parent(store, workspace, token_budget=100)
             model = BlockingAnswerModel()
             async with await Session.open(
-                database=tmp_path / "rollout.sqlite3", workspace=workspace, model=model,
-                thread_id=parent.thread_id, completion_gate=AcceptAnswer(), max_steps=4,
+                database=tmp_path / "rollout.sqlite3",
+                workspace=workspace,
+                model=model,
+                thread_id=parent.thread_id,
+                completion_gate=AcceptAnswer(),
+                max_steps=4,
             ) as manager:
-
                 first = asyncio.create_task(
                     manager.run_child(
                         parent_turn_id=parent.turn_id,
@@ -230,19 +252,22 @@ async def test_unknown_child_keeps_parent_allocation_locked(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
+    async with await RuntimeStore.open(tmp_path / "rollout.sqlite3") as store:
         parent = _running_parent(store, workspace, token_budget=100)
         async with await Session.open(
-            database=tmp_path / "rollout.sqlite3", workspace=workspace, model=UnknownAnswerModel(),
-            thread_id=parent.thread_id, completion_gate=AcceptAnswer(), max_steps=4,
+            database=tmp_path / "rollout.sqlite3",
+            workspace=workspace,
+            model=UnknownAnswerModel(),
+            thread_id=parent.thread_id,
+            completion_gate=AcceptAnswer(),
+            max_steps=4,
         ) as manager:
-
             child = await manager.run_child(
-                    parent_turn_id=parent.turn_id,
-                    user_message="uncertain child",
-                    max_steps=2,
-                    max_tokens_total=60,
-                )
+                parent_turn_id=parent.turn_id,
+                user_message="uncertain child",
+                max_steps=2,
+                max_tokens_total=60,
+            )
 
             assert child.status == "paused"
             allocation = store.read_child_budget_allocation(child.turn_id)

@@ -34,11 +34,11 @@ Praxis 的公开入口以 CLI 为先，Python SDK 与其共享能力和执行语
 
 工具 runner 的同步函数在阻塞 worker 中执行；依赖调用事件循环的逻辑使用 `async def`。每个 `RolloutStore` 有自己的单一 owner 线程，连接创建、事务、查询、产物写入与校验、关闭都在该线程执行，并保留 SQLite 默认线程亲和检查。async 工具的 Store 回调也必须 await 持久化边界。
 
-`RuntimeState` 拥有 Turn、审批、模型操作、工具 claim/fencing、预算和记忆的业务转换；`RolloutStore` 拥有 SQLite 连接、SQL、canonical log、投影写入和 blob I/O。共享值对象在 `harness/records.py`，纯事实重放在 `harness/reducer.py`。业务层不使用 SQL、SQLite Row 或 JSON 列编码；存储层不依赖预算、审批或模型策略。导入约束会检查这个边界。
+`RuntimeStore` 只负责资源生命周期、一致读和事务入口。Turn、模型、工具、预算、上下文、完成和记忆的业务命令分别放在 `turn_ops`、`model_ops`、`tool_ops`、`budget_ops`、`context_ops`、`completion_ops` 和 `memory_ops`。命令显式接收 Store，例如 `turn_ops.start_turn(store, ...)`；没有旧业务对象的兼容别名。`RuntimeTx` 提供受限持久化操作，不向业务命令暴露 SQLite 连接。`RolloutStore` 拥有连接、SQL、canonical log、投影写入和 blob I/O。共享值对象在 `harness/records.py`，纯事实重放在 `harness/reducer.py`。
 
-业务操作使用 `with RuntimeState.open_sync(path) as state` 或 `async with await RuntimeState.open(path) as state`，异步读取用 `await state.run_async(state.read_turn, turn_id)`。`state.persistence` 是实际存储对象；纯维护可以直接打开 `RolloutStore`。两者均无参、非阻塞构造，显式打开，未打开时拒绝操作，关闭可安全重复。同步打开在事件循环线程上立即报错，须改用异步工厂。存储子类必须保持无参、非阻塞构造。
+使用 `with RuntimeStore.open_sync(path) as store` 或 `async with await RuntimeStore.open(path) as store` 打开资源；异步读取用 `await store.run_async(store.read_turn, turn_id)`。`store.read_snapshot(query)` 保证一次决策所需的多个查询来自同一 SQLite 快照，嵌套读取借用已有事务。`store.persistence` 留给维护和存储生命周期；纯维护可以直接打开 `RolloutStore`。两者均无参、非阻塞构造，显式打开，关闭可重复。事件循环线程须使用异步工厂。
 
-一次业务操作在 owner 内读取受保护状态、检查不变量，并通过 `with state.persistence.transaction()` 决定原子提交范围；跨 Turn、预算或审批的多个事实仍共同提交。存储层追加事实、运行 reducer、写投影，然后 COMMIT；`capture_mutation_async` 返回本次真实提交的记录，通知只从这些记录派生。artifact 安装与引用持有和 GC 相同的写事务边界，顺序仍是 blob fsync/rename 在先、数据库引用提交在后。文件输入、内存边界、跨进程互斥和 GC 部分失败契约见 [Rollout 与 Artifact 存储](rollout-storage.md)。
+一次业务命令完整运行在 owner 内，通过 `with store.tx.transaction()` 决定原子提交范围；跨 Turn、预算或审批的多个事实仍共同提交。存储层追加事实、运行 reducer、写投影，然后 COMMIT；`capture_mutation_async` 返回本次真实提交的记录，通知只从这些记录派生。artifact 安装与引用持有和 GC 相同的写事务边界，顺序仍是 blob fsync/rename 在先、数据库引用提交在后。文件输入、内存边界、跨进程互斥和 GC 部分失败契约见 [Rollout 与 Artifact 存储](rollout-storage.md)。
 
 同步方法和 `close()` 是明确的 blocking API。多查询帮助函数应作为一个完整闭包交给 owner；不要把连接或 SQLite cursor 交给其他线程。惰性查询用 `iterate` 在 owner 逐项推进，并在 `aclosing` 作用域内使用。`open/open_sync` 的 `max_pending_operations` 缺省为 128，计入正在执行的操作；容量满时 `StoreBusyError` 明确表示此次工作未被接纳。关闭屏障不受容量限制，不丢弃已接纳工作。
 
@@ -65,6 +65,16 @@ uv run python scripts/verify_agent_rollout.py --database /path/to/rollout.sqlite
 完整审计仍需读取全部历史和引用 blob，单 owner 内的慢操作仍会阻挡后续操作；接纳容量控制内存积压，不承诺查询抢占或延迟指标。canonical log 暂不做在线截断：fork、预算和附件可能跨线程引用历史，尚无产品层保留期限或丢弃语义；协调备份和可重建投影提供当前本地使用所需的恢复路径，不擅自删除事实或搭建归档服务。
 
 职责划分核对了官方 [Codex 固定源码提交](https://github.com/openai/codex/tree/2cab11ca40aad193382348a7bda46da2fc47596a/codex-rs/core/src/session) 的 Session → LiveThread → recorder → reconstruction 链。Claude 对照使用本地 `brath-claude-code` 的 `276b8e6a0160939c74f04074a5e10ec1ba76982b`，README 自述 2026-03-31 快照、origin 为 Gitee 镜像；其来源和整库可构建性未独立证实，不代表官方版本声明。这里保留本项目事实与投影同事务、提交成功后才通知的更严格契约。
+
+## 执行内核
+
+`Session` 管理输入、资源和公开结果；新 Turn 和恢复都进入 `TurnRunner.drive`。恢复决策从同一读快照中的模型操作、响应处理收据、工具和交互事实推导，携带确切 operation/response 身份，不以最后一条消息猜测执行位置。`execution_facts` 保存响应处理收据和完整工具批次接纳事实。`ModelRunner` 独立管理准备、claim、provider I/O、流式输出和用量结算；`ContextEngine` 管理上下文测量与压缩作业。
+
+主机控制信息使用 `StepControl` 和 `ModelMessage.runtime_metadata`，文本是单向渲染结果。用户即使粘贴相同标题或 JSON 也不能产生主机控制状态。完整 Step 快照和冻结 canonical/wire 请求存入引用完整性可审计的 artifact；replay 校验 request/context/tool/wire 四个 hash，发送冻结 wire，不重新序列化 provider 请求。凭据从当前可信连接取得，不写入 artifact。旧记录仅在其保存的快照、版本和 hash 能精确恢复时继续执行，历史读取与安全取消独立保留。
+
+写入协议为 payload schema 4；读取器仍支持既有 1–3 记录。首次可写打开安装 SQLite 最低 writer 协议门禁，旧二进制的 schema 3 INSERT 会在执行模型和工具之前被拒绝。升级前应按下文备份数据库和 artifact 目录；不要把数据库交回旧版本继续写入。
+
+本次内核替换对照官方 [Codex 固定源码 a4c9194](https://github.com/openai/codex/tree/a4c9194247c6a1e79aa3e72cc6cd77238f2ed354)，Claude 参考仍为上文注明来源限制的历史镜像；不把 SDK 协议解析器当作完整执行内核源码。
 
 ## 本地检查
 

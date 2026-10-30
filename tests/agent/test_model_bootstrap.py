@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from agent_runtime.agent import Agent
-from agent_runtime.harness import RuntimeState, Session
+from agent_runtime.harness import RuntimeStore, Session, turn_ops
 from agent_runtime.models import ModelSessionState, ModelSpec
 from tests.agent.harness.test_public_agent_cutover import PublicHarnessModel
 
@@ -78,6 +78,7 @@ async def test_model_bootstrap_uses_current_selected_model_for_new_turn(
 
     class FakeControlPlane:
         state = ModelSessionState(current_model_id="current-model")
+
         def ensure_model_binding_trust(self, *, has_existing_bindings: bool) -> None:
             assert isinstance(has_existing_bindings, bool)
 
@@ -134,12 +135,14 @@ async def test_resume_bootstraps_only_the_operation_binding_when_prepared(
         "test_marker": "frozen-binding",
     }
 
-    async with (await RuntimeState.open(database)) as store:
-        thread = store.create_thread(
+    async with await RuntimeStore.open(database) as store:
+        thread = turn_ops.create_thread(
+            store,
             workspace=workspace,
         )
 
-        turn = store.start_turn(
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="Original task",
             binding_manifest=frozen_binding,
@@ -151,6 +154,7 @@ async def test_resume_bootstraps_only_the_operation_binding_when_prepared(
 
     class FakeControlPlane:
         state = ModelSessionState(current_model_id="current-model")
+
         def ensure_model_binding_trust(self, *, has_existing_bindings: bool) -> None:
             assert isinstance(has_existing_bindings, bool)
 

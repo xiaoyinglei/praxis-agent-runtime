@@ -415,9 +415,11 @@ def configure_services(
                 if prior is not None and prior["root"] == snapshot["root"]:
                     # Refresh known scopes once for a new Turn. Do not silently
                     # drop nested guidance when only the root was bootstrapped.
-                    snapshot = extend_instructions(snapshot, session.tool_execution_context,
-                                                   (Path(snapshot["root"]) / scope / "AGENTS.md"
-                                                    for scope in prior["directories"]))
+                    snapshot = extend_instructions(
+                        snapshot,
+                        session.tool_execution_context,
+                        (Path(snapshot["root"]) / scope / "AGENTS.md" for scope in prior["directories"]),
+                    )
             return snapshot
 
     session.binding_provider = SessionBindingProvider(
@@ -435,6 +437,7 @@ def configure_services(
         model_token_budget_total=max_tokens_total,
         model_cost_budget_total_micros=max_cost_micros,
         project_instructions=project_instructions_for_turn,
-        request_settings=(None if session.model_control_plane is None else
-                          session.model_control_plane.request_settings),
+        request_settings=(
+            None if session.model_control_plane is None else session.model_control_plane.request_settings
+        ),
     )

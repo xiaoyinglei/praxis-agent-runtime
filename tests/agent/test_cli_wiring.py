@@ -20,7 +20,7 @@ from agent_runtime.cli import (
     _load_knowledge_config,
     agent_app,
 )
-from agent_runtime.harness import RuntimeState
+from agent_runtime.harness import RuntimeStore, turn_ops
 from agent_runtime.model_probe import ModelProbe, ModelProbeEvidence, ProbeLevel
 from agent_runtime.modeling.chat import OpenAICompatibleChatGenerator
 from agent_runtime.models import ModelControlPlane
@@ -73,25 +73,16 @@ def test_cli_defaults_leave_legacy_rag_agent_state_untouched(
 
     assert switched.id == current.id
     assert not cli_module.DEFAULT_CHECKPOINT_PATH.exists()
-    assert json.loads(
-        cli_module.DEFAULT_MODEL_SESSION_PATH.read_text(
-            encoding="utf-8"
-        )
-    ) == {
+    assert json.loads(cli_module.DEFAULT_MODEL_SESSION_PATH.read_text(encoding="utf-8")) == {
         "version": 1,
         "revision": 1,
         "current_model_id": current.id,
     }
 
-    assert (
-        legacy_checkpoint.read_bytes()
-        == b"legacy checkpoint sentinel"
-    )
+    assert legacy_checkpoint.read_bytes() == b"legacy checkpoint sentinel"
 
-    assert (
-        legacy_session.read_text(encoding="utf-8")
-        == legacy_session_text
-    )
+    assert legacy_session.read_text(encoding="utf-8") == legacy_session_text
+
 
 def test_agent_constructor_and_switch_paths_keep_requester_domains() -> None:
     agent = Agent(
@@ -101,27 +92,15 @@ def test_agent_constructor_and_switch_paths_keep_requester_domains() -> None:
 
     current = agent.current_model()
 
-    assert (
-        agent._get_model_control_plane()
-        .state.selection_requester
-        == "system"
-    )
+    assert agent._get_model_control_plane().state.selection_requester == "system"
 
     agent.switch_model(current.id)
 
-    assert (
-        agent._get_model_control_plane()
-        .state.selection_requester
-        == "user"
-    )
+    assert agent._get_model_control_plane().state.selection_requester == "user"
 
     agent._request_model_switch(current.id)
 
-    assert (
-        agent._get_model_control_plane()
-        .state.selection_requester
-        == "agent"
-    )
+    assert agent._get_model_control_plane().state.selection_requester == "agent"
 
 
 def test_agent_and_builder_pass_explicit_workspace_security_domain(
@@ -272,9 +251,7 @@ def test_agent_command_options_match_the_clean_public_contract(
 
     assert command_info is not None
     option_names = {
-        option
-        for parameter in command_info.params
-        for option in (*parameter.opts, *parameter.secondary_opts)
+        option for parameter in command_info.params for option in (*parameter.opts, *parameter.secondary_opts)
     }
     for option in present:
         assert option in option_names
@@ -882,9 +859,10 @@ def test_agent_chat_followup_restores_workspace_but_uses_current_session_model(
         storage_root=tmp_path / "knowledge",
         vector_backend="sqlite",
     )
-    with RuntimeState.open_sync(database) as store:
-        thread = store.create_thread(workspace=turn_workspace)
-        previous = store.start_turn(
+    with RuntimeStore.open_sync(database) as store:
+        thread = turn_ops.create_thread(store, workspace=turn_workspace)
+        previous = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="remember cobalt",
             binding_manifest={
@@ -892,7 +870,8 @@ def test_agent_chat_followup_restores_workspace_but_uses_current_session_model(
                 "knowledge_config": knowledge.model_dump(mode="json"),
             },
         )
-        previous = store.complete_turn(
+        previous = turn_ops.complete_turn(
+            store,
             turn_id=previous.turn_id,
             answer="remembered cobalt",
         )
@@ -1312,13 +1291,17 @@ def test_worktree_pause_recovery_uses_the_effective_database(tmp_path, monkeypat
 
     actual = {}
     workspace = tmp_path / "managed"
-    monkeypatch.setattr(cli_module, "_open_cli_worktree", lambda _name:
-                        SimpleNamespace(worktree=SimpleNamespace(root=workspace)))
+    monkeypatch.setattr(
+        cli_module, "_open_cli_worktree", lambda _name: SimpleNamespace(worktree=SimpleNamespace(root=workspace))
+    )
+
     def create(**kwargs):
         actual.update(kwargs)
         return SimpleNamespace()
+
     async def run(*_args, **_kwargs):
         return SimpleNamespace(status="paused", turn_id="worktree-turn", pause=None)
+
     monkeypatch.setattr(cli_module, "_create_agent_facade", create)
     monkeypatch.setattr(cli_module, "_run_facade_command", run)
     monkeypatch.setattr(cli_module, "_display_agent_result", lambda *_args, **_kwargs: None)

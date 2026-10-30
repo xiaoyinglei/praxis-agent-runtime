@@ -4,6 +4,7 @@ Entries are per database, so independent Sessions never overwrite each other's
 registration. Deletion holds the workspace lock while reading this inventory;
 Session opening holds its shared side while registering a store.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -17,8 +18,7 @@ from agent_runtime.user_config import user_config_directory
 
 def _managed_root(workspace: Path) -> Path | None:
     resolved = workspace.resolve()
-    return next((root for root in (resolved, *resolved.parents)
-                 if (root / ".praxis/worktree.json").is_file()), None)
+    return next((root for root in (resolved, *resolved.parents) if (root / ".praxis/worktree.json").is_file()), None)
 
 
 def _inventory(root: Path) -> Path:
@@ -53,8 +53,12 @@ def registered_workspace_stores(workspace: Path) -> tuple[Path, ...]:
     paths: set[Path] = set()
     for entry in _inventory(root).glob("*.json"):
         record = json.loads(entry.read_text(encoding="utf-8"))
-        if (not isinstance(record, dict) or record.get("version") != 1
-                or record.get("workspace") != str(root) or not isinstance(record.get("database"), str)):
+        if (
+            not isinstance(record, dict)
+            or record.get("version") != 1
+            or record.get("workspace") != str(root)
+            or not isinstance(record.get("database"), str)
+        ):
             raise ValueError("invalid workspace store inventory")
         database = Path(record["database"])
         expected = hashlib.sha256(os.fsencode(database)).hexdigest() + ".json"

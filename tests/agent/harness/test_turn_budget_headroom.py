@@ -5,7 +5,7 @@ from dataclasses import replace
 
 import pytest
 
-from agent_runtime.harness import HarnessModelResponse, ModelToolCall, RuntimeState, ToolOrchestrator
+from agent_runtime.harness import HarnessModelResponse, ModelToolCall, RuntimeStore, ToolOrchestrator, turn_ops
 from agent_runtime.harness.completion import DeliveryCompletionGate
 from agent_runtime.harness.tool_router import StaticToolRouter
 from agent_runtime.tools.permissions import ToolExecutionContext
@@ -17,7 +17,7 @@ from tests.agent.harness.test_tool_orchestrator import _read_tool
 
 @pytest.mark.parametrize("task", ["preserve API constraints", "compare archived research evidence"])
 def test_turn_budget_compacts_while_summary_and_continuation_still_fit(tmp_path, task):
-    with RuntimeState.open_sync(tmp_path / "headroom.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "headroom.db") as store:
         runner, turn, gateway = capacity_runner(
             store, tmp_path, tokens=95_000, messages=2000, summary="Applied work; verification still required."
         )
@@ -28,7 +28,7 @@ def test_turn_budget_compacts_while_summary_and_continuation_still_fit(tmp_path,
         assert original.resource_request.input_tokens < 100_000  # far below the 1M model window
         assert original.resource_request.total_tokens * 2 > 95_000 - 8192
 
-        result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
+        result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
 
         assert result.status == "completed"
         compacted = [i for i in store.list_items(turn.turn_id) if i.kind == "context_compaction"]
@@ -45,10 +45,10 @@ def test_turn_budget_compacts_while_summary_and_continuation_still_fit(tmp_path,
 
 
 def test_ample_turn_budget_keeps_history_and_output_ceiling(tmp_path):
-    with RuntimeState.open_sync(tmp_path / "ample.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "ample.db") as store:
         runner, turn, gateway = capacity_runner(store, tmp_path, tokens=1_200_000, messages=2000)
         seed(store, turn_id=turn.turn_id, kind="agent_message", payload={"text": "history" * 5500})
-        result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
+        result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "completed"
         assert not any(i.kind == "context_compaction" for i in store.list_items(turn.turn_id))
         assert len(gateway.requests) == 1
@@ -57,14 +57,15 @@ def test_ample_turn_budget_keeps_history_and_output_ceiling(tmp_path):
 @pytest.mark.parametrize("check_passed", [True, False])
 def test_long_context_compaction_keeps_post_change_gate_and_frozen_budget(tmp_path, check_passed):
     database = tmp_path / "delivery.db"
-    with RuntimeState.open_sync(database) as store:
+    with RuntimeStore.open_sync(database) as store:
         runner, turn, gateway = capacity_runner(
             store, tmp_path, tokens=100_000, messages=2000, summary="Changed value.txt; retain recorded check outcome."
         )
         # The capacity helper starts a normal Turn; construct a delivery Turn
         # in the same thread so the production completion policy is frozen.
-        store.fail_turn(turn_id=turn.turn_id, reason_code="fixture", message="fixture")
-        turn = store.start_turn(
+        turn_ops.fail_turn(store, turn_id=turn.turn_id, reason_code="fixture", message="fixture")
+        turn = turn_ops.start_turn(
+            store,
             thread_id=turn.thread_id,
             user_message="Keep the public async API unchanged.",
             binding_manifest={**turn.binding_manifest, "completion_policy": {"require_workspace_change": True}},
@@ -91,11 +92,15 @@ def test_long_context_compaction_keeps_post_change_gate_and_frozen_budget(tmp_pa
         runner._completion_gate = DeliveryCompletionGate(store)
         context = runner.restore_turn_context(turn.turn_id)
         # Reopen from durable state, as approval recovery does; no budget reset.
-    with RuntimeState.open_sync(database) as reopened:
+    with RuntimeStore.open_sync(database) as reopened:
         runner._store = reopened
+        runner._model_runner._store = reopened
+        runner._context_engine._store = reopened
         runner._context_manager = type(runner._context_manager)(reopened)
+        runner._model_runner._context_manager = runner._context_manager
+        runner._context_engine._context_manager = runner._context_manager
         runner._completion_gate = DeliveryCompletionGate(reopened)
-        result = asyncio.run(runner.run_turn(context, start_step=1))
+        result = asyncio.run(runner.drive(context, start_step=1))
         assert (result.status == "completed") is check_passed
         if not check_passed:
             assert result.status == "failed" and result.answer is None
@@ -112,7 +117,7 @@ def test_repeated_real_file_tool_results_keep_an_affordable_summary_escape_path(
     """Grow the real transcript and charge measured inputs, not constant fake usage."""
     for index in range(6):
         (tmp_path / f"{index}.txt").write_text(f"evidence {index}: " + "data " * 2000)
-    with RuntimeState.open_sync(tmp_path / "loop.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "loop.db") as store:
         runner, turn, _gateway = capacity_runner(
             store, tmp_path, tokens=220_000, messages=2000, summary="Retain objective and already-read evidence."
         )
@@ -150,7 +155,7 @@ def test_repeated_real_file_tool_results_keep_an_affordable_summary_escape_path(
             )
 
         runner._model.dispatch = dispatch
-        result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
+        result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "completed", store.read_turn(turn.turn_id).terminal_message
         assert calls == 7
         assert len(store.list_tool_operations(turn.turn_id)) == 6

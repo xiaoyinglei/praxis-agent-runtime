@@ -537,12 +537,18 @@ def apply_record(
             if record.payload_schema_version >= 3:
                 identity = payload.get("answer_item_id")
                 answer = state.items.get(identity) if isinstance(identity, str) else None
-                if (answer is None or answer["turn_id"] != turn_id or answer["status"] != "completed"
-                        or answer["kind"] not in {"model_response", "agent_message"}
-                        or (answer["kind"] == "agent_message" and not isinstance(answer["payload"].get("text"), str))
-                        or (answer["kind"] == "model_response" and not isinstance(
-                            answer["payload"].get("outputs"), (list, tuple)))
-                        or answer["payload"].get("response_status", "completed") != "completed"):
+                if (
+                    answer is None
+                    or answer["turn_id"] != turn_id
+                    or answer["status"] != "completed"
+                    or answer["kind"] not in {"model_response", "agent_message"}
+                    or (answer["kind"] == "agent_message" and not isinstance(answer["payload"].get("text"), str))
+                    or (
+                        answer["kind"] == "model_response"
+                        and not isinstance(answer["payload"].get("outputs"), (list, tuple))
+                    )
+                    or answer["payload"].get("response_status", "completed") != "completed"
+                ):
                     raise ValueError("Turn completion requires a committed answer Item from this Turn")
             turn = state.turns[turn_id]
             turn["status"] = "completed"
@@ -557,15 +563,33 @@ def apply_record(
             turn = state.turns[turn_id]
             turn["status"] = "cancelled" if record.record_type == "turn_cancelled" else "failed"
             turn["terminal_reason_code"] = (
-                "cancelled"
-                if record.record_type == "turn_cancelled"
-                else payload["reason_code"]
+                "cancelled" if record.record_type == "turn_cancelled" else payload["reason_code"]
             )
             turn["terminal_message"] = payload.get("message")
             turn["applied_thread_sequence"] = sequence
             thread = state.threads[thread_id]
             thread["active_turn_id"] = None
             thread["applied_thread_sequence"] = sequence
+        case "execution_protocol_adopted" | "response_handling_decided" | "tool_batch_admitted":
+            turn_id = _turn_id(record)
+            if record.producer != "runtime" or turn_id not in state.turns:
+                raise ValueError("execution handling fact requires its runtime-owned Turn")
+            if record.record_type == "response_handling_decided":
+                response = state.items.get(payload["response_item_id"])
+                handling_operation = state.model_operations.get(payload["operation_id"])
+                if (
+                    response is None
+                    or handling_operation is None
+                    or response["turn_id"] != turn_id
+                    or handling_operation.get("response_item_id") != payload["response_item_id"]
+                    or handling_operation["status"] != "completed"
+                ):
+                    raise ValueError("handling receipt must reference a completed canonical response")
+            if record.record_type == "tool_batch_admitted":
+                response = state.items.get(payload["response_item_id"])
+                if response is None or response["turn_id"] != turn_id or response["status"] != "completed":
+                    raise ValueError("batch admission requires a committed response")
+            _advance(state, thread_id, turn_id, sequence)
         case _:
             raise ValueError(f"unsupported record type: {record.record_type}")
 
@@ -589,7 +613,7 @@ def _identity_v1(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     return payload
 
 
-_PAYLOAD_UPCASTERS = {1: _identity_v1, 2: _identity_v1, 3: _identity_v1}
+_PAYLOAD_UPCASTERS = {1: _identity_v1, 2: _identity_v1, 3: _identity_v1, 4: _identity_v1}
 
 
 def _advance(

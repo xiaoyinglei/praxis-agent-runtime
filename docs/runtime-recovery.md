@@ -89,7 +89,7 @@ Linux 的候选工作区支持工作区内相对符号链接，保留普通文�
 
 ## 工具批次、取消与结果恢复
 
-同一模型响应的原生 `tool_calls` 经 `TurnExecutor` 进入
+同一模型响应的原生 `tool_calls` 经 `TurnRunner` 进入
 `ToolOrchestrator.execute_batch`：先记录全部调用，再按能力及状态边界分段。
 `ToolExecutor` 预检当前段，按 `max_parallel_calls` 和已解析资源冲突分批执行。
 独占工具、远程未知结果和改变运行时状态的操作保持执行屏障；运行时不根据工具名、
@@ -124,3 +124,12 @@ claim 事件投递期间、runner 尚未进入时的取消会提交确定的取�
 以及 [Claude 的完整并行工具结果协议](https://platform.claude.com/docs/en/agents-and-tools/tool-use/parallel-tool-use)。
 Python 实现复用本项目执行和持久化组件，没有复制外部源码；Claude 本地参考副本仅用于比较，
 不作为已核实私有核心或可复制授权的依据。
+
+
+## 单一驱动与幂等回复
+
+普通运行、prepared replay、unknown 显式 retry、工具批次恢复、交互回复和压缩续跑均由 `TurnRunner.drive` 推进。响应先成为 canonical Item；处理收据绑定确切 operation 和 response Item，工具调用在执行前整批持久接纳。进程在任一边界退出后，从这些事实恢复，保留原调用身份和已完成结果。
+
+clarification/choice 的回复按原 `expected_request_id` 保存。回复已提交但确认丢失时，同身份、同内容重试继续当前工作；不同内容拒绝。旧回复不会被应用到后来出现的新问题。已提交取消事实优先于下一请求、工具 claim 和答案完成；provider 已经发生的用量仍保留。
+
+容量拒绝形成持久恢复链。压缩后的请求、新输入导致的 supersede 和进程重启继续携带同一 root；成功消费正常 Step 才结束该链。同链再次超过 provider 容量明确失败，不无限购买摘要。

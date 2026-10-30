@@ -10,17 +10,18 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from agent_runtime.core.runtime_diagnostics import redact_sensitive_text
+from agent_runtime.harness import memory_ops, turn_ops
 from agent_runtime.harness.memory import MemoryEntry
 from agent_runtime.harness.memory_identity import thread_in_memory_scope
 from agent_runtime.harness.protocol import ContextSourceChangedError
-from agent_runtime.harness.state import RuntimeState, _state_operation
+from agent_runtime.harness.runtime_store import RuntimeStore, owner_operation
 from agent_runtime.tools.tool import JsonValue, NormalizedToolOutput, Tool
 
 MemoryKind = Literal["preference", "fact", "reference"]
 
 
 def record_revision(
-    store: RuntimeState,
+    store: RuntimeStore,
     state: dict[str, Any],
     entry: Mapping[str, Any],
     *,
@@ -51,9 +52,9 @@ def record_revision(
     return stamped
 
 
-@_state_operation
+@owner_operation
 def _write(
-    store: RuntimeState,
+    store: RuntimeStore,
     workspace: Path,
     *,
     action: str,
@@ -83,8 +84,9 @@ def _write(
             key=key, title=clean_title, text=clean_text, kind=selected_kind, source_item_ids=["pending"]
         ).model_dump()
         if source_item_ids is None:
-            thread = store.create_thread(workspace=workspace)
-            turn = store.start_turn(
+            thread = turn_ops.create_thread(store, workspace=workspace)
+            turn = turn_ops.start_turn(
+                store,
                 thread_id=thread.thread_id,
                 binding_manifest={"memory_maintenance": True, "memory_management": True},
                 user_message=json.dumps(
@@ -93,14 +95,11 @@ def _write(
                 ),
             )
             source_item_ids = [i.item_id for i in store.list_items(turn.turn_id) if i.kind == "user_message"]
-            store.complete_turn(turn_id=turn.turn_id, answer=f"memory {action} recorded")
+            turn_ops.complete_turn(store, turn_id=turn.turn_id, answer=f"memory {action} recorded")
         refs = {}
         for ref in source_item_ids:
             item = store.read_item(ref)
-            if (
-                item.kind != "user_message"
-                or not thread_in_memory_scope(store, workspace, item.thread_id)
-            ):
+            if item.kind != "user_message" or not thread_in_memory_scope(store, workspace, item.thread_id):
                 raise ValueError("explicit memory provenance must be a user message in this workspace")
             refs[ref] = item.thread_id
         validated["source_item_ids"] = list(source_item_ids)
@@ -111,11 +110,11 @@ def _write(
         )
         state["entries"] = [e for e in state["entries"] if e["key"] != key] + [entry]
         state["deleted_keys"] = [k for k in state["deleted_keys"] if k != key]
-        return store.commit_memory_state(workspace, expected_version=state["version"], state=state)
+        return memory_ops.commit_memory_state(store, workspace, expected_version=state["version"], state=state)
 
 
 def remember_memory(
-    store: RuntimeState,
+    store: RuntimeStore,
     workspace: Path,
     *,
     key: str,
@@ -139,7 +138,7 @@ def remember_memory(
 
 
 def edit_memory(
-    store: RuntimeState,
+    store: RuntimeStore,
     workspace: Path,
     *,
     key: str,
@@ -163,7 +162,7 @@ def edit_memory(
 
 
 def explain_memory(
-    store: RuntimeState,
+    store: RuntimeStore,
     workspace: Path,
     *,
     key: str,
@@ -190,7 +189,7 @@ def explain_memory(
     }
 
 
-def create_memory_management_tool(store: RuntimeState) -> Tool:
+def create_memory_management_tool(store: RuntimeStore) -> Tool:
     from agent_runtime.harness.tool_orchestrator import current_tool_turn_id
     from agent_runtime.tools.tool import (
         CancellationMode,
@@ -250,12 +249,14 @@ def create_memory_management_tool(store: RuntimeState) -> Tool:
         else:
             if thread.parent_thread_id is not None or turn.binding_manifest.get("budget_parent_turn_id"):
                 raise ValueError("child agents cannot make explicit user memory edits")
+
             def write() -> dict[str, Any]:
                 with store.persistence.transaction():
                     if not thread_in_memory_scope(store, workspace, turn.thread_id):
                         raise ContextSourceChangedError("memory workspace binding changed before explicit edit")
                     sources = [
-                        i.item_id for i in store.list_items(turn.turn_id)
+                        i.item_id
+                        for i in store.list_items(turn.turn_id)
                         if i.kind == "user_message" and i.status == "completed" and i.producer == "user"
                     ]
                     if not sources:
@@ -275,12 +276,19 @@ def create_memory_management_tool(store: RuntimeState) -> Tool:
                     }
                     if action == "remember":
                         changed = remember_memory(
-                            store, workspace, title=arguments.get("title", key),
-                            kind=arguments.get("kind", "fact"), **kwargs,
+                            store,
+                            workspace,
+                            title=arguments.get("title", key),
+                            kind=arguments.get("kind", "fact"),
+                            **kwargs,
                         )
                     else:
                         changed = edit_memory(
-                            store, workspace, title=arguments.get("title"), kind=arguments.get("kind"), **kwargs,
+                            store,
+                            workspace,
+                            title=arguments.get("title"),
+                            kind=arguments.get("kind"),
+                            **kwargs,
                         )
                     return {
                         "version": changed["version"],

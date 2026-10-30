@@ -8,16 +8,17 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime.harness import RuntimeState
+from agent_runtime.harness import RuntimeStore, artifact_ops, model_ops, tool_ops, turn_ops
 
 
 class InjectedArtifactCrashError(RuntimeError):
     pass
 
 
-def _turn(store: RuntimeState, workspace: Path) -> str:
-    thread = store.create_thread(workspace=workspace)
-    return store.start_turn(
+def _turn(store: RuntimeStore, workspace: Path) -> str:
+    thread = turn_ops.create_thread(store, workspace=workspace)
+    return turn_ops.start_turn(
+        store,
         thread_id=thread.thread_id,
         user_message="retain one binary artifact",
         binding_manifest={"model_id": "test-model"},
@@ -50,10 +51,11 @@ def test_artifact_write_before_reference_survives_every_crash_boundary(
         if observed == phase:
             raise InjectedArtifactCrashError(phase)
 
-    with RuntimeState.open_sync(database) as store:
+    with RuntimeStore.open_sync(database) as store:
         turn_id = _turn(store, workspace)
         with pytest.raises(InjectedArtifactCrashError, match=phase):
-            store.commit_artifact(
+            artifact_ops.commit_artifact(
+                store,
                 turn_id=turn_id,
                 content=source if from_file else b"complete artifact bytes",
                 media_type="application/octet-stream",
@@ -61,7 +63,7 @@ def test_artifact_write_before_reference_survives_every_crash_boundary(
                 fault_injector=crash,
             )
 
-    with RuntimeState.open_sync(database) as reopened:
+    with RuntimeStore.open_sync(database) as reopened:
         artifacts = reopened.list_artifacts(turn_id)
         assert bool(artifacts) is committed
         if committed:
@@ -103,12 +105,14 @@ def test_fresh_process_crash_never_leaves_a_record_pointing_to_partial_blob(
     database = tmp_path / "rollout.sqlite3"
     source = tmp_path / "source.bin"
     source.write_bytes(b"fresh process artifact")
-    with RuntimeState.open_sync(database) as store:
+    with RuntimeStore.open_sync(database) as store:
         turn_id = _turn(store, workspace)
     script = """
+from agent_runtime.harness import artifact_ops
+
 import os
 from pathlib import Path
-from agent_runtime.harness import RuntimeState
+from agent_runtime.harness import RuntimeStore
 
 database = Path(os.environ["ARTIFACT_TEST_DATABASE"])
 turn_id = os.environ["ARTIFACT_TEST_TURN"]
@@ -118,8 +122,8 @@ def crash(observed: str) -> None:
     if observed == phase:
         os._exit(97)
 
-with RuntimeState.open_sync(database) as store:
-    store.commit_artifact(
+with RuntimeStore.open_sync(database) as store:
+    artifact_ops.commit_artifact(store,
         turn_id=turn_id,
         content=Path(os.environ["ARTIFACT_TEST_SOURCE"]) if os.environ["ARTIFACT_TEST_FROM_FILE"] == "1"
                 else b"fresh process artifact",
@@ -145,7 +149,7 @@ with RuntimeState.open_sync(database) as store:
     )
 
     assert completed.returncode == 97, completed.stderr
-    with RuntimeState.open_sync(database) as reopened:
+    with RuntimeStore.open_sync(database) as reopened:
         artifacts = reopened.list_artifacts(turn_id)
         assert bool(artifacts) is committed
         assert reopened.verify().valid is True
@@ -161,15 +165,17 @@ def test_corrupt_referenced_artifact_fails_verify_and_blocks_dispatch(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RuntimeState.open_sync(database) as store:
+    with RuntimeStore.open_sync(database) as store:
         turn_id = _turn(store, workspace)
-        artifact = store.commit_artifact(
+        artifact = artifact_ops.commit_artifact(
+            store,
             turn_id=turn_id,
             content=b"trusted bytes",
             media_type="text/plain",
             name="evidence.txt",
         )
-        store.record_tool_result(
+        tool_ops.record_tool_result(
+            store,
             turn_id=turn_id,
             operation_id=None,
             result={
@@ -185,7 +191,8 @@ def test_corrupt_referenced_artifact_fails_verify_and_blocks_dispatch(
                 ],
             },
         )
-        operation = store.prepare_model_operation(
+        operation = model_ops.prepare_model_operation(
+            store,
             turn_id=turn_id,
             request_hash="request-hash",
             context_hash="context-hash",
@@ -203,16 +210,17 @@ def test_corrupt_referenced_artifact_fails_verify_and_blocks_dispatch(
         assert report.valid is False
         assert any("artifact" in error for error in report.errors)
         with pytest.raises(RuntimeError, match="artifact integrity"):
-            store.dispatch_model_attempt(operation.operation_id)
+            model_ops.dispatch_model_attempt(store, operation.operation_id)
 
 
 def test_tool_result_cannot_reference_an_unknown_artifact(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
         turn_id = _turn(store, workspace)
         with pytest.raises(RuntimeError, match="unknown artifact"):
-            store.record_tool_result(
+            tool_ops.record_tool_result(
+                store,
                 turn_id=turn_id,
                 operation_id=None,
                 result={
@@ -256,12 +264,16 @@ def test_file_artifact_is_streamed_and_independent_of_source(tmp_path: Path, mon
             return BoundedReader(stream)
         return stream
 
-    with RuntimeState.open_sync(tmp_path / "run.db") as state:
+    with RuntimeStore.open_sync(tmp_path / "run.db") as state:
         turn_id = _turn(state, tmp_path)
         with monkeypatch.context() as patch:
             patch.setattr(os, "fdopen", open_file)
-            artifact = state.commit_artifact(
-                turn_id=turn_id, content=source, media_type="application/octet-stream", name=source.name,
+            artifact = artifact_ops.commit_artifact(
+                state,
+                turn_id=turn_id,
+                content=source,
+                media_type="application/octet-stream",
+                name=source.name,
             )
         assert reads
         assert artifact.blob_sha256 == expected_hash
@@ -272,7 +284,7 @@ def test_file_artifact_is_streamed_and_independent_of_source(tmp_path: Path, mon
 
 
 def test_gc_reports_partial_filesystem_failure_and_can_be_retried(tmp_path: Path, monkeypatch) -> None:
-    with RuntimeState.open_sync(tmp_path / "run.db") as state:
+    with RuntimeStore.open_sync(tmp_path / "run.db") as state:
         temporary = state.artifact_root / "tmp"
         temporary.mkdir(parents=True)
         paths = [temporary / name for name in ("a.tmp", "b.tmp", "c.tmp")]
@@ -300,7 +312,7 @@ def test_gc_reports_partial_filesystem_failure_and_can_be_retried(tmp_path: Path
 
 @pytest.mark.parametrize("age", [0, -1, float("nan"), float("inf"), True])
 def test_gc_rejects_invalid_grace_period(tmp_path: Path, age) -> None:
-    with RuntimeState.open_sync(tmp_path / "run.db") as state:
+    with RuntimeStore.open_sync(tmp_path / "run.db") as state:
         with pytest.raises(ValueError, match="finite positive"):
             state.gc_unreferenced_artifacts(min_age_seconds=age)
 
@@ -308,7 +320,7 @@ def test_gc_rejects_invalid_grace_period(tmp_path: Path, age) -> None:
 def _gc_process(database: Path, connection) -> None:
     import sqlite3
 
-    with RuntimeState.open_sync(database) as state:
+    with RuntimeStore.open_sync(database) as state:
         state.run_sync(lambda: state.persistence._connection.execute("PRAGMA busy_timeout=50").close())
         connection.send("ready")
         while connection.recv() == "collect":
@@ -330,7 +342,7 @@ def test_process_gc_cannot_delete_a_blob_between_install_and_reference(tmp_path,
     context = multiprocessing.get_context("spawn")
     parent, child = context.Pipe()
     process = context.Process(target=_gc_process, args=(database, child))
-    with RuntimeState.open_sync(database) as state:
+    with RuntimeStore.open_sync(database) as state:
         turn_id = _turn(state, tmp_path)
 
         def leave_orphan(stage):
@@ -338,8 +350,12 @@ def test_process_gc_cannot_delete_a_blob_between_install_and_reference(tmp_path,
                 raise InjectedArtifactCrashError("orphan")
 
         with pytest.raises(InjectedArtifactCrashError):
-            state.commit_artifact(
-                turn_id=turn_id, content=b"reused orphan", media_type="text/plain", name="orphan",
+            artifact_ops.commit_artifact(
+                state,
+                turn_id=turn_id,
+                content=b"reused orphan",
+                media_type="text/plain",
+                name="orphan",
                 fault_injector=leave_orphan,
             )
         [blob] = list((state.artifact_root / "blobs").iterdir())
@@ -359,9 +375,13 @@ def test_process_gc_cannot_delete_a_blob_between_install_and_reference(tmp_path,
                         raise InjectedArtifactCrashError("rollback")
 
             def commit():
-                return state.commit_artifact(
-                    turn_id=turn_id, content=source if from_file else b"reused orphan",
-                    media_type="text/plain", name="retained", fault_injector=collect_before_reference,
+                return artifact_ops.commit_artifact(
+                    state,
+                    turn_id=turn_id,
+                    content=source if from_file else b"reused orphan",
+                    media_type="text/plain",
+                    name="retained",
+                    fault_injector=collect_before_reference,
                 )
 
             if rollback:
@@ -388,7 +408,7 @@ def test_process_gc_cannot_delete_a_blob_between_install_and_reference(tmp_path,
 
 
 def test_low_level_blob_installation_requires_the_gc_write_boundary(tmp_path):
-    with RuntimeState.open_sync(tmp_path / "run.db") as state:
+    with RuntimeStore.open_sync(tmp_path / "run.db") as state:
         with pytest.raises(RuntimeError, match="write transaction"):
             state.persistence.install_blob(b"unprotected")
         assert not state.artifact_root.exists()
@@ -400,12 +420,16 @@ def test_file_artifact_rejects_a_changed_expected_source(tmp_path):
     source = tmp_path / "source.bin"
     expected = hashlib.sha256(b"original").hexdigest()
     source.write_bytes(b"replaced")
-    with RuntimeState.open_sync(tmp_path / "run.db") as state:
+    with RuntimeStore.open_sync(tmp_path / "run.db") as state:
         turn_id = _turn(state, tmp_path)
         with pytest.raises(RuntimeError, match="source hash mismatch"):
-            state.commit_artifact(
-                turn_id=turn_id, content=source, expected_sha256=expected,
-                media_type="text/plain", name="source.bin",
+            artifact_ops.commit_artifact(
+                state,
+                turn_id=turn_id,
+                content=source,
+                expected_sha256=expected,
+                media_type="text/plain",
+                name="source.bin",
             )
         assert state.list_artifacts(turn_id) == ()
         assert not list((state.artifact_root / "blobs").iterdir())
@@ -419,11 +443,15 @@ def test_file_artifact_rejects_nonregular_sources_without_committing(tmp_path, s
     if source_kind == "fifo":
         source = tmp_path / "fifo"
         os.mkfifo(source)
-    with RuntimeState.open_sync(tmp_path / "run.db") as state:
+    with RuntimeStore.open_sync(tmp_path / "run.db") as state:
         turn_id = _turn(state, tmp_path)
         before = state.list_turn_records(turn_id)
         with pytest.raises(ValueError, match="regular file"):
-            state.commit_artifact(
-                turn_id=turn_id, content=source, media_type="application/octet-stream", name=source_kind,
+            artifact_ops.commit_artifact(
+                state,
+                turn_id=turn_id,
+                content=source,
+                media_type="application/octet-stream",
+                name=source_kind,
             )
         assert state.list_turn_records(turn_id) == before

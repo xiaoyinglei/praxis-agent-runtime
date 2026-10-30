@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime.harness import RolloutEventReader, RuntimeState
+from agent_runtime.harness import RolloutEventReader, RuntimeStore, context_ops, model_ops, tool_ops, turn_ops
 from agent_runtime.harness.protocol import HarnessModelResponse
 from agent_runtime.harness.records import RolloutRecord
 from agent_runtime.streaming.events import EventType, StreamEvent, derive_model_public_item_id
@@ -28,7 +28,7 @@ def record(record_type: str, payload: dict, *, index: int = 1) -> RolloutRecord:
 
 @pytest.fixture
 def reader(tmp_path: Path):
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as state:
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as state:
         yield RolloutEventReader(state)
 
 
@@ -36,10 +36,10 @@ def test_interaction_request_and_resolution_are_actionable_and_replayable(tmp_pa
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RuntimeState.open_sync(database) as state:
-        thread = state.create_thread(workspace=workspace)
-        turn = state.start_turn(thread_id=thread.thread_id, user_message="ask first", binding_manifest={})
-        interaction = state.request_clarification(turn_id=turn.turn_id, question="Which branch?")
+    with RuntimeStore.open_sync(database) as state:
+        thread = turn_ops.create_thread(state, workspace=workspace)
+        turn = turn_ops.start_turn(state, thread_id=thread.thread_id, user_message="ask first", binding_manifest={})
+        interaction = turn_ops.request_clarification(state, turn_id=turn.turn_id, question="Which branch?")
         waiting = RolloutEventReader(state).read(thread.thread_id)
         requested = [event for event in waiting if event.event_type == "interaction_requested"]
         assert len(requested) == 1
@@ -50,7 +50,9 @@ def test_interaction_request_and_resolution_are_actionable_and_replayable(tmp_pa
             "request": {"question": "Which branch?"},
         }
         cursor = requested[0].cursor
-        state.resolve_clarification(turn_id=turn.turn_id, request_id=interaction.request_id, response="private answer")
+        turn_ops.resolve_clarification(
+            state, turn_id=turn.turn_id, request_id=interaction.request_id, response="private answer"
+        )
         tail = RolloutEventReader(state).read(thread.thread_id, after=cursor)
         resolved = [event for event in tail if event.event_type == "interaction_resolved"]
         assert len(resolved) == 1
@@ -58,7 +60,7 @@ def test_interaction_request_and_resolution_are_actionable_and_replayable(tmp_pa
         assert resolved[0].data["status"] == "resolved"
         assert "private answer" not in str(resolved[0].data)
         expected = [(event.event_type, event.data, event.cursor) for event in tail]
-    with RuntimeState.open_sync(database) as reopened:
+    with RuntimeStore.open_sync(database) as reopened:
         replay = RolloutEventReader(reopened).read(thread.thread_id, after=cursor)
         assert [(event.event_type, event.data, event.cursor) for event in replay] == expected
 
@@ -67,10 +69,11 @@ def test_interaction_request_and_resolution_are_actionable_and_replayable(tmp_pa
 def test_actual_approval_control_actions_preserve_interaction_outcome(tmp_path: Path, action: str, status: str) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as state:
-        thread = state.create_thread(workspace=workspace)
-        turn = state.start_turn(thread_id=thread.thread_id, user_message="write a file", binding_manifest={})
-        approval = state.request_tool_approval(
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as state:
+        thread = turn_ops.create_thread(state, workspace=workspace)
+        turn = turn_ops.start_turn(state, thread_id=thread.thread_id, user_message="write a file", binding_manifest={})
+        approval = tool_ops.request_tool_approval(
+            state,
             turn_id=turn.turn_id,
             operation_id="operation-1",
             tool_call_id="call-1",
@@ -82,10 +85,10 @@ def test_actual_approval_control_actions_preserve_interaction_outcome(tmp_path: 
             effects=("write",),
         )
         if action == "abort":
-            state.cancel_turn(turn_id=turn.turn_id)
+            turn_ops.cancel_turn(state, turn_id=turn.turn_id)
         else:
-            state.refresh_tool_approval(
-                turn_id=turn.turn_id, request={"tool_name": "write_file", "question": "Allow again?"}
+            tool_ops.refresh_tool_approval(
+                state, turn_id=turn.turn_id, request={"tool_name": "write_file", "question": "Allow again?"}
             )
         resolved = [
             event
@@ -102,12 +105,15 @@ def test_actual_approval_control_actions_preserve_interaction_outcome(tmp_path: 
 def test_actual_compaction_notification_keeps_version_and_refs_without_summary(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as state:
-        thread = state.create_thread(workspace=workspace)
-        turn = state.start_turn(thread_id=thread.thread_id, user_message="compact history", binding_manifest={})
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as state:
+        thread = turn_ops.create_thread(state, workspace=workspace)
+        turn = turn_ops.start_turn(
+            state, thread_id=thread.thread_id, user_message="compact history", binding_manifest={}
+        )
         covered = tuple(item.item_id for item in state.list_context_items(turn.turn_id) if item.status == "completed")
         source_revision = state.context_source_revision(turn.turn_id)
-        state.record_context_compaction(
+        context_ops.record_context_compaction(
+            state,
             turn_id=turn.turn_id,
             covered_item_ids=covered,
             summary="private summary text",
@@ -145,10 +151,11 @@ def test_incomplete_response_remains_visible_without_invalidating_completed_outp
     database = tmp_path / "rollout.sqlite3"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(database) as state:
-        thread = state.create_thread(workspace=workspace)
-        turn = state.start_turn(thread_id=thread.thread_id, user_message="answer fully", binding_manifest={})
-        operation = state.prepare_model_operation(
+    with RuntimeStore.open_sync(database) as state:
+        thread = turn_ops.create_thread(state, workspace=workspace)
+        turn = turn_ops.start_turn(state, thread_id=thread.thread_id, user_message="answer fully", binding_manifest={})
+        operation = model_ops.prepare_model_operation(
+            state,
             turn_id=turn.turn_id,
             request_hash="request-1",
             context_hash="context-1",
@@ -156,8 +163,11 @@ def test_incomplete_response_remains_visible_without_invalidating_completed_outp
             wire_hash="wire-1",
             request_ref={"input_revision": 1, "request_id": "request-1"},
         )
-        attempt = state.dispatch_model_attempt(operation.operation_id, worker_id="worker-1", lease_seconds=30)
-        assert state.complete_model_attempt(
+        attempt = model_ops.dispatch_model_attempt(
+            state, operation.operation_id, worker_id="worker-1", lease_seconds=30
+        )
+        assert model_ops.complete_model_attempt(
+            state,
             operation_id=operation.operation_id,
             attempt_id=attempt.attempt_id,
             generation=attempt.generation,
@@ -188,7 +198,7 @@ def test_incomplete_response_remains_visible_without_invalidating_completed_outp
         assert len(outputs) == 1
         assert outputs[0].event.status.value == "success"
         expected = [(event.event_type, event.data, event.cursor) for event in events]
-    with RuntimeState.open_sync(database) as state:
+    with RuntimeStore.open_sync(database) as state:
         events = RolloutEventReader(state).read(thread.thread_id)
         assert [(event.event_type, event.data, event.cursor) for event in events] == expected
 

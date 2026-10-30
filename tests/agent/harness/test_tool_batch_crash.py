@@ -1,4 +1,5 @@
 """An actual dead batch worker must not replay completed or uncertain calls."""
+
 from __future__ import annotations
 
 import asyncio
@@ -10,16 +11,21 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime.harness import HarnessModelResponse, ModelToolCall, RuntimeState, Session
+from agent_runtime.harness import HarnessModelResponse, ModelToolCall, RuntimeStore, Session, tool_ops
 from tests.agent.harness.test_tool_orchestrator import AcceptToolAnswer, ToolThenAnswerModel, _read_tool
 
 
 class CrashBatchModel(ToolThenAnswerModel):
     async def dispatch(self, prepared, *, event_sink=None):
         if self.requests[-1].step == 1:
-            return HarnessModelResponse.from_parts(text="", provider_response_id="batch", usage={}, tool_calls=tuple(
-                ModelToolCall(id=f"call-{i}", name="read_file", arguments={"path": str(i)}) for i in range(3)
-            ))
+            return HarnessModelResponse.from_parts(
+                text="",
+                provider_response_id="batch",
+                usage={},
+                tool_calls=tuple(
+                    ModelToolCall(id=f"call-{i}", name="read_file", arguments={"path": str(i)}) for i in range(3)
+                ),
+            )
         return HarnessModelResponse.from_parts(text="README was read", provider_response_id="done", usage={})
 
 
@@ -29,7 +35,7 @@ async def test_killed_batch_retains_finished_result_reconciles_uncertain_and_run
     workspace.mkdir()
     database = tmp_path / "state.db"
     launches = tmp_path / "launches.txt"
-    script = '''
+    script = """
 import asyncio, sys
 from pathlib import Path
 from dataclasses import replace
@@ -53,15 +59,19 @@ async def main():
         print(session.thread_id, flush=True)
         await session.submit("inspect independent records")
 asyncio.run(main())
-'''
-    child = subprocess.Popen([sys.executable, "-u", "-c", script, str(workspace), str(database), str(launches)],
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                             env={**os.environ, "PYTHONPATH": str(Path.cwd())})
+"""
+    child = subprocess.Popen(
+        [sys.executable, "-u", "-c", script, str(workspace), str(database), str(launches)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "PYTHONPATH": str(Path.cwd())},
+    )
     try:
         thread_id = (await asyncio.wait_for(asyncio.to_thread(child.stdout.readline), 10)).strip()
         assert (await asyncio.wait_for(asyncio.to_thread(child.stdout.readline), 10)).strip() == "WAITING"
         for _ in range(100):
-            async with (await RuntimeState.open(database)) as store:
+            async with await RuntimeStore.open(database) as store:
                 operations = store.list_tool_operations()
                 if any(op.tool_call_id == "call-0" and op.result_item_id for op in operations):
                     turn_id = operations[0].turn_id
@@ -84,24 +94,41 @@ asyncio.run(main())
         return {"text": args["path"]}
 
     model = CrashBatchModel()
-    async with await Session.open(database=database, workspace=workspace, thread_id=thread_id, model=model,
+    async with await Session.open(
+        database=database,
+        workspace=workspace,
+        thread_id=thread_id,
+        model=model,
         tools={"read_file": replace(_read_tool(workspace=workspace), run=run, timeout_seconds=60)},
-        completion_gate=AcceptToolAnswer()) as reopened:
+        completion_gate=AcceptToolAnswer(),
+    ) as reopened:
         result = await reopened.resume(turn_id, action="continue")
         assert result.status == "paused" and result.pause.kind == "tool_reconciliation"
         assert launches.read_text().splitlines() == ["0", "1"]
         assert not model.requests
         unknown = [op for op in reopened.store.list_tool_operations(turn_id) if op.status == "unknown"]
         assert [op.tool_call_id for op in unknown] == ["call-1"]
-        reopened.store.resolve_tool_reconciliation(turn_id=turn_id, status="failed", result={
-            "tool_call_id": "call-1", "tool_name": "read_file", "is_error": True,
-            "error_code": "interrupted", "model_content": "Original operation independently reconciled.",
-            "content": [], "attachments": [],
-        }, reconciler_revision="test-independent-observation-v1")
+        tool_ops.resolve_tool_reconciliation(
+            reopened.store,
+            turn_id=turn_id,
+            status="failed",
+            result={
+                "tool_call_id": "call-1",
+                "tool_name": "read_file",
+                "is_error": True,
+                "error_code": "interrupted",
+                "model_content": "Original operation independently reconciled.",
+                "content": [],
+                "attachments": [],
+            },
+            reconciler_revision="test-independent-observation-v1",
+        )
         result = await reopened.resume(turn_id, action="continue")
         assert result.status == "done"
         assert launches.read_text().splitlines() == ["0", "1", "2"]
         assert [m.tool_call_id for m in model.requests[-1].messages if m.role == "tool"] == [
-            "call-0", "call-1", "call-2",
+            "call-0",
+            "call-1",
+            "call-2",
         ]
         assert reopened.store.verify().valid

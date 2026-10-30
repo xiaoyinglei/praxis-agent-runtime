@@ -8,7 +8,7 @@ import json
 import pytest
 
 from agent_runtime.core.messages import ModelToolCall, StopReason, ToolUseResult
-from agent_runtime.harness import RolloutContextManager, RuntimeState, TurnExecutor
+from agent_runtime.harness import RolloutContextManager, RuntimeStore, TurnRunner
 from agent_runtime.modeling.contracts import normalize_llm_usage
 from agent_runtime.modeling.gateway import AgentModelResponse, model_request_input_text
 from agent_runtime.modeling.openai_wire import serialize_openai_request
@@ -83,31 +83,35 @@ def test_bad_call_feedback_then_corrected_file_action_survives_restart(tmp_path,
 
     gateway = CorrectedArgumentsGateway(path="result.txt", body="verified\n")
     gateway.workspace = tmp_path
-    original_handle = TurnExecutor._handle_model_response
+    original_handle = TurnRunner._handle_model_response
 
     async def stop_after_commit(self, **kwargs):
         raise Crash()
 
     database = tmp_path / "run.db"
-    with RuntimeState.open_sync(database) as store:
+    with RuntimeStore.open_sync(database) as store:
         runner, turn, initial_gateway = file_runner(store, tmp_path)
         monkeypatch.setattr(initial_gateway, "agenerate_model_request", gateway.agenerate_model_request)
         if restart:
-            monkeypatch.setattr(TurnExecutor, "_handle_model_response", stop_after_commit)
+            monkeypatch.setattr(TurnRunner, "_handle_model_response", stop_after_commit)
             with pytest.raises(Crash):
-                asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
+                asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
             assert not (tmp_path / "result.txt").exists()
             assert not store.list_tool_operations(turn.turn_id)
-            monkeypatch.setattr(TurnExecutor, "_handle_model_response", original_handle)
+            monkeypatch.setattr(TurnRunner, "_handle_model_response", original_handle)
         else:
-            result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
+            result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
             assert result.status == "completed"
-    with RuntimeState.open_sync(database) as reopened:
+    with RuntimeStore.open_sync(database) as reopened:
         runner._store = reopened
         runner._context_manager = RolloutContextManager(reopened)
         runner._tool_orchestrator._store = reopened
+        runner._model_runner._store = reopened
+        runner._model_runner._context_manager = runner._context_manager
+        runner._context_engine._store = reopened
+        runner._context_engine._context_manager = runner._context_manager
         if restart:
-            result = asyncio.run(runner.recover_committed_model_response(turn_id=turn.turn_id))
+            result = asyncio.run(runner.drive(action="continue", turn_id=turn.turn_id))
             assert result.status == "completed"
         assert (tmp_path / "result.txt").read_text() == "verified\n"
         results = [i.payload for i in reopened.list_items(turn.turn_id) if i.kind == "tool_result"]
@@ -121,8 +125,11 @@ def test_bad_call_feedback_then_corrected_file_action_survives_restart(tmp_path,
         assert "JSON" in call.argument_error
         context = runner.restore_turn_context(turn.turn_id)
         for operation in reopened.list_model_operations(turn.turn_id):
-            replay = asyncio.run(runner._prepare_step(runner.restore_step_context(context, operation)))
+            replay = asyncio.run(runner._model_runner.prepare(runner.restore_step_context(context, operation)))
             assert (replay.request_hash, replay.context_hash, replay.tool_hash, replay.wire_hash) == (
-                operation.request_hash, operation.context_hash, operation.tool_hash, operation.wire_hash,
+                operation.request_hash,
+                operation.context_hash,
+                operation.tool_hash,
+                operation.wire_hash,
             )
         assert reopened.verify().valid

@@ -15,9 +15,10 @@ from agent_runtime.budget.pricing import (
 )
 from agent_runtime.core.llm_registry import ResolvedModel
 from agent_runtime.core.messages import StopReason, ToolUseResult
+from agent_runtime.harness import model_ops, turn_ops
 from agent_runtime.harness.model_adapter import GatewayHarnessModel
 from agent_runtime.harness.protocol import HarnessModelRequest, ModelMessage
-from agent_runtime.harness.state import RuntimeState
+from agent_runtime.harness.runtime_store import RuntimeStore
 from agent_runtime.model_definition import ModelCapabilities, RequestDefaultsDefinition
 from agent_runtime.modeling.config import GenerationConfig
 from agent_runtime.modeling.contracts import (
@@ -34,9 +35,7 @@ class CharacterAccounting:
     def count(self, text: str) -> int:
         return len(text)
 
-    def clip(
-        self, text: str, token_budget: int, *, add_ellipsis: bool = False
-    ) -> str:
+    def clip(self, text: str, token_budget: int, *, add_ellipsis: bool = False) -> str:
         del add_ellipsis
         return text[:token_budget]
 
@@ -45,9 +44,7 @@ class CapturingGateway:
     def __init__(self) -> None:
         self.requests: list[object] = []
 
-    def effective_stage_budget(
-        self, stage: LLMCallStage, *, kwargs: object = None
-    ) -> LLMStageBudget:
+    def effective_stage_budget(self, stage: LLMCallStage, *, kwargs: object = None) -> LLMStageBudget:
         del stage, kwargs
         return LLMStageBudget(
             max_input_tokens=4096,
@@ -80,9 +77,7 @@ class RejectingQuotaGate:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def acquire(
-        self, *, provider: str, model: str, requested_tokens: int
-    ) -> None:
+    async def acquire(self, *, provider: str, model: str, requested_tokens: int) -> None:
         del provider, model, requested_tokens
         self.calls += 1
         raise ProviderQuotaPreflightError("quota exhausted")
@@ -97,9 +92,7 @@ class NeverCalledProvider:
         raise AssertionError("provider I/O must not start")
 
 
-def _resolved(
-    gateway: object, *, pricing: dict[str, int | None]
-) -> ResolvedModel:
+def _resolved(gateway: object, *, pricing: dict[str, int | None]) -> ResolvedModel:
     revision = pricing_revision(
         provider="openai-compatible",
         model="provider-model",
@@ -131,14 +124,15 @@ def test_integer_pricing_and_revision_are_deterministic() -> None:
         cache_read_cost_per_1m=None,
         cache_write_cost_per_1m=None,
     )
-    assert estimated_model_cost_micros(
-        input_tokens=1000,
-        max_output_tokens=500,
-        pricing=pricing,
-    ) == 6000
-    assert pricing_revision(
-        provider="p", model="m", pricing=pricing
-    ) == pricing_revision(
+    assert (
+        estimated_model_cost_micros(
+            input_tokens=1000,
+            max_output_tokens=500,
+            pricing=pricing,
+        )
+        == 6000
+    )
+    assert pricing_revision(provider="p", model="m", pricing=pricing) == pricing_revision(
         provider="p", model="m", pricing=dict(reversed(tuple(pricing.items())))
     )
 
@@ -150,24 +144,28 @@ def test_actual_cost_uses_input_rate_for_unconfigured_cache_price() -> None:
         "cache_read": None,
         "cache_write": None,
     }
-    assert actual_model_cost_micros(
-        {
-            "input_tokens": 1000,
-            "logical_input_tokens": 1000,
-            "uncached_input_tokens": 700,
-            "cache_read_input_tokens": 300,
-            "output_tokens": 500,
-        },
-        pricing=pricing,
-    ) == 6000
+    assert (
+        actual_model_cost_micros(
+            {
+                "input_tokens": 1000,
+                "logical_input_tokens": 1000,
+                "uncached_input_tokens": 700,
+                "cache_read_input_tokens": 300,
+                "output_tokens": 500,
+            },
+            pricing=pricing,
+        )
+        == 6000
+    )
 
 
 def test_cost_limit_is_enforced_by_durable_budget_state(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="bounded",
             binding_manifest={
@@ -175,7 +173,8 @@ def test_cost_limit_is_enforced_by_durable_budget_state(tmp_path: Path) -> None:
                 "model_cost_budget_total_micros": 5000,
             },
         )
-        operation = store.prepare_model_operation(
+        operation = model_ops.prepare_model_operation(
+            store,
             turn_id=turn.turn_id,
             request_hash="r",
             context_hash="c",
@@ -184,7 +183,8 @@ def test_cost_limit_is_enforced_by_durable_budget_state(tmp_path: Path) -> None:
             request_ref={"input_revision": 1, "request_id": "req"},
         )
         with pytest.raises(BudgetLimitExceededError) as raised:
-            store.dispatch_model_attempt(
+            model_ops.dispatch_model_attempt(
+                store,
                 operation.operation_id,
                 resource_request=ResourceUsage(
                     input_tokens=10,

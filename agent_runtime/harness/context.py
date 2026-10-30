@@ -8,7 +8,8 @@ from collections.abc import Iterator, Mapping
 from dataclasses import replace
 from typing import Any
 
-from agent_runtime.core.messages import model_message_payload
+from agent_runtime.core.messages import model_message_payload, restore_model_message
+from agent_runtime.harness import context_ops
 from agent_runtime.harness.protocol import (
     ContextBudgetExceededError,
     ContextCompactionCandidate,
@@ -17,7 +18,7 @@ from agent_runtime.harness.protocol import (
     restore_model_response,
 )
 from agent_runtime.harness.records import ItemSnapshot
-from agent_runtime.harness.state import RuntimeState
+from agent_runtime.harness.runtime_store import RuntimeStore
 from agent_runtime.modeling.contracts import ContextCapacityPolicy, context_capacity_policy
 
 
@@ -26,7 +27,7 @@ class RolloutContextManager:
 
     def __init__(
         self,
-        store: RuntimeState,
+        store: RuntimeStore,
         *,
         max_item_bytes: int | None = None,
         max_total_bytes: int | None = None,
@@ -51,7 +52,8 @@ class RolloutContextManager:
         policy = None if turn_id is None else self.capacity_policy(turn_id)
         defaults = {"max_item_bytes": 500_000, "max_total_bytes": 4_000_000, "max_messages": 2000}
         return {
-            name: explicit if (explicit := getattr(self, "_" + name)) is not None
+            name: explicit
+            if (explicit := getattr(self, "_" + name)) is not None
             else (getattr(policy, name) if policy is not None else value)
             for name, value in defaults.items()
         }
@@ -68,7 +70,8 @@ class RolloutContextManager:
     ) -> ItemSnapshot:
         """Persist a compaction Item; original Items remain canonical history."""
 
-        return self._store.record_context_compaction(
+        return context_ops.record_context_compaction(
+            self._store,
             turn_id=turn_id,
             covered_item_ids=covered_item_ids,
             summary=summary,
@@ -84,8 +87,14 @@ class RolloutContextManager:
 
     def current_plan(self, turn_id: str) -> ItemSnapshot | None:
         """Read canonical advisory state, including after compaction or restart."""
-        return next((item for item in reversed(self._store.list_items(turn_id))
-                     if item.kind == "plan_state" and item.status == "completed"), None)
+        return next(
+            (
+                item
+                for item in reversed(self._store.list_items(turn_id))
+                if item.kind == "plan_state" and item.status == "completed"
+            ),
+            None,
+        )
 
     def _validate_budget(
         self, projected: tuple[ModelMessage, ...], *, turn_id: str | None = None
@@ -100,17 +109,20 @@ class RolloutContextManager:
             if item_bytes > limits["max_item_bytes"]:
                 raise ContextBudgetExceededError(
                     "byte_guard: Model context single Item exceeds the configured byte limit "
-                    f"({item_bytes} > {limits['max_item_bytes']}).", reason_code="byte_guard"
+                    f"({item_bytes} > {limits['max_item_bytes']}).",
+                    reason_code="byte_guard",
                 )
             if len(messages) >= limits["max_messages"]:
                 raise ContextBudgetExceededError(
                     "message_guard: Model context exceeds the configured message-count limit "
-                    f"({len(messages) + 1} > {limits['max_messages']}).", reason_code="message_guard"
+                    f"({len(messages) + 1} > {limits['max_messages']}).",
+                    reason_code="message_guard",
                 )
             if total_bytes + item_bytes > limits["max_total_bytes"]:
                 raise ContextBudgetExceededError(
                     "byte_guard: Model context exceeds the configured total byte limit "
-                    f"({total_bytes + item_bytes} > {limits['max_total_bytes']}).", reason_code="byte_guard"
+                    f"({total_bytes + item_bytes} > {limits['max_total_bytes']}).",
+                    reason_code="byte_guard",
                 )
             messages.append(message)
             total_bytes += item_bytes
@@ -216,14 +228,18 @@ class RolloutContextManager:
             raise ContextBudgetExceededError(
                 "No completed context is available for compaction.", reason_code="no_compactable_context"
             )
-        semantic_tail = (summary_override is not None and self.capacity_policy(turn_id) is not None and retained > 0)
+        semantic_tail = summary_override is not None and self.capacity_policy(turn_id) is not None and retained > 0
         if semantic_tail:
             # The source already summarizes this exchange. Preserve its raw
             # replay separately, so the next summary does not summarize it again.
-            raw_cut = (len(items) if semantic_cut == len(projected)
-                       else next(n for n, item in enumerate(items) if item.item_id == projected[semantic_cut][0]))
-            raw_cut = max(raw_cut, max((raw_indices[identity] + 1
-                                       for identity, _ in projected[:semantic_cut]), default=0))
+            raw_cut = (
+                len(items)
+                if semantic_cut == len(projected)
+                else next(n for n, item in enumerate(items) if item.item_id == projected[semantic_cut][0])
+            )
+            raw_cut = max(
+                raw_cut, max((raw_indices[identity] + 1 for identity, _ in projected[:semantic_cut]), default=0)
+            )
         covered = items[:raw_cut]
         protected_users = {latest_user} | {
             item.item_id for item in items if item.turn_id == turn_id and item.kind == "user_message"
@@ -363,8 +379,9 @@ class RolloutContextManager:
         messages = floor.messages
         context_size = next(_message_size_bytes(m) for m in messages if m.role == "context")
         limits = self.limits(floor.turn_id)
-        return min(limits["max_total_bytes"] - sum(map(_message_size_bytes, messages)),
-                   limits["max_item_bytes"] - context_size)
+        return min(
+            limits["max_total_bytes"] - sum(map(_message_size_bytes, messages)), limits["max_item_bytes"] - context_size
+        )
 
     def semantic_source(self, turn_id: str, *, retained_tail_messages: int = 0) -> tuple[str, str]:
         """Freeze the current continuation plus new history, without truncation.
@@ -401,21 +418,34 @@ class RolloutContextManager:
         previously_summarized = {
             item_id
             for item in items
-            if item.kind == "context_compaction" and ("tool_result_overrides" not in item.payload
-            or str(item.payload.get("algorithm_revision", "")).startswith("semantic-compaction-"))
+            if item.kind == "context_compaction"
+            and (
+                "tool_result_overrides" not in item.payload
+                or str(item.payload.get("algorithm_revision", "")).startswith("semantic-compaction-")
+            )
             for item_id in item.payload.get("covered_item_ids", ())
         }
         if self.capacity_policy(turn_id) is not None:
             # Elision coverage proves archival, not semantic coverage. Recover
             # canonical evidence only after the most recent semantic summary.
-            semantic = next((item for item in reversed(items) if item.kind == "context_compaction"
-                             and str(item.payload.get("algorithm_revision", "")).startswith("semantic-compaction-")),
-                            None)
+            semantic = next(
+                (
+                    item
+                    for item in reversed(items)
+                    if item.kind == "context_compaction"
+                    and str(item.payload.get("algorithm_revision", "")).startswith("semantic-compaction-")
+                ),
+                None,
+            )
             summarized = set() if semantic is None else set(semantic.payload["covered_item_ids"])
             sources = []
             if semantic is not None:
-                sources.append({"history_index": history_positions[semantic.item_id],
-                                **model_message_payload(_compaction_message(semantic.payload))})
+                sources.append(
+                    {
+                        "history_index": history_positions[semantic.item_id],
+                        **model_message_payload(_compaction_message(semantic.payload)),
+                    }
+                )
             answer_item_ids = self._accepted_answer_ids(items)
             for item in items:
                 if (
@@ -435,10 +465,15 @@ class RolloutContextManager:
             {
                 "history_index": history_positions[item.item_id],
                 "role": "context",
-                "body": _json({"runtime_verification": {
-                    key: item.payload[key] for key in ("verification_kind", "verified_resources", "verifier")
-                    if key in item.payload
-                }}),
+                "body": _json(
+                    {
+                        "runtime_verification": {
+                            key: item.payload[key]
+                            for key in ("verification_kind", "verified_resources", "verifier")
+                            if key in item.payload
+                        }
+                    }
+                ),
             }
             for item in items
             if item.kind == "verification"
@@ -481,8 +516,10 @@ class RolloutContextManager:
         return replace(candidate, payload_json=_json(payload))
 
     def max_tool_result_bytes(self, turn_id: str) -> int:
-        return max((len(m.content.encode("utf-8")) for _, m in self._projected_messages(turn_id)
-                    if m.role == "tool"), default=0)
+        return max(
+            (len(m.content.encode("utf-8")) for _, m in self._projected_messages(turn_id) if m.role == "tool"),
+            default=0,
+        )
 
     def cheap_candidates(
         self, turn_id: str, *, include_recent: bool = False, max_result_bytes: int | None = None
@@ -518,8 +555,9 @@ class RolloutContextManager:
             if message.role != "tool" or item_id in unsettled or by_id[item_id].payload.get("is_error"):
                 continue
             canonical = _item_message(by_id[item_id])
-            content = _web_result_excerpt(canonical.content if canonical is not None else message.content,
-                                          max_result_bytes, item_id)
+            content = _web_result_excerpt(
+                canonical.content if canonical is not None else message.content, max_result_bytes, item_id
+            )
             if content is None:
                 content = f"Tool output archived. Use read_context(item_id={item_id!r}) to recover it."
                 if max_result_bytes is not None:
@@ -573,7 +611,8 @@ class RolloutContextManager:
 
     def commit_compaction(self, candidate: ContextCompactionCandidate) -> ItemSnapshot:
         payload = json.loads(candidate.payload_json)
-        return self._store.record_context_compaction(
+        return context_ops.record_context_compaction(
+            self._store,
             turn_id=candidate.turn_id,
             expected_source_revision=candidate.source_revision,
             covered_item_ids=tuple(payload["covered_item_ids"]),
@@ -602,7 +641,7 @@ class RolloutContextManager:
         return _project_items(items, answer_item_ids=self._accepted_answer_ids(items))
 
 
-def validate_tool_history(store: RuntimeState, turn_id: str) -> None:
+def validate_tool_history(store: RuntimeStore, turn_id: str) -> None:
     """Check provider message structure without applying an old Turn's capacity limits."""
     projected = RolloutContextManager(store)._project_items(store.list_context_items(turn_id))
     _validate_tool_groups(tuple(message for _, message in projected))
@@ -617,17 +656,24 @@ def _unique_json(values: list[Any]) -> list[Any]:
 
 
 def _project_items(
-    items: tuple[ItemSnapshot, ...], *, answer_item_ids: frozenset[str] = frozenset(),
+    items: tuple[ItemSnapshot, ...],
+    *,
+    answer_item_ids: frozenset[str] = frozenset(),
 ) -> tuple[tuple[str, ModelMessage], ...]:
     replacements, suppressed = _compaction_projection(items, answer_item_ids=answer_item_ids)
     reconciled = {
         (item.turn_id, result.get("tool_call_id"))
         for item in items
-        if item.kind == "tool_reconciliation" and item.producer == "reconciler" and item.status == "completed"
+        if item.kind == "tool_reconciliation"
+        and item.producer == "reconciler"
+        and item.status == "completed"
         and isinstance((result := item.payload.get("result")), Mapping)
     }
-    stable_groups = {item.item_id for item in items
-                     if item.kind == "model_response" and item.payload.get("tool_result_order") == "call-v1"}
+    stable_groups = {
+        item.item_id
+        for item in items
+        if item.kind == "model_response" and item.payload.get("tool_result_order") == "call-v1"
+    }
     projected = []
     for item in items:
         if item.status != "completed":
@@ -637,13 +683,16 @@ def _project_items(
         if item.item_id not in suppressed:
             projected.extend((item.item_id, message) for message in _request_context_messages(item))
         superseded = item.kind == "tool_result" and (item.turn_id, item.payload.get("tool_call_id")) in reconciled
-        if (item.item_id not in suppressed and not superseded
-                and (message := _item_message(item, answer_item_ids=answer_item_ids)) is not None):
+        if (
+            item.item_id not in suppressed
+            and not superseded
+            and (message := _item_message(item, answer_item_ids=answer_item_ids)) is not None
+        ):
             projected.append((item.item_id, message))
         if item.item_id not in suppressed and item.kind == "model_request" and item.producer == "runtime":
-            input_update = item.payload.get("request_ref", {}).get("runtime_input_update")
-            if isinstance(input_update, str):
-                projected.append((item.item_id, ModelMessage(role="context", body=input_update)))
+            input_update = _request_context_message(item, "runtime_input_message", "runtime_input_update")
+            if input_update is not None:
+                projected.append((item.item_id, input_update))
     # Preserve receive order in the ledger; keep provider tool groups complete.
     ordered = []
     deferred = []
@@ -656,8 +705,9 @@ def _project_items(
             deferred.append(entry)
             continue
         if message.tool_calls:
-            call_order = ({call.id: index for index, call in enumerate(message.tool_calls)}
-                          if entry[0] in stable_groups else {})
+            call_order = (
+                {call.id: index for index, call in enumerate(message.tool_calls)} if entry[0] in stable_groups else {}
+            )
         if message.role == "tool" and pending:
             tool_results.append(entry)
             pending.discard(message.tool_call_id or "")
@@ -705,21 +755,44 @@ def _validate_tool_groups(messages: tuple[ModelMessage, ...]) -> None:
         raise ContextBudgetExceededError("Context contains an unfinished tool group.")
 
 
+def _restore_context_message(payload: Mapping[str, Any]) -> ModelMessage:
+    message = restore_model_message(payload)
+    if message.role != "context":
+        raise ValueError("runtime context snapshots must contain context messages")
+    return message
+
+
+def _request_context_message(item: ItemSnapshot, field: str, legacy_field: str) -> ModelMessage | None:
+    request_ref = item.payload.get("request_ref", {})
+    snapshot = request_ref.get(field)
+    if isinstance(snapshot, Mapping):
+        return _restore_context_message(snapshot)
+    # Old requests retain their presentation without acquiring control metadata.
+    text = request_ref.get(legacy_field)
+    return ModelMessage(role="context", body=text) if isinstance(text, str) else None
+
+
 def _request_context_messages(item: ItemSnapshot) -> tuple[ModelMessage, ...]:
     if item.kind != "model_request" or item.producer != "runtime":
         return ()
-    return tuple(ModelMessage(role="context", body=update)
-                 for update in item.payload.get("request_ref", {}).get("context_updates", ())
-                 if isinstance(update, str))
+    request_ref = item.payload.get("request_ref", {})
+    snapshots = request_ref.get("context_update_messages")
+    if snapshots is not None:
+        return tuple(_restore_context_message(snapshot) for snapshot in snapshots)
+    return tuple(
+        ModelMessage(role="context", body=update)
+        for update in request_ref.get("context_updates", ())
+        if isinstance(update, str)
+    )
 
 
 def _item_message(
-    item: ItemSnapshot, *, answer_item_ids: frozenset[str] = frozenset(),
+    item: ItemSnapshot,
+    *,
+    answer_item_ids: frozenset[str] = frozenset(),
 ) -> ModelMessage | None:
     if item.kind == "model_request" and item.producer == "runtime":
-        update = item.payload.get("request_ref", {}).get("runtime_context_update")
-        if isinstance(update, str):
-            return ModelMessage(role="context", body=update)
+        return _request_context_message(item, "runtime_context_message", "runtime_context_update")
     text = item.payload.get("text")
     if item.kind == "user_message" and isinstance(text, str):
         return ModelMessage(role="user", body=text)
@@ -731,12 +804,15 @@ def _item_message(
         if item.payload.get("response_status") == "incomplete":
             # Do not replay partial assistant text, reasoning, or a tool group
             # for which no execution/result exists. This also survives compaction.
-            return ModelMessage(role="context", body=(
-                "A previous model step was incomplete (output limit or another provider stop). "
-                "Its partial output was discarded; no tools from that step were executed. "
-                "Generate a complete next step from the completed history. Keep it concise; "
-                "do not repeat completed tool actions."
-            ))
+            return ModelMessage(
+                role="context",
+                body=(
+                    "A previous model step was incomplete (output limit or another provider stop). "
+                    "Its partial output was discarded; no tools from that step were executed. "
+                    "Generate a complete next step from the completed history. Keep it concise; "
+                    "do not repeat completed tool actions."
+                ),
+            )
         if response.tool_calls or item.item_id in answer_item_ids:
             return ModelMessage(role="assistant", body=outputs)
     if item.kind == "tool_result":
@@ -752,23 +828,32 @@ def _item_message(
         result = item.payload.get("result")
         if isinstance(result, Mapping) and isinstance(result.get("tool_call_id"), str):
             content = result.get("model_content")
-            return ModelMessage(role="tool", tool_call_id=result["tool_call_id"],
-                                  body=content if isinstance(content, str) else _json(dict(result)))
+            return ModelMessage(
+                role="tool",
+                tool_call_id=result["tool_call_id"],
+                body=content if isinstance(content, str) else _json(dict(result)),
+            )
     if item.kind in {"completion_feedback", "context_message"} and isinstance(text, str):
         return ModelMessage(role="context", body=text)
     if item.kind == "tool_continuation" and item.producer == "runtime":
-        return ModelMessage(role="context", body=(
-            "The live command owner closed. Confirmed terminal outcome (the process is not reattached):\n"
-            + _json(dict(item.payload))
-        ))
+        return ModelMessage(
+            role="context",
+            body=(
+                "The live command owner closed. Confirmed terminal outcome (the process is not reattached):\n"
+                + _json(dict(item.payload))
+            ),
+        )
     if item.kind == "input_file":
         if item.payload.get("storage") == "reference" and isinstance(item.payload.get("path"), str):
-            return ModelMessage(role="context", body=(
-                f"Attached input file (read-only original, not copied): {_json(item.payload['path'])}. "
-                f"SHA256 at attachment: {item.payload.get('sha256')}. "
-                "This is a live local file reference: read its current contents with file tools; "
-                "the original may change or be removed. Write derived outputs inside the workspace."
-            ))
+            return ModelMessage(
+                role="context",
+                body=(
+                    f"Attached input file (read-only original, not copied): {_json(item.payload['path'])}. "
+                    f"SHA256 at attachment: {item.payload.get('sha256')}. "
+                    "This is a live local file reference: read its current contents with file tools; "
+                    "the original may change or be removed. Write derived outputs inside the workspace."
+                ),
+            )
         workspace_path = item.payload.get("workspace_path")
         sha256 = item.payload.get("sha256")
         if isinstance(workspace_path, str) and isinstance(sha256, str):
@@ -780,7 +865,7 @@ def _item_message(
 
 
 def _runtime_preserved_facts(
-    store: RuntimeState,
+    store: RuntimeStore,
     *,
     turn_id: str,
     covered_items: tuple[ItemSnapshot, ...],
@@ -856,8 +941,6 @@ def _runtime_preserved_facts(
     }
 
 
-
-
 def _compaction_projection(
     items: tuple[ItemSnapshot, ...],
     *,
@@ -907,11 +990,19 @@ def _compaction_projection(
             replacements.pop(target, None)
         anchor = covered[0]
         if item.payload.get("algorithm_revision") in {
-            "semantic-compaction-v4", "semantic-compaction-v5", "semantic-compaction-v6",
+            "semantic-compaction-v4",
+            "semantic-compaction-v5",
+            "semantic-compaction-v6",
         }:
             protected = set(item.payload.get("preserved_item_ids", ()))
-            anchor = next((original.item_id for original in items if original.item_id in protected
-                           and original.kind == "model_response"), anchor)
+            anchor = next(
+                (
+                    original.item_id
+                    for original in items
+                    if original.item_id in protected and original.kind == "model_response"
+                ),
+                anchor,
+            )
             # Place execution memory at the last summarized message, so work
             # already done in this Turn follows the request that triggered it.
             anchor = next(
@@ -920,8 +1011,10 @@ def _compaction_projection(
                     for original in reversed(items)
                     if original.item_id in covered
                     and original.item_id not in protected
-                    and (_item_message(original, answer_item_ids=answer_item_ids) is not None
-                         or original.kind == "context_compaction")
+                    and (
+                        _item_message(original, answer_item_ids=answer_item_ids) is not None
+                        or original.kind == "context_compaction"
+                    )
                 ),
                 anchor,
             )
@@ -969,9 +1062,7 @@ def _compaction_message(payload: Mapping[str, Any]) -> ModelMessage:
         )
     except (TypeError, ValueError) as exc:
         raise RuntimeError("committed context compaction payload is malformed") from exc
-    return ModelMessage(
-        role="context", body=f"Context compaction:\n{content}", context_category="continuation_summary"
-    )
+    return ModelMessage(role="context", body=f"Context compaction:\n{content}", context_category="continuation_summary")
 
 
 def _message_size_bytes(message: ModelMessage) -> int:
@@ -993,9 +1084,14 @@ def _web_result_excerpt(content: str, budget: int | None, item_id: str) -> str |
     if not isinstance(envelope, dict):
         return None
     source = envelope.get("structured_content")
-    if (not isinstance(source, dict) or not isinstance(source.get("source_id"), str)
-            or not source["source_id"].startswith("artifact_") or not isinstance(source.get("content"), str)
-            or not isinstance(source.get("start_line"), int) or "next_line" not in source):
+    if (
+        not isinstance(source, dict)
+        or not isinstance(source.get("source_id"), str)
+        or not source["source_id"].startswith("artifact_")
+        or not isinstance(source.get("content"), str)
+        or not isinstance(source.get("start_line"), int)
+        or "next_line" not in source
+    ):
         return None
     if budget is not None and len(content.encode()) <= budget:
         return content
@@ -1014,10 +1110,16 @@ def _web_result_excerpt(content: str, budget: int | None, item_id: str) -> str |
     projected["visible_end_line"] = source["start_line"] + len(kept) - 1 if kept else None
     if omitted:
         projected["truncated"] = True
-    return _json({**envelope, "structured_content": projected, "truncated": True,
-                  "archive_lookup": f"read_context(item_id={item_id!r}) recovers the original tool message; "
-                                    "web_fetch(source_id=structured_content.source_id, start_line=next_line) "
-                                    "continues the saved webpage. item_id is not a source_id."})
+    return _json(
+        {
+            **envelope,
+            "structured_content": projected,
+            "truncated": True,
+            "archive_lookup": f"read_context(item_id={item_id!r}) recovers the original tool message; "
+            "web_fetch(source_id=structured_content.source_id, start_line=next_line) "
+            "continues the saved webpage. item_id is not a source_id.",
+        }
+    )
 
 
 def _web_source_reference(item: ItemSnapshot, projected_content: str | None = None) -> dict[str, Any] | None:
@@ -1031,14 +1133,30 @@ def _web_source_reference(item: ItemSnapshot, projected_content: str | None = No
             return None
     if not isinstance(source, Mapping):
         return None
-    if isinstance(source.get('query'), str) and isinstance(source.get('provider'), str):
-        return {'item_id': item.item_id, 'kind': 'search_leads',
-                **{key: source[key] for key in ('query', 'provider', 'result_status', 'previous_query',
-                                               'freshness_requested', 'freshness_verified', 'error_code',
-                                               'error_message', 'connection_mode', 'failure_stage',
-                                               'cache_hit', 'results_truncated')
-                   if key in source},
-                'is_error': bool(item.payload.get('is_error'))}
+    if isinstance(source.get("query"), str) and isinstance(source.get("provider"), str):
+        return {
+            "item_id": item.item_id,
+            "kind": "search_leads",
+            **{
+                key: source[key]
+                for key in (
+                    "query",
+                    "provider",
+                    "result_status",
+                    "previous_query",
+                    "freshness_requested",
+                    "freshness_verified",
+                    "error_code",
+                    "error_message",
+                    "connection_mode",
+                    "failure_stage",
+                    "cache_hit",
+                    "results_truncated",
+                )
+                if key in source
+            },
+            "is_error": bool(item.payload.get("is_error")),
+        }
     if not isinstance(source.get("source_id"), str):
         return None
     if not source["source_id"].startswith("artifact_") or not source.get("url"):
@@ -1049,14 +1167,43 @@ def _web_source_reference(item: ItemSnapshot, projected_content: str | None = No
     start = source.get("start_line")
     lines = content.splitlines() if isinstance(content, str) else []
     acquired_end = start + len(lines) - 1 if type(start) is int and lines else None
-    return {"item_id": item.item_id, "acquired_end_line": acquired_end, **{key: source[key] for key in (
-        "source_id", "url", "title", "published_at", "published_at_source", "content_hash",
-        "start_line", "next_line", "fetch_next_line", "context_truncated", "total_lines",
-        "source_truncated", "truncated",
-        "view", "line_basis", "section_id", "next_section", "next_link",
-        "warning", "extraction_method", "connection_mode", "failure_stage", "render_mode",
-        "render_diagnostics", "error_code", "error_message",
-    ) if key in source}, 'is_error': bool(item.payload.get('is_error'))}
+    return {
+        "item_id": item.item_id,
+        "acquired_end_line": acquired_end,
+        **{
+            key: source[key]
+            for key in (
+                "source_id",
+                "url",
+                "title",
+                "published_at",
+                "published_at_source",
+                "content_hash",
+                "start_line",
+                "next_line",
+                "fetch_next_line",
+                "context_truncated",
+                "total_lines",
+                "source_truncated",
+                "truncated",
+                "view",
+                "line_basis",
+                "section_id",
+                "next_section",
+                "next_link",
+                "warning",
+                "extraction_method",
+                "connection_mode",
+                "failure_stage",
+                "render_mode",
+                "render_diagnostics",
+                "error_code",
+                "error_message",
+            )
+            if key in source
+        },
+        "is_error": bool(item.payload.get("is_error")),
+    }
 
 
 def _web_acquired_ranges(refs: list[dict[str, Any]]) -> list[dict[str, Any]]:

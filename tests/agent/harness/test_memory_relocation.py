@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from agent_runtime.harness import RuntimeState
+from agent_runtime.harness import RuntimeStore, model_ops, tool_ops, turn_ops
 from agent_runtime.harness.memory_identity import (
     bind_memory_thread,
     memory_namespace,
@@ -62,12 +62,12 @@ def test_actual_directory_move_keeps_identity_versions_jobs_and_frozen_history(t
     source = tmp_path / "original"
     destination = tmp_path / "renamed"
     source.mkdir()
-    with RuntimeState.open_sync(tmp_path / "host.db") as state:
-        thread = state.create_thread(workspace=source)
-        turn = state.start_turn(
-            thread_id=thread.thread_id, user_message="remember", binding_manifest={"workspace": str(source)}
+    with RuntimeStore.open_sync(tmp_path / "host.db") as state:
+        thread = turn_ops.create_thread(state, workspace=source)
+        turn = turn_ops.start_turn(
+            state, thread_id=thread.thread_id, user_message="remember", binding_manifest={"workspace": str(source)}
         )
-        state.complete_turn(turn_id=turn.turn_id, answer="done")
+        turn_ops.complete_turn(state, turn_id=turn.turn_id, answer="done")
         original_records = state.list_records(thread.thread_id)
         legacy_id, memory, jobs = _legacy(state, source)
         scope_id = memory_namespace(state, source, create=True)
@@ -98,11 +98,11 @@ def test_reused_old_path_gets_a_new_scope_and_cannot_access_moved_threads(tmp_pa
     source, destination = tmp_path / "old", tmp_path / "new"
     source.mkdir()
     destination.mkdir()
-    with RuntimeState.open_sync(tmp_path / "host.db") as state:
-        old_thread = state.create_thread(workspace=source)
+    with RuntimeStore.open_sync(tmp_path / "host.db") as state:
+        old_thread = turn_ops.create_thread(state, workspace=source)
         old_scope = memory_namespace(state, source, create=True)
         relocate_memory(state, source, destination)
-        new_thread = state.create_thread(workspace=source)
+        new_thread = turn_ops.create_thread(state, workspace=source)
         assert not thread_in_memory_scope(state, source, old_thread.thread_id)
         assert thread_in_memory_scope(state, source, new_thread.thread_id)
         new_scope = memory_namespace(state, source, create=True)
@@ -117,10 +117,10 @@ def test_read_only_legacy_reads_do_not_promote_or_write(tmp_path, monkeypatch):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "host.db"
-    with RuntimeState.open_sync(database) as state:
-        thread = state.create_thread(workspace=workspace)
+    with RuntimeStore.open_sync(database) as state:
+        thread = turn_ops.create_thread(state, workspace=workspace)
         legacy_id, _, _ = _legacy(state, workspace)
-    with RuntimeState.open_sync(database, read_only=True) as state:
+    with RuntimeStore.open_sync(database, read_only=True) as state:
 
         def forbidden(*args, **kwargs):
             raise AssertionError("read attempted to write metadata")
@@ -138,8 +138,8 @@ def test_read_only_reopen_preserves_promoted_memory_and_relocated_membership(tmp
     source.mkdir()
     destination.mkdir()
     database = tmp_path / "host.db"
-    with RuntimeState.open_sync(database) as state:
-        thread = state.create_thread(workspace=source)
+    with RuntimeStore.open_sync(database) as state:
+        thread = turn_ops.create_thread(state, workspace=source)
         _, memory, jobs = _legacy(state, source)
         scope_id = memory_namespace(state, source, create=True)
         workspace = source
@@ -150,7 +150,7 @@ def test_read_only_reopen_preserves_promoted_memory_and_relocated_membership(tmp
         expected_scope = memory_scope(state, workspace)
         previous_version = state.read_memory_state(workspace, version=1)
     metadata_before = _metadata(database)
-    with RuntimeState.open_sync(database, read_only=True) as state:
+    with RuntimeStore.open_sync(database, read_only=True) as state:
 
         def forbidden(*args, **kwargs):
             raise AssertionError("read attempted to write metadata")
@@ -173,8 +173,8 @@ def test_read_only_reopen_preserves_promoted_memory_and_relocated_membership(tmp
 
 
 def test_binding_threads_does_not_initialize_a_disabled_memory_scope(tmp_path):
-    with RuntimeState.open_sync(tmp_path / "host.db") as state:
-        thread = state.create_thread(workspace=tmp_path)
+    with RuntimeStore.open_sync(tmp_path / "host.db") as state:
+        thread = turn_ops.create_thread(state, workspace=tmp_path)
         bind_memory_thread(state, thread.thread_id, tmp_path)
         assert memory_scope(state, tmp_path) is None
         assert thread_memory_scope(state, thread.thread_id) is None
@@ -187,7 +187,7 @@ def test_destination_data_conflicts_without_changing_either_namespace(tmp_path, 
     source, destination = tmp_path / "old", tmp_path / "new"
     source.mkdir()
     destination.mkdir()
-    with RuntimeState.open_sync(tmp_path / "host.db") as state:
+    with RuntimeStore.open_sync(tmp_path / "host.db") as state:
         source_id = memory_namespace(state, source, create=True)
         if destination_kind == "scope":
             destination_id = memory_namespace(state, destination, create=True)
@@ -205,7 +205,7 @@ def test_stale_expected_version_preserves_binding_and_expired_lease(tmp_path):
     source, destination = tmp_path / "old", tmp_path / "new"
     source.mkdir()
     destination.mkdir()
-    with RuntimeState.open_sync(tmp_path / "host.db") as state:
+    with RuntimeStore.open_sync(tmp_path / "host.db") as state:
         _legacy(state, source)
         namespace = memory_namespace(state, source, create=True)
         lease = _canonical({"owner": "worker", "expires_at": 1})
@@ -222,7 +222,7 @@ def test_active_memory_lease_refuses_relocation_and_promotion(tmp_path, legacy):
     source, destination = tmp_path / "old", tmp_path / "new"
     source.mkdir()
     destination.mkdir()
-    with RuntimeState.open_sync(tmp_path / "host.db") as state:
+    with RuntimeStore.open_sync(tmp_path / "host.db") as state:
         namespace = _legacy(state, source)[0] if legacy else memory_namespace(state, source, create=True)
         _put(state, f"memory-job:{namespace}", _canonical({"owner": "worker", "expires_at": time.time() + 60}))
         with pytest.raises(ContextSourceChangedError, match="lease"):
@@ -237,11 +237,11 @@ def test_unresolved_maintenance_turn_blocks_relocation_even_after_lease_expiry(t
     source, destination = tmp_path / "old", tmp_path / "new"
     source.mkdir()
     destination.mkdir()
-    with RuntimeState.open_sync(tmp_path / "host.db") as state:
+    with RuntimeStore.open_sync(tmp_path / "host.db") as state:
         namespace = memory_namespace(state, source, create=True)
-        thread = state.create_thread(workspace=source)
-        turn = state.start_turn(
-            thread_id=thread.thread_id, user_message="extract", binding_manifest={"memory_maintenance": True}
+        thread = turn_ops.create_thread(state, workspace=source)
+        turn = turn_ops.start_turn(
+            state, thread_id=thread.thread_id, user_message="extract", binding_manifest={"memory_maintenance": True}
         )
         _put(
             state,
@@ -259,9 +259,9 @@ def test_job_reconciliation_blocks_relocation_without_an_active_turn_or_lease(tm
     source.mkdir()
     destination.mkdir()
     database = tmp_path / "host.db"
-    with RuntimeState.open_sync(database) as state:
+    with RuntimeStore.open_sync(database) as state:
         namespace = memory_namespace(state, source, create=True)
-        thread = state.create_thread(workspace=source)
+        thread = turn_ops.create_thread(state, workspace=source)
         _put(
             state,
             f"memory-jobs:{namespace}",
@@ -283,15 +283,17 @@ def test_terminal_maintenance_turn_with_unresolved_model_operation_blocks_reloca
     source.mkdir()
     destination.mkdir()
     database = tmp_path / "host.db"
-    with RuntimeState.open_sync(database) as state:
+    with RuntimeStore.open_sync(database) as state:
         namespace = memory_namespace(state, source, create=True)
-        thread = state.create_thread(workspace=source)
-        turn = state.start_turn(
+        thread = turn_ops.create_thread(state, workspace=source)
+        turn = turn_ops.start_turn(
+            state,
             thread_id=thread.thread_id,
             user_message="extract",
             binding_manifest={"memory_maintenance": True},
         )
-        operation = state.prepare_model_operation(
+        operation = model_ops.prepare_model_operation(
+            state,
             turn_id=turn.turn_id,
             request_hash="request",
             context_hash="context",
@@ -299,10 +301,11 @@ def test_terminal_maintenance_turn_with_unresolved_model_operation_blocks_reloca
             wire_hash="wire",
             request_ref={"input_revision": 1, "request_id": "maintenance-request"},
         )
-        attempt = state.dispatch_model_attempt(operation.operation_id)
-        state.fail_turn(turn_id=turn.turn_id, reason_code="worker_failed", message="worker stopped")
+        attempt = model_ops.dispatch_model_attempt(state, operation.operation_id)
+        turn_ops.fail_turn(state, turn_id=turn.turn_id, reason_code="worker_failed", message="worker stopped")
         if operation_status == "unknown":
-            state.mark_model_attempt_unknown(
+            model_ops.mark_model_attempt_unknown(
+                state,
                 operation_id=operation.operation_id,
                 attempt_id=attempt.attempt_id,
                 generation=attempt.generation,
@@ -330,15 +333,17 @@ def test_terminal_maintenance_turn_with_tool_reconciliation_blocks_relocation(tm
     source.mkdir()
     destination.mkdir()
     database = tmp_path / "host.db"
-    with RuntimeState.open_sync(database) as state:
+    with RuntimeStore.open_sync(database) as state:
         namespace = memory_namespace(state, source, create=True)
-        thread = state.create_thread(workspace=source)
-        turn = state.start_turn(
+        thread = turn_ops.create_thread(state, workspace=source)
+        turn = turn_ops.start_turn(
+            state,
             thread_id=thread.thread_id,
             user_message="extract",
             binding_manifest={"memory_maintenance": True},
         )
-        state.record_tool_call(
+        tool_ops.record_tool_call(
+            state,
             turn_id=turn.turn_id,
             tool_call_id="maintenance-call",
             tool_name="inspect",
@@ -357,10 +362,13 @@ def test_terminal_maintenance_turn_with_tool_reconciliation_blocks_relocation(tm
             "error_code": None,
             "requires_reconciliation": False,
         }
-        state.record_tool_execution_state(status="prepared", **values)
-        state.record_tool_execution_state(status="ready", **values)
-        claim = state.claim_tool_operation(operation_id="maintenance-operation", worker_id="worker", lease_seconds=30)
-        assert state.commit_tool_operation_outcome(
+        tool_ops.record_tool_execution_state(state, status="prepared", **values)
+        tool_ops.record_tool_execution_state(state, status="ready", **values)
+        claim = tool_ops.claim_tool_operation(
+            state, operation_id="maintenance-operation", worker_id="worker", lease_seconds=30
+        )
+        assert tool_ops.commit_tool_operation_outcome(
+            state,
             operation_id=claim.operation_id,
             claim_generation=claim.claim_generation,
             fencing_token=claim.fencing_token,
@@ -369,7 +377,7 @@ def test_terminal_maintenance_turn_with_tool_reconciliation_blocks_relocation(tm
             error_code="partial_result",
             requires_reconciliation=True,
         )
-        state.fail_turn(turn_id=turn.turn_id, reason_code="worker_failed", message="worker stopped")
+        turn_ops.fail_turn(state, turn_id=turn.turn_id, reason_code="worker_failed", message="worker stopped")
         assert state.read_turn(turn.turn_id).status == "failed"
         assert state.list_tool_operations(turn.turn_id)[0].requires_reconciliation
         _put(
@@ -391,7 +399,7 @@ def test_relocation_failure_rolls_back_promotion_bindings_and_all_keys(tmp_path,
     source, destination = tmp_path / "old", tmp_path / "new"
     source.mkdir()
     destination.mkdir()
-    with RuntimeState.open_sync(tmp_path / "host.db") as state:
+    with RuntimeStore.open_sync(tmp_path / "host.db") as state:
         legacy_id, _, _ = _legacy(state, source)
         original = state.persistence.put_metadata
         writes = 0
@@ -425,9 +433,9 @@ def test_late_relocation_failure_restores_all_metadata_and_thread_associations(
     source.mkdir()
     destination.mkdir()
     database = tmp_path / "host.db"
-    with RuntimeState.open_sync(database) as state:
-        source_thread = state.create_thread(workspace=source)
-        target_thread = state.create_thread(workspace=destination)
+    with RuntimeStore.open_sync(database) as state:
+        source_thread = turn_ops.create_thread(state, workspace=source)
+        target_thread = turn_ops.create_thread(state, workspace=destination)
         legacy_id, _, _ = _legacy(state, source)
         namespace = legacy_id if legacy else memory_namespace(state, source, create=True)
         _put(state, f"memory-job:{namespace}", _canonical({"owner": "expired", "expires_at": 1}))
@@ -468,9 +476,9 @@ def test_relocation_retry_is_idempotent_and_adopts_unbound_target_threads(tmp_pa
     source, destination = tmp_path / "old", tmp_path / "new"
     source.mkdir()
     destination.mkdir()
-    with RuntimeState.open_sync(tmp_path / "host.db") as state:
+    with RuntimeStore.open_sync(tmp_path / "host.db") as state:
         namespace = memory_namespace(state, source, create=True)
-        target_thread = state.create_thread(workspace=destination)
+        target_thread = turn_ops.create_thread(state, workspace=destination)
         first = relocate_memory(state, source, destination)
         second = relocate_memory(state, source, destination)
         assert first == second
@@ -484,7 +492,7 @@ def test_missing_source_is_rejected_and_legacy_version_integrity_is_checked(tmp_
     source, destination = tmp_path / "old", tmp_path / "new"
     source.mkdir()
     destination.mkdir()
-    with RuntimeState.open_sync(tmp_path / "host.db") as state:
+    with RuntimeStore.open_sync(tmp_path / "host.db") as state:
         with pytest.raises(KeyError, match="source"):
             relocate_memory(state, source, destination)
         namespace, _, _ = _legacy(state, source)

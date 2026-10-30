@@ -90,7 +90,10 @@ def _threads(
 
 
 def _replay_thread(
-    store: RolloutStore, thread_id: str, *, created: Callable[[str, str, int], None] | None = None,
+    store: RolloutStore,
+    thread_id: str,
+    *,
+    created: Callable[[str, str, int], None] | None = None,
 ) -> tuple[ProjectionState, str | None, dict[str, int] | None, list[str]]:
     state = ProjectionState()
     errors: list[str] = []
@@ -163,7 +166,10 @@ def _compare_projections(connection: sqlite3.Connection, thread_id: str, state: 
 
 
 def _metadata_matches(
-    connection: sqlite3.Connection, thread_id: str, state: ProjectionState, digest: str | None,
+    connection: sqlite3.Connection,
+    thread_id: str,
+    state: ProjectionState,
+    digest: str | None,
     position: Mapping[str, int] | None,
 ) -> bool:
     row = connection.execute("SELECT * FROM projection_meta WHERE thread_id = ?", (thread_id,)).fetchone()
@@ -219,7 +225,9 @@ def _artifact_errors(store: RolloutStore, state: ProjectionState) -> list[str]:
 
 
 def _attachment_errors(
-    items: Iterable[Mapping[str, Any]], connection: sqlite3.Connection, selected: frozenset[str] | None,
+    items: Iterable[Mapping[str, Any]],
+    connection: sqlite3.Connection,
+    selected: frozenset[str] | None,
     local_artifacts: Mapping[str, Mapping[str, Any]],
 ) -> list[str]:
     errors = []
@@ -281,12 +289,12 @@ def rebuild_store(store: RolloutStore) -> None:
                         staging.execute(row[0])
                     staging.execute("BEGIN")
                     staging.execute(
-                        'CREATE TABLE rebuild_order (table_name TEXT, entity_id TEXT, record_id INTEGER, '
-                        'PRIMARY KEY(table_name, entity_id)) WITHOUT ROWID'
+                        "CREATE TABLE rebuild_order (table_name TEXT, entity_id TEXT, record_id INTEGER, "
+                        "PRIMARY KEY(table_name, entity_id)) WITHOUT ROWID"
                     )
 
                     def created(table: str, identity: str, record_id: int) -> None:
-                        staging.execute('INSERT INTO rebuild_order VALUES (?, ?, ?)', (table, identity, record_id))
+                        staging.execute("INSERT INTO rebuild_order VALUES (?, ?, ?)", (table, identity, record_id))
 
                     for thread_id in _threads(source, None, include_projections=False):
                         state, digest, position, errors = _replay_thread(store, thread_id, created=created)
@@ -322,12 +330,12 @@ def rebuild_store(store: RolloutStore) -> None:
                     for table in reversed(_TABLES):
                         source.execute(f"DELETE FROM main.{table}")
                     for table in _TABLES:
-                        key = 'thread_id' if table == 'projection_meta' else storage._PROJECTIONS[table][0]
-                        ordered_table = 'threads' if table == 'projection_meta' else table
+                        key = "thread_id" if table == "projection_meta" else storage._PROJECTIONS[table][0]
+                        ordered_table = "threads" if table == "projection_meta" else table
                         source.execute(
-                            f'INSERT INTO main.{table} SELECT p.* FROM rollout_rebuild_stage.{table} AS p '
-                            'JOIN rollout_rebuild_stage.rebuild_order AS o '
-                            f'ON o.table_name = ? AND o.entity_id = p.{key} ORDER BY o.record_id, p.rowid',
+                            f"INSERT INTO main.{table} SELECT p.* FROM rollout_rebuild_stage.{table} AS p "
+                            "JOIN rollout_rebuild_stage.rebuild_order AS o "
+                            f"ON o.table_name = ? AND o.entity_id = p.{key} ORDER BY o.record_id, p.rowid",
                             (ordered_table,),
                         )
             finally:

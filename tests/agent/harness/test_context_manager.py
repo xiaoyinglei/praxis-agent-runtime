@@ -16,8 +16,10 @@ from agent_runtime.harness import (
     ModelMessage,
     PreparedModelCall,
     RolloutContextManager,
-    RuntimeState,
-    TurnExecutor,
+    RuntimeStore,
+    TurnRunner,
+    model_ops,
+    turn_ops,
 )
 from agent_runtime.harness.protocol import model_response_payload
 from tests.agent.harness.legacy_fixtures import record_migrated_context_item
@@ -26,15 +28,17 @@ from tests.agent.harness.legacy_fixtures import record_migrated_context_item
 def test_context_manager_builds_followup_from_thread_history(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=workspace)
-        first = store.start_turn(
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        first = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="first question",
             binding_manifest={"model_id": "model-v1"},
         )
-        store.complete_turn(turn_id=first.turn_id, answer="first answer")
-        second = store.start_turn(
+        turn_ops.complete_turn(store, turn_id=first.turn_id, answer="first answer")
+        second = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="follow up",
             binding_manifest={"model_id": "model-v2"},
@@ -55,9 +59,10 @@ def test_context_manager_rejects_an_oversized_item_before_provider_serialization
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="x" * 200,
             binding_manifest={"model_id": "model-v1"},
@@ -70,9 +75,10 @@ def test_context_manager_rejects_an_oversized_item_before_provider_serialization
 def test_context_manager_enforces_total_bytes_and_message_count(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="a" * 80,
             binding_manifest={"model_id": "model-v1"},
@@ -99,9 +105,10 @@ def test_context_manager_counts_tool_arguments_toward_the_item_limit(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="inspect",
             binding_manifest={"model_id": "model-v1"},
@@ -112,10 +119,8 @@ def test_context_manager_counts_tool_arguments_toward_the_item_limit(
             kind="model_response",
             payload=model_response_payload(
                 HarnessModelResponse.from_parts(
-                    text='',
-                    tool_calls=(
-                        ModelToolCall(id='call-1', name='read_file', arguments={'path': 'x' * 500}),
-                    ),
+                    text="",
+                    tool_calls=(ModelToolCall(id="call-1", name="read_file", arguments={"path": "x" * 500}),),
                 )
             ),
         )
@@ -141,10 +146,7 @@ async def test_context_budget_failure_fails_turn_without_calling_model(
             self.prepare_calls += 1
             raise AssertionError("oversized context must not reach model preparation")
 
-        async def dispatch(
-            self,
-            prepared: PreparedModelCall,
-         *, event_sink: object = None) -> HarnessModelResponse:
+        async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
             del prepared
             self.dispatch_calls += 1
             raise AssertionError("oversized context must not reach provider I/O")
@@ -154,10 +156,10 @@ async def test_context_budget_failure_fails_turn_without_calling_model(
             del proposal
             return CompletionDecision(action="accept", reason="accepted")
 
-    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
-        thread = store.create_thread(workspace=workspace)
+    async with await RuntimeStore.open(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
         model = NeverCalledModel()
-        result = await TurnExecutor(
+        result = await TurnRunner(
             thread_id=thread.thread_id,
             store=store,
             model=model,
@@ -187,15 +189,17 @@ def test_compaction_replaces_a_committed_prefix_without_deleting_rollout_history
         "unresolved_work": ["run full suite"],
         "uncertain_side_effects": [],
     }
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=workspace)
-        first = store.start_turn(
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        first = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="old question",
             binding_manifest={"model_id": "model-v1"},
         )
-        store.complete_turn(turn_id=first.turn_id, answer="old answer")
-        second = store.start_turn(
+        turn_ops.complete_turn(store, turn_id=first.turn_id, answer="old answer")
+        second = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="current question",
             binding_manifest={"model_id": "model-v1"},
@@ -240,15 +244,17 @@ def test_budget_compaction_is_durable_and_preserves_user_constraints_as_data(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=workspace)
-        first = store.start_turn(
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        first = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="Keep the runtime architecture and never write outside workspace.",
             binding_manifest={"model_id": "model-v1"},
         )
-        store.complete_turn(turn_id=first.turn_id, answer="acknowledged")
-        second = store.start_turn(
+        turn_ops.complete_turn(store, turn_id=first.turn_id, answer="acknowledged")
+        second = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="Continue with the current implementation.",
             binding_manifest={"model_id": "model-v1"},
@@ -279,9 +285,10 @@ def test_compaction_requires_a_prefix_and_explicit_critical_fact_categories(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="current question",
             binding_manifest={"model_id": "model-v1"},
@@ -312,15 +319,21 @@ def test_tool_followup_preserves_reasoning_through_durable_context(tmp_path: Pat
     from agent_runtime.harness.model_adapter import _model_messages
 
     db = tmp_path / "reasoning.sqlite"
-    with RuntimeState.open_sync(db) as store:
-        thread = store.create_thread(workspace=tmp_path)
-        turn = store.start_turn(thread_id=thread.thread_id, user_message="inspect", binding_manifest={})
-        operation = store.prepare_model_operation(
-            turn_id=turn.turn_id, request_hash="request", context_hash="context",
-            tool_hash="tools", wire_hash="wire", request_ref={"input_revision": 1, "request_id": "request"},
+    with RuntimeStore.open_sync(db) as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(store, thread_id=thread.thread_id, user_message="inspect", binding_manifest={})
+        operation = model_ops.prepare_model_operation(
+            store,
+            turn_id=turn.turn_id,
+            request_hash="request",
+            context_hash="context",
+            tool_hash="tools",
+            wire_hash="wire",
+            request_ref={"input_revision": 1, "request_id": "request"},
         )
-        attempt = store.dispatch_model_attempt(operation.operation_id, worker_id="test", lease_seconds=30)
-        store.complete_model_attempt(
+        attempt = model_ops.dispatch_model_attempt(store, operation.operation_id, worker_id="test", lease_seconds=30)
+        model_ops.complete_model_attempt(
+            store,
             operation_id=operation.operation_id,
             attempt_id=attempt.attempt_id,
             generation=attempt.generation,
@@ -337,7 +350,7 @@ def test_tool_followup_preserves_reasoning_through_durable_context(tmp_path: Pat
                 ),
             ),
         )
-    with RuntimeState.open_sync(db) as store:
+    with RuntimeStore.open_sync(db) as store:
         messages = RolloutContextManager(store).build(turn.turn_id)
         assistant = _model_messages(messages)[-1]
         assert assistant.reasoning_content == "Inspect the selected file."

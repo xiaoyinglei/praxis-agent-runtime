@@ -8,7 +8,7 @@ import pytest
 from typer.testing import CliRunner
 
 from agent_runtime import Agent, cli
-from agent_runtime.harness import RuntimeState
+from agent_runtime.harness import RuntimeStore
 from agent_runtime.permission_policy import PermissionPolicy, ToolRule
 from agent_runtime.runtime import mcp
 from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel
@@ -45,13 +45,21 @@ def test_frozen_disabled_mcp_recovers_without_trusting_new_workspace_config(
             return agent
 
         monkeypatch.setattr(cli, "_create_agent_facade", create_real_agent)
-        result = CliRunner().invoke(cli.agent_app, [
-            "recover", paused.turn_id, "--rollout-db", str(database), "--action", "allow_once",
-        ])
+        result = CliRunner().invoke(
+            cli.agent_app,
+            [
+                "recover",
+                paused.turn_id,
+                "--rollout-db",
+                str(database),
+                "--action",
+                "allow_once",
+            ],
+        )
         assert result.exit_code == 0, result.output or repr(result.exception)
 
     assert target.read_text(encoding="utf-8") == "after"
-    with RuntimeState.open_sync(database) as store:
+    with RuntimeStore.open_sync(database) as store:
         assert store.read_turn(paused.turn_id).status == "completed"
         assert store.verify().valid
 
@@ -89,17 +97,21 @@ async def test_public_resume_keeps_frozen_mcp_discovery_ceiling(
     original_config.write_text("servers: []\n", encoding="utf-8")
     monkeypatch.setenv("AGENT_MCP_CONFIG", str(original_config))
     original = Agent(
-        workspace_path=workspace, checkpoint_db=database,
-        enable_workspace_mcp=original_enabled, permissions=policy(original_denied),
+        workspace_path=workspace,
+        checkpoint_db=database,
+        enable_workspace_mcp=original_enabled,
+        permissions=policy(original_denied),
         mcp_config_trust=mcp.decide_mcp_config_trust(
-            original_config, workspace_root=workspace, trust_workspace=True,
+            original_config,
+            workspace_root=workspace,
+            trust_workspace=True,
         ),
     )
     monkeypatch.setattr(original, "_model_factory", PatchThenAnswerModel)
     paused = await original.run("change value.txt", require_workspace_change=False)
     assert paused.status == "paused"
     assert target.read_text(encoding="utf-8") == "before"
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         frozen_policy = store.read_turn(paused.turn_id).binding_manifest["mcp_policy"]
     assert frozen_policy["workspace_discovery_enabled"] is original_enabled
 
@@ -124,8 +136,10 @@ async def test_public_resume_keeps_frozen_mcp_discovery_ceiling(
     monkeypatch.setattr(mcp, "resolve_product_mcp_config", discover)
     monkeypatch.setattr(mcp, "open_trusted_product_mcp_tools", open_tools)
     restarted = Agent(
-        workspace_path=workspace, checkpoint_db=database,
-        enable_workspace_mcp=current_enabled, permissions=policy(current_denied),
+        workspace_path=workspace,
+        checkpoint_db=database,
+        enable_workspace_mcp=current_enabled,
+        permissions=policy(current_denied),
         mcp_config_trust=mcp.decide_mcp_config_trust(config, workspace_root=workspace, trust_workspace=True),
     )
     monkeypatch.setattr(restarted, "_model_factory", PatchThenAnswerModel)
@@ -140,7 +154,7 @@ async def test_public_resume_keeps_frozen_mcp_discovery_ceiling(
     assert len(discoveries) == expected_discoveries
     assert len(opened) == expected_discoveries
     assert restarted.enable_workspace_mcp is current_enabled
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         assert store.read_turn(paused.turn_id).binding_manifest["mcp_policy"] == frozen_policy
         assert store.verify().valid
 
@@ -159,7 +173,9 @@ async def test_public_resume_rechecks_current_tool_denial_before_one_time_approv
     assert paused.status == "paused"
 
     restarted = Agent(
-        workspace_path=tmp_path, checkpoint_db=database, enable_workspace_mcp=False,
+        workspace_path=tmp_path,
+        checkpoint_db=database,
+        enable_workspace_mcp=False,
         permissions=PermissionPolicy(tools=(ToolRule(pattern="apply_patch", decision="deny"),)),
     )
     monkeypatch.setattr(restarted, "_model_factory", PatchThenAnswerModel)
@@ -167,7 +183,7 @@ async def test_public_resume_rechecks_current_tool_denial_before_one_time_approv
 
     assert resumed.status == "paused"
     assert target.read_text(encoding="utf-8") == "before"
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         [approval] = store.list_approvals(paused.turn_id)
         assert approval.status == "invalidated"
         assert store.verify().valid

@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from functools import partial
 from pathlib import Path
 
 import pytest
 
+from agent_runtime.harness import tool_ops
 from agent_runtime.harness.verification import assess_tool_verification
 
 
@@ -80,8 +82,9 @@ def test_managed_runner_preserves_plain_python_semantics_without_certificates(tm
         text=True,
     )
     assert result.returncode == 0, result.stderr
-    normal = subprocess.run([sys.executable, *(["-O"] if optimized else []), str(script)],
-                            capture_output=True, text=True)
+    normal = subprocess.run(
+        [sys.executable, *(["-O"] if optimized else []), str(script)], capture_output=True, text=True
+    )
     assert result.returncode == normal.returncode
     assert result.stdout == normal.stdout
     assert not report.exists()
@@ -98,7 +101,8 @@ def test_managed_runner_preserves_the_source_annotation_semantics(tmp_path, futu
     normal = subprocess.run([sys.executable, str(script)], capture_output=True, text=True)
     managed = subprocess.run(
         [sys.executable, "-I", str(runner), str(script), str(tmp_path / "report.json")],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     assert managed.returncode == normal.returncode
     assert managed.stdout == normal.stdout
@@ -130,14 +134,14 @@ def test_executed_assertion_does_not_invent_file_coverage(tmp_path):
 
 
 def test_unrelated_assertions_do_not_verify_the_changed_file(tmp_path):
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
     from agent_runtime.harness.completion import DeliveryCompletionGate
     from tests.agent.harness.test_completion_gate import _commit_tool_result, _proposal
     from tests.agent.harness.test_verification_feedback import _start_changed_turn
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
         turn = _start_changed_turn(store, workspace)
         for target in ["other.py", "module.py"]:
             _commit_tool_result(
@@ -197,14 +201,14 @@ def test_managed_runner_does_not_overwrite_task_files(tmp_path):
 
 
 def test_saved_verification_is_reassessed_against_bound_source_result(tmp_path):
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
     from agent_runtime.harness.completion import DeliveryCompletionGate
     from tests.agent.harness.test_completion_gate import _commit_tool_result, _proposal
     from tests.agent.harness.test_verification_feedback import _start_changed_turn
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
         turn = _start_changed_turn(store, workspace)
         _commit_tool_result(
             store,
@@ -215,7 +219,8 @@ def test_saved_verification_is_reassessed_against_bound_source_result(tmp_path):
             result={"exit_code": 0},
         )
         # An immutable historical event emitted by the old classifier.
-        store.record_verification(
+        tool_ops.record_verification(
+            store,
             turn_id=turn.turn_id,
             operation_id="operation-collected",
             kind="test",
@@ -228,21 +233,23 @@ def test_saved_verification_is_reassessed_against_bound_source_result(tmp_path):
 
 
 def test_mismatched_call_and_operation_cannot_attest_saved_verification(tmp_path, monkeypatch):
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
     from agent_runtime.harness.completion import DeliveryCompletionGate
     from tests.agent.harness.test_completion_gate import _commit_tool_result, _proposal
     from tests.agent.harness.test_verification_feedback import _start_changed_turn
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
         turn = _start_changed_turn(store, workspace)
-        record_call = store.record_tool_call
+        record_call = partial(tool_ops.record_tool_call, store)
 
         def inconsistent_call(**kwargs):
             return record_call(**{**kwargs, "tool_name": "read_file"})
 
-        monkeypatch.setattr(store, "record_tool_call", inconsistent_call)
+        monkeypatch.setattr(
+            tool_ops, "record_tool_call", lambda _store, *args, **kwargs: (inconsistent_call)(*args, **kwargs)
+        )
         _commit_tool_result(
             store,
             turn_id=turn.turn_id,

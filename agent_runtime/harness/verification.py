@@ -236,11 +236,13 @@ def _verifier_mode(words: Sequence[str]) -> str | None:
     # Cargo forwards libtest listing options; Go forwards test binary options.
     # Other runners stop interpreting their own options at '--'.
     if runner not in {"cargo", "go"} and "--" in arguments:
-        arguments = arguments[:arguments.index("--")]
+        arguments = arguments[: arguments.index("--")]
     options = {argument.split("=", 1)[0] for argument in arguments if argument.startswith("--")}
     short = {
-        char for argument in arguments if argument.startswith("-") and not argument.startswith("--")
-        and runner != "go" for char in argument[1:]
+        char
+        for argument in arguments
+        if argument.startswith("-") and not argument.startswith("--") and runner != "go"
+        for char in argument[1:]
     }
     if options & {"--help", "--version", "--collect-only", "--co", "--no-run"} or short & {"h", "V"}:
         return "no_tests_executed"

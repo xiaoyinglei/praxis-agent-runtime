@@ -19,7 +19,8 @@ from agent_runtime.workspace import open_workspace
 from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel
 
 pytestmark = pytest.mark.skipif(
-    sys.platform not in {"darwin", "linux"}, reason="requires an actual supported OS sandbox",
+    sys.platform not in {"darwin", "linux"},
+    reason="requires an actual supported OS sandbox",
 )
 
 
@@ -34,7 +35,7 @@ async def test_sigkill_owner_then_reattach_exact_same_command(tmp_path, released
         pytest.skip("requires bubblewrap")
     workspace = open_workspace(tmp_path / "workspace", create=True)
     request = request_for("printf x >> counter; printf ready; sleep 0.8; printf done")
-    script = '''
+    script = """
 import asyncio, json, sys
 from pathlib import Path
 from agent_runtime.tools.builtins.command_sessions import DurableCommandSessions
@@ -51,9 +52,13 @@ async def main():
     print(result.model_dump_json(), flush=True)
     await asyncio.Event().wait()
 asyncio.run(main())
-'''
-    process = subprocess.Popen([sys.executable, "-c", script, str(workspace.root), request.model_dump_json(),
-                                str(released)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-c", script, str(workspace.root), request.model_dump_json(), str(released)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
     owner = DurableCommandSessions(workspace)
     try:
         assert process.stdout is not None
@@ -62,8 +67,9 @@ asyncio.run(main())
         result = shell.RunCommandOutput.model_validate_json(line)
         process.kill()  # actual SIGKILL; aclose cannot run
         await asyncio.to_thread(process.wait)
-        await owner.restore(result.session_id, request=request, digest=result.request_digest,
-                            operation_id="operation_test")
+        await owner.restore(
+            result.session_id, request=request, digest=result.request_digest, operation_id="operation_test"
+        )
         final = await owner.manage(result.session_id, action="wait", wait_seconds=10)
         assert final.exit_code == 0, final
         assert final.stdout == "readydone"
@@ -81,8 +87,8 @@ async def test_durable_log_reads_preserve_middle_failure_and_offset(tmp_path):
     workspace = open_workspace(tmp_path / "workspace", create=True)
     owner = DurableCommandSessions(workspace)
     request = request_for(
-        "awk 'BEGIN { for(i=0;i<18000;i++)printf \"A\"; "
-        "printf \"IMPORTANT_MIDDLE_FAILURE\"; for(i=0;i<18000;i++)printf \"B\"; }'"
+        'awk \'BEGIN { for(i=0;i<18000;i++)printf "A"; '
+        'printf "IMPORTANT_MIDDLE_FAILURE"; for(i=0;i<18000;i++)printf "B"; }\''
     )
     try:
         result = await owner.start(request)
@@ -131,11 +137,16 @@ async def test_recovery_rejects_other_owner_and_request_tampering(tmp_path):
         result = await owner.start(request)
         await owner.after_commit({}, result.model_dump(), "operation_test")
         with pytest.raises(RuntimeError, match="another live Agent"):
-            await second.restore(result.session_id, request=request, digest=result.request_digest,
-                                 operation_id="operation_test")
+            await second.restore(
+                result.session_id, request=request, digest=result.request_digest, operation_id="operation_test"
+            )
         with pytest.raises(ValueError, match="does not match"):
-            await second.restore(result.session_id, request=request_for("touch unexpected"),
-                                 digest=result.request_digest, operation_id="operation_test")
+            await second.restore(
+                result.session_id,
+                request=request_for("touch unexpected"),
+                digest=result.request_digest,
+                operation_id="operation_test",
+            )
     finally:
         await owner.aclose()
         await second.aclose()
@@ -166,6 +177,7 @@ async def test_lost_worker_keeps_identity_and_is_never_replayed(tmp_path, action
 @pytest.mark.anyio
 async def test_policy_revocation_cancels_before_publication_and_hides_old_output(tmp_path):
     from agent_runtime.permission_policy import PermissionPolicy
+
     workspace = open_workspace(tmp_path / "workspace", create=True)
     policy = PermissionPolicy().resolve(workspace.root)
     workspace.permission_provider = lambda: policy
@@ -185,6 +197,7 @@ async def test_policy_revocation_cancels_before_publication_and_hides_old_output
 @pytest.mark.anyio
 async def test_worker_journal_is_hidden_under_explicit_parent_read_grant(tmp_path):
     from agent_runtime.permission_policy import PathRule, PermissionPolicy
+
     workspace = open_workspace(tmp_path / "workspace", create=True)
     private = journal.private_root(workspace.root)
     secret = private / ("secret_" + os.urandom(8).hex())
@@ -217,26 +230,50 @@ class CrashResumeModel(PatchThenAnswerModel):
         request = prepared.dispatch_payload
         outputs = [json.loads(m.content)["structured_content"] for m in request.messages if m.role == "tool"]
         if not outputs:
-            wait = ("while [ ! -f command-release ]; do sleep 0.05; done"
-                    if self.wait_for_release else f"sleep {self.delay}")
-            call = ModelToolCall(id="launch", name="run_command", arguments={
-                "command": f"printf ready; {wait}; printf done", "timeout_seconds": None,
-                "yield_time_seconds": 0.01,
-            })
+            wait = (
+                "while [ ! -f command-release ]; do sleep 0.05; done"
+                if self.wait_for_release
+                else f"sleep {self.delay}"
+            )
+            call = ModelToolCall(
+                id="launch",
+                name="run_command",
+                arguments={
+                    "command": f"printf ready; {wait}; printf done",
+                    "timeout_seconds": None,
+                    "yield_time_seconds": 0.01,
+                },
+            )
         elif len(outputs) == 1:
-            call = ModelToolCall(id="patch", name="apply_patch", arguments={
-                "file_path": "source", "old_string": "before", "new_string": "after",
-            })
+            call = ModelToolCall(
+                id="patch",
+                name="apply_patch",
+                arguments={
+                    "file_path": "source",
+                    "old_string": "before",
+                    "new_string": "after",
+                },
+            )
         elif outputs[-1].get("status") != "completed":
-            call = ModelToolCall(id="wait-" + str(request.step), name="manage_command", arguments={
-                "session_id": outputs[0]["session_id"], "action": "wait", "wait_seconds": 5,
-            })
+            call = ModelToolCall(
+                id="wait-" + str(request.step),
+                name="manage_command",
+                arguments={
+                    "session_id": outputs[0]["session_id"],
+                    "action": "wait",
+                    "wait_seconds": 5,
+                },
+            )
         else:
             assert outputs[-1]["exit_code"] == 0, outputs[-1]
-            return HarnessModelResponse.from_parts(text="Recovered original command", provider_response_id=None,
-                                        usage={"input_tokens": 3, "output_tokens": 3})
-        return HarnessModelResponse.from_parts(text="", provider_response_id=None, tool_calls=(call,),
-                                    usage={"input_tokens": 3, "output_tokens": 3})
+            return HarnessModelResponse.from_parts(
+                text="Recovered original command",
+                provider_response_id=None,
+                usage={"input_tokens": 3, "output_tokens": 3},
+            )
+        return HarnessModelResponse.from_parts(
+            text="", provider_response_id=None, tool_calls=(call,), usage={"input_tokens": 3, "output_tokens": 3}
+        )
 
 
 @pytest.mark.anyio
@@ -244,13 +281,13 @@ class CrashResumeModel(PatchThenAnswerModel):
 @pytest.mark.parametrize("abort", [False, True])
 async def test_public_sdk_restores_ledger_authorized_job_after_sigkill(tmp_path, monkeypatch, inspector, abort):
     from agent_runtime import Agent
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "source").write_text("before")
     database = tmp_path / "rollout.db"
-    script = '''
+    script = """
 import asyncio, json, sys
 from pathlib import Path
 from agent_runtime import Agent
@@ -267,10 +304,12 @@ async def main():
         print(json.dumps({'turn_id': result.turn_id}), flush=True)
         await asyncio.Event().wait()
 asyncio.run(main())
-'''
+"""
     process = subprocess.Popen(
         [sys.executable, "-c", script, str(workspace), str(database), "abort" if abort else "1.5"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
     try:
         line = await asyncio.wait_for(asyncio.to_thread(process.stdout.readline), 15)
@@ -280,7 +319,7 @@ asyncio.run(main())
         await asyncio.to_thread(process.wait)
         agent = Agent(workspace_path=workspace, checkpoint_db=database, enable_workspace_mcp=False)
         monkeypatch.setattr(agent, "_model_factory", CrashResumeModel)
-        async with (await RuntimeState.open(database)) as store:
+        async with await RuntimeStore.open(database) as store:
             launch = next(i for i in store.list_items(turn_id) if i.kind == "tool_result")
             key = launch.payload["structured_content"]["session_id"]
         if inspector == "sdk":
@@ -292,10 +331,19 @@ asyncio.run(main())
             from typer.testing import CliRunner
 
             from agent_runtime import cli
+
             monkeypatch.chdir(workspace)
-            inspected = await asyncio.to_thread(CliRunner().invoke, cli.agent_app, [
-                "commands", turn_id, key, "--rollout-db", str(database),
-            ])
+            inspected = await asyncio.to_thread(
+                CliRunner().invoke,
+                cli.agent_app,
+                [
+                    "commands",
+                    turn_id,
+                    key,
+                    "--rollout-db",
+                    str(database),
+                ],
+            )
             assert inspected.exit_code == 0, inspected.output
             assert json.loads(inspected.output)["session_id"] == key
             if abort:
@@ -303,7 +351,7 @@ asyncio.run(main())
         if abort:
             result = await agent.resume(turn_id, "abort")
             assert result.status == "failed"  # Public AgentResult maps cancelled Turn to failed.
-            async with (await RuntimeState.open(database)) as store:
+            async with await RuntimeStore.open(database) as store:
                 assert store.read_turn(turn_id).status == "cancelled"
                 terminal = next(i for i in store.list_items(turn_id) if i.kind == "tool_continuation")
                 assert terminal.payload["structured_content"]["status"] == "cancelled"
@@ -312,7 +360,7 @@ asyncio.run(main())
             return
         result = await agent.resume(turn_id, "allow_once")
         assert result.status == "done", result
-        async with (await RuntimeState.open(database)) as store:
+        async with await RuntimeStore.open(database) as store:
             outputs = [i.payload for i in store.list_items(turn_id) if i.kind == "tool_result"]
             assert outputs[-1]["structured_content"]["stdout"] == "readydone"
             origin = outputs[-1]["metadata"]["runtime_workspace_origin_operation_id"]
@@ -329,6 +377,7 @@ asyncio.run(main())
 @pytest.mark.anyio
 async def test_completed_output_is_withheld_after_policy_change(tmp_path):
     from agent_runtime.permission_policy import PermissionPolicy
+
     workspace = open_workspace(tmp_path / "workspace", create=True)
     policy = PermissionPolicy().resolve(workspace.root)
     workspace.permission_provider = lambda: policy
@@ -371,7 +420,9 @@ async def test_linux_large_workspace_background_build_publishes_checked_progress
     ending = {"success": "exit 0", "failure": "exit 7", "timeout": "sleep 10"}[finish]
     request = shell.RunCommandInput(
         command="printf partial > build-progress; " + ending,
-        workspace_write=True, publish_on_failure=True, yield_time_seconds=0.01,
+        workspace_write=True,
+        publish_on_failure=True,
+        yield_time_seconds=0.01,
         timeout_seconds=0.2 if finish == "timeout" else None,
     )
     try:
@@ -391,6 +442,7 @@ async def test_linux_large_workspace_background_build_publishes_checked_progress
 async def test_policy_change_at_wait_return_confirms_cancellation_before_detach(tmp_path, monkeypatch):
     from agent_runtime.permission_policy import PermissionPolicy
     from agent_runtime.tools.builtins.command_sessions import CommandSessions
+
     workspace = open_workspace(tmp_path / "workspace", create=True)
     policy = PermissionPolicy().resolve(workspace.root)
     workspace.permission_provider = lambda: policy
@@ -417,6 +469,7 @@ async def test_policy_change_at_wait_return_confirms_cancellation_before_detach(
 @pytest.mark.anyio
 async def test_unreadable_current_policy_cancels_instead_of_losing_monitor(tmp_path):
     from agent_runtime.permission_policy import PermissionPolicy
+
     workspace = open_workspace(tmp_path / "workspace", create=True)
     policy = PermissionPolicy().resolve(workspace.root)
     workspace.permission_provider = lambda: policy

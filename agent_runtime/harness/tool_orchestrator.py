@@ -24,8 +24,10 @@ from agent_runtime.checkpoints import (
 )
 from agent_runtime.core.messages import tool_result_message
 from agent_runtime.core.runtime_diagnostics import exception_diagnostic
+from agent_runtime.harness import artifact_ops, tool_ops
 from agent_runtime.harness.events import commit_and_publish
-from agent_runtime.harness.state import ResourceClaimConflictError, RuntimeState
+from agent_runtime.harness.operation_values import ResourceClaimConflictError
+from agent_runtime.harness.runtime_store import RuntimeStore
 from agent_runtime.harness.verification import classify_tool_verification
 from agent_runtime.streaming.events import (
     ItemDeltaKind,
@@ -125,7 +127,8 @@ class ToolOrchestrator:
         terminal: set[tuple[str, str]] = set()
         operations = await self._store.run_async(self._store.list_tool_operations, turn_id)
         observed_results = {
-            operation.result_item_id for operation in operations
+            operation.result_item_id
+            for operation in operations
             if operation.tool_name == "manage_command" and operation.status == "succeeded"
         }
         for evidence_item in items.values():
@@ -133,18 +136,29 @@ class ToolOrchestrator:
             output = payload.get("structured_content")
             metadata = payload.get("metadata", {})
             origin = metadata.get("runtime_workspace_origin_operation_id")
-            if (evidence_item.kind == "tool_result" and evidence_item.producer == "tool"
-                    and evidence_item.item_id in observed_results and isinstance(origin, str)
-                    and isinstance(output, Mapping) and output.get("status") in {"completed", "cancelled"}):
+            if (
+                evidence_item.kind == "tool_result"
+                and evidence_item.producer == "tool"
+                and evidence_item.item_id in observed_results
+                and isinstance(origin, str)
+                and isinstance(output, Mapping)
+                and output.get("status") in {"completed", "cancelled"}
+            ):
                 key = output.get("session_id")
                 if isinstance(key, str):
                     terminal.add((origin, key))
-            if (evidence_item.kind == "tool_continuation" and evidence_item.producer == "runtime"
-                    and isinstance(payload.get("key"), str) and isinstance(payload.get("operation_id"), str)
-                    and isinstance(output, Mapping) and output.get("session_id") == payload["key"]
-                    and output.get("status") in {"completed", "cancelled"}):
-                original = next((operation for operation in operations
-                                 if operation.operation_id == payload["operation_id"]), None)
+            if (
+                evidence_item.kind == "tool_continuation"
+                and evidence_item.producer == "runtime"
+                and isinstance(payload.get("key"), str)
+                and isinstance(payload.get("operation_id"), str)
+                and isinstance(output, Mapping)
+                and output.get("session_id") == payload["key"]
+                and output.get("status") in {"completed", "cancelled"}
+            ):
+                original = next(
+                    (operation for operation in operations if operation.operation_id == payload["operation_id"]), None
+                )
                 if original is not None and original.result_item_id == payload.get("source_result_item_id"):
                     terminal.add((original.operation_id, payload["key"]))
         for operation in operations:
@@ -157,8 +171,11 @@ class ToolOrchestrator:
             if not isinstance(output, Mapping) or output.get("status") != "running":
                 continue
             key, digest = output.get("session_id"), output.get("request_digest")
-            if (not isinstance(key, str) or not isinstance(digest, str)
-                    or ((operation.operation_id, key) in terminal and not include_terminal)):
+            if (
+                not isinstance(key, str)
+                or not isinstance(digest, str)
+                or ((operation.operation_id, key) in terminal and not include_terminal)
+            ):
                 continue
             tool = self._tools.get("run_command")
             if tool is None or operation.execution_revision != tool.execution_revision:
@@ -166,20 +183,25 @@ class ToolOrchestrator:
             call = await self._store.run_async(
                 self._committed_tool_call, turn_id=turn_id, tool_call_id=operation.tool_call_id
             )
-            await sessions.restore(key, request=RunCommandInput.model_validate(dict(call.arguments)),
-                                   digest=digest, operation_id=operation.operation_id)
+            await sessions.restore(
+                key,
+                request=RunCommandInput.model_validate(dict(call.arguments)),
+                digest=digest,
+                operation_id=operation.operation_id,
+            )
             if (operation.operation_id, key) in terminal:
                 continue  # Terminal log inspection cannot attribute later host edits.
             metadata = item.payload.get("metadata", {})
             root = Path(sessions.workspace.root) if "write_workspace" in operation.effects else None
             before = metadata.get("workspace_tree_after_sha256")
-            self._executor.restore_continuation(sessions, key, operation_id=operation.operation_id,
-                                               workspace_root=root, before_sha256=before)
+            self._executor.restore_continuation(
+                sessions, key, operation_id=operation.operation_id, workspace_root=root, before_sha256=before
+            )
 
     def __init__(
         self,
         *,
-        store: RuntimeState,
+        store: RuntimeStore,
         tools: Mapping[str, Tool],
         execution_context: ToolExecutionContext,
         worker_id: str | None = None,
@@ -204,15 +226,26 @@ class ToolOrchestrator:
         self._instruction_snapshots: dict[str, Mapping[str, Any]] = {}
 
     async def _save_output_artifact(
-        self, source: Path, media_type: str, name: str, expected_sha256: str,
+        self,
+        source: Path,
+        media_type: str,
+        name: str,
+        expected_sha256: str,
     ) -> ArtifactReference:
         # The Store remains the sole owner of durable artifact identities.
         # A local source file is copied and verified before it becomes a durable
         # identity; its URI is never returned as a canonical artifact reference.
         turn_id = current_tool_turn_id()
-        artifact = await self._commit(lambda: self._store.commit_artifact(
-            turn_id=turn_id, content=source, media_type=media_type, name=name, expected_sha256=expected_sha256,
-        ))
+        artifact = await self._commit(
+            lambda: artifact_ops.commit_artifact(
+                self._store,
+                turn_id=turn_id,
+                content=source,
+                media_type=media_type,
+                name=name,
+                expected_sha256=expected_sha256,
+            )
+        )
         return ArtifactReference(artifact.artifact_id, artifact.media_type, artifact.name)
 
     def attach_event_dispatcher(
@@ -229,15 +262,21 @@ class ToolOrchestrator:
         self._instruction_snapshots.clear()
 
     async def close_continuation(
-        self, continuation: ToolContinuation, result: Mapping[str, JsonValue],
+        self,
+        continuation: ToolContinuation,
+        result: Mapping[str, JsonValue],
     ) -> None:
         metadata = await self._executor.observe_continuation(continuation)
         operation_id = metadata.get("runtime_workspace_origin_operation_id")
         if isinstance(operation_id, str):
-            await self._commit(lambda: self._store.record_tool_continuation(
-                operation_id=operation_id, key=continuation.key,
-                result={**dict(result), "metadata": dict(metadata)},
-            ))
+            await self._commit(
+                lambda: tool_ops.record_tool_continuation(
+                    self._store,
+                    operation_id=operation_id,
+                    key=continuation.key,
+                    result={**dict(result), "metadata": dict(metadata)},
+                )
+            )
 
     async def reconcile_command_observation(self, sessions: Any, turn_id: str) -> bool:
         """Observe an authorized original job after its wait/status client died.
@@ -259,8 +298,12 @@ class ToolOrchestrator:
             return False
         operation = await self._store.run_async(self._store.read_tool_operation, pending[0].operation_id)
         tool = self._tools.get("manage_command")
-        if (operation.tool_name != "manage_command" or operation.status != "unknown"
-                or tool is None or operation.execution_revision != tool.execution_revision):
+        if (
+            operation.tool_name != "manage_command"
+            or operation.status != "unknown"
+            or tool is None
+            or operation.execution_revision != tool.execution_revision
+        ):
             return False
         call = await self._store.run_async(
             self._committed_tool_call, turn_id=turn_id, tool_call_id=operation.tool_call_id
@@ -272,8 +315,7 @@ class ToolOrchestrator:
         # checks. It attaches the same worker; it does not execute its command.
         await self.restore_command_sessions(sessions, turn_id, include_terminal=True)
         output = await sessions.manage(request.session_id, action="status", wait_seconds=0)
-        if (output.session_id != request.session_id
-                or output.sandbox_error not in {None, "command_permissions_changed"}):
+        if output.session_id != request.session_id or output.sandbox_error not in {None, "command_permissions_changed"}:
             return False
         continuation = sessions.continuation(call.arguments, output.model_dump(mode="json"))
         if continuation is None:
@@ -281,9 +323,12 @@ class ToolOrchestrator:
         normalized = _normalize_command_output(output)
         metadata = await self._executor.observe_continuation(continuation)
         result = ToolResult(
-            tool_call_id=call.tool_call_id, tool_name=call.tool_name,
-            structured_content=normalized.structured_content, is_error=normalized.is_error,
-            error_code=normalized.error_code, error_message=normalized.error_message,
+            tool_call_id=call.tool_call_id,
+            tool_name=call.tool_name,
+            structured_content=normalized.structured_content,
+            is_error=normalized.is_error,
+            error_code=normalized.error_code,
+            error_message=normalized.error_message,
             truncated=output.truncated,
             metadata={**dict(metadata), "reconciler_revision": "durable-command-observation-v1"},
         )
@@ -296,11 +341,19 @@ class ToolOrchestrator:
                 self.reconcile(turn_id=turn_id, outcome=ToolReconciliationOutcome(status=status, result=result))
                 origin = metadata.get("runtime_workspace_origin_operation_id")
                 if continuation.terminal and isinstance(origin, str):
-                    self._store.record_tool_continuation(operation_id=origin, key=continuation.key, result={
-                        "structured_content": output.model_dump(mode="json"), "is_error": normalized.is_error,
-                        "error_code": normalized.error_code, "error_message": normalized.error_message,
-                        "metadata": dict(metadata),
-                    })
+                    tool_ops.record_tool_continuation(
+                        self._store,
+                        operation_id=origin,
+                        key=continuation.key,
+                        result={
+                            "structured_content": output.model_dump(mode="json"),
+                            "is_error": normalized.is_error,
+                            "error_code": normalized.error_code,
+                            "error_message": normalized.error_message,
+                            "metadata": dict(metadata),
+                        },
+                    )
+
         await self._commit(commit)
         return True
 
@@ -316,9 +369,13 @@ class ToolOrchestrator:
                 snapshot = operation.request_ref.get("step_snapshot")
                 if not isinstance(snapshot, Mapping):
                     raise RuntimeError("model tool call has no durable Step snapshot")
-                return {**snapshot, "input_revision": self._store.request_input_revision(
-                    turn_id, operation.request_ref,
-                )}
+                return {
+                    **snapshot,
+                    "input_revision": self._store.request_input_revision(
+                        turn_id,
+                        operation.request_ref,
+                    ),
+                }
         return None
 
     def _context_for_call(self, turn_id: str, call: ToolCall) -> ToolExecutionContext:
@@ -405,18 +462,31 @@ class ToolOrchestrator:
                 record = await self._store.run_async(self._pending_record, turn_id, call)
                 assert record is not None
                 await self._persist_execution_record(turn_id=turn_id, tool=self._tools[call.tool_name], record=record)
-            await self._commit(lambda: self._store.reject_ready_tool_operation(
-                operation_id=operation.operation_id, error_code="input_superseded",
-            ))
+            await self._commit(
+                lambda: tool_ops.reject_ready_tool_operation(
+                    self._store,
+                    operation_id=operation.operation_id,
+                    error_code="input_superseded",
+                )
+            )
         result = ToolResult(
-            tool_call_id=call.tool_call_id, tool_name=call.tool_name, is_error=True,
-            error_code="input_superseded", error_message="Action not executed: superseded by new user input.",
-            retryable=False, content=(), metadata={"execution_started": False},
+            tool_call_id=call.tool_call_id,
+            tool_name=call.tool_name,
+            is_error=True,
+            error_code="input_superseded",
+            error_message="Action not executed: superseded by new user input.",
+            retryable=False,
+            content=(),
+            metadata={"execution_started": False},
         )
-        await self._commit(lambda: self._store.record_tool_result(
-            turn_id=turn_id, operation_id=None if operation is None else operation.operation_id,
-            result=_tool_result_payload(result),
-        ))
+        await self._commit(
+            lambda: tool_ops.record_tool_result(
+                self._store,
+                turn_id=turn_id,
+                operation_id=None if operation is None else operation.operation_id,
+                result=_tool_result_payload(result),
+            )
+        )
         return result
 
     async def execute(self, *, turn_id: str, call: ToolCall) -> ToolResult:
@@ -487,7 +557,8 @@ class ToolOrchestrator:
 
     async def _record_call(self, turn_id: str, call: ToolCall) -> None:
         await self._commit(
-            lambda: self._store.record_tool_call(
+            lambda: tool_ops.record_tool_call(
+                self._store,
                 turn_id=turn_id,
                 tool_call_id=call.tool_call_id,
                 tool_name=call.tool_name,
@@ -521,7 +592,8 @@ class ToolOrchestrator:
                 execution.trace.targets,
             )
             interaction = await self._commit(
-                lambda: self._store.request_tool_approval(
+                lambda: tool_ops.request_tool_approval(
+                    self._store,
                     turn_id=turn_id,
                     operation_id=record.operation_id,
                     tool_call_id=record.tool_call_id,
@@ -561,8 +633,11 @@ class ToolOrchestrator:
                 metadata={
                     **execution.result.metadata,
                     "diagnostic": exception_diagnostic(
-                        error, stage="tool_result_commit_failed", tool_call_id=call.tool_call_id,
-                        operation_id=operation_id, turn_id=turn_id,
+                        error,
+                        stage="tool_result_commit_failed",
+                        tool_call_id=call.tool_call_id,
+                        operation_id=operation_id,
+                        turn_id=turn_id,
                     ),
                     "result_commit_failed": True,
                 },
@@ -584,10 +659,12 @@ class ToolOrchestrator:
             raise ValueError("batch tool call identities must be unique")
         for call in calls:
             await self._record_call(turn_id, call)
+
         def parallel_local(call: ToolCall) -> bool:
             tool = self._tools.get(call.tool_name)
             return bool(
-                tool is not None and tool.concurrency_safe
+                tool is not None
+                and tool.concurrency_safe
                 and tool.cancellation_mode in {CancellationMode.COOPERATIVE, CancellationMode.MANAGED_PROCESS}
             )
 
@@ -724,10 +801,13 @@ class ToolOrchestrator:
             return
 
     async def _record_turn_checkpoint(
-        self, turn_id: str, snapshot: CheckpointSnapshot,
+        self,
+        turn_id: str,
+        snapshot: CheckpointSnapshot,
     ) -> None:
         def persist() -> None:
-            self._store.record_workspace_checkpoint(
+            tool_ops.record_workspace_checkpoint(
+                self._store,
                 turn_id=turn_id,
                 checkpoint_id=snapshot.checkpoint_id,
                 trigger=snapshot.trigger,
@@ -811,7 +891,8 @@ class ToolOrchestrator:
         operation_id = None if record is None else record.operation_id
         if record is None:
             await self._commit(
-                lambda: self._store.record_tool_result(
+                lambda: tool_ops.record_tool_result(
+                    self._store,
                     turn_id=turn_id,
                     operation_id=None,
                     result=_tool_result_payload(execution.result),
@@ -821,10 +902,14 @@ class ToolOrchestrator:
         claim = self._claims.get(record.operation_id)
         if claim is None:
             operation = await self._store.run_async(self._store.read_tool_operation, record.operation_id)
-            if (operation.status == "failed" and operation.error_code == record.error_code
-                    and record.error_code in {"resource_busy", "input_superseded"}):
+            if (
+                operation.status == "failed"
+                and operation.error_code == record.error_code
+                and record.error_code in {"resource_busy", "input_superseded"}
+            ):
                 await self._commit(
-                    lambda: self._store.record_tool_result(
+                    lambda: tool_ops.record_tool_result(
+                        self._store,
                         turn_id=turn_id,
                         operation_id=operation_id,
                         result=_tool_result_payload(execution.result),
@@ -840,7 +925,8 @@ class ToolOrchestrator:
         if status is None:
             raise RuntimeError(f"unsupported ToolExecutionRecord status: {record.status}")
         accepted = await self._commit(
-            lambda: self._store.commit_tool_operation_result(
+            lambda: tool_ops.commit_tool_operation_result(
+                self._store,
                 turn_id=turn_id,
                 operation_id=record.operation_id,
                 claim_generation=claim[0],
@@ -875,7 +961,8 @@ class ToolOrchestrator:
         )
         if evidence is not None:
             await self._commit(
-                lambda: self._store.record_verification(
+                lambda: tool_ops.record_verification(
+                    self._store,
                     turn_id=turn_id,
                     operation_id=record.operation_id,
                     kind=evidence.kind,
@@ -885,7 +972,10 @@ class ToolOrchestrator:
             )
 
     async def resume_approval(
-        self, *, turn_id: str, decision: str,
+        self,
+        *,
+        turn_id: str,
+        decision: str,
         on_session_grant: Callable[[CommandGrant], None] | None = None,
     ) -> ToolResult:
         pending = await self._store.run_async(
@@ -905,7 +995,7 @@ class ToolOrchestrator:
             self._committed_tool_call, turn_id=turn_id, tool_call_id=operation.tool_call_id
         )
         if await self._store.run_async(self.input_superseded, turn_id, call):
-            await self._commit(lambda: self._store.resolve_tool_approval(turn_id=turn_id, decision="deny"))
+            await self._commit(lambda: tool_ops.resolve_tool_approval(self._store, turn_id=turn_id, decision="deny"))
             return await self._discard_superseded(turn_id, call)
         tool = self._tools.get(call.tool_name)
         if tool is None:
@@ -922,28 +1012,42 @@ class ToolOrchestrator:
             arguments = tool.validate_input(call.arguments)
             outcome = can_use_tool(tool, arguments, tool.resolve_use(arguments), execution_context)
             if outcome.decision is UseToolDecision.ASK:
-                preflight = await self._execute_in_turn(turn_id, call, context=replace(
-                    execution_context,
-                    approved_tool_call_ids=execution_context.approved_tool_call_ids - {call.tool_call_id},
-                    require_confirmation_for=execution_context.require_confirmation_for | {call.tool_name},
-                ))
+                preflight = await self._execute_in_turn(
+                    turn_id,
+                    call,
+                    context=replace(
+                        execution_context,
+                        approved_tool_call_ids=execution_context.approved_tool_call_ids - {call.tool_call_id},
+                        require_confirmation_for=execution_context.require_confirmation_for | {call.tool_name},
+                    ),
+                )
                 current_request = _approval_request(
-                    preflight, record=ToolExecutionRecord.prepare(call, tool), tool=tool,
-                    context=execution_context, arguments=call.arguments,
+                    preflight,
+                    record=ToolExecutionRecord.prepare(call, tool),
+                    tool=tool,
+                    context=execution_context,
+                    arguments=call.arguments,
                 )
                 if _approval_scope(current_request) != _approval_scope(interaction.request):
-                    interaction = await self._commit(lambda: self._store.refresh_tool_approval(
-                        turn_id=turn_id, request=current_request,
-                    ))
+                    interaction = await self._commit(
+                        lambda: tool_ops.refresh_tool_approval(
+                            self._store,
+                            turn_id=turn_id,
+                            request=current_request,
+                        )
+                    )
                 raise ToolApprovalInvalidatedError(interaction.request_id)
             decision = "approve" if outcome.decision is UseToolDecision.ALLOW else "deny"
         grant = None
         if on_session_grant is not None:
             arguments = tool.validate_input(call.arguments)
             grant = command_grant(tool, arguments, tool.resolve_use(arguments), execution_context)
-            if (decision != "approve" or grant is None
-                    or interaction.request.get("approval_scope", "tool") != "tool"
-                    or interaction.request.get("session_grant") != grant.to_json()):
+            if (
+                decision != "approve"
+                or grant is None
+                or interaction.request.get("approval_scope", "tool") != "tool"
+                or interaction.request.get("session_grant") != grant.to_json()
+            ):
                 raise ValueError("this approval does not offer a current Session command grant")
         if decision == "approve" and not recheck:
             preflight_context = replace(
@@ -972,14 +1076,16 @@ class ToolOrchestrator:
                 interaction.request
             ) != _approval_scope(current_request):
                 invalidated = await self._commit(
-                    lambda: self._store.invalidate_tool_approval(
+                    lambda: tool_ops.invalidate_tool_approval(
+                        self._store,
                         turn_id=turn_id,
                         reason="approval scope changed before execution",
                     )
                 )
                 raise ToolApprovalInvalidatedError(invalidated.request_id)
         interaction = await self._commit(
-            lambda: self._store.resolve_tool_approval(
+            lambda: tool_ops.resolve_tool_approval(
+                self._store,
                 turn_id=turn_id,
                 decision=decision,
                 policy_recheck=recheck,
@@ -997,15 +1103,17 @@ class ToolOrchestrator:
         approved = decision == "approve" and not recheck
         context = replace(
             execution_context,
-            approved_tool_call_ids=(
-                execution_context.approved_tool_call_ids | (approval_ids if approved else set())
-            ),
+            approved_tool_call_ids=(execution_context.approved_tool_call_ids | (approval_ids if approved else set())),
             denied_tool_call_ids=(
                 execution_context.denied_tool_call_ids | (approval_ids if decision == "deny" else set())
             ),
         )
         result = await self._execute_approved_record(
-            turn_id=turn_id, call=call, tool=tool, context=context, record=record,
+            turn_id=turn_id,
+            call=call,
+            tool=tool,
+            context=context,
+            record=record,
         )
         if on_session_grant is not None and grant is not None and not result.is_error:
             await self._store.run_async(on_session_grant, grant)
@@ -1051,25 +1159,42 @@ class ToolOrchestrator:
             execution_context = execution_context.refreshed()
             outcome = can_use_tool(tool, arguments, tool.resolve_use(arguments), execution_context)
             if outcome.decision is UseToolDecision.ASK:
-                preflight = await self._execute_in_turn(turn_id, call, context=replace(
-                    execution_context,
-                    approved_tool_call_ids=execution_context.approved_tool_call_ids - {call.tool_call_id},
-                    require_confirmation_for=execution_context.require_confirmation_for | {call.tool_name},
-                ))
-                current_request = _approval_request(
-                    preflight, record=ToolExecutionRecord.prepare(call, tool), tool=tool,
-                    context=execution_context, arguments=call.arguments,
+                preflight = await self._execute_in_turn(
+                    turn_id,
+                    call,
+                    context=replace(
+                        execution_context,
+                        approved_tool_call_ids=execution_context.approved_tool_call_ids - {call.tool_call_id},
+                        require_confirmation_for=execution_context.require_confirmation_for | {call.tool_name},
+                    ),
                 )
-                refreshed = await self._commit(lambda: self._store.refresh_tool_approval(
-                    turn_id=turn_id, request=current_request,
-                ))
+                current_request = _approval_request(
+                    preflight,
+                    record=ToolExecutionRecord.prepare(call, tool),
+                    tool=tool,
+                    context=execution_context,
+                    arguments=call.arguments,
+                )
+                refreshed = await self._commit(
+                    lambda: tool_ops.refresh_tool_approval(
+                        self._store,
+                        turn_id=turn_id,
+                        request=current_request,
+                    )
+                )
                 raise ToolApprovalInvalidatedError(refreshed.request_id)
             return await self._execute_approved_record(
-                turn_id=turn_id, call=call, tool=tool, context=execution_context,
+                turn_id=turn_id,
+                call=call,
+                tool=tool,
+                context=execution_context,
                 record=ToolExecutionRecord(
-                    tool_call_id=operation.tool_call_id, tool_name=operation.tool_name,
-                    operation_id=operation.operation_id, arguments_digest=operation.arguments_digest,
-                    idempotent=operation.idempotent, status=ExecutionStatus.PREPARED,
+                    tool_call_id=operation.tool_call_id,
+                    tool_name=operation.tool_name,
+                    operation_id=operation.operation_id,
+                    arguments_digest=operation.arguments_digest,
+                    idempotent=operation.idempotent,
+                    status=ExecutionStatus.PREPARED,
                     attempt_count=operation.attempt_count,
                 ),
             )
@@ -1093,7 +1218,8 @@ class ToolOrchestrator:
             interaction.request
         ) != _approval_scope(current_request):
             invalidated = await self._commit(
-                lambda: self._store.invalidate_resolved_tool_approval(
+                lambda: tool_ops.invalidate_resolved_tool_approval(
+                    self._store,
                     turn_id=turn_id,
                     reason="approval scope changed before recovered execution",
                 )
@@ -1111,13 +1237,23 @@ class ToolOrchestrator:
         )
         context = replace(
             execution_context,
-            approved_tool_call_ids=(execution_context.approved_tool_call_ids | {call.tool_call_id}
-                                    | ({_network_approval_id(call.tool_call_id)}
-                                       if interaction.request.get("approval_scope") == "network" else set())),
+            approved_tool_call_ids=(
+                execution_context.approved_tool_call_ids
+                | {call.tool_call_id}
+                | (
+                    {_network_approval_id(call.tool_call_id)}
+                    if interaction.request.get("approval_scope") == "network"
+                    else set()
+                )
+            ),
             denied_tool_call_ids=(execution_context.denied_tool_call_ids - {call.tool_call_id}),
         )
         return await self._execute_approved_record(
-            turn_id=turn_id, call=call, tool=tool, context=context, record=record,
+            turn_id=turn_id,
+            call=call,
+            tool=tool,
+            context=context,
+            record=record,
         )
 
     async def _execute_approved_record(
@@ -1206,7 +1342,8 @@ class ToolOrchestrator:
         revision = result.metadata.get("reconciler_revision")
         if not isinstance(revision, str) or not revision.strip():
             raise RuntimeError("reconciled ToolResult requires reconciler_revision")
-        self._store.resolve_tool_reconciliation(
+        tool_ops.resolve_tool_reconciliation(
+            self._store,
             turn_id=turn_id,
             status=outcome.status,
             result=_tool_result_payload(result),
@@ -1275,17 +1412,24 @@ class ToolOrchestrator:
                 self._committed_tool_call, turn_id=turn_id, tool_call_id=record.tool_call_id
             )
             if await self._store.run_async(self.input_superseded, turn_id, call):
-                await self._commit(lambda: self._store.reject_ready_tool_operation(
-                    operation_id=record.operation_id, error_code="input_superseded",
-                ))
+                await self._commit(
+                    lambda: tool_ops.reject_ready_tool_operation(
+                        self._store,
+                        operation_id=record.operation_id,
+                        error_code="input_superseded",
+                    )
+                )
                 raise ExecutionStartRejectedError("input_superseded", "New user input superseded this action.")
             lease_seconds = max(
                 self._lease_seconds,
                 tool.timeout_seconds + _TOOL_LEASE_GRACE_SECONDS,
             )
+
             def claim_operation() -> Any:
-                claim = self._store.claim_tool_operation(
-                    operation_id=record.operation_id, worker_id=self._worker_id,
+                claim = tool_ops.claim_tool_operation(
+                    self._store,
+                    operation_id=record.operation_id,
+                    worker_id=self._worker_id,
                     lease_seconds=lease_seconds,
                 )
                 if claim.fencing_token is None:
@@ -1301,7 +1445,8 @@ class ToolOrchestrator:
                 await self._commit(claim_operation)
             except ResourceClaimConflictError as conflict:
                 await self._commit(
-                    lambda: self._store.reject_ready_tool_operation(
+                    lambda: tool_ops.reject_ready_tool_operation(
+                        self._store,
                         operation_id=record.operation_id,
                         error_code="resource_busy",
                     )
@@ -1332,7 +1477,8 @@ class ToolOrchestrator:
             ((), ()),
         )
         await self._commit(
-            lambda: self._store.record_tool_execution_state(
+            lambda: tool_ops.record_tool_execution_state(
+                self._store,
                 turn_id=turn_id,
                 operation_id=record.operation_id,
                 tool_call_id=record.tool_call_id,
@@ -1488,8 +1634,9 @@ def _policy_revision(context: ToolExecutionContext, tool: Tool, execution: ToolE
     effects = frozenset(execution.trace.effects)
     targets = execution.trace.targets
     payload = {
-        "permissions_revision": (None if context.effective_permissions is None
-                                 else context.effective_permissions.revision),
+        "permissions_revision": (
+            None if context.effective_permissions is None else context.effective_permissions.revision
+        ),
         "approval_mode": context.approval_mode,
         "workspace_root": (None if context.workspace_root is None else str(context.workspace_root)),
         "cwd": None if context.cwd is None else str(context.cwd),

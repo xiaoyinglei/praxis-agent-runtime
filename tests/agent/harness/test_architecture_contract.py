@@ -15,31 +15,38 @@ def _constructor_owners(name: str) -> set[Path]:
     return {
         path.relative_to(ROOT)
         for path in RUNTIME.rglob("*.py")
-        if any(isinstance(node, ast.Call) and (
-            isinstance(node.func, ast.Name) and node.func.id == name
-            or isinstance(node.func, ast.Attribute) and node.func.attr == name
-        ) for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))))
+        if any(
+            isinstance(node, ast.Call)
+            and (
+                isinstance(node.func, ast.Name)
+                and node.func.id == name
+                or isinstance(node.func, ast.Attribute)
+                and node.func.attr == name
+            )
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        )
     }
 
 
 def test_rollout_reducer_and_tool_runtime_each_have_one_behavior_owner() -> None:
-    assert _sources_containing("self._append_and_reduce(") == {Path("agent_runtime/harness/state.py")}
+    assert not (RUNTIME / "harness" / "state.py").exists()
+    assert _sources_containing("store.tx.append_record(**fact)") == {Path("agent_runtime/harness/facts.py")}
     assert _sources_containing("INSERT INTO rollout_records (") == {Path("agent_runtime/harness/rollout.py")}
     assert _constructor_owners("ToolExecutor") == {Path("agent_runtime/harness/tool_orchestrator.py")}
     assert _sources_containing("tool.run(arguments)") == {Path("agent_runtime/tools/executor.py")}
-    assert _sources_containing("executor = TurnExecutor(") == {Path("agent_runtime/harness/session.py")}
+    assert _sources_containing("executor = TurnRunner(") == {Path("agent_runtime/harness/session.py")}
 
 
 def test_session_owns_resources_and_turn_executor_borrows_them() -> None:
     session = (RUNTIME / "harness" / "session.py").read_text()
     turn = (RUNTIME / "harness" / "turn.py").read_text()
     assert "class Session:" in session
-    assert "class TurnExecutor:" in turn
-    assert "class TurnContext:" in turn
-    assert "class StepContext:" in turn
+    assert "class TurnRunner:" in turn
+    assert "class TurnContext:" in (RUNTIME / "harness" / "execution_context.py").read_text()
+    assert "class StepContext:" in (RUNTIME / "harness" / "execution_context.py").read_text()
     assert "self._stack = AsyncExitStack()" in session
     assert "self._active_turn_lock = asyncio.Lock()" in session
-    assert "RuntimeState(" not in turn
+    assert "RuntimeStore(" not in turn
     assert "AsyncExitStack" not in turn
     for removed in ("composition.py", "thread_manager.py", "facade.py"):
         assert not (RUNTIME / "harness" / removed).exists()
@@ -72,6 +79,4 @@ def test_provider_wire_and_model_dispatch_ownership_is_explicit() -> None:
         source = (RUNTIME / "harness" / component).read_text(encoding="utf-8")
         assert "serialize_openai_request" not in source
         assert "render_local_agent_request" not in source
-    assert _sources_containing("await self._model.dispatch(") == {
-        Path("agent_runtime/harness/turn.py")
-    }
+    assert _sources_containing("await self._model.dispatch(") == {Path("agent_runtime/harness/model_runner.py")}

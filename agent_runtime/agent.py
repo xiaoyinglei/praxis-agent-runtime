@@ -8,10 +8,12 @@ import logging
 import os
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import ExitStack, asynccontextmanager
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from agent_runtime.approval import MODE_ORDER, ApprovalMode
+from agent_runtime.harness import memory_ops, turn_ops
 from agent_runtime.harness.memory import MemoryConfig
 from agent_runtime.harness.protocol import DEFAULT_MAX_STEPS, item_text
 from agent_runtime.knowledge import RAGKnowledgeConfig
@@ -91,8 +93,8 @@ class Agent:
         self.model = model
         self.checkpoint_db = checkpoint_db
 
-        workspace = (Path.cwd() if workspace_path is None else Path(workspace_path))
-        self.workspace_path = (workspace.expanduser().resolve())
+        workspace = Path.cwd() if workspace_path is None else Path(workspace_path)
+        self.workspace_path = workspace.expanduser().resolve()
         for value in (permissions, managed_permissions):
             if value is not None and not isinstance(value, (PermissionPolicy, Path, str)):
                 raise TypeError("permissions must be PermissionPolicy, a policy file path, or None")
@@ -129,18 +131,21 @@ class Agent:
         return self._get_model_control_plane().request_settings()
 
     def configure_request(
-        self, *, reasoning_effort: str | None = None, max_output_tokens: int | str | None = None,
+        self,
+        *,
+        reasoning_effort: str | None = None,
+        max_output_tokens: int | str | None = None,
     ) -> dict[str, Any]:
         plane = self._get_model_control_plane()
         settings = plane.configure_request(
-            reasoning_effort=reasoning_effort, max_output_tokens=max_output_tokens,
+            reasoning_effort=reasoning_effort,
+            max_output_tokens=max_output_tokens,
             persist=self.model_session_path is not None,
         )
         self._request_settings_revision = settings["revision"]
         self._request_overrides[settings["model_id"]] = {
             "model_id": settings["model_id"],
-            "options": {key: ("default" if value is None else value)
-                        for key, value in settings["preferences"].items()},
+            "options": {key: ("default" if value is None else value) for key, value in settings["preferences"].items()},
         }
         self._pending_request_settings[settings["model_id"]] = self._request_overrides[settings["model_id"]]
         return settings
@@ -190,21 +195,30 @@ class Agent:
             allow_execute_tools=allow_execute_tools,
             allow_web_tools=allow_web_tools,
             approval_mode=approval_mode,
-            max_steps=max_steps, max_turns=max_turns, max_tokens_total=max_tokens_total,
+            max_steps=max_steps,
+            max_turns=max_turns,
+            max_tokens_total=max_tokens_total,
             max_cost_micros=max_cost_micros,
-            event_sink=event_sink, _event_dispatcher=_event_dispatcher,
+            event_sink=event_sink,
+            _event_dispatcher=_event_dispatcher,
         ) as session:
             return await session.submit(task, files=files)
 
     @asynccontextmanager
     async def session(
-        self, *, previous_turn_id: str | None = None, thread_id: str | None = None,
+        self,
+        *,
+        previous_turn_id: str | None = None,
+        thread_id: str | None = None,
         require_workspace_change: bool = False,
         acceptance_command: str | None = None,
-        allow_write_tools: bool = False, allow_execute_tools: bool = False,
+        allow_write_tools: bool = False,
+        allow_execute_tools: bool = False,
         allow_web_tools: bool = False,
         approval_mode: ApprovalMode | None = None,
-        max_steps: int | None = None, max_turns: int | None = None, max_tokens_total: int | None = None,
+        max_steps: int | None = None,
+        max_turns: int | None = None,
+        max_tokens_total: int | None = None,
         max_cost_micros: int | None = None,
         event_sink: AgentEventSink | None = None,
         _event_dispatcher: TurnEventDispatcher | None = None,
@@ -221,15 +235,21 @@ class Agent:
             raise ValueError("max_steps and legacy max_turns must agree when both are provided")
         step_budget = max_steps if max_steps is not None else max_turns
         session = await Session.open(
-            agent=self, previous_turn_id=previous_turn_id, frozen_turn_id=_frozen_turn_id, thread_id=thread_id,
+            agent=self,
+            previous_turn_id=previous_turn_id,
+            frozen_turn_id=_frozen_turn_id,
+            thread_id=thread_id,
             require_workspace_change=require_workspace_change,
             acceptance_command=acceptance_command,
-            allow_write_tools=allow_write_tools, allow_execute_tools=allow_execute_tools,
+            allow_write_tools=allow_write_tools,
+            allow_execute_tools=allow_execute_tools,
             allow_web_tools=allow_web_tools,
             approval_mode=approval_mode if approval_mode is not None else self.approval_mode,
             max_steps=DEFAULT_MAX_STEPS if step_budget is None else step_budget,
-            max_tokens_total=max_tokens_total, max_cost_micros=max_cost_micros,
-            event_sink=event_sink, event_dispatcher=_event_dispatcher,
+            max_tokens_total=max_tokens_total,
+            max_cost_micros=max_cost_micros,
+            event_sink=event_sink,
+            event_dispatcher=_event_dispatcher,
             _background_memory=_background_memory,
         )
         async with session:
@@ -237,9 +257,9 @@ class Agent:
 
     async def steer(self, text: str, *, expected_turn_id: str) -> ItemSnapshot:
         """Persist guidance without opening a model; target must still be active."""
-        from agent_runtime.harness import RuntimeState
+        from agent_runtime.harness import RuntimeStore
 
-        async with await RuntimeState.open(self._harness_database()) as store:
+        async with await RuntimeStore.open(self._harness_database()) as store:
             turn = await store.run_async(store.read_turn, expected_turn_id)
             if (
                 Path((await store.run_async(store.read_thread, turn.thread_id)).workspace).resolve()
@@ -247,14 +267,17 @@ class Agent:
             ):
                 raise RuntimeError("Turn belongs to a different workspace security domain")
             return await store.run_async(
-                store.receive_turn_input, thread_id=turn.thread_id, turn_id=expected_turn_id, text=text
+                partial(turn_ops.receive_turn_input, store),
+                thread_id=turn.thread_id,
+                turn_id=expected_turn_id,
+                text=text,
             )
 
     def input_status(self, item_id: str) -> str:
         """Inspect a steering receipt without model I/O."""
-        from agent_runtime.harness import RuntimeState
+        from agent_runtime.harness import RuntimeStore
 
-        with RuntimeState.open_sync(self._harness_database()) as store:
+        with RuntimeStore.open_sync(self._harness_database()) as store:
             item = store.read_item(item_id)
             if Path(store.read_thread(item.thread_id).workspace).resolve() != self._workspace_path():
                 raise RuntimeError("input belongs to a different workspace security domain")
@@ -263,49 +286,56 @@ class Agent:
     def memories(self) -> dict[str, object]:
         """Inspect this workspace's memory without opening a model or creating state."""
         from agent_runtime.harness.memory import memory_snapshot
-        from agent_runtime.harness.state import RuntimeState
+        from agent_runtime.harness.runtime_store import RuntimeStore
 
         database = self._harness_database()
         if not database.exists():
-            return {"version": 0, "workspace": str(self.workspace_path), "entries": [],
-                    "use_memories": self.memory.use_memories if self.memory is not None else False,
-                    "generate_memories": self.memory.generate_memories if self.memory is not None else False}
-        with RuntimeState.open_sync(database, read_only=True) as store:
+            return {
+                "version": 0,
+                "workspace": str(self.workspace_path),
+                "entries": [],
+                "use_memories": self.memory.use_memories if self.memory is not None else False,
+                "generate_memories": self.memory.generate_memories if self.memory is not None else False,
+            }
+        with RuntimeStore.open_sync(database, read_only=True) as store:
+
             def read() -> dict[str, object]:
                 with store.persistence.read_snapshot():
                     state = store.read_memory_state(self.workspace_path)
-                    return {**memory_snapshot(store, self.workspace_path),
-                            "maintenance_jobs": {key: {name: value for name, value in job.items()
-                                                       if name != "candidates"}
-                                                 for key, job in store.read_memory_jobs(self.workspace_path).items()},
-                            "use_memories": self.memory.use_memories if self.memory is not None
-                            else state["use_memories"],
-                            "generate_memories": self.memory.generate_memories if self.memory is not None
-                            else state["generate_memories"]}
+                    return {
+                        **memory_snapshot(store, self.workspace_path),
+                        "maintenance_jobs": {
+                            key: {name: value for name, value in job.items() if name != "candidates"}
+                            for key, job in store.read_memory_jobs(self.workspace_path).items()
+                        },
+                        "use_memories": self.memory.use_memories if self.memory is not None else state["use_memories"],
+                        "generate_memories": self.memory.generate_memories
+                        if self.memory is not None
+                        else state["generate_memories"],
+                    }
 
             return store.run_sync(read)
 
     def configure_memory(self, config: MemoryConfig) -> dict[str, object]:
         """Persist workspace defaults; independent use and contribution controls."""
         from agent_runtime.harness.memory import configure_memory
-        from agent_runtime.harness.state import RuntimeState
+        from agent_runtime.harness.runtime_store import RuntimeStore
 
         if not isinstance(config, MemoryConfig):
             raise TypeError("config must be MemoryConfig")
-        with RuntimeState.open_sync(self._harness_database()) as store:
+        with RuntimeStore.open_sync(self._harness_database()) as store:
             result = configure_memory(store, self.workspace_path, config)
         self.memory = config
         return result
 
-    def relocate_memory(self, previous_workspace: Path, *,
-                        expected_version: int | None = None) -> dict[str, object]:
+    def relocate_memory(self, previous_workspace: Path, *, expected_version: int | None = None) -> dict[str, object]:
         """Rebind memory after moving a workspace, using its existing database.
 
         Both workspace paths must be idle. The source directory may no longer
         exist; historical Threads and Turns retain their original workspace.
         """
         from agent_runtime.harness.ownership import workspace_owner
-        from agent_runtime.harness.state import RuntimeState
+        from agent_runtime.harness.runtime_store import RuntimeStore
 
         previous = Path(previous_workspace).expanduser().resolve()
         workspace = self.workspace_path
@@ -319,42 +349,69 @@ class Agent:
         with ExitStack() as locks:
             for path in sorted((previous, workspace)):
                 locks.enter_context(workspace_owner(path, exclusive=True))
-            with RuntimeState.open_sync(database) as store:
-                return store.relocate_memory(previous_workspace=previous, workspace=workspace,
-                                             expected_version=expected_version)
+            with RuntimeStore.open_sync(database) as store:
+                return memory_ops.relocate_memory(
+                    store, previous_workspace=previous, workspace=workspace, expected_version=expected_version
+                )
 
     def delete_memory(self, key: str) -> dict[str, object]:
         from agent_runtime.harness.memory import delete_memory
-        from agent_runtime.harness.state import RuntimeState
+        from agent_runtime.harness.runtime_store import RuntimeStore
 
-        with RuntimeState.open_sync(self._harness_database()) as store:
+        with RuntimeStore.open_sync(self._harness_database()) as store:
             return delete_memory(store, self.workspace_path, key)
 
-    def remember_memory(self, key: str, text: str, *, title: str | None = None,
-                        kind: Literal["preference", "fact", "reference"] = "fact",
-                        expected_version: int | None = None) -> dict[str, object]:
+    def remember_memory(
+        self,
+        key: str,
+        text: str,
+        *,
+        title: str | None = None,
+        kind: Literal["preference", "fact", "reference"] = "fact",
+        expected_version: int | None = None,
+    ) -> dict[str, object]:
         from agent_runtime.harness.memory_management import remember_memory
-        from agent_runtime.harness.state import RuntimeState
+        from agent_runtime.harness.runtime_store import RuntimeStore
 
-        with RuntimeState.open_sync(self._harness_database()) as store:
-            return remember_memory(store, self.workspace_path, key=key, title=title or key, text=text,
-                                   kind=kind, expected_version=expected_version)
+        with RuntimeStore.open_sync(self._harness_database()) as store:
+            return remember_memory(
+                store,
+                self.workspace_path,
+                key=key,
+                title=title or key,
+                text=text,
+                kind=kind,
+                expected_version=expected_version,
+            )
 
-    def edit_memory(self, key: str, text: str, *, title: str | None = None,
-                    kind: Literal["preference", "fact", "reference"] | None = None,
-                    expected_version: int | None = None) -> dict[str, object]:
+    def edit_memory(
+        self,
+        key: str,
+        text: str,
+        *,
+        title: str | None = None,
+        kind: Literal["preference", "fact", "reference"] | None = None,
+        expected_version: int | None = None,
+    ) -> dict[str, object]:
         from agent_runtime.harness.memory_management import edit_memory
-        from agent_runtime.harness.state import RuntimeState
+        from agent_runtime.harness.runtime_store import RuntimeStore
 
-        with RuntimeState.open_sync(self._harness_database()) as store:
-            return edit_memory(store, self.workspace_path, key=key, title=title, text=text,
-                               kind=kind, expected_version=expected_version)
+        with RuntimeStore.open_sync(self._harness_database()) as store:
+            return edit_memory(
+                store,
+                self.workspace_path,
+                key=key,
+                title=title,
+                text=text,
+                kind=kind,
+                expected_version=expected_version,
+            )
 
     def explain_memory(self, key: str, *, offset: int = 0, limit: int = 8) -> dict[str, object]:
         from agent_runtime.harness.memory_management import explain_memory
-        from agent_runtime.harness.state import RuntimeState
+        from agent_runtime.harness.runtime_store import RuntimeStore
 
-        with RuntimeState.open_sync(self._harness_database(), read_only=True) as store:
+        with RuntimeStore.open_sync(self._harness_database(), read_only=True) as store:
             return explain_memory(store, self.workspace_path, key=key, offset=offset, limit=limit)
 
     async def refresh_memory(self) -> dict[str, object]:
@@ -363,24 +420,39 @@ class Agent:
             return await session.refresh_memory()
 
     async def command(
-        self, turn_id: str, session_id: str, *, action: Literal["status", "wait", "cancel", "read"] = "status",
-        wait_seconds: float = 10, stream: Literal["stdout", "stderr"] = "stdout",
-        offset: int = 0, max_bytes: int = 16000,
+        self,
+        turn_id: str,
+        session_id: str,
+        *,
+        action: Literal["status", "wait", "cancel", "read"] = "status",
+        wait_seconds: float = 10,
+        stream: Literal["stdout", "stderr"] = "stdout",
+        offset: int = 0,
+        max_bytes: int = 16000,
     ) -> RunCommandOutput:
         """Control the original committed command without calling a model or rerunning it."""
         from agent_runtime.harness.command_recovery import manage_command
-        return await manage_command(self, turn_id, session_id, action=action, wait_seconds=wait_seconds,
-                                    stream=stream, offset=offset, max_bytes=max_bytes)
+
+        return await manage_command(
+            self,
+            turn_id,
+            session_id,
+            action=action,
+            wait_seconds=wait_seconds,
+            stream=stream,
+            offset=offset,
+            max_bytes=max_bytes,
+        )
 
     async def list_checkpoints(self, *, thread_id: str | None = None) -> list[dict[str, object]]:
         """List workspace checkpoints recorded for this workspace's Threads."""
         from agent_runtime.checkpoints import _numeric, thread_checkpoint_rows
-        from agent_runtime.harness import RuntimeState
+        from agent_runtime.harness import RuntimeStore
 
         database = self._harness_database()
         rows: list[dict[str, object]] = []
         if database.exists():
-            async with await RuntimeState.open(database, read_only=True) as store:
+            async with await RuntimeStore.open(database, read_only=True) as store:
                 threads = (
                     (thread_id,)
                     if thread_id is not None
@@ -402,16 +474,18 @@ class Agent:
         for entry in await CheckpointService(self._workspace_path()).list_checkpoints():
             if entry.checkpoint_id in recorded or entry.trigger != "restore":
                 continue
-            service_rows.append({
-                "checkpoint_id": entry.checkpoint_id,
-                "turn_id": "",
-                "trigger": "restore",
-                "tree_sha256": None,
-                "changed_file_count": 0,
-                "wall_time": entry.timestamp,
-                "sequence": entry.sequence,
-                "turn_input": "回滚前状态（撤销回滚用）",
-            })
+            service_rows.append(
+                {
+                    "checkpoint_id": entry.checkpoint_id,
+                    "turn_id": "",
+                    "trigger": "restore",
+                    "tree_sha256": None,
+                    "changed_file_count": 0,
+                    "wall_time": entry.timestamp,
+                    "sequence": entry.sequence,
+                    "turn_input": "回滚前状态（撤销回滚用）",
+                }
+            )
         rows.extend(service_rows)
 
         def row_order(row: dict[str, object]) -> tuple[float, int]:
@@ -427,16 +501,14 @@ class Agent:
         restoring underneath live execution would corrupt its workspace views.
         """
         from agent_runtime.checkpoints import CheckpointService
-        from agent_runtime.harness import RuntimeState
+        from agent_runtime.harness import RuntimeStore
 
-        async with await RuntimeState.open(self._harness_database(), read_only=True) as store:
+        async with await RuntimeStore.open(self._harness_database(), read_only=True) as store:
             active = await store.run_async(
                 lambda: [turn.turn_id for turn in store.list_turns() if turn.status in {"running", "paused"}]
             )
         if active:
-            raise RuntimeError(
-                "存在未结束的 Turn（运行中或等待输入），请先完成、取消或恢复后再回滚。"
-            )
+            raise RuntimeError("存在未结束的 Turn（运行中或等待输入），请先完成、取消或恢复后再回滚。")
         result = await CheckpointService(self._workspace_path()).restore(checkpoint_id)
         return {
             "target_checkpoint_id": result.target_checkpoint_id,
@@ -458,7 +530,11 @@ class Agent:
         }
 
     async def commit(
-        self, message: str, *, branch_name: str | None = None, expected_preview_id: str | None = None,
+        self,
+        message: str,
+        *,
+        branch_name: str | None = None,
+        expected_preview_id: str | None = None,
     ) -> dict[str, object]:
         """Commit workspace changes on a ``praxis/*`` branch of the real repository.
 
@@ -469,9 +545,9 @@ class Agent:
         actual terminal outcome and raises DeliveryInterruptedError with its result.
         """
         from agent_runtime.git_delivery import GitDelivery
-        from agent_runtime.harness import RuntimeState
+        from agent_runtime.harness import RuntimeStore
 
-        async with await RuntimeState.open(self._harness_database(), read_only=True) as store:
+        async with await RuntimeStore.open(self._harness_database(), read_only=True) as store:
             active = await store.run_async(
                 lambda: [
                     turn.turn_id
@@ -481,11 +557,11 @@ class Agent:
                 ]
             )
         if active:
-            raise RuntimeError(
-                "存在未结束的 Turn（运行中或等待输入），请先完成、取消或恢复后再提交。"
-            )
+            raise RuntimeError("存在未结束的 Turn（运行中或等待输入），请先完成、取消或恢复后再提交。")
         result = await GitDelivery(self._workspace_path()).commit(
-            message, branch_name=branch_name, expected_preview_id=expected_preview_id,
+            message,
+            branch_name=branch_name,
+            expected_preview_id=expected_preview_id,
         )
         return {
             "commit_id": result.commit_id,
@@ -512,8 +588,12 @@ class Agent:
         }
 
     async def open_pull_request(
-        self, *, title: str | None = None, body: str | None = None,
-        base_branch: str | None = None, expected_preview_id: str | None = None,
+        self,
+        *,
+        title: str | None = None,
+        body: str | None = None,
+        base_branch: str | None = None,
+        expected_preview_id: str | None = None,
     ) -> dict[str, object]:
         """Push the current praxis branch and open (or return) its pull request.
 
@@ -521,9 +601,9 @@ class Agent:
         confirmed the previewed change set, and refuses while Turns are active.
         """
         from agent_runtime.git_delivery import GitDelivery
-        from agent_runtime.harness import RuntimeState
+        from agent_runtime.harness import RuntimeStore
 
-        async with await RuntimeState.open(self._harness_database(), read_only=True) as store:
+        async with await RuntimeStore.open(self._harness_database(), read_only=True) as store:
             active = await store.run_async(
                 lambda: [
                     turn.turn_id
@@ -533,11 +613,12 @@ class Agent:
                 ]
             )
         if active:
-            raise RuntimeError(
-                "存在未结束的 Turn（运行中或等待输入），请先完成、取消或恢复后再发布。"
-            )
+            raise RuntimeError("存在未结束的 Turn（运行中或等待输入），请先完成、取消或恢复后再发布。")
         result = await GitDelivery(self._workspace_path()).open_pull_request(
-            title=title, body=body, base_branch=base_branch, expected_preview_id=expected_preview_id,
+            title=title,
+            body=body,
+            base_branch=base_branch,
+            expected_preview_id=expected_preview_id,
         )
         return {
             "url": result.url,
@@ -546,7 +627,9 @@ class Agent:
         }
 
     async def pull_request_checks(
-        self, branch: str | None = None, *,
+        self,
+        branch: str | None = None,
+        *,
         include_failure_logs: bool = False,
         wait_seconds: float = 0.0,
         poll_interval_seconds: float = 20.0,
@@ -566,14 +649,10 @@ class Agent:
             "overall": report.overall,
             "pull_request_url": report.pull_request_url,
             "checks": [
-                {"name": check.name, "state": check.state,
-                 "workflow": check.workflow, "link": check.link}
+                {"name": check.name, "state": check.state, "workflow": check.workflow, "link": check.link}
                 for check in report.checks
             ],
-            "failure_logs": [
-                {"workflow": name, "logs": logs}
-                for name, logs in report.failure_logs
-            ],
+            "failure_logs": [{"workflow": name, "logs": logs} for name, logs in report.failure_logs],
         }
 
     async def resume(
@@ -586,7 +665,7 @@ class Agent:
         event_sink: AgentEventSink | None = None,
         expected_request_id: str | None = None,
     ) -> AgentResult:
-        from agent_runtime.harness import RuntimeState, TurnResult
+        from agent_runtime.harness import RuntimeStore, TurnResult
 
         if action == "abort":
             from agent_runtime.harness import RolloutEventReader
@@ -596,7 +675,7 @@ class Agent:
                 recover_owner_loss,
             )
 
-            async with await RuntimeState.open(self._harness_database()) as store:
+            async with await RuntimeStore.open(self._harness_database()) as store:
                 turn = await store.run_async(store.read_turn, turn_id)
                 thread = await store.run_async(store.read_thread, turn.thread_id)
                 if Path(thread.workspace).resolve() != self._workspace_path():
@@ -618,7 +697,9 @@ class Agent:
                     plan = await store.run_async(recovery_plan, store, turn_id)
                     if not plan.accepts("abort"):
                         raise ConversationRecoveryRequiredError(f"取消未完成：{plan.reason_code}；请先核对执行状态。")
-                    mutation = await store.run_async(store.capture_mutation, lambda: store.cancel_turn(turn_id=turn_id))
+                    mutation = await store.run_async(
+                        store.capture_mutation, lambda: turn_ops.cancel_turn(store, turn_id=turn_id)
+                    )
                     cancelled = mutation.value
                     result = await store.run_async(
                         AgentResult._from_harness,
@@ -636,8 +717,9 @@ class Agent:
                             await dispatcher.emit(replayed.event, cursor=replayed.cursor)
             return result
         async with self.session(_frozen_turn_id=turn_id, event_sink=event_sink) as session:
-            return await session.resume(turn_id, action, user_input=user_input, files=files,
-                                        expected_request_id=expected_request_id)
+            return await session.resume(
+                turn_id, action, user_input=user_input, files=files, expected_request_id=expected_request_id
+            )
 
     async def recovery_state(self, turn_id: str) -> dict[str, Any]:
         """Inspect available actions without loading a model or recovering execution.
@@ -647,9 +729,9 @@ class Agent:
         """
         from agent_runtime.harness.ownership import ConversationBusyError, execution_owner
         from agent_runtime.harness.recovery import recovery_plan
-        from agent_runtime.harness.state import RuntimeState
+        from agent_runtime.harness.runtime_store import RuntimeStore
 
-        async with await RuntimeState.open(self._harness_database(), read_only=True) as store:
+        async with await RuntimeStore.open(self._harness_database(), read_only=True) as store:
             turn = await store.run_async(store.read_turn, turn_id)
             if (
                 Path((await store.run_async(store.read_thread, turn.thread_id)).workspace).resolve()
@@ -673,9 +755,9 @@ class Agent:
                 }
 
     async def read_result(self, turn_id: str) -> AgentResult:
-        from agent_runtime.harness import RuntimeState, TurnResult
+        from agent_runtime.harness import RuntimeStore, TurnResult
 
-        async with await RuntimeState.open(self._harness_database(), read_only=True) as store:
+        async with await RuntimeStore.open(self._harness_database(), read_only=True) as store:
             turn = await store.run_async(store.read_turn, turn_id)
             thread = await store.run_async(store.read_thread, turn.thread_id)
             if Path(thread.workspace).resolve() != self._workspace_path():
@@ -731,7 +813,8 @@ class Agent:
                 task,
                 previous_turn_id=previous_turn_id,
                 files=files,
-                max_steps=max_steps, max_turns=max_turns,
+                max_steps=max_steps,
+                max_turns=max_turns,
                 max_tokens_total=max_tokens_total,
                 max_cost_micros=max_cost_micros,
                 require_workspace_change=require_workspace_change,
@@ -768,9 +851,9 @@ class Agent:
             dispatcher.close()
 
     async def pending_input(self, turn_id: str) -> AgentPause | None:
-        from agent_runtime.harness import RuntimeState, TurnResult
+        from agent_runtime.harness import RuntimeStore, TurnResult
 
-        async with await RuntimeState.open(self._harness_database(), read_only=True) as store:
+        async with await RuntimeStore.open(self._harness_database(), read_only=True) as store:
             turn = await store.run_async(store.read_turn, turn_id)
             thread = await store.run_async(store.read_thread, turn.thread_id)
             if Path(thread.workspace).resolve() != self._workspace_path():
@@ -794,8 +877,9 @@ class Agent:
 
     def effective_permissions(self) -> ResolvedPermissions:
         """Reload trusted sources; saved conversation grants cannot widen them."""
-        return resolve_permission_sources(self.workspace_path, self.permissions, self.managed_permissions,
-                                          read_files=self._input_read_files)
+        return resolve_permission_sources(
+            self.workspace_path, self.permissions, self.managed_permissions, read_files=self._input_read_files
+        )
 
     def _reference_harness_files(
         self,
@@ -810,8 +894,9 @@ class Agent:
         originals = [resolve_local_file(value, base=self._workspace_path(), resolve_symlinks=False) for value in files]
         paths = [path.resolve() for path in originals]
         selected = tuple(dict.fromkeys((*self._input_read_files, *(str(path) for path in (*originals, *paths)))))
-        permissions = resolve_permission_sources(self.workspace_path, self.permissions, self.managed_permissions,
-                                                 read_files=selected)
+        permissions = resolve_permission_sources(
+            self.workspace_path, self.permissions, self.managed_permissions, read_files=selected
+        )
         if permission_ceiling is not None:
             permissions = permissions.intersection(permission_ceiling.with_read_files(selected))
         for path in originals:
@@ -857,9 +942,9 @@ class Agent:
             for model_id, override in self._request_overrides.items():
                 from agent_runtime.core.generation_settings import ModelRequestPreferences
 
-                plane.state.request_preferences[model_id] = ModelRequestPreferences.model_validate({
-                    key: None if value == "default" else value for key, value in override["options"].items()
-                })
+                plane.state.request_preferences[model_id] = ModelRequestPreferences.model_validate(
+                    {key: None if value == "default" else value for key, value in override["options"].items()}
+                )
         return plane
 
 
