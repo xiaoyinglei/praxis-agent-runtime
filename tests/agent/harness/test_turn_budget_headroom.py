@@ -6,7 +6,7 @@ from dataclasses import replace
 import pytest
 
 from agent_runtime.harness import HarnessModelResponse, ModelToolCall, RuntimeStore, ToolOrchestrator, turn_ops
-from agent_runtime.harness.completion import DeliveryCompletionGate
+from agent_runtime.harness.stop import StopChecks
 from agent_runtime.harness.tool_router import StaticToolRouter
 from agent_runtime.tools.permissions import ToolExecutionContext
 from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
@@ -68,7 +68,10 @@ def test_long_context_compaction_keeps_post_change_gate_and_frozen_budget(tmp_pa
             store,
             thread_id=turn.thread_id,
             user_message="Keep the public async API unchanged.",
-            binding_manifest={**turn.binding_manifest, "completion_policy": {"require_workspace_change": True}},
+            binding_manifest={
+                **turn.binding_manifest,
+                "completion_policy": {"require_workspace_change": True, "acceptance_command": "pytest -q"},
+            },
         )
         seed(store, turn_id=turn.turn_id, kind="agent_message", payload={"text": "history " * 5500})
         _commit_tool_result(
@@ -89,17 +92,21 @@ def test_long_context_compaction_keeps_post_change_gate_and_frozen_budget(tmp_pa
             result={"exit_code": 0 if check_passed else 1},
             operation_failed=not check_passed,
         )
-        runner._completion_gate = DeliveryCompletionGate(store)
+        runner._stop._gate = StopChecks(store)
         context = runner.restore_turn_context(turn.turn_id)
         # Reopen from durable state, as approval recovery does; no budget reset.
     with RuntimeStore.open_sync(database) as reopened:
         runner._store = reopened
+        runner._requests._store = reopened
+        runner._responses._store = reopened
+        runner._stop._store = reopened
         runner._model_runner._store = reopened
         runner._context_engine._store = reopened
         runner._context_manager = type(runner._context_manager)(reopened)
+        runner._requests._context_manager = runner._context_manager
         runner._model_runner._context_manager = runner._context_manager
         runner._context_engine._context_manager = runner._context_manager
-        runner._completion_gate = DeliveryCompletionGate(reopened)
+        runner._stop._gate = StopChecks(reopened)
         result = asyncio.run(runner.drive(context, start_step=1))
         assert (result.status == "completed") is check_passed
         if not check_passed:
@@ -127,10 +134,12 @@ def test_repeated_real_file_tool_results_keep_an_affordable_summary_escape_path(
             max_model_output_bytes=30_000,
             run=lambda args: {"text": (tmp_path / str(args["path"])).read_text()},
         )
-        runner._tool_router = StaticToolRouter({"read_file": tool})
+        runner._requests._tool_router = StaticToolRouter({"read_file": tool})
         runner._tool_orchestrator = ToolOrchestrator(
             store=store, tools={"read_file": tool}, execution_context=ToolExecutionContext(workspace_root=tmp_path)
         )
+        runner._requests._tool_orchestrator = runner._tool_orchestrator
+        runner._responses._tool_orchestrator = runner._tool_orchestrator
         calls = 0
 
         async def dispatch(prepared, **_kwargs):

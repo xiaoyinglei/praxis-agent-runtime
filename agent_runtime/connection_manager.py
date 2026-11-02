@@ -1,4 +1,5 @@
 """Host-owned, loopback-only connection UI sharing the public MCP services."""
+
 from __future__ import annotations
 
 import asyncio
@@ -18,18 +19,33 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from agent_runtime import mcp_admin
 
 CATALOG = (
-    {"id": "github", "title": "GitHub", "description": "连接仓库、Issue 和 Pull Request",
-     "detail": "使用本机 GitHub CLI 登录；首次连接请先运行 gh auth login。",
-     "url": mcp_admin.GITHUB_READONLY_URL, "auth": "github",
-     "documentation": "https://github.com/github/github-mcp-server/blob/main/docs/remote-server.md"},
-    {"id": "notion", "title": "Notion", "description": "搜索和读取工作区文档",
-     "detail": "在 Notion 官方页面授权，选择允许访问的工作区。",
-     "url": "https://mcp.notion.com/mcp", "auth": "oauth",
-     "documentation": "https://developers.notion.com/guides/mcp/get-started-with-mcp"},
-    {"id": "linear", "title": "Linear", "description": "查看团队项目与任务",
-     "detail": "在 Linear 官方页面授权，默认申请读取权限。",
-     "url": "https://mcp.linear.app/mcp", "auth": "oauth",
-     "documentation": "https://linear.app/docs/mcp"},
+    {
+        "id": "github",
+        "title": "GitHub",
+        "description": "连接仓库、Issue 和 Pull Request",
+        "detail": "使用本机 GitHub CLI 登录；首次连接请先运行 gh auth login。",
+        "url": mcp_admin.GITHUB_READONLY_URL,
+        "auth": "github",
+        "documentation": "https://github.com/github/github-mcp-server/blob/main/docs/remote-server.md",
+    },
+    {
+        "id": "notion",
+        "title": "Notion",
+        "description": "搜索和读取工作区文档",
+        "detail": "在 Notion 官方页面授权，选择允许访问的工作区。",
+        "url": "https://mcp.notion.com/mcp",
+        "auth": "oauth",
+        "documentation": "https://developers.notion.com/guides/mcp/get-started-with-mcp",
+    },
+    {
+        "id": "linear",
+        "title": "Linear",
+        "description": "查看团队项目与任务",
+        "detail": "在 Linear 官方页面授权，默认申请读取权限。",
+        "url": "https://mcp.linear.app/mcp",
+        "auth": "oauth",
+        "documentation": "https://linear.app/docs/mcp",
+    },
 )
 _ASSETS = Path(__file__).with_name("connection_assets")
 _MAX_BODY = 16_384
@@ -58,7 +74,8 @@ class AddConnection(BaseModel):
                 raise ValueError("Unknown connection preset")
             return preset["id"], {
                 "url": None if preset["id"] == "github" else preset["url"],
-                "oauth": preset["auth"] == "oauth", "read_only": self.read_only,
+                "oauth": preset["auth"] == "oauth",
+                "read_only": self.read_only,
                 "oauth_scopes": ("read",) if preset["id"] == "linear" and self.read_only else (),
             }
         if not self.name or not self.url:
@@ -72,12 +89,22 @@ class AddConnection(BaseModel):
         ):
             raise ValueError("OAuth options require OAuth authentication")
         return self.name, {
-            "url": self.url, "read_only": self.read_only, "oauth": self.auth == "oauth",
+            "url": self.url,
+            "read_only": self.read_only,
+            "oauth": self.auth == "oauth",
             "bearer_token_env_var": self.bearer_token_env_var,
-            "oauth_client_id": self.oauth_client_id, "oauth_scopes": tuple(self.oauth_scopes),
+            "oauth_client_id": self.oauth_client_id,
+            "oauth_scopes": tuple(self.oauth_scopes),
             "oauth_callback_port": self.oauth_callback_port,
             "oauth_allowed_domains": tuple(self.oauth_allowed_domains),
         }
+
+
+class ConfigureConnection(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    name: str = Field(min_length=1, max_length=80)
+    read_only: bool | None = None
+    tools: list[str] | None = Field(default=None, max_length=4096)
 
 
 class ConnectionServer(ThreadingHTTPServer):
@@ -133,9 +160,28 @@ class ConnectionServer(ThreadingHTTPServer):
     def connections(self) -> list[dict[str, Any]]:
         result = []
         for entry in mcp_admin.mcp_connections():
-            visible = {key: entry[key] for key in ("name", "url", "enabled", "read_only", "transport") if key in entry}
-            visible["auth"] = ("oauth" if entry.get("oauth") else "saved" if entry.get("keychain") else
-                               "environment" if entry.get("bearer_token_env_var") else "none")
+            visible = {
+                key: entry[key]
+                for key in (
+                    "name",
+                    "url",
+                    "enabled",
+                    "read_only",
+                    "transport",
+                    "tools_allowlist",
+                    "allow_all_tools",
+                )
+                if key in entry
+            }
+            visible["auth"] = (
+                "oauth"
+                if entry.get("oauth")
+                else "saved"
+                if entry.get("keychain")
+                else "environment"
+                if entry.get("bearer_token_env_var")
+                else "none"
+            )
             result.append(visible)
         return result
 
@@ -174,9 +220,14 @@ class ConnectionServer(ThreadingHTTPServer):
 
     def check(self, name: str) -> dict[str, Any]:
         from agent_runtime.mcp_cli import check_mcp_connection
+
         result = self.run_async(check_mcp_connection(name, self.workspace))
-        return {"connected": bool(result["connected"]), "tools": result["tools"],
-                "diagnostics": [item.get("code", "connection_failed") for item in result.get("diagnostics", [])]}
+        return {
+            "connected": bool(result["connected"]),
+            "tools": result["tools"],
+            "action_tools": result.get("action_tools", []),
+            "diagnostics": [item.get("code", "connection_failed") for item in result.get("diagnostics", [])],
+        }
 
     def login(self, name: str, job: dict[str, Any]) -> None:
         from agent_runtime.mcp_oauth import login_mcp_oauth
@@ -192,6 +243,15 @@ class ConnectionServer(ThreadingHTTPServer):
         if arguments.get("oauth"):
             self.login(name, job)
         return self.check(name)
+
+    def configure(self, request: ConfigureConnection) -> dict[str, Any]:
+        mcp_admin.configure_mcp_connection(
+            request.name,
+            read_only=request.read_only,
+            tools=None if request.tools is None else tuple(request.tools),
+            workspace=self.workspace,
+        )
+        return self.check(request.name)
 
     def action(self, action: str, name: str, job: dict[str, Any]) -> dict[str, Any]:
         if action == "login":
@@ -237,8 +297,11 @@ class ConnectionHandler(BaseHTTPRequestHandler):
         if not self.authorized(api=api):
             self.respond(403, {"error": "此页面需要本次启动的本机连接管理会话。"})
             return
-        assets = {"/": ("index.html", "text/html"), "/app.js": ("app.js", "text/javascript"),
-                  "/style.css": ("style.css", "text/css")}
+        assets = {
+            "/": ("index.html", "text/html"),
+            "/app.js": ("app.js", "text/javascript"),
+            "/style.css": ("style.css", "text/css"),
+        }
         if self.path in assets:
             asset, content_type = assets[self.path]
             self.respond(200, (_ASSETS / asset).read_bytes(), content_type)
@@ -271,6 +334,9 @@ class ConnectionHandler(BaseHTTPRequestHandler):
             if self.path == "/api/add":
                 name, arguments = AddConnection.model_validate(body).registration()
                 identifier = self.server.start_job(name, lambda job: self.server.add(name, arguments, job))
+            elif self.path == "/api/configure":
+                request = ConfigureConnection.model_validate(body)
+                identifier = self.server.start_job(request.name, lambda job: self.server.configure(request))
             elif self.path in {"/api/login", "/api/check", "/api/remove"}:
                 if not isinstance(body, dict) or set(body) != {"name"} or not isinstance(body["name"], str):
                     raise ValueError

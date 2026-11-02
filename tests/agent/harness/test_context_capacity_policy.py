@@ -486,7 +486,9 @@ def test_capacity_and_compaction_are_visible_in_replayed_events(tmp_path):
         diagnostics = compacted.data["capacity_diagnostics"]
         assert diagnostics["compacted"] is True
         assert diagnostics["trigger_reason"] == "message_guard"
-        assert diagnostics["after_input_tokens"] < diagnostics["before_input_tokens"]
+        # Byte/message admission rejected the context before token serialization.
+        assert diagnostics["before_input_tokens"] is None
+        assert diagnostics["after_input_tokens"] > 0
         assert diagnostics["summary_calls"] == 1
         budget = next(
             event for event in events if event.event_type == "budget_update" and event.data["purpose"] == "agent_step"
@@ -495,7 +497,7 @@ def test_capacity_and_compaction_are_visible_in_replayed_events(tmp_path):
         assert budget.data["budget_status"]["cost_remaining_micros"] == "unset"
         assert "agent_steps_remaining" in budget.data["budget_status"]
         message = store.list_model_operations(turn.turn_id)[-1].request_ref["step_snapshot"]["messages"][-1]
-        assert "Runtime budget status:" in message["body"]
+        assert "Resource limits (runtime ledger)" in message["body"]
 
 
 def test_terminal_displays_capacity_and_compaction_tokens_without_cost(capsys):

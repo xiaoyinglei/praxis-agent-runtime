@@ -1,83 +1,51 @@
-# Loop termination and durable continuation
+# 预算、执行与停止
 
-## Design boundary
+入口保持 `Agent.run/chat/resume` 和 CLI `agent run/chat/resume` 一致。Session 持有存储、模型与工具资源；一次用户输入创建 Turn，恢复继续同一个 Turn。规划仍是可见的建议状态，不改变权限或证明任务正确。
 
-The model chooses actions and proposes an answer. The runtime owns input ordering,
-tool outcomes, approvals, budgets and explicit completion contracts. A read count,
-an advisory plan or answer wording cannot establish whether a task made progress.
-Default `done` therefore continues to mean that the Turn ended, with independent
-acceptance reported separately.
+| 职责 | 代码 | 边界 |
+| --- | --- | --- |
+| 真实预算与准入 | `budget/`、`harness/budget_ops.py`、`model_ops.py` | used/reserved/uncertain 均计入暴露；实际用量不截断；子任务使用持久分配；正常工作保留恢复与答复余量 |
+| 预算事实投影 | `harness/budget_context.py` | 明确单位、来源和剩余额度；没有配置的额度不编造压力 |
+| 请求捕获与恢复 | `harness/request_context.py` | 当前环境、时钟、规划、预算与明确停止条件在历史尾部增量交付；不变字段不重复；压缩后补回当前快照 |
+| 生命周期调度 | `harness/execution.py` | 从持久恢复位置推进，处理批准、取消、重试和上下文恢复；不评价答案正确性 |
+| 模型与工具 | `model_runner.py`、`responses.py`、`tool_orchestrator.py` | 单次模型操作、已提交响应消费、工具批执行各有唯一入口；重启复用同一路径 |
+| 可选停止条件 | `harness/stop.py` | 自然 final 可结束；明确条件可反馈继续、暂停或失败；决定与终结在同一宿主事务提交 |
+| 公共展示 | `result.py`、CLI、terminal UI | 生命周期、工具原始证据、诊断；不生成通用任务验证评分 |
 
-Reference implementations, inspected on 2026-10-24:
+## 唯一的步数预算来源
 
-- [Codex turn loop, commit 2839ed763bd3f404398e1f0c95bf4e2d172213c0](https://github.com/openai/codex/blob/2839ed763bd3f404398e1f0c95bf4e2d172213c0/codex-rs/core/src/session/turn.rs#L591-L784):
-  tool follow-up and pending input keep the loop running. Stop hooks run at the
-  boundary where neither requires continuation.
-- [Claude Code Stop protocol](https://code.claude.com/docs/en/hooks#stop-input):
-  hooks receive continuation state; eight consecutive hook continuations are
-  bounded, with a tool call resetting the count. This is a public protocol
-  reference, not a claim to have inspected Claude Code's private core.
+新任务的 `max_steps` 默认 `None`。显式正整数冻结为 `model_step_budget`，运行、预算展示、恢复及子任务都通过 `execution_context.step_limit_from_binding` 读取。恢复不使用 16 步兜底，也不与当前 Session 的上限取较小值；未设置步数预算时不展示虚构的剩余步数。子任务继承父 Turn 上限并可收紧，取消工具 schema 中的 50 步上限，禁止扩张父 Turn 的明确上限。
 
-## Selected changes
+该预算限制每个 Turn 的普通模型决策轮。内部摘要按测得工作树的节点数接纳，不把同一整数又当作另一份摘要额度；摘要、重试和续跑的真实 token/费用继续统一记账与预留。已持久保存的摘要计划中的次数及重试上限保持有效。固定 8 次的连续停止驳回防护属于独立的防空转协议，工具或新输入重置它；它不限制正常任务总轮数。
 
-1. Both fresh tool execution and committed-response recovery call
-   `TurnExecutor._after_tool_batch`. It reads canonical results, respects pending
-   interactions and superseding input, and applies the existing repeated-failure
-   policy. Recovery executes only calls lacking a committed result. An accepted
-   `tool_reconciliation.result` replaces its original unknown outcome according
-   to the operation's result pointer; the original remains in the audit ledger.
-   Parameter and approval-denial results without an operation result pointer
-   still participate in failure counting.
-2. Recovery feedback references the committed model response that triggered it.
-   Reopening after that feedback does not consume the grant twice. Each batch
-   receives one post-tool decision, including a partially recovered batch.
-3. Final proposals reference their model response; feedback references its
-   completion decision. Recovery reuses an existing proposal, decision and
-   feedback instead of evaluating or counting the same response again.
-4. New Turns freeze `completion_continuation_policy=bounded-v1`, allowing eight
-   consecutive completion rejections without a tool exchange or new user input.
-   A ninth rejection fails with `completion_continuation_limit`, preserving the
-   actual check's validation status and scope. A ninth **acceptance** still passes.
-   Unlike an advisory Stop hook, an explicit acceptance requirement must never be
-   bypassed to end a loop. Every request shares the original step/token/cost limits.
-5. Tool calls and new user input reset this protocol counter. This does not certify
-   progress: repeated successful reads remain available, and the global budget
-   still bounds tool loops. Old Turns without the new policy keep their frozen
-   limits. No historical event is rewritten and no new execution loop is added.
+## 自然结束和明确条件
 
-## Alternatives rejected
+模型给出完整最终响应且没有工具调用时，运行停止条件。API 失败、未完成响应、待批准或不确定执行先按实际生命周期处理。已启动并返回会话标识的后台进程可以继续存在，不要求所有长期进程退出。显式验收命令本身必须获得终态结果。
 
-- Enforcing a number of reads, edits or matching words would turn observations
-  into a task-specific progress judge and would break valid investigation.
-- Raising all budgets would postpone the failure without fixing replay or
-  completion feedback.
-- Automatically accepting after failed checks would violate the user's explicit
-  contract. The bounded state is a failure with recorded evidence, not success.
+`require_workspace_change=True` 仅要求可信操作记录过真实写入。`acceptance_command="..."` 要求冻结的原命令在工作区根目录真实执行，最新一次退出码为 0，无超时、取消或沙箱错误，而且此后没有本任务或受预算分配的同工作区子任务修改。命令自身产生构建输出可以属于该次检查。普通工具权限与批准继续生效。
 
-## Verification plan
+Runtime 不解析命令名称来推断检查能力，不把 `echo pytest`、文件读取或一段断言重新分类成任务验收；也不会额外调用模型当裁判。用户配置什么命令，Runtime 就检查那条命令的真实执行条件。结果的含义仍取决于该命令实际检查了什么。停止反馈受到冻结的连续次数上限和总预算约束，不允许无限循环。
 
-- Public Agent/CLI: normal execution, recovery after tool result and recovery
-  grant, repeated Stop rejection, proposal/decision/feedback crash boundaries.
-- Normal counterexamples: repeated successful reads; tool exchange and steering
-  reset the count; acceptance at the boundary succeeds; old Turns keep their
-  policy; a real committed write executes once after reopening.
-- Existing approval, reconciliation, streaming, compaction, incomplete-response,
-  completion and budget regressions; Ruff, mypy and import contracts.
-- Scripted models verify the protocol and real filesystem effects. They do not
-  establish model reasoning quality; paid model benchmarks are not part of this
-  implementation run.
+`AgentResult.validation_status/validation_scope` 与同名协议、事件字段已移除。它们此前可能仅表示发生写入，容易被误读为整个需求正确。调用方改为检查 `status`、具体 `tool_calls[].structured_output`、`diagnostics` 与用户配置的条件；未配置检查时直接结束，不打印默认验证回执。没有另设同义通用评分字段。
 
-## Verified on macOS, 2026-10-24
+## 缓存和历史
 
-- Final Harness suite: 776 passed, including 19 new termination cases.
-- Main Agent/CLI regression: 3224 passed, 76 skipped, one old feedback-payload
-  assertion failed because it omitted the new source link. That assertion now
-  verifies the full proposal/decision/feedback chain; the complete Session suite
-  (28 cases) and final Harness suite both passed after the update.
-- Maintained source/test/script Ruff, runtime mypy (129 source files), all five
-  import contracts and `git diff --check` passed. The CLI acceptance tests were
-  rerun with native Seatbelt access; the product sandbox was not disabled.
-- Real process exit after a committed recovery grant, a real file mutation with
-  exactly one execution, mixed failure batches, steering, truncated tool JSON,
-  immutable budgets and old-policy recovery are covered. No paid model call or
-  Linux execution was performed in this run.
+静态系统提示内容与顺序固定。动态状态只在已有历史尾部追加，预算来自真实宿主账本，描述剩余容量而不指示提前宣布完成。预算通知在初始、余额跨过 50%/20%/10%、最后两单位或保留余量边界时追加，并标明观测请求；执行准入每次读取精确余额。动态事实同样计入上下文字节限制和压缩候选测量。内部维护请求使用各自的有限输入和输出额度，不注入用户交互环境。
+
+新捕获请求统一使用当前的增量上下文投影；不保留第二套旧动态前缀策略。已经持久保存的 Step、工具版本和 frozen wire 通过恢复入口精确回放，不读取新时钟、环境或提示后重建。源代码升级会改变新请求的提示，可能产生一次缓存失效，不宣称零损失或已经节省费用。
+
+历史记录保持不可变；旧验证元数据不再投影成公共评分。历史未终结的 accept 决定在恢复结束前重新检查，避免子任务后续写入使旧验收失效。新决定、反馈和终结原子提交，避免新建此故障窗口。
+
+旧 `harness/turn.py`、`completion.py` 以及只用于推断证书的 `verification.py` 已退役。相关分类器测试不再代表产品契约；保留实际命令/Python 执行测试，并由明确停止条件、来源关联、修改后时序、冻结恢复、缓存和公共入口回归覆盖当前契约。
+
+## 源码取舍与验证
+
+2026-11-02 定点对照 Codex 固定快照 `a4c9194247c6a1e79aa3e72cc6cd77238f2ed354` 的 `session/turn.rs`、`session/rollout_budget.rs` 和预算上下文实现：待续执行先处理，停止检查可反馈继续，预算提醒在历史追加后才标记已交付。它是本地固定快照，不代表当前线上身份。
+
+同时对照本地 Claude 历史镜像 `276b8e6a0160939c74f04074a5e10ec1ba76982b` 的 `query.ts`、`query/stopHooks.ts`：正常响应进入停止检查，阻塞反馈追加到历史，API 失败不进入同一停止循环。该镜像的来源和构建完整性未核实，不称官方当前完整源码。保留这些职责边界和本项目的持久执行、权限、缓存恢复能力；替换提前收敛文案、推断验证证书和第二套实时旧提示策略。
+
+前一轮预算上下文与收尾重构的相关离线回归为 **1240 passed、1 skipped**，包含 CLI/SDK、明确验收、批准、取消、后台命令、崩溃恢复、子任务写入时序、缓存、压缩和 MCP 能力边界。全 Runtime mypy 检查 167 个源文件，6 条依赖契约、修改文件 Ruff 与 `git diff --check` 通过。脚本模型和真实本地工具证明执行协议；未调用云模型，不据此宣称模型任务质量或费用已经改善。
+
+步数预算统一后，无提权 Harness 回归为 **1122 passed、1 skipped、5 deselected**，另有 CLI/终端/公开结果与预算边界补充回归 **94 passed**。此前因自动审批服务用量限制未执行的真实进程回归，现已获准提权补跑：**16 passed（9.53 秒）**，覆盖 macOS 命令会话、真实沙箱路径、MCP 子进程生命周期、本地回环端口及 CLI/SDK 显式验收与批准恢复。此前的提权验证阻塞已解除，未调用云模型。当前 Runtime mypy 167 文件、6 条依赖契约通过。
+
+步数来源边界专项 **13 passed**，覆盖默认无上限、显式限制、缺字段恢复、当前会话上限不覆盖冻结值、子任务继承与拒绝扩张、单轮普通任务的多节点摘要，以及以持久记录从第 128 轮恢复到第 129 轮。

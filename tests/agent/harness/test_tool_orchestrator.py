@@ -908,7 +908,7 @@ class AcceptToolAnswer:
 
 @pytest.mark.anyio
 async def test_candidate_sdk_runs_model_tool_result_model_loop(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr("agent_runtime.harness.turn.capture_runtime_clock", lambda: {"date": "2026-10-20"})
+    monkeypatch.setattr("agent_runtime.harness.request_context.capture_runtime_clock", lambda: {"date": "2026-10-20"})
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     model = ToolThenAnswerModel()
@@ -937,7 +937,7 @@ async def test_candidate_sdk_runs_model_tool_result_model_loop(tmp_path: Path, m
         assert "Runtime budget status" not in str(model.requests[1].messages)
         assert (
             runtime.store.list_model_operations(result.turn_id)[1].request_ref["budget_status"]["agent_steps_remaining"]
-            > 0
+            == "unset"
         )
         assert model.requests[1].messages[: len(model.requests[0].messages)] == model.requests[0].messages
         [tool_message] = [message for message in model.requests[1].messages if message.role == "tool"]
@@ -959,7 +959,7 @@ async def test_tool_context_pairing_and_provider_request_hash_survive_restart(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr("agent_runtime.harness.turn.capture_runtime_clock", lambda: {"date": "2026-10-20"})
+    monkeypatch.setattr("agent_runtime.harness.request_context.capture_runtime_clock", lambda: {"date": "2026-10-20"})
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
@@ -1199,8 +1199,6 @@ async def test_read_only_calls_do_not_hide_repeated_identical_failure(tmp_path):
 def test_failure_streak_respects_real_changes_and_external_effects(changed, external, expected):
     from types import SimpleNamespace
 
-    from agent_runtime.harness.turn import TurnRunner
-
     items, operations = [], []
     for index in range(5):
         failed = index % 2 == 0
@@ -1240,9 +1238,10 @@ def test_failure_streak_respects_real_changes_and_external_effects(changed, exte
                 effects=["network"] if external else ["write_workspace", "execute_process"],
             )
         )
-    executor = TurnRunner.__new__(TurnRunner)
-    executor._store = SimpleNamespace(list_items=lambda _: items, list_tool_operations=lambda _: operations)
-    assert executor._repeated_tool_failure("turn") is expected
+    from agent_runtime.harness.execution_facts import repeated_tool_failure
+
+    store = SimpleNamespace(list_items=lambda _: items, list_tool_operations=lambda _: operations)
+    assert repeated_tool_failure(store, "turn") is expected
 
 
 @pytest.mark.anyio

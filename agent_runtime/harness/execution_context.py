@@ -13,6 +13,14 @@ from agent_runtime.harness.protocol import HarnessModelRequest, ModelMessage
 from agent_runtime.tools.tool import Tool
 
 
+def step_limit_from_binding(binding: Mapping[str, Any]) -> int | None:
+    """The frozen Turn is the sole source; missing means no step ceiling."""
+    limit = binding.get("model_step_budget")
+    if limit is not None and (type(limit) is not int or limit < 1):
+        raise ValueError("model_step_budget must be a positive integer or None")
+    return limit
+
+
 @dataclass(frozen=True, slots=True)
 class TurnContext:
     """Identity and initial settings; each new Step captures its own binding."""

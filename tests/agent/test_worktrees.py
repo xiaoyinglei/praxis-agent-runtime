@@ -471,7 +471,7 @@ async def test_public_worktree_run_verifies_real_git_status(
         monkeypatch.setattr(agent, "_model_factory", lambda: SessionCommandModel(command))
         result = await agent.run("Inspect Git", allow_execute_tools=True, acceptance_command=command, max_steps=4)
         assert result.status == "done", result
-        assert result.validation_status == "passed"
+        assert not hasattr(result, "validation_status")
     else:
         monkeypatch.chdir(repo)
         monkeypatch.setenv("PRAXIS_WORKTREE_ROOT", str(worktrees_root))

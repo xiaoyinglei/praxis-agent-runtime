@@ -3,11 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from agent_runtime.harness import (
-    DeliveryCompletionGate,
     ModelMessage,
     RolloutContextManager,
     RuntimeStore,
     StepContext,
+    StopChecks,
     TurnContext,
     TurnRunner,
     turn_ops,
@@ -54,7 +54,7 @@ def test_session_captures_one_immutable_request_view_per_step(tmp_path: Path, mo
             },
         )
     )
-    monkeypatch.setattr("agent_runtime.harness.turn.capture_runtime_clock", lambda: next(clocks))
+    monkeypatch.setattr("agent_runtime.harness.request_context.capture_runtime_clock", lambda: next(clocks))
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
@@ -75,7 +75,7 @@ def test_session_captures_one_immutable_request_view_per_step(tmp_path: Path, mo
             store=store,
             model=_UnusedModel(),
             context_manager=RolloutContextManager(store),
-            completion_gate=DeliveryCompletionGate(store),
+            completion_gate=StopChecks(store),
             tool_router=router,
         )
         turn_context = session.restore_turn_context(turn.turn_id)
@@ -98,9 +98,10 @@ def test_session_captures_one_immutable_request_view_per_step(tmp_path: Path, mo
         clock = request.binding_manifest["runtime_clock"]
         assert clock["current_date"] == clock["current_time"][:10]
         assert clock["timezone"] and clock["utc_offset"]
-        assert {key: value for key, value in request.binding_manifest.items() if key != "runtime_clock"} == (
-            dict(turn_context.binding_manifest)
-        )
+        for key, value in turn_context.binding_manifest.items():
+            assert request.binding_manifest[key] == value
+        assert request.binding_manifest["execution_context_policy"]["cache_continuity"] == "append-v1"
+        assert request.binding_manifest["runtime_context_message"]["runtime_metadata"]["kind"] == "runtime_state"
         assert request.binding_manifest is step_context.binding_manifest
         next_step = session.capture_step_context(turn_context, step=2)
         assert next_step.binding_manifest["runtime_clock"]["current_date"] == "2032-01-01"
@@ -124,7 +125,7 @@ def test_session_rejects_a_turn_from_another_thread(tmp_path: Path) -> None:
             store=store,
             model=_UnusedModel(),
             context_manager=RolloutContextManager(store),
-            completion_gate=DeliveryCompletionGate(store),
+            completion_gate=StopChecks(store),
         )
 
         try:

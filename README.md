@@ -166,7 +166,7 @@ Praxis 以 Thread 保存聊天，以 Turn 表示一次请求，以 Step 推进�
 - **提交交付：**`/commit` 由你确认后把变更提交到仓库的 `praxis/*` 分支——宿主侧执行、以你的 git 身份提交，模型与沙箱始终无法写 `.git`；`/pull` 推送该分支并经 GitHub CLI 创建 Pull Request，`/checks` 查看/等待 CI 并可把失败日志交给 agent 修复，形成“修改 → 提交 → PR → CI 修复”的交付闭环。模型也可通过 `commit_changes` / `open_pull_request` 工具自己发起交付请求，按正常审批模式确认（完全访问模式下自动放行）。
 - **外部服务：**通过 `agent connections` 管理账号。个人远程 MCP 在需要调用时连接；缺少认证或工具目录时才显示连接提示，点击后由你选择登录，不会在普通聊天中自动弹授权页。
 - **聊天与记忆：**`agent resume` 打开历史聊天；可选记忆按工作区隔离、默认关闭，来源与修改可检查。记忆生成与 RAG 是独立能力。
-- **结果与验证：**运行结束不等于答案已经证实。`AgentResult.validation_status` 区分未评估、通过和失败，`validation_scope` 说明实际检查范围；只读分析可以直接回答，不制造修改证据。
+- **结果与证据：**运行结束表示本轮生命周期结束。具体命令、退出码和工具输出保留在 `AgentResult.tool_calls`；需要停止前的明确检查，可配置 `acceptance_command`。Runtime 不输出通用的任务正确性评分。
 
 操作方法和配置示例见[使用指南](docs/guide.md)。
 
@@ -188,7 +188,9 @@ async def main() -> None:
         require_workspace_change=False,
     )
     print(result.answer)
-    print(result.validation_status)
+    print(result.status)
+    for call in result.tool_calls:
+        print(call.tool_name, call.structured_output)
 
 
 asyncio.run(main())

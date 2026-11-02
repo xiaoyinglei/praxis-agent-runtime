@@ -117,7 +117,6 @@ def test_engine_installs_measured_continuation_with_reserved_attempt(tmp_path):
             restore_step_context=executor.restore_step_context,
             dispatch_prepared=executor._model_runner.dispatch,
             commit=executor._commit,
-            max_steps=16,
             budget_status=executor._budget_status,
         )
         context, prepared = asyncio.run(engine.prepare_or_resume(executor.restore_turn_context(turn.turn_id), step=1))
@@ -169,7 +168,6 @@ def test_completed_node_is_reused_after_store_restart(tmp_path):
             restore_step_context=executor.restore_step_context,
             dispatch_prepared=executor._model_runner.dispatch,
             commit=executor._commit,
-            max_steps=16,
         )
         return engine, executor.restore_turn_context(turn_id), gateway
 

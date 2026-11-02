@@ -241,7 +241,7 @@ def test_fresh_runner_consumes_committed_tool_call_without_replaying_model(
         )
         assert len(model.requests) == 1
         assert model.requests[0].step == 2
-        assert [message.role for message in model.requests[0].messages] == [
+        assert [message.role for message in model.requests[0].messages if message.role != "context"] == [
             "user",
             "assistant",
             "tool",

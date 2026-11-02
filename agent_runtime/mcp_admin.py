@@ -1,4 +1,5 @@
 """Host-controlled MCP registration and endpoint-bound personal credentials."""
+
 from __future__ import annotations
 
 import json
@@ -21,6 +22,7 @@ from agent_runtime.runtime.mcp import validate_http_mcp_url
 from agent_runtime.user_config import user_config_directory
 
 GITHUB_READONLY_URL = "https://api.githubcopilot.com/mcp/readonly"
+GITHUB_URL = "https://api.githubcopilot.com/mcp/"
 
 
 def user_mcp_config() -> Path:
@@ -29,6 +31,7 @@ def user_mcp_config() -> Path:
 
 def _credential_service(name: str) -> str:
     from agent_runtime.tools.integrations.mcp import normalize_mcp_name
+
     normalized = normalize_mcp_name(name)
     if not normalized or normalized != name:
         raise ValueError("MCP credential name must be a canonical server name")
@@ -37,6 +40,7 @@ def _credential_service(name: str) -> str:
 
 def _bearer_storage(name: str) -> Any:
     from agent_runtime.mcp_oauth import MCPOAuthStorage
+
     _credential_service(name)
     # Manual credentials remain name-addressable; their payload binds the exact
     # remote URL before load_mcp_credential returns any token.
@@ -51,7 +55,10 @@ def _read_keychain(name: str) -> str:
         return value
     completed = subprocess.run(
         ["/usr/bin/security", "find-generic-password", "-a", "praxis", "-s", _credential_service(name), "-w"],
-        capture_output=True, text=True, timeout=15, check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
     )
     if completed.returncode != 0:
         raise ValueError(f"MCP credential missing: run agent mcp login {name}")
@@ -71,7 +78,6 @@ def load_mcp_credential(name: str, url: str) -> str:
         raise ValueError("MCP credential is invalid; log in again") from None
 
 
-
 def _write_keychain(name: str, value: str) -> None:
     if sys.platform != "darwin":
         _bearer_storage(name).update({"bearer": value})
@@ -79,8 +85,9 @@ def _write_keychain(name: str, value: str) -> None:
     # security's interactive input keeps credentials out of the process argv.
     command = "add-generic-password -U -a praxis -s " + shlex.quote(_credential_service(name))
     command += " -w " + shlex.quote(value) + "\n"
-    completed = subprocess.run(["/usr/bin/security", "-i"], input=command, capture_output=True,
-                               text=True, timeout=30, check=False)
+    completed = subprocess.run(
+        ["/usr/bin/security", "-i"], input=command, capture_output=True, text=True, timeout=30, check=False
+    )
     if completed.returncode != 0 or "SecKeychain" in completed.stderr:
         raise ValueError("Unable to save MCP credential in macOS Keychain")
     if _read_keychain(name) != value:
@@ -93,7 +100,9 @@ def _delete_keychain(name: str) -> None:
         return
     completed = subprocess.run(
         ["/usr/bin/security", "delete-generic-password", "-a", "praxis", "-s", _credential_service(name)],
-        capture_output=True, timeout=15, check=False,
+        capture_output=True,
+        timeout=15,
+        check=False,
     )
     if completed.returncode not in {0, 44}:
         raise ValueError("Unable to remove MCP credential from Keychain")
@@ -127,16 +136,24 @@ def configuration_lock() -> Iterator[None]:
 
 
 def authorize_github_cli_endpoint(url: str) -> None:
-    if url not in {GITHUB_READONLY_URL, "https://api.githubcopilot.com/mcp/"}:
+    if url not in {GITHUB_READONLY_URL, GITHUB_URL}:
         raise ValueError("GitHub CLI credentials can only be used with the official GitHub MCP endpoint")
 
+
 def github_cli_token() -> str:
-    executable = next((Path(path) for path in ("/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh")
-                       if Path(path).is_file()), None)
+    executable = next(
+        (Path(path) for path in ("/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh") if Path(path).is_file()),
+        None,
+    )
     if executable is None:
         raise ValueError("GitHub CLI is not installed; provide a token with agent mcp login github")
-    completed = subprocess.run([str(executable), "auth", "token", "--hostname", "github.com"],
-                               capture_output=True, text=True, timeout=30, check=False)
+    completed = subprocess.run(
+        [str(executable), "auth", "token", "--hostname", "github.com"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
     if completed.returncode != 0 or not completed.stdout.strip():
         raise ValueError("GitHub CLI is not logged in; run gh auth login --hostname github.com, then try again")
     return completed.stdout.strip()
@@ -169,7 +186,6 @@ def mcp_connections() -> list[dict[str, Any]]:
     return cast(list[dict[str, Any]], raw["servers"])
 
 
-
 def _policy_toml(policy: PermissionPolicy) -> str:
     data = policy.model_dump(mode="json")
     lines = [f"{key}={json.dumps(data[key])}" for key in ("profile", "approval")]
@@ -178,20 +194,46 @@ def _policy_toml(policy: PermissionPolicy) -> str:
             lines.append(f"\n[[{group}]]")
             lines.extend(f"{key}={json.dumps(value, ensure_ascii=False)}" for key, value in rule.items())
     lines.append("\n[network]")
-    lines.extend(f"{key}={json.dumps(value, ensure_ascii=False)}"
-                 for key, value in data["network"].items() if key != "rules")
+    lines.extend(
+        f"{key}={json.dumps(value, ensure_ascii=False)}" for key, value in data["network"].items() if key != "rules"
+    )
     for rule in data["network"]["rules"]:
         lines.append("\n[[network.rules]]")
         lines.extend(f"{key}={json.dumps(value, ensure_ascii=False)}" for key, value in rule.items())
     return "\n".join(lines) + "\n"
 
-def _register_remote_mcp(name: str, *, url: str | None = None, bearer_token_env_var: str | None = None,
-                        tools: tuple[str, ...] = (), read_only: bool = True,
-                        workspace: Path | None = None, oauth: bool = False,
-                        oauth_client_id: str | None = None, oauth_scopes: tuple[str, ...] = (),
-                        oauth_allowed_domains: tuple[str, ...] = (), oauth_callback_port: int = 0) -> Path:
+
+def _tool_names(tools: tuple[str, ...]) -> tuple[str, ...]:
+    if isinstance(tools, str) or any(
+        not isinstance(name, str) or not name or any(char.isspace() or ord(char) < 32 for char in name)
+        for name in tools
+    ):
+        raise ValueError("Tool names must be nonempty names without whitespace")
+    if len(set(tools)) != len(tools):
+        raise ValueError("Tool names must be unique")
+    return tuple(tools)
+
+
+def _register_remote_mcp(
+    name: str,
+    *,
+    url: str | None = None,
+    bearer_token_env_var: str | None = None,
+    tools: tuple[str, ...] = (),
+    read_only: bool = True,
+    workspace: Path | None = None,
+    oauth: bool = False,
+    oauth_client_id: str | None = None,
+    oauth_scopes: tuple[str, ...] = (),
+    oauth_allowed_domains: tuple[str, ...] = (),
+    oauth_callback_port: int = 0,
+) -> Path:
     _credential_service(name)
+    if type(read_only) is not bool:
+        raise ValueError("read_only must be a boolean")
+    tools = _tool_names(tools)
     from agent_runtime.mcp_oauth import validate_oauth_domains
+
     oauth_allowed_domains = validate_oauth_domains(oauth_allowed_domains)
     if type(oauth_callback_port) is not int or not 0 <= oauth_callback_port <= 65535:
         raise ValueError("OAuth callback port must be an integer from 0 to 65535")
@@ -204,13 +246,13 @@ def _register_remote_mcp(name: str, *, url: str | None = None, bearer_token_env_
     if any(not scope or any(c.isspace() or ord(c) < 32 for c in scope) for scope in oauth_scopes):
         raise ValueError("OAuth scopes must be nonempty individual scope names")
     if name == "github" and url is None:
-        url = GITHUB_READONLY_URL if read_only else "https://api.githubcopilot.com/mcp/"
-        tools = tools or ("search_repositories", "get_file_contents", "issue_read", "pull_request_read")
+        url = GITHUB_READONLY_URL if read_only else GITHUB_URL
     if url is None:
         raise ValueError("A remote MCP service URL is required")
     url = validate_http_mcp_url(url)
     if bearer_token_env_var is not None:
         import re
+
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", bearer_token_env_var):
             raise ValueError("bearer_token_env_var must name an environment variable")
     scope = Path.cwd() if workspace is None else workspace
@@ -228,9 +270,15 @@ def _register_remote_mcp(name: str, *, url: str | None = None, bearer_token_env_
     data = (tomllib.loads(before) if permissions.suffix == ".toml" else json.loads(before)) if before else {}
     declared = PermissionPolicy.model_validate(data)
     rule = NetworkRule(domain=str(httpx.URL(url).host), decision="allow")
-    candidate = declared.model_copy(update={"network": declared.network.model_copy(update={
-        "rules": (*declared.network.rules, rule),
-    })})
+    candidate = declared.model_copy(
+        update={
+            "network": declared.network.model_copy(
+                update={
+                    "rules": (*declared.network.rules, rule),
+                }
+            )
+        }
+    )
     if resolve_permission_sources(scope, candidate).network_decision(url) != "allow":
         raise ValueError("Network preauthorization is restricted by a permission ceiling")
     next_policy = (before or "") + "\n[[network.rules]]\ndomain=" + json.dumps(rule.domain) + '\ndecision="allow"\n'
@@ -243,8 +291,15 @@ def _register_remote_mcp(name: str, *, url: str | None = None, bearer_token_env_
             next_policy = _policy_toml(candidate)
     if permissions.suffix == ".json":
         next_policy = json.dumps(candidate.model_dump(mode="json"), ensure_ascii=False, indent=2) + "\n"
-    entry: dict[str, Any] = {"name": name, "transport": "http", "url": url, "enabled": True,
-                             "read_only": read_only, "tools_allowlist": list(tools), "allow_all_tools": not tools}
+    entry: dict[str, Any] = {
+        "name": name,
+        "transport": "http",
+        "url": url,
+        "enabled": True,
+        "read_only": read_only,
+        "tools_allowlist": list(tools),
+        "allow_all_tools": not tools,
+    }
     if name == "github" and read_only:
         entry["headers"] = {"X-MCP-Readonly": "true"}
     previous_credential: str | None = None
@@ -288,17 +343,106 @@ def _register_remote_mcp(name: str, *, url: str | None = None, bearer_token_env_
     return config
 
 
-def register_remote_mcp(name: str, *, url: str | None = None, bearer_token_env_var: str | None = None,
-                        tools: tuple[str, ...] = (), read_only: bool = True,
-                        workspace: Path | None = None, oauth: bool = False,
-                        oauth_client_id: str | None = None, oauth_scopes: tuple[str, ...] = (),
-                        oauth_allowed_domains: tuple[str, ...] = (), oauth_callback_port: int = 0) -> Path:
+def register_remote_mcp(
+    name: str,
+    *,
+    url: str | None = None,
+    bearer_token_env_var: str | None = None,
+    tools: tuple[str, ...] = (),
+    read_only: bool = True,
+    workspace: Path | None = None,
+    oauth: bool = False,
+    oauth_client_id: str | None = None,
+    oauth_scopes: tuple[str, ...] = (),
+    oauth_allowed_domains: tuple[str, ...] = (),
+    oauth_callback_port: int = 0,
+) -> Path:
     with configuration_lock():
-        return _register_remote_mcp(name, url=url, bearer_token_env_var=bearer_token_env_var,
-                                    tools=tools, read_only=read_only, workspace=workspace, oauth=oauth,
-                                    oauth_client_id=oauth_client_id, oauth_scopes=oauth_scopes,
-                                    oauth_allowed_domains=oauth_allowed_domains,
-                                    oauth_callback_port=oauth_callback_port)
+        return _register_remote_mcp(
+            name,
+            url=url,
+            bearer_token_env_var=bearer_token_env_var,
+            tools=tools,
+            read_only=read_only,
+            workspace=workspace,
+            oauth=oauth,
+            oauth_client_id=oauth_client_id,
+            oauth_scopes=oauth_scopes,
+            oauth_allowed_domains=oauth_allowed_domains,
+            oauth_callback_port=oauth_callback_port,
+        )
+
+
+def configure_mcp_connection(
+    name: str,
+    *,
+    read_only: bool | None = None,
+    tools: tuple[str, ...] | None = None,
+    workspace: Path | None = None,
+) -> Path:
+    """Change an existing HTTP connection's tool scope without removing its login.
+
+    None preserves a setting; tools=() explicitly selects all server tools.
+    This host action changes discovery, never approves an individual tool call.
+    Existing scopes are never widened merely by selecting full runtime access.
+    """
+    _credential_service(name)
+    if read_only is not None and type(read_only) is not bool:
+        raise ValueError("read_only must be a boolean")
+    if tools is not None:
+        tools = _tool_names(tools)
+    if read_only is None and tools is None:
+        raise ValueError("Choose a read-only/action mode or a tool scope")
+    with configuration_lock():
+        entries = mcp_connections()
+        entry = next((item for item in entries if item["name"] == name), None)
+        if entry is None or entry.get("transport") != "http":
+            raise ValueError("A registered HTTP MCP connection is required")
+        updated = dict(entry)
+        if read_only is not None:
+            updated["read_only"] = read_only
+            # The legacy official read-only endpoint cannot provide actions.
+            # Only this exact preset endpoint may be changed without a new URL.
+            if entry["url"] in {GITHUB_READONLY_URL, GITHUB_URL}:
+                if not read_only:
+                    updated["url"] = GITHUB_URL
+                headers = {
+                    key: value for key, value in entry.get("headers", {}).items() if key.lower() != "x-mcp-readonly"
+                }
+                if read_only:
+                    headers["X-MCP-Readonly"] = "true"
+                updated["headers"] = headers
+        if tools is not None:
+            updated.update(tools_allowlist=list(tools), allow_all_tools=not tools)
+        changed_endpoint = updated["url"] != entry["url"]
+        credential_before = None
+        token: str | None = None
+        if changed_endpoint:
+            scope = Path.cwd() if workspace is None else workspace
+            if resolve_permission_sources(scope).network_decision(updated["url"]) != "allow":
+                raise ValueError("Current permission policy must allow the updated MCP endpoint")
+            if entry.get("oauth"):
+                raise ValueError("An OAuth endpoint change requires a separate connection and login")
+            if entry.get("keychain"):
+                # Rebind only the known official endpoint pair, never another host.
+                token = load_mcp_credential(name, entry["url"])
+                credential_before = _read_keychain(name)
+        config = user_mcp_config()
+        payload = {"servers": [updated if item["name"] == name else item for item in entries]}
+        content = yaml.safe_dump(payload, sort_keys=False, allow_unicode=True)
+        from agent_runtime.runtime.mcp_catalog import preserve_other_catalogs
+
+        try:
+            if credential_before is not None:
+                assert token is not None
+                save_mcp_credential(name, updated["url"], token)
+            with preserve_other_catalogs(config, content, changed_server=name):
+                _atomic_write(config, content)
+        except Exception:
+            if credential_before is not None:
+                _write_keychain(name, credential_before)
+            raise
+        return config
 
 
 def remove_mcp_connection(name: str) -> None:
@@ -310,6 +454,7 @@ def remove_mcp_connection(name: str) -> None:
             raise ValueError("MCP connection is not registered")
         if selected.get("oauth"):
             from agent_runtime.mcp_oauth import clear_oauth_credentials
+
             clear_oauth_credentials(name, selected["url"])
         if selected.get("keychain"):
             _delete_keychain(name)

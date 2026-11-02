@@ -39,7 +39,7 @@ def test_rollout_reducer_and_tool_runtime_each_have_one_behavior_owner() -> None
 
 def test_session_owns_resources_and_turn_executor_borrows_them() -> None:
     session = (RUNTIME / "harness" / "session.py").read_text()
-    turn = (RUNTIME / "harness" / "turn.py").read_text()
+    turn = (RUNTIME / "harness" / "execution.py").read_text()
     assert "class Session:" in session
     assert "class TurnRunner:" in turn
     assert "class TurnContext:" in (RUNTIME / "harness" / "execution_context.py").read_text()
@@ -48,7 +48,7 @@ def test_session_owns_resources_and_turn_executor_borrows_them() -> None:
     assert "self._active_turn_lock = asyncio.Lock()" in session
     assert "RuntimeStore(" not in turn
     assert "AsyncExitStack" not in turn
-    for removed in ("composition.py", "thread_manager.py", "facade.py"):
+    for removed in ("composition.py", "thread_manager.py", "facade.py", "turn.py", "completion.py", "verification.py"):
         assert not (RUNTIME / "harness" / removed).exists()
     assert not _sources_containing("_open_harness_runtime")
 

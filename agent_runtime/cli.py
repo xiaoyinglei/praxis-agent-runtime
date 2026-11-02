@@ -525,20 +525,6 @@ def _display_agent_result(
     if result.answer and not answer_streamed:
         print(f"\n{safe_terminal_text(result.answer)}")
 
-    if result.status == "done" and show_outcome:
-        scope = (
-            f"（范围: {safe_terminal_text(result.validation_scope)}）" if result.validation_scope is not None else ""
-        )
-        print(f"\n验证状态: {result.validation_status}{scope}")
-        if result.validation_status == "not_evaluated":
-            print("本轮运行已结束；任务验收尚未评估。")
-        elif result.validation_scope == "workspace_change":
-            print("此状态仅表示工作区修改及修改后的验证检查。")
-        elif result.validation_scope == "workspace_change_recorded":
-            print("仅确认工作区发生了实际修改；任务验收尚未评估。")
-        elif result.validation_scope == "acceptance_command":
-            print("仅确认用户指定的验收命令执行成功。")
-
     if result.status == "paused" and result.pause is None and result.needs_user_input:
         print(f"\n暂停原因: {result.needs_user_input}")
 
@@ -1776,8 +1762,6 @@ async def _chat_facade_loop(
                     )
                 )
                 event_display.show_context_status()
-                if last_result is not None:
-                    print(f"验证状态: {last_result.validation_status}")
                 continue
             if query == "/copy":
                 if not last_answer:
@@ -2637,7 +2621,9 @@ def agent_chat(
     ] = None,
     max_turns: Annotated[
         int | None,
-        typer.Option("--max-steps", "--max-turns", min=1, help="每条消息允许的最大执行 step 数（旧名 --max-turns）"),
+        typer.Option(
+            "--max-steps", "--max-turns", min=1, help="每条消息的执行步数上限；默认不限制（旧名 --max-turns）"
+        ),
     ] = None,
     allow_write_tools: Annotated[
         bool,
@@ -2812,7 +2798,9 @@ def agent_run(
     ] = None,
     max_turns: Annotated[
         int | None,
-        typer.Option("--max-steps", "--max-turns", min=1, help="本次运行允许的最大执行 step 数（旧名 --max-turns）"),
+        typer.Option(
+            "--max-steps", "--max-turns", min=1, help="本次运行的执行步数上限；默认不限制（旧名 --max-turns）"
+        ),
     ] = None,
     model: Annotated[
         str | None,
@@ -3281,7 +3269,6 @@ async def _watch_command(
             print("agent 等待审批或补充输入；用 agent resume 选择会话继续。")
             return 1
         print(result.answer or "（agent 未返回文字结论）")
-        print(f"验证状态: {result.validation_status}")
         print("修复完成后请检查工作区，再运行聊天内 /commit 提交、/pull 推送。")
         return 1
     except DeliveryError as error:

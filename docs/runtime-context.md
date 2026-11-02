@@ -8,7 +8,7 @@ Existing Turns retain their saved policy and request layout.
 
 1. `RolloutContextManager` projects the visible conversation, including committed
    project and memory updates, completed tool groups and compaction replacements.
-2. `TurnRunner.capture_step_context` restores the Turn's frozen project rules
+2. `RequestContext.capture_step_context` restores the Turn's frozen project rules
    and trusted scoped discoveries, compares them with the last visible snapshot,
    and appends changed snapshots. A new snapshot replaces the earlier snapshot
    of that kind, including removed project scopes.

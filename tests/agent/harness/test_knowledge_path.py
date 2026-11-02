@@ -228,7 +228,7 @@ async def test_tool_grounding_flags_do_not_judge_the_final_answer(
         assert result.status == "done"
         assert result.groundedness is False
         assert result.insufficient_evidence is False
-        assert result.validation_status == "not_evaluated"
+        assert not hasattr(result, "validation_status")
         assert result.tool_calls[0].structured_output["groundedness_flag"] is groundedness
         assert result.tool_calls[0].structured_output["insufficient_evidence"] is insufficient
 

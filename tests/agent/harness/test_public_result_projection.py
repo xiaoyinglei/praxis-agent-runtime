@@ -40,8 +40,6 @@ def test_public_result_dto_is_frozen_and_keeps_thread_turn_identity() -> None:
         "plan_events",
         "needs_user_input",
         "thread_id",
-        "validation_status",
-        "validation_scope",
         "model_error",
     )
     call = AgentToolCall(
@@ -114,8 +112,7 @@ async def test_interrupted_model_exposes_public_retry_prompt(tmp_path):
         assert paused.pause.options == ("retry", "abort")
         resumed = await session.resume(paused.turn_id, "retry")
         assert resumed.status == "done"
-        assert resumed.validation_status == "not_evaluated"
-        assert resumed.validation_scope is None
+        assert not hasattr(resumed, "validation_status")
         assert model.attempts == 2
         assert session.store.verify().valid
 
@@ -136,8 +133,7 @@ async def test_harness_turn_projects_to_the_stable_public_agent_result(tmp_path:
 
         assert result.answer == "public harness answer"
         assert result.status == "done"
-        assert result.validation_status == "not_evaluated"
-        assert result.validation_scope is None
+        assert not hasattr(result, "validation_status")
         assert result.groundedness is False
         assert result.insufficient_evidence is False
         assert result.thread_id == internal.thread_id

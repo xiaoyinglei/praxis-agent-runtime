@@ -1172,27 +1172,43 @@ async def test_candidate_sdk_crosses_control_plane_gateway_and_rollout_store(
         assert runtime.store.verify().valid is True
 
 
-def test_coding_instructions_include_real_workspace_in_provider_request(tmp_path):
-    from agent_runtime.builtin.generic import coding_instructions
+def test_system_instructions_keep_workspace_facts_out_of_the_static_provider_prefix(tmp_path):
+    from agent_runtime.harness.control import append_runtime_state
+    from agent_runtime.prompts import SYSTEM_INSTRUCTIONS
+    from agent_runtime.runtime_environment import capture_runtime_environment
+
+    messages, _ = append_runtime_state(
+        (ModelMessage(role="user", body="Explain MoE with Python"),),
+        {"Current execution environment": capture_runtime_environment(str(tmp_path))},
+    )
 
     model = GatewayHarnessModel(
         model_id="test-model",
         resolved=_resolved_model(gateway=CapturingGateway()),
-        instructions=coding_instructions(tmp_path),
+        instructions=SYSTEM_INSTRUCTIONS,
     )
-    prepared = model.prepare(
-        HarnessModelRequest(
-            thread_id="thread",
-            turn_id="turn",
-            messages=(ModelMessage(role="user", body="Explain MoE with Python"),),
-            binding_manifest={"model_id": "test-model"},
-        )
+    request = HarnessModelRequest(
+        thread_id="thread",
+        turn_id="turn",
+        messages=messages,
+        binding_manifest={"model_id": "test-model"},
     )
+    prepared = model.prepare(request)
     wire = serialize_openai_request(prepared.dispatch_payload.request)
     text = str(wire)
     assert str(tmp_path) in text
+    assert str(tmp_path) not in wire.payload["messages"][0]["content"]
+    assert "# Doing tasks" in wire.payload["messages"][0]["content"]
     assert "working_dir" in text
     assert "Current model ID for this turn:" in text
+    changed_prompt = GatewayHarnessModel(
+        model_id="test-model",
+        resolved=_resolved_model(gateway=CapturingGateway()),
+        instructions=("Changed instructions after the request was saved.",),
+    )
+    restored = changed_prompt.replay(prepared.frozen_payload, request=request)
+    assert restored.wire_hash == prepared.wire_hash
+    assert restored.dispatch_payload.wire.serialized_json == prepared.dispatch_payload.wire.serialized_json
 
 
 def test_runtime_clock_is_visible_and_stable_when_repreparing_saved_request():

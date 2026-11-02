@@ -29,6 +29,29 @@ function button(text, callback, className) {
   const node = element("button", text, className); node.type = "button";
   node.addEventListener("click", callback); return node;
 }
+function scopeEditor(entry) {
+  const details = element("details", null, "tool-scope"), form = element("form");
+  details.append(element("summary", "调整工具范围"));
+  const actionLabel = element("label", null, "check"), allowActions = document.createElement("input");
+  allowActions.type = "checkbox"; allowActions.checked = entry.read_only === false;
+  actionLabel.append(allowActions, document.createTextNode("接入服务动作；调用时仍需单独批准"));
+  const allLabel = element("label", null, "check"), allTools = document.createElement("input");
+  allTools.type = "checkbox"; allTools.checked = entry.allow_all_tools === true;
+  allLabel.append(allTools, document.createTextNode("发现服务提供的全部工具"));
+  const namesLabel = element("label", "仅接入以下工具（逗号或换行分隔）"), names = document.createElement("textarea");
+  names.rows = 3; names.value = (entry.tools_allowlist || []).join(", "); names.disabled = allTools.checked;
+  allTools.addEventListener("change", () => {names.disabled = allTools.checked;}); namesLabel.append(names);
+  const save = element("button", "保存并刷新工具", "primary"); save.type = "submit"; save.dataset.name = entry.name;
+  form.append(actionLabel, allLabel, namesLabel, save);
+  form.addEventListener("submit", event => {
+    event.preventDefault();
+    const selected = names.value.split(/[,\n]/).map(name => name.trim()).filter(Boolean);
+    if (!allTools.checked && !selected.length) {message("请选择全部工具，或填写工具名称。", true); return;}
+    if (allowActions.checked && entry.read_only !== false && !confirm(`允许 ${entry.name} 提供写入等服务动作？账号权限仍由服务商决定，具体动作仍需批准。`)) return;
+    run("/api/configure", {name: entry.name, read_only: !allowActions.checked, tools: allTools.checked ? [] : selected}, entry.name);
+  });
+  details.append(form); return details;
+}
 async function run(path, body, label) {
   if (active.has(label)) return;
   active.add(label); renderBusy();
@@ -41,7 +64,7 @@ async function run(path, body, label) {
       if (state.status === "done") {
         const result = state.result;
         if (result.removed) message(`已移除 ${label} 的本机连接。`);
-        else if (result.connected) message(`${label} 已连接，发现 ${result.tools.length} 个可用工具。新开 Agent 会话即可使用。`);
+        else if (result.connected) message(`${label} 已连接，发现 ${result.tools.length} 个可用工具，其中 ${(result.action_tools || []).length} 个服务动作需要批准。重新打开会话后生效；批准不会增加账号权限。`);
         else message(`${label} 已添加，但连接检查未通过。请检查认证、服务工具范围和项目权限后重试。`, true);
         break;
       }
@@ -67,6 +90,8 @@ async function refresh() {
     for (const entry of connections) {
       const row = element("div", null, "connection"), info = element("div");
       info.append(element("strong", entry.name), element("small", `${entry.url || "本地服务"} · ${entry.read_only === false ? "允许动作" : "只读"}`));
+      info.append(element("small", entry.allow_all_tools ? "工具范围：服务发现；未固定工具数量" : `工具范围：${(entry.tools_allowlist || []).join(", ") || "未配置"}`));
+      if (entry.transport === "http") info.append(scopeEditor(entry));
       row.append(info); const actions = element("div", null, "actions");
       if (entry.auth === "oauth") actions.append(button("重新授权", () => run("/api/login", {name: entry.name}, entry.name)));
       actions.append(button("检查连接", () => run("/api/check", {name: entry.name}, entry.name)));

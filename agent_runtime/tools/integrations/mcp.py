@@ -101,9 +101,7 @@ def create_mcp_tools(
             descriptor.tool_name,
         )
         if canonical_name in names:
-            raise ValueError(
-                f"duplicate canonical MCP tool name: {canonical_name}"
-            )
+            raise ValueError(f"duplicate canonical MCP tool name: {canonical_name}")
         names.add(canonical_name)
         tools.append(_create_mcp_tool(descriptor, call_tool))
     return tuple(tools)
@@ -132,10 +130,7 @@ def _create_mcp_tool(
             name=name,
             description=(
                 descriptor.description.strip()
-                or (
-                    f"Call {descriptor.tool_name} on the configured MCP server "
-                    f"{descriptor.server_name}."
-                )
+                or (f"Call {descriptor.tool_name} on the configured MCP server {descriptor.server_name}.")
             ),
             input_schema=descriptor.input_schema,
         ),
@@ -144,24 +139,29 @@ def _create_mcp_tool(
         normalize_output=lambda raw: _normalize_mcp_output(raw, descriptor),
         output_schema=None,
         static_effects=frozenset(effects),
-        approval_profile=(ToolApprovalProfile.MCP_ACTION if descriptor.require_action_approval else None),
+        approval_profile=(
+            ToolApprovalProfile.MCP_ACTION
+            if (
+                descriptor.require_action_approval
+                or (
+                    descriptor.endpoint_url is not None
+                    and (not descriptor.read_only_hint or descriptor.destructive_hint)
+                )
+            )
+            else None
+        ),
         resolve_use=lambda _arguments: ResolvedToolUse(
             effects=frozenset(effects),
-            targets=(ToolTarget(kind="mcp_tool", value=name),) + (
-                () if descriptor.endpoint_url is None else
-                (ToolTarget(kind="public_web", value=descriptor.endpoint_url),)
+            targets=(ToolTarget(kind="mcp_tool", value=name),)
+            + (
+                ()
+                if descriptor.endpoint_url is None
+                else (ToolTarget(kind="public_web", value=descriptor.endpoint_url),)
             ),
         ),
-        execution_revision=(
-            f"integration-mcp-v1:{descriptor.execution_revision}"
-        ),
-        idempotent=(
-            not descriptor.destructive_hint
-            and (descriptor.read_only_hint or descriptor.idempotent_hint)
-        ),
-        concurrency_safe=(
-            descriptor.read_only_hint and not descriptor.destructive_hint
-        ),
+        execution_revision=(f"integration-mcp-v1:{descriptor.execution_revision}"),
+        idempotent=(not descriptor.destructive_hint and (descriptor.read_only_hint or descriptor.idempotent_hint)),
+        concurrency_safe=(descriptor.read_only_hint and not descriptor.destructive_hint),
         cancellation_mode=CancellationMode.REMOTE_BEST_EFFORT,
         interrupt_behavior=InterruptBehavior.CANCEL,
         timeout_seconds=descriptor.timeout_seconds,
@@ -224,11 +224,7 @@ def _normalize_mcp_output(
         structured = json_schema_output(None, cast(JsonValue, structured))
     is_error = bool(_field(raw, "isError", "is_error", default=False))
     error_text = next(
-        (
-            str(block.data.get("text", ""))
-            for block in blocks
-            if block.type == "text" and block.data.get("text")
-        ),
+        (str(block.data.get("text", "")) for block in blocks if block.type == "text" and block.data.get("text")),
         "MCP tool reported an error",
     )
     return NormalizedToolOutput(
@@ -258,9 +254,7 @@ def _content_block(raw: object) -> ToolContentBlock | None:
         data = _field(raw, "data", default="")
         media_type = _field(raw, "mimeType", "mime_type", default="")
         if isinstance(data, str):
-            payload: dict[str, JsonValue] = {
-                "data": data
-            }
+            payload: dict[str, JsonValue] = {"data": data}
             if isinstance(media_type, str) and media_type:
                 payload["mime_type"] = media_type
             return ToolContentBlock(type="image", data=payload)
@@ -271,10 +265,14 @@ def _content_block(raw: object) -> ToolContentBlock | None:
             uri = _field(resource, "uri", default="")
         text = _field(resource, "text", default=None)
         if isinstance(text, str):
-            return ToolContentBlock(type="text", data={
-                "text": text, "resource_uri": str(uri),
-                "truncated": False,
-            })
+            return ToolContentBlock(
+                type="text",
+                data={
+                    "text": text,
+                    "resource_uri": str(uri),
+                    "truncated": False,
+                },
+            )
         if isinstance(uri, (str, AnyUrl)):
             return ToolContentBlock(
                 type="resource",

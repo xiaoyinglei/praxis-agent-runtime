@@ -456,7 +456,7 @@ def test_resume_after_compaction_commit_does_not_repeat_it(tmp_path: Path, monke
         "timezone": "UTC",
         "utc_offset": "+00:00",
     }
-    monkeypatch.setattr("agent_runtime.harness.turn.capture_runtime_clock", lambda: clock)
+    monkeypatch.setattr("agent_runtime.harness.request_context.capture_runtime_clock", lambda: clock)
     model, gateway = model_for()
     with RuntimeStore.open_sync(database) as store:
         thread, turn = start(store, tmp_path)
@@ -489,12 +489,17 @@ def test_resume_after_compaction_commit_does_not_repeat_it(tmp_path: Path, monke
                 request_ref=prepared.request_ref,
             )
             monkeypatch.setattr(
-                "agent_runtime.harness.turn.capture_runtime_clock",
+                "agent_runtime.harness.request_context.capture_runtime_clock",
                 lambda: {**clock, "current_time": "2032-01-01T00:00:01+00:00", "current_date": "2032-01-01"},
             )
         # Process loss after compaction, either before or after saving the Step.
     with RuntimeStore.open_sync(database) as store:
-        assert RolloutContextManager(store).build(turn.turn_id) == candidate.messages
+        restored = RolloutContextManager(store).build(turn.turn_id)
+        assert restored[: len(candidate.messages)] == candidate.messages
+        if save_prepared_request:
+            assert restored[-1].content == step.messages[-1].content
+        else:
+            assert restored == candidate.messages
         model, gateway = model_for()
         runner = TurnRunner(
             thread_id=thread.thread_id,

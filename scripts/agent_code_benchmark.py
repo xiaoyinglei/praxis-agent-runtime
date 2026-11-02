@@ -2151,7 +2151,11 @@ def _infer_architecture_layers(paths: Sequence[str]) -> set[str]:
         if any(path.startswith(f"{root}/loop/") for root in runtime_roots) or path in {
             "agent_runtime/harness/session.py",
             "agent_runtime/harness/context.py",
-            "agent_runtime/harness/completion.py",
+            "agent_runtime/harness/execution.py",
+            "agent_runtime/harness/responses.py",
+            "agent_runtime/harness/request_context.py",
+            "agent_runtime/harness/budget_context.py",
+            "agent_runtime/harness/stop.py",
         }:
             layers.add("loop")
         if any(

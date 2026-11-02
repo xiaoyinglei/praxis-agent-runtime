@@ -29,20 +29,19 @@ def test_cumulative_budget_exhaustion_is_not_a_context_window_failure(tmp_path):
         assert store.read_turn(turn.turn_id).terminal_reason_code == "model_token_budget_exhausted"
 
 
-@pytest.mark.parametrize("failure", ["output_limit", "provider_overflow", "invalid", "step_budget"])
+@pytest.mark.parametrize("failure", ["output_limit", "provider_overflow", "invalid", "prior_summaries"])
 def test_required_summary_failure_keeps_its_own_cause(tmp_path, failure):
     expected = {
         "output_limit": "context_summary_incomplete",
         "provider_overflow": "summary_context_overflow",
         "invalid": "context_summary_invalid",
-        "step_budget": "model_step_budget_exhausted",
+        "prior_summaries": "completed",
     }[failure]
     with RuntimeStore.open_sync(tmp_path / "summary.db") as store:
         runner, turn, _ = capacity_runner(store, tmp_path, tokens=200000, messages=3)
         long_history(store, turn)
-        if failure == "step_budget":
-            runner._max_steps = 1
-            # Charge the existing frozen allowance with real committed summary outcomes.
+        if failure == "prior_summaries":
+            # Old summary operations are evidence, not a second ordinary-step quota.
             for index in range(16):
                 op = model_ops.prepare_model_operation(
                     store,
@@ -82,9 +81,26 @@ def test_required_summary_failure_keeps_its_own_cause(tmp_path, failure):
 
             runner._model.dispatch = dispatch
         result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
-        assert result.status == "failed"
+        if failure == "prior_summaries":
+            assert result.status == "completed"
+            assert (
+                len(
+                    [
+                        op
+                        for op in store.list_model_operations(turn.turn_id)
+                        if op.request_ref.get("purpose") == "agent_step"
+                    ]
+                )
+                == 1
+            )
+        else:
+            assert result.status == "failed"
         terminal = store.read_turn(turn.turn_id)
         assert terminal.terminal_reason_code == expected
+        if failure == "prior_summaries":
+            assert terminal.terminal_message is None
+            assert store.verify().valid
+            return
         if failure == "output_limit":
             assert "max_output_tokens" in terminal.terminal_message
         assert not any(i.kind == "context_compaction" for i in store.list_items(turn.turn_id))

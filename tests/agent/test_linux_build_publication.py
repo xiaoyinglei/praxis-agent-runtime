@@ -375,7 +375,7 @@ def test_public_linux_approval_recovery_publishes_partial_build_as_tool_failure(
         monkeypatch.setattr(fresh, "_model_factory", BuildOnce)
         result = asyncio.run(fresh.resume(paused.turn_id, "allow_once"))
         assert result.status == "done"
-        assert result.validation_status == "not_evaluated"
+        assert not hasattr(result, "validation_status")
     else:
         original = cli._create_agent_facade
 

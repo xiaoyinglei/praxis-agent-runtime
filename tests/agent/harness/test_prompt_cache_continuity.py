@@ -30,6 +30,10 @@ async def test_real_turn_appends_state_and_restores_identical_saved_wire(tmp_pat
         instructions=("Static instructions",),
     )
     wires = [adapter.prepare(r).dispatch_payload.request for r in model.requests]
+    environment_key = "Current execution environment"
+    assert str(tmp_path) not in wires[0].messages[0].content
+    assert environment_key in str(wires[0].messages[1:])
+    assert str(tmp_path) in str(wires[0].messages[1:])
     for before, after in zip(wires, wires[1:], strict=False):
         assert after.messages[: len(before.messages)] == before.messages
         assert after.tools == before.tools
@@ -43,8 +47,59 @@ async def test_real_turn_appends_state_and_restores_identical_saved_wire(tmp_pat
             if i.kind == "model_request"
         ]
         assert len(updates) == len(wires) and updates[0]
+        assert sum(environment_key in (update or "") for update in updates) == 1
         assert "Current advisory plan" not in (updates[2] or "")  # unchanged plan is not copied every step
         assert store.verify().valid
+
+
+def test_environment_changes_append_and_compaction_restores_the_current_snapshot(tmp_path, monkeypatch):
+    from agent_runtime.harness import RolloutContextManager, TurnRunner
+    from agent_runtime.harness.control import ContextSnapshot
+    from agent_runtime.runtime_environment import capture_runtime_environment
+    from tests.agent.harness.test_compaction_consistency import Accept
+
+    with RuntimeStore.open_sync(tmp_path / "rollout.db") as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        record = turn_ops.start_turn(
+            store,
+            thread_id=thread.thread_id,
+            user_message="Inspect the workspace",
+            binding_manifest={"execution_context_policy": {"revision": "working-context-v2"}},
+        )
+        runner = TurnRunner(
+            thread_id=thread.thread_id,
+            store=store,
+            model=PlanningModel(),
+            context_manager=RolloutContextManager(store),
+            completion_gate=Accept(),
+        )
+        turn = runner.restore_turn_context(record.turn_id)
+        initial = (ModelMessage(role="user", body="Inspect the workspace"),)
+        first, update = runner._requests._append_runtime_state(turn, initial, step=1, clock={})
+        assert update is not None
+        environment = ContextSnapshot.from_messages(first).runtime_state["Current execution environment"]
+        assert environment["workspace_root"] == str(tmp_path)
+        assert environment["default_tool_working_directory"] == str(tmp_path)
+        assert environment["host_platform"]
+        unchanged, duplicate = runner._requests._append_runtime_state(turn, first, step=2, clock={})
+        assert duplicate is None and unchanged == first
+        monkeypatch.setattr(
+            "agent_runtime.harness.request_context.capture_runtime_environment",
+            lambda workspace: {**capture_runtime_environment(workspace), "host_platform": "another-host"},
+        )
+        changed, delta = runner._requests._append_runtime_state(turn, first, step=3, clock={})
+        assert delta is not None
+        assert changed[: len(first)] == first
+        assert set(delta.runtime_metadata["state"]) == {"Current execution environment"}
+        compacted = (ModelMessage(role="user", body="Continue from the saved summary"),)
+        restored, restored_update = runner._requests._append_runtime_state(turn, compacted, step=4, clock={})
+        assert restored_update is not None
+        assert ContextSnapshot.from_messages(restored).runtime_state["Current execution environment"] == {
+            **environment,
+            "host_platform": "another-host",
+        }
+        assert first[: len(initial)] == initial
+        assert restored[: len(compacted)] == compacted
 
 
 @pytest.mark.parametrize("effort", ["off", "low", "high"])
@@ -141,7 +196,9 @@ async def test_summary_uses_saved_parent_and_falls_back_when_fork_is_too_large(t
         runner = TurnRunner(
             thread_id=result.thread_id, store=store, model=adapter, context_manager=manager, completion_gate=Accept()
         )
-        runner._tool_orchestrator = SimpleNamespace(restore_tools=lambda revisions: captures.requests[-1].tools)
+        runner._requests._tool_orchestrator = SimpleNamespace(
+            restore_tools=lambda revisions: captures.requests[-1].tools
+        )
         turn = runner.restore_turn_context(result.turn_id)
         digest, source = manager.semantic_source(result.turn_id, retained_tail_messages=0)
         plan = {
@@ -300,14 +357,15 @@ async def test_capacity_metadata_keeps_full_prefix_and_saved_replay(tmp_path, mo
     assert result.status == "done", result.diagnostics
     before, after = gateway.requests
     assert after.messages[: len(before.messages)] == before.messages
-    assert sum(m.content.startswith("Runtime input limits:\n") for m in after.messages) == int(legacy)
+    assert sum(m.content.startswith("Runtime input limits:\n") for m in after.messages) == 0
     if not legacy:
         assert "Runtime budget status" not in str(after.messages)
-        assert "requests_remaining_including_this" not in str(after.messages)
+        assert "agent_requests_remaining_including_this" in str(after.messages)
+        assert "runtime budget ledger before dispatch" in str(after.messages)
         assert "effective_input_limit" not in str(after.messages)
     async with await RuntimeStore.open(tmp_path / "rollout.db") as store:
         operations = store.list_model_operations(result.turn_id)
-        assert bool(operations[0].request_ref.get("runtime_input_update")) == legacy
+        assert "runtime_input_update" not in operations[0].request_ref
         assert "runtime_input_update" not in operations[1].request_ref
         for operation in operations:
             assert operation.request_ref["context_projection"]["effective_input_limit"] > 0
@@ -320,12 +378,12 @@ async def test_capacity_metadata_keeps_full_prefix_and_saved_replay(tmp_path, mo
             context_manager=RolloutContextManager(store),
             completion_gate=Accept(),
         )
-        runner._tool_orchestrator = SimpleNamespace(restore_tools=lambda revisions: captured[0].tools)
+        runner._requests._tool_orchestrator = SimpleNamespace(restore_tools=lambda revisions: captured[0].tools)
 
         def forbid_clock():
             raise AssertionError("recovery must not recapture time")
 
-        monkeypatch.setattr("agent_runtime.harness.turn.capture_runtime_clock", forbid_clock)
+        monkeypatch.setattr("agent_runtime.harness.request_context.capture_runtime_clock", forbid_clock)
         for operation in operations:
             restored = runner.restore_step_context(runner.restore_turn_context(result.turn_id), operation)
             prepared = await runner._model_runner.prepare(restored)
@@ -370,7 +428,7 @@ defaults:
 async def test_summary_rejects_provider_tool_calls_and_keeps_original_history(tmp_path):
     from agent_runtime.core.messages import ModelToolCall, StopReason
     from agent_runtime.harness import ContextBudgetExceededError, RolloutContextManager, TurnRunner
-    from agent_runtime.harness.turn import StepContext
+    from agent_runtime.harness.execution_context import StepContext
     from tests.agent.harness.test_compaction_consistency import Accept
 
     class MisbehavingGateway(CapturingGateway):
@@ -455,11 +513,10 @@ def test_new_turn_clears_previous_acceptance_contract(tmp_path):
                 }
             ),
         )
-        _, update = runner._append_runtime_state(
+        _, update = runner._requests._append_runtime_state(
             runner.restore_turn_context(record.turn_id),
             (ModelMessage(role="user", body="old task"), previous),
             step=1,
-            pressure=False,
             clock={},
         )
         assert json.loads(update.content[len(marker) :].split("\n", 1)[0])["acceptance_contract"] is None

@@ -64,7 +64,7 @@ async def test_cancellation_committed_before_provider_return_cannot_complete_ans
 
 @pytest.mark.anyio
 async def test_clarification_created_before_handling_receipt_survives_reopen(tmp_path, monkeypatch):
-    import agent_runtime.harness.turn as turn_module
+    import agent_runtime.harness.responses as response_module
 
     database = tmp_path / "run.db"
     async with await Session.open(
@@ -79,7 +79,7 @@ async def test_clarification_created_before_handling_receipt_survives_reopen(tmp
             raise ProcessStopped()
 
         with monkeypatch.context() as patch:
-            patch.setattr(turn_module, "response_handled", stop_before_handling)
+            patch.setattr(response_module, "response_handled", stop_before_handling)
             with pytest.raises(ProcessStopped):
                 await session.submit("Produce an answer")
         thread_id = session.thread_id

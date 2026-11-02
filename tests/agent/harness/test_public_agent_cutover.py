@@ -94,7 +94,7 @@ def assert_answer_event_contract(events: list[StreamEvent]) -> None:
     assert {event.item_kind for event in items} == {TurnItemKind.AGENT_MESSAGE}
     decision = next(event for event in events if event.type is EventType.COMPLETION_DECIDED)
     assert decision.data["action"] == "accept"
-    assert decision.data["validation_status"] == "not_evaluated"
+    assert "validation_status" not in decision.data
     assert decision.data["proposal_item_id"]
 
 
@@ -158,8 +158,11 @@ async def test_public_result_exposes_durable_unknown_model_diagnostic(
     diagnostic = result.diagnostics[0]
     assert diagnostic.code == "model_dispatch_outcome_unknown"
     assert diagnostic.component == "model"
-    assert diagnostic.error_type == "ConnectionError"
-    assert diagnostic.message == "provider connection ended after dispatch"
+    assert result.model_error is not None
+    assert diagnostic.error_type == result.model_error.kind == "transport_unknown"
+    assert diagnostic.message == result.model_error.message
+    assert result.model_error.provider_outcome == "unknown"
+    assert result.model_error.billing_outcome == "unknown"
 
 
 @pytest.mark.anyio

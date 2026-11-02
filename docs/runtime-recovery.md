@@ -91,7 +91,7 @@ Linux 的候选工作区支持工作区内相对符号链接，保留普通文�
 
 ## 工具批次、取消与结果恢复
 
-同一模型响应的原生 `tool_calls` 经 `TurnRunner` 进入
+同一模型响应的原生 `tool_calls` 经 `ResponseHandler` 进入
 `ToolOrchestrator.execute_batch`：先记录全部调用，再按能力及状态边界分段。
 `ToolExecutor` 预检当前段，按 `max_parallel_calls` 和已解析资源冲突分批执行。
 独占工具、远程未知结果和改变运行时状态的操作保持执行屏障；运行时不根据工具名、

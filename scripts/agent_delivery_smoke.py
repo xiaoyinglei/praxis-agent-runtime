@@ -51,17 +51,14 @@ class SmokeResult:
     event_lines: tuple[str, ...] = ()
     workspace_diff: str = ""
     error: str = ""
-    validation_status: str = "not_evaluated"
-    validation_scope: str | None = None
     check_outputs: tuple[str, ...] = ()
 
 
 CHECKOUT_BEFORE = (
-    "def total_after_discount(subtotal, discount_percent):\n"
-    "    return round(subtotal * (1 - discount_percent), 2)\n"
+    "def total_after_discount(subtotal, discount_percent):\n    return round(subtotal * (1 - discount_percent), 2)\n"
 )
 CHECKOUT_AFTER = CHECKOUT_BEFORE.replace("1 - discount_percent", "1 - discount_percent / 100")
-CHECKOUT_TESTS = '''import unittest
+CHECKOUT_TESTS = """import unittest
 from pricing import total_after_discount
 
 class PricingTests(unittest.TestCase):
@@ -73,7 +70,7 @@ class PricingTests(unittest.TestCase):
 
     def test_full_discount(self):
         self.assertEqual(total_after_discount(100, 100), 0)
-'''
+"""
 CHECKOUT_COMMAND = "python3 -m unittest -v"
 
 
@@ -121,9 +118,7 @@ class _SmokeModel:
             raise RuntimeError("smoke model ID changed")
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
-        digest = hashlib.sha256(
-            f"{self.case.name}:{request.turn_id}:{request.step}".encode()
-        ).hexdigest()
+        digest = hashlib.sha256(f"{self.case.name}:{request.turn_id}:{request.step}".encode()).hexdigest()
         return PreparedModelCall(
             request_hash=digest,
             context_hash=digest,
@@ -133,9 +128,7 @@ class _SmokeModel:
                 "step": request.step,
                 "request_id": f"{request.turn_id}:step:{request.step}",
                 "toolset_revision": toolset_revision_for_tools(request.tools),
-                "exposed_tool_names": [
-                    tool.definition.name for tool in request.tools
-                ],
+                "exposed_tool_names": [tool.definition.name for tool in request.tools],
             },
         )
 
@@ -153,11 +146,19 @@ class _SmokeModel:
             calls = {
                 1: ModelToolCall(id="checkout-read", name="read_file", arguments={"path": "pricing.py"}),
                 2: ModelToolCall(
-                    id="checkout-reproduce", name="run_command", arguments={"command": CHECKOUT_COMMAND},
+                    id="checkout-reproduce",
+                    name="run_command",
+                    arguments={"command": CHECKOUT_COMMAND},
                 ),
-                3: ModelToolCall(id="checkout-patch", name="apply_patch", arguments={
-                    "file_path": "pricing.py", "old_string": CHECKOUT_BEFORE, "new_string": CHECKOUT_AFTER,
-                }),
+                3: ModelToolCall(
+                    id="checkout-patch",
+                    name="apply_patch",
+                    arguments={
+                        "file_path": "pricing.py",
+                        "old_string": CHECKOUT_BEFORE,
+                        "new_string": CHECKOUT_AFTER,
+                    },
+                ),
                 4: ModelToolCall(id="checkout-verify", name="run_command", arguments={"command": CHECKOUT_COMMAND}),
             }
             call = calls.get(step)
@@ -247,22 +248,25 @@ async def _run_case(case: SmokeCase, *, model: _SmokeModel | None = None) -> Smo
             result.status == "done"
             and result.answer == expected_answer
             and tools == case.expected_tools
-            and (case.name == "direct_answer" or (
-                after == expected_after and after != before
-                and result.validation_status == "passed"
-                and result.validation_scope == (
-                    "acceptance_command" if case.name == "checkout_demo" else "workspace_change_recorded"
-                )
-            ))
+            and (case.name == "direct_answer" or (after == expected_after and after != before))
         )
         if case.name == "checkout_demo":
             passed = (
-                passed and len(checks) == 2 and "FAILED (failures=2)" in checks[0]
-                and "Ran 3 tests" in checks[1] and "\nOK\n" in checks[1]
+                passed
+                and len(checks) == 2
+                and "FAILED (failures=2)" in checks[0]
+                and "Ran 3 tests" in checks[1]
+                and "\nOK\n" in checks[1]
             )
         event_lines = _v2_event_lines(result)
-        diff = "".join(difflib.unified_diff(before.splitlines(keepends=True), after.splitlines(keepends=True),
-                                          fromfile=f"a/{filename}", tofile=f"b/{filename}"))
+        diff = "".join(
+            difflib.unified_diff(
+                before.splitlines(keepends=True),
+                after.splitlines(keepends=True),
+                fromfile=f"a/{filename}",
+                tofile=f"b/{filename}",
+            )
+        )
         return SmokeResult(
             name=case.name,
             passed=passed,
@@ -272,8 +276,6 @@ async def _run_case(case: SmokeCase, *, model: _SmokeModel | None = None) -> Smo
             event_lines=event_lines,
             workspace_diff=diff,
             error="" if passed else "public Harness result did not match the smoke contract",
-            validation_status=result.validation_status,
-            validation_scope=result.validation_scope,
             check_outputs=checks,
         )
 
@@ -290,9 +292,7 @@ def _v2_event_lines(result: AgentResult) -> tuple[str, ...]:
         item_id = f"tool:{result.turn_id}:{call.tool_call_id}:1"
         preview = ""
         if call.arguments is not None:
-            preview = ", ".join(
-                f"{key}={value!r}" for key, value in call.arguments.items()
-            )
+            preview = ", ".join(f"{key}={value!r}" for key, value in call.arguments.items())
         canonical.append(
             (
                 index,

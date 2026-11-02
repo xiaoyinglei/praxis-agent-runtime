@@ -371,7 +371,7 @@ def test_oversized_summary_with_tail_reuses_same_generation_without_losing_unsee
             if summary:
                 assert "TAIL_EVIDENCE" in prepared.request_ref["step_snapshot"]["messages"][0]["body"]
             return HarnessModelResponse.from_parts(
-                text=("TAIL_EVIDENCE summarized. " + "s" * 2450) if summary else "done",
+                text=("TAIL_EVIDENCE summarized. " + "s" * 1600) if summary else "done",
                 provider_response_id=None,
                 usage={"input_tokens": 1, "output_tokens": 1},
             )
@@ -383,7 +383,9 @@ def test_oversized_summary_with_tail_reuses_same_generation_without_losing_unsee
         result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "completed"
         assert [p.request_ref["purpose"] for p in dispatched] == ["context_summary", "agent_step"]
-        final_messages = manager.build(turn.turn_id)
+        final_messages = RolloutContextManager(store).build(turn.turn_id)
+        assert final_messages[-1].content == "done"
+        manager._validate_budget(final_messages[:-1])
         assert any("TAIL_EVIDENCE summarized." in m.content for m in final_messages)
         assert not any(m.role == "tool" for m in final_messages)
         assert store.verify().valid

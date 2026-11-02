@@ -57,18 +57,12 @@ def record_completion_decision(
     proposal_item_id: str,
     action: str,
     reason: str,
-    validation_status: str = "not_evaluated",
-    validation_scope: str | None = None,
     reason_code: str | None = None,
 ) -> ItemSnapshot:
     if action not in {"accept", "continue", "pause", "fail"}:
         raise ValueError(f"unsupported completion action: {action}")
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError("completion reason must be non-empty")
-    if validation_status not in {"not_evaluated", "passed", "failed"}:
-        raise ValueError(f"unsupported completion validation status: {validation_status}")
-    if validation_scope is not None and (not isinstance(validation_scope, str) or not validation_scope.strip()):
-        raise ValueError("completion validation scope must be non-empty or None")
     if reason_code is not None and (not isinstance(reason_code, str) or not reason_code.strip()):
         raise ValueError("completion reason code must be non-empty or None")
     item_id = f"item_{uuid4().hex}"
@@ -82,7 +76,7 @@ def record_completion_decision(
             thread_id=thread_id,
             turn_id=turn_id,
             record_type="item_started",
-            producer="verifier",
+            producer="runtime",
             payload={"item_id": item_id, "kind": "completion_decision"},
         )
         facts.append_fact(
@@ -90,15 +84,13 @@ def record_completion_decision(
             thread_id=thread_id,
             turn_id=turn_id,
             record_type="item_completed",
-            producer="verifier",
+            producer="runtime",
             payload={
                 "item_id": item_id,
                 "payload": {
                     "proposal_item_id": proposal_item_id,
                     "action": action,
                     "reason": reason,
-                    "validation_status": validation_status,
-                    "validation_scope": validation_scope,
                     **({"reason_code": reason_code} if reason_code is not None else {}),
                 },
             },
@@ -137,7 +129,7 @@ def record_completion_feedback(
             thread_id=thread_id,
             turn_id=turn_id,
             record_type="item_started",
-            producer="verifier",
+            producer="runtime",
             payload={"item_id": item_id, "kind": "completion_feedback"},
         )
         facts.append_fact(
@@ -145,7 +137,7 @@ def record_completion_feedback(
             thread_id=thread_id,
             turn_id=turn_id,
             record_type="item_completed",
-            producer="verifier",
+            producer="runtime",
             payload={"item_id": item_id, "payload": payload},
         )
     return store._latest_item(turn_id)

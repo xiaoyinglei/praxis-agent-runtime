@@ -137,12 +137,13 @@ def test_later_batch_admission_preserves_earlier_evidence_prefixes(tmp_path):
         thread, turn = start(store, tmp_path)
         for i in range(3):
             exchange(store, turn.turn_id, str(i), f"RULE_{i}: " + "samples " * 2000)
+        # Leave space for four non-elidable call/result envelopes plus live facts.
         model, gateway = model_for(9000)
         runner = TurnRunner(
             thread_id=thread.thread_id,
             store=store,
             model=model,
-            context_manager=RolloutContextManager(store, max_total_bytes=5000),
+            context_manager=RolloutContextManager(store, max_total_bytes=7000),
             completion_gate=Accept(),
         )
         context = runner.restore_turn_context(turn.turn_id)

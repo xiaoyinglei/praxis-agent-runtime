@@ -1,8 +1,8 @@
 """Praxis Harness public runtime protocol."""
 
-from agent_runtime.harness.completion import DeliveryCompletionGate
 from agent_runtime.harness.context import RolloutContextManager
 from agent_runtime.harness.events import ReplayEvent, RolloutEvent, RolloutEventReader
+from agent_runtime.harness.execution import TurnRunner
 from agent_runtime.harness.execution_context import StepContext, TurnContext
 from agent_runtime.harness.model_adapter import (
     ControlPlaneHarnessModel,
@@ -47,12 +47,12 @@ from agent_runtime.harness.records import (
 from agent_runtime.harness.rollout import RolloutStore
 from agent_runtime.harness.runtime_store import RuntimeStore
 from agent_runtime.harness.session import Session
+from agent_runtime.harness.stop import StopChecks
 from agent_runtime.harness.tool_orchestrator import (
     ToolOrchestrator,
     ToolReconciliationOutcome,
 )
 from agent_runtime.harness.tool_router import DurableToolRouter, StaticToolRouter
-from agent_runtime.harness.turn import TurnRunner
 from agent_runtime.modeling.events import (
     ModelEvent,
     ModelEventSink,
@@ -89,7 +89,7 @@ __all__ = [
     "ContextCompactionCandidate",
     "ContextSourceChangedError",
     "ContextCompactionRequiredError",
-    "DeliveryCompletionGate",
+    "StopChecks",
     "DurableToolRouter",
     "ModelMessage",
     "GatewayHarnessModel",

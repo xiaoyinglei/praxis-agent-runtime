@@ -5,6 +5,7 @@ import json
 import threading
 import time
 from contextlib import contextmanager
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -65,10 +66,18 @@ def test_api_needs_local_session_capability(tmp_path, route):
 
 
 def test_catalog_is_static_and_listing_never_returns_config_secrets(tmp_path, monkeypatch):
-    monkeypatch.setattr("agent_runtime.mcp_admin.mcp_connections", lambda: [{
-        "name": "docs", "url": "https://docs.example/mcp", "enabled": True,
-        "headers": {"Authorization": "secret-token"}, "oauth": True,
-    }])
+    monkeypatch.setattr(
+        "agent_runtime.mcp_admin.mcp_connections",
+        lambda: [
+            {
+                "name": "docs",
+                "url": "https://docs.example/mcp",
+                "enabled": True,
+                "headers": {"Authorization": "secret-token"},
+                "oauth": True,
+            }
+        ],
+    )
     with running_server(tmp_path) as (server, client):
         catalog = client.get("/api/catalog", headers=headers(server)).json()
         assert {item["id"] for item in catalog} == {"github", "notion", "linear"}
@@ -90,10 +99,16 @@ def test_add_custom_connection_reuses_host_registration_and_check(tmp_path, monk
 
     monkeypatch.setattr("agent_runtime.mcp_cli.check_mcp_connection", check)
     with running_server(tmp_path) as (server, client):
-        response = client.post("/api/add", headers=headers(server), json={
-            "name": "docs", "url": "https://docs.example/mcp", "auth": "environment",
-            "bearer_token_env_var": "DOCS_TOKEN",
-        })
+        response = client.post(
+            "/api/add",
+            headers=headers(server),
+            json={
+                "name": "docs",
+                "url": "https://docs.example/mcp",
+                "auth": "environment",
+                "bearer_token_env_var": "DOCS_TOKEN",
+            },
+        )
         assert response.status_code == 202
         job = wait_job(client, server, response.json()["id"])
         assert job["status"] == "done"
@@ -105,10 +120,14 @@ def test_add_custom_connection_reuses_host_registration_and_check(tmp_path, monk
         assert arguments["bearer_token_env_var"] == "DOCS_TOKEN"
 
 
-@pytest.mark.parametrize("body", [
-    {"preset": "unknown"}, {"name": "docs", "url": "https://docs.example/mcp", "token": "secret"},
-    {"name": "docs", "url": "https://docs.example/mcp", "read_only": "false"},
-])
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"preset": "unknown"},
+        {"name": "docs", "url": "https://docs.example/mcp", "token": "secret"},
+        {"name": "docs", "url": "https://docs.example/mcp", "read_only": "false"},
+    ],
+)
 def test_add_rejects_ambiguous_or_secret_fields_before_mutation(tmp_path, monkeypatch, body):
     def forbidden(*args, **kwargs):
         raise AssertionError("must not mutate")
@@ -117,6 +136,62 @@ def test_add_rejects_ambiguous_or_secret_fields_before_mutation(tmp_path, monkey
     with running_server(tmp_path) as (server, client):
         assert client.post("/api/add", headers=headers(server), json=body).status_code == 400
         assert client.post("/api/add", headers=headers(server), content=json.dumps(body)).status_code == 415
+
+
+def test_configure_connection_uses_the_same_host_scope_service(tmp_path, monkeypatch):
+    observed = []
+    monkeypatch.setattr(
+        "agent_runtime.mcp_admin.configure_mcp_connection", lambda name, **kwargs: observed.append((name, kwargs))
+    )
+    monkeypatch.setattr(
+        "agent_runtime.mcp_cli.check_mcp_connection",
+        AsyncMock(
+            return_value={
+                "connected": True,
+                "tools": ["mcp__docs__create"],
+                "action_tools": ["mcp__docs__create"],
+                "diagnostics": [],
+            }
+        ),
+    )
+    with running_server(tmp_path) as (server, client):
+        response = client.post(
+            "/api/configure",
+            headers=headers(server),
+            json={
+                "name": "docs",
+                "read_only": False,
+                "tools": [],
+            },
+        )
+        assert response.status_code == 202
+        job = wait_job(client, server, response.json()["id"])
+        assert job["status"] == "done"
+        assert job["result"]["action_tools"] == ["mcp__docs__create"]
+        assert observed == [("docs", {"read_only": False, "tools": (), "workspace": tmp_path})]
+        assert (
+            client.post(
+                "/api/configure",
+                headers=headers(server),
+                json={
+                    "name": "docs",
+                    "read_only": "false",
+                },
+            ).status_code
+            == 400
+        )
+        assert (
+            client.post(
+                "/api/configure",
+                headers=headers(server),
+                json={
+                    "name": "docs",
+                    "token": "not-accepted",
+                },
+            ).status_code
+            == 400
+        )
+        assert len(observed) == 1
 
 
 def test_job_error_does_not_return_secret_exception_messages(tmp_path, monkeypatch):
@@ -152,9 +227,17 @@ def test_cli_exposes_local_connection_manager(tmp_path, monkeypatch):
 
     monkeypatch.setattr("agent_runtime.connection_manager.ConnectionServer", Server)
     monkeypatch.setattr("agent_runtime.connection_manager.webbrowser.open", lambda *_: pytest.fail("--no-open ignored"))
-    result = CliRunner().invoke(agent_app, [
-        "connections", "--no-open", "--workspace", str(tmp_path), "--port", "4567",
-    ])
+    result = CliRunner().invoke(
+        agent_app,
+        [
+            "connections",
+            "--no-open",
+            "--workspace",
+            str(tmp_path),
+            "--port",
+            "4567",
+        ],
+    )
     assert result.exit_code == 0
     assert observed == [(tmp_path, 4567), "served", "closed"]
     assert "127.0.0.1:4567" in result.stdout

@@ -11,11 +11,12 @@ from uuid import uuid4
 
 from agent_runtime.checkpoints import CheckpointService
 from agent_runtime.core.model_request import toolset_revision_for_tools
-from agent_runtime.harness.completion import DeliveryCompletionGate
 from agent_runtime.harness.context import RolloutContextManager
 from agent_runtime.harness.context_recall import READ_CONTEXT_NAME, create_context_recall_tool
-from agent_runtime.harness.protocol import DEFAULT_MAX_STEPS, BoundHarnessModel, CompletionGate
+from agent_runtime.harness.execution_context import step_limit_from_binding
+from agent_runtime.harness.protocol import BoundHarnessModel, CompletionGate
 from agent_runtime.harness.retry_policy import RetryPolicy
+from agent_runtime.harness.stop import StopChecks
 from agent_runtime.harness.tool_orchestrator import ToolOrchestrator, current_tool_turn_id
 from agent_runtime.harness.tool_router import DurableToolRouter
 from agent_runtime.project_instructions import instruction_snapshot
@@ -85,7 +86,7 @@ class SessionBindingProvider:
         mcp_config_trust: Mapping[str, object] | None,
         require_workspace_change: bool,
         acceptance_command: str | None,
-        model_step_budget: int,
+        model_step_budget: int | None,
         model_token_budget_total: int | None,
         model_cost_budget_total_micros: int | None,
         project_instructions: Callable[[str], Mapping[str, Any] | None] | None = None,
@@ -153,7 +154,6 @@ class SessionBindingProvider:
         binding["model_response_recovery"] = {"revision": "restart-step-v1", "max_retries": 1}
         binding["tool_failure_recovery"] = {"revision": "one-replan-v1"}
         binding["completion_continuation_policy"] = {"revision": "bounded-v1", "max_continuations": 8}
-        binding["step_budget_policy"] = {"revision": "pressure-v1"}
         binding["execution_context_policy"] = {
             "revision": "working-context-v2",
             "cache_continuity": "append-v1",
@@ -205,7 +205,7 @@ def configure_services(
     mcp_config_trust: Mapping[str, object] | None = None,
     enable_subagents: bool = False,
     skill_runtime: HarnessSkillRuntime | None = None,
-    max_steps: int = DEFAULT_MAX_STEPS,
+    max_steps: int | None = None,
     max_tokens_total: int | None = None,
     max_cost_micros: int | None = None,
 ) -> None:
@@ -213,8 +213,7 @@ def configure_services(
         if not isinstance(acceptance_command, str) or not acceptance_command.strip():
             raise ValueError("acceptance_command must be a non-empty string or None")
         acceptance_command = acceptance_command.strip()
-    if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 1:
-        raise ValueError("max_steps must be a positive integer")
+    step_limit_from_binding({"model_step_budget": max_steps})
     if max_tokens_total is not None and (
         isinstance(max_tokens_total, bool) or not isinstance(max_tokens_total, int) or max_tokens_total < 1
     ):
@@ -381,7 +380,7 @@ def configure_services(
         ),
         discoverable_names=discoverable_names,
     )
-    resolved_completion_gate = completion_gate or DeliveryCompletionGate(store)
+    resolved_completion_gate = completion_gate or StopChecks(store)
 
     execution_context = replace(
         execution_context,
