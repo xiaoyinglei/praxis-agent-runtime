@@ -1014,8 +1014,9 @@ def test_provider_failure_leaves_durable_unknown_attempt_for_reconciliation(
         unknown = [
             record for record in store.list_records(thread.thread_id) if record.record_type == "model_attempt_unknown"
         ]
-        assert unknown[-1].payload["error_type"] == "ConnectionError"
-        assert unknown[-1].payload["error_message"] == ("provider connection was lost after dispatch")
+        assert unknown[-1].payload["failure"]["kind"] == "transport_unknown"
+        assert unknown[-1].payload["failure"]["provider_outcome"] == "unknown"
+        assert unknown[-1].payload["error_message"] == "Provider transport failed; request outcome is unknown."
         assert store.verify().valid is True
 
 
@@ -1050,14 +1051,14 @@ def test_known_model_rejection_fails_without_unknown_or_retry_state(
         rejected = [
             record for record in store.list_records(thread.thread_id) if record.record_type == "model_attempt_rejected"
         ]
-        assert rejected[-1].payload["error_type"] == "RuntimeError"
-        assert rejected[-1].payload["error_message"] == ("provider rejected a validly delivered request")
+        assert rejected[-1].payload["failure"]["kind"] == "protocol_error"
+        assert rejected[-1].payload["error_message"] == "Provider response violated the model protocol."
         assert not any(record.record_type == "model_attempt_unknown" for record in store.list_records(thread.thread_id))
         assert store.verify().valid is True
 
 
 @pytest.mark.anyio
-async def test_partial_provider_failure_closes_started_channels_failed(
+async def test_partial_provider_failure_closes_started_channels_unknown(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -1084,7 +1085,7 @@ async def test_partial_provider_failure_closes_started_channels_failed(
         while not stream.empty:
             events.append(stream.receive_nowait())
 
-        assert result.status == "failed"
+        assert result.status == "paused"
         completed = [
             event
             for event in events
@@ -1101,7 +1102,7 @@ async def test_partial_provider_failure_closes_started_channels_failed(
             TurnItemKind.REASONING,
             TurnItemKind.PLAN,
         }
-        assert all(event.status is ItemStatus.FAILED for event in completed)
+        assert all(event.status is ItemStatus.OUTCOME_UNKNOWN for event in completed)
         assert {event.item_kind: event.data["content"] for event in completed} == {
             TurnItemKind.AGENT_MESSAGE: "partial answer",
             TurnItemKind.REASONING: "partial reasoning",

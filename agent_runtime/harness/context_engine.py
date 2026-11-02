@@ -91,7 +91,7 @@ class ContextEngine:
             operation = next(op for op in self._store.list_model_operations() if op.operation_id == operation_id)
             if operation.request_ref.get("purpose") != "context_summary":
                 return False
-            if operation.status not in {"prepared", "unknown"}:
+            if operation.status not in {"prepared", "unknown", "retry_wait"}:
                 return False
             stale = self._store.request_input_revision(
                 operation.turn_id, operation.request_ref
@@ -1090,7 +1090,13 @@ class ContextEngine:
         ) as failure:
             if active_job is not None:
                 if isinstance(failure, SummaryStoppedError):
-                    status = "waiting_unknown" if failure.result.status == "paused" else "cancelled"
+                    status = (
+                        "waiting_unknown"
+                        if failure.result.status == "paused"
+                        else "cancelled"
+                        if failure.result.status == "cancelled"
+                        else "failed"
+                    )
                 elif isinstance(failure, ContextSourceChangedError):
                     status = "superseded"
                 else:

@@ -11,7 +11,7 @@ import copy
 import hashlib
 import json
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from uuid import uuid4
 
@@ -394,11 +394,13 @@ def admit_retry(store: RuntimeStore, *, turn_id: str, operation_id: str, amount:
         job_id = operation.request_ref.get("compaction_job_id") or plan.get("job_id")
         if job_id is None:
             return
-        if operation.status != "unknown":
-            raise RuntimeError("compaction retry admission requires an unknown operation")
+        if operation.status not in {"unknown", "retry_wait"}:
+            raise RuntimeError("compaction retry admission requires an unknown or scheduled operation")
         job = read_job(store, turn_id=turn_id, job_id=job_id)
         _check_completed_call_allowances(store, turn_id=turn_id, job_id=job_id)
-        if amount != store.read_budget_reservation(operation.active_attempt_id).reserved:
+        if replace(amount, retries=0) != replace(
+            store.read_budget_reservation(operation.active_attempt_id).reserved, retries=0
+        ):
             raise ContextBudgetExceededError("Retry amount differs from the frozen request allowance.")
         if job.status not in {"planned", "running", "candidate_ready", "waiting_unknown", "installed"}:
             raise ContextBudgetExceededError("Compaction retry job no longer has an active allowance.")
@@ -472,8 +474,25 @@ def abandon_saved_summary(store: RuntimeStore, *, turn_id: str, operation_id: st
     """Discard obsolete local work; provider uncertainty stays in its reservation."""
     with store.tx.transaction():
         operation = next(op for op in store.list_model_operations(turn_id) if op.operation_id == operation_id)
-        if operation.request_ref.get("purpose") != "context_summary" or operation.status not in {"prepared", "unknown"}:
+        if operation.request_ref.get("purpose") != "context_summary" or operation.status not in {
+            "prepared",
+            "unknown",
+            "retry_wait",
+        }:
             raise RuntimeError("only an uncompleted saved summary can be abandoned")
+        from agent_runtime.harness import model_retry_ops
+
+        if model_retry_ops.read_schedule(store, operation_id) is not None:
+            model_retry_ops.cancel_scheduled_retry(
+                store,
+                operation_id=operation_id,
+                reason_code="context_source_superseded",
+                reason="summary source changed before retry",
+            )
+            job_id = operation.request_ref.get("compaction_plan", {}).get("job_id")
+            if job_id:
+                finish_job(store, turn_id=turn_id, job_id=job_id, status="superseded")
+            return
         uncertain = operation.status == "unknown"
         facts.append_fact(
             store,
@@ -515,3 +534,19 @@ def abandon_saved_summary(store: RuntimeStore, *, turn_id: str, operation_id: st
                     "reason": "obsolete summary abandoned with exposure preserved",
                 },
             )
+
+
+@owner_operation
+def finish_active_jobs(store: RuntimeStore, *, turn_id: str, status: str) -> None:
+    """Release only unused holds when the owning Turn ends, never unknown attempts."""
+    with store.tx.transaction():
+        seen: set[str] = set()
+        for item in reversed(store.list_items(turn_id)):
+            if item.kind != "compaction_job" or item.status != "completed":
+                continue
+            job_id = item.payload["job_id"]
+            if job_id in seen:
+                continue
+            seen.add(job_id)
+            if item.payload["status"] in {"planned", "running", "candidate_ready", "waiting_unknown"}:
+                finish_job(store, turn_id=turn_id, job_id=job_id, status=status)

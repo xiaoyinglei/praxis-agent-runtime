@@ -25,6 +25,7 @@ from agent_runtime.core.model_request import (
     build_model_request,
     build_stable_context,
     canonical_model_request_json,
+    freeze_json_mapping,
 )
 from agent_runtime.harness.control import ContextSnapshot
 from agent_runtime.harness.prepared_requests import decode_frozen_request, encode_frozen_request, restore_prepared_call
@@ -35,7 +36,6 @@ from agent_runtime.harness.protocol import (
     HarnessModelResponse,
     ModelContextOverflowError,
     ModelDispatchCancelledError,
-    ModelDispatchOutcomeUnknownError,
     ModelDispatchPreflightError,
     ModelMessage,
     PreparedModelCall,
@@ -52,6 +52,7 @@ from agent_runtime.modeling.events import (
     ModelStreamState,
     emit_model_event,
 )
+from agent_runtime.modeling.failures import ModelCallFailed, classify_model_failure
 from agent_runtime.modeling.gateway import (
     LLMContextOverflowError,
     _emit_complete_model_response,
@@ -270,6 +271,9 @@ class GatewayHarnessModel:
             wire = local_wire
         else:
             openai_wire = serialize_openai_request(canonical_request)
+            # The first dispatch and restored dispatch share the same canonical
+            # key ordering, so the SDK emits identical JSON bodies on replay.
+            openai_wire = replace(openai_wire, payload=freeze_json_mapping(json.loads(openai_wire.serialized_json)))
             wire_hash = openai_wire.provider_wire_hash
             serializer_revision = openai_wire.serializer_revision
             wire = openai_wire
@@ -407,67 +411,65 @@ class GatewayHarnessModel:
             if current is not None and current.cancelling():
                 raise
             raise ModelDispatchCancelledError("provider acknowledged model cancellation") from exc
-        except BaseException as exc:
-            body = getattr(exc, "body", None)
-            code = getattr(exc, "code", None)
-            if isinstance(body, Mapping):
-                error = body.get("error", body)
-                if isinstance(error, Mapping):
-                    code = error.get("code", code)
-            if getattr(exc, "status_code", None) == 400 and code in {
+        except Exception as exc:
+            if getattr(exc, "status_code", None) == 400 and getattr(exc, "code", None) in {
                 "context_length_exceeded",
                 "context_window_exceeded",
             }:
-                raise ModelContextOverflowError(str(exc)) from exc
-            if _is_uncertain_transport_failure(exc):
-                raise ModelDispatchOutcomeUnknownError(str(exc).strip() or type(exc).__name__) from exc
-            raise
-        if response.provider_wire_hash != payload.wire_hash:
-            raise RuntimeError("provider wire changed between prepare and dispatch")
-        if event_sink is not None:
-            if not stream_state.started:
-                await _emit_complete_model_response(forward_event, response)
-            if not stream_state.completed:
-                raise ModelDispatchOutcomeUnknownError("model stream ended without a terminal response")
-            if stream_state.outputs != response.outputs:
-                raise RuntimeError("model stream output snapshots disagree with the terminal response")
-            if stream_state.provider_response_id != response.provider_response_id:
-                raise RuntimeError("model stream response identity disagrees with the terminal response")
-        turn = response.turn
-        incomplete = response.stop_reason in {StopReason.MAX_TOKENS, StopReason.INCOMPLETE}
-        if not incomplete:
-            if response.stop_reason is StopReason.TOOL_USE and not turn.tool_calls:
-                raise RuntimeError("tool-use stop reason did not include tool calls")
-            if response.stop_reason is StopReason.END_TURN and any(
-                output.kind == "tool_call" for output in response.outputs
-            ):
-                raise RuntimeError("end-turn response unexpectedly included tool calls")
-            if not turn.text.strip() and not turn.tool_calls:
-                raise RuntimeError("model returned neither text nor tool calls")
-        result = HarnessModelResponse(
-            provider_response_id=response.provider_response_id,
-            usage=_priced_usage_payload(response.usage.model_dump(mode="json"), resolved),
-            outputs=response.outputs,
-            stop_reason=response.raw_stop_reason or response.stop_reason.value,
-            status="incomplete" if incomplete else "completed",
-            incomplete_reason=(
-                "max_output_tokens"
-                if response.stop_reason is StopReason.MAX_TOKENS
-                else response.raw_stop_reason or "unknown"
+                raise ModelContextOverflowError(
+                    "Provider context window exceeded.",
+                    failure=classify_model_failure(exc, output_started=bool(stream_state.outputs)),
+                ) from None
+            raise ModelCallFailed(classify_model_failure(exc, output_started=bool(stream_state.outputs))) from None
+        try:
+            if response.provider_wire_hash != payload.wire_hash:
+                raise RuntimeError("provider wire changed between prepare and dispatch")
+            if event_sink is not None:
+                if not stream_state.started:
+                    await _emit_complete_model_response(forward_event, response)
+                if not stream_state.completed:
+                    raise ConnectionError("model stream ended without a terminal response")
+                if stream_state.outputs != response.outputs:
+                    raise RuntimeError("model stream output snapshots disagree with the terminal response")
+                if stream_state.provider_response_id != response.provider_response_id:
+                    raise RuntimeError("model stream response identity disagrees with the terminal response")
+            turn = response.turn
+            incomplete = response.stop_reason in {StopReason.MAX_TOKENS, StopReason.INCOMPLETE}
+            if not incomplete:
+                if response.stop_reason is StopReason.TOOL_USE and not turn.tool_calls:
+                    raise RuntimeError("tool-use stop reason did not include tool calls")
+                if response.stop_reason is StopReason.END_TURN and any(
+                    output.kind == "tool_call" for output in response.outputs
+                ):
+                    raise RuntimeError("end-turn response unexpectedly included tool calls")
+                if not turn.text.strip() and not turn.tool_calls:
+                    raise RuntimeError("model returned neither text nor tool calls")
+            result = HarnessModelResponse(
+                provider_response_id=response.provider_response_id,
+                usage=_priced_usage_payload(response.usage.model_dump(mode="json"), resolved),
+                outputs=response.outputs,
+                stop_reason=response.raw_stop_reason or response.stop_reason.value,
+                status="incomplete" if incomplete else "completed",
+                incomplete_reason=(
+                    "max_output_tokens"
+                    if response.stop_reason is StopReason.MAX_TOKENS
+                    else response.raw_stop_reason or "unknown"
+                )
+                if incomplete
+                else None,
             )
-            if incomplete
-            else None,
-        )
-        if event_sink is not None:
-            stream_state.validate_response(
-                outputs=result.outputs,
-                provider_response_id=result.provider_response_id,
-                usage=result.usage,
-                status=result.status,
-                incomplete_reason=result.incomplete_reason,
-                stop_reason=result.stop_reason,
-            )
-        return result
+            if event_sink is not None:
+                stream_state.validate_response(
+                    outputs=result.outputs,
+                    provider_response_id=result.provider_response_id,
+                    usage=result.usage,
+                    status=result.status,
+                    incomplete_reason=result.incomplete_reason,
+                    stop_reason=result.stop_reason,
+                )
+            return result
+        except Exception as exc:
+            raise ModelCallFailed(classify_model_failure(exc, output_started=bool(stream_state.outputs))) from None
 
 
 class ControlPlaneHarnessModel:
@@ -602,24 +604,6 @@ def _authenticated_model_binding(
         dict[str, JsonValue],
         {key: manifest[key] for key in _AUTHENTICATED_MODEL_BINDING_FIELDS},
     )
-
-
-def _is_uncertain_transport_failure(error: BaseException) -> bool:
-    if isinstance(error, (ConnectionError, TimeoutError)):
-        return True
-    error_type = type(error)
-    return (error_type.__module__, error_type.__name__) in {
-        ("openai", "APIConnectionError"),
-        ("openai", "APITimeoutError"),
-        ("httpx", "ConnectError"),
-        ("httpx", "ConnectTimeout"),
-        ("httpx", "ReadError"),
-        ("httpx", "ReadTimeout"),
-        ("httpcore", "ConnectError"),
-        ("httpcore", "ConnectTimeout"),
-        ("httpcore", "ReadError"),
-        ("httpcore", "ReadTimeout"),
-    }
 
 
 def _model_messages(

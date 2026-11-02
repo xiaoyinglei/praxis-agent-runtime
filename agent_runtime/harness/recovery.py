@@ -21,6 +21,7 @@ class ContinuationKind(StrEnum):
     INPUT = "input"
     RESUME_CANCELLED = "resume_cancelled"
     RETRY_MODEL = "retry_model"
+    WAIT_RETRY = "wait_retry"
     APPROVED_READY = "approved_ready"
     COMMITTED_RESPONSE = "committed_response"
     PREPARED_MODEL = "prepared_model"
@@ -95,6 +96,14 @@ def pending_input_supersession(store: RuntimeStore, turn_id: str) -> bool:
         return False
     attempt = operations[-1].active_attempt_id
     records = store.list_turn_records(turn_id)
+    if any(
+        record.record_type == "model_retry_cancelled"
+        and record.payload.get("attempt_id") == attempt
+        and record.payload.get("reason_code")
+        in {"input_superseded", "context_source_superseded", "model_retry_cancelled"}
+        for record in records
+    ):
+        return True
     if any(
         record.record_type == "model_attempt_rejected"
         and record.payload.get("attempt_id") == attempt
@@ -283,6 +292,15 @@ def _recovery_decision(store: RuntimeStore, turn_id: str) -> RecoveryDecision:
         return plan("unavailable", (), "pending_interaction", *(item.request_id for item in pending))
     if turn.status == "paused" and store.turn_cancellation_pending(turn_id):
         return plan("resume_cancelled", ("continue",), "cancellation_settled")
+    waiting = tuple(op for op in models if op.status == "retry_wait")
+    if len(waiting) == 1 and turn.status == "running":
+        return plan(
+            "wait_retry",
+            ("continue",),
+            "model_retry_scheduled",
+            waiting[0].operation_id,
+            request_id=waiting[0].operation_id,
+        )
     unknown = tuple(op for op in models if op.status == "unknown")
     if len(unknown) == 1:
         return plan(

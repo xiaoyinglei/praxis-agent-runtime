@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -180,10 +181,57 @@ def apply_record(
             attempt["status"] = "cancelled"
             attempt["applied_thread_sequence"] = sequence
             _advance(state, thread_id, _turn_id(record), sequence)
+        case "model_retry_scheduled" | "model_retry_cancelled":
+            retry_turn_id = _turn_id(record)
+            operation = state.model_operations[payload["operation_id"]]
+            attempt = state.model_attempts[payload["attempt_id"]]
+            if (
+                record.producer != "runtime"
+                or operation["turn_id"] != retry_turn_id
+                or operation["thread_id"] != thread_id
+                or operation["active_attempt_id"] != payload["attempt_id"]
+                or operation["generation"] != payload["generation"]
+                or attempt["operation_id"] != payload["operation_id"]
+            ):
+                raise ValueError("retry fact must reference the current runtime-owned generation")
+            if record.record_type == "model_retry_scheduled":
+                if operation["status"] != "failed" or attempt["status"] != "failed":
+                    raise ValueError("automatic retry requires a rejected current attempt")
+                for field_name in ("observed_at", "retry_at", "deadline_at"):
+                    number = payload[field_name]
+                    if type(number) not in {int, float} or not math.isfinite(number):
+                        raise ValueError("retry times must be finite")
+                if not payload["observed_at"] <= payload["retry_at"] <= payload["deadline_at"]:
+                    raise ValueError("retry schedule exceeds its deadline")
+                if (
+                    type(payload["retry_number"]) is not int
+                    or type(payload["max_retries"]) is not int
+                    or not 1 <= payload["retry_number"] <= payload["max_retries"]
+                ):
+                    raise ValueError("retry schedule count exceeds its allowance")
+                failure = payload["failure"]
+                if (
+                    not isinstance(failure, Mapping)
+                    or failure.get("retryable") is not True
+                    or failure.get("output_started") is not False
+                    or failure.get("provider_outcome") not in {"not_sent", "rejected"}
+                ):
+                    raise ValueError("automatic retry requires an unambiguous eligible failure")
+                operation["status"] = "retry_wait"
+            else:
+                if operation["status"] not in {"retry_wait", "prepared"}:
+                    raise ValueError("only waiting or unstarted retries may be cancelled")
+                operation["status"] = "failed"
+                if attempt["status"] == "prepared":
+                    attempt["status"] = "failed"
+                    attempt["applied_thread_sequence"] = sequence
+            operation["applied_thread_sequence"] = sequence
+            _advance(state, thread_id, retry_turn_id, sequence)
         case "model_retry_prepared":
             operation = state.model_operations[payload["operation_id"]]
             previous = state.model_attempts[payload["previous_attempt_id"]]
-            previous["status"] = "abandoned"
+            if not payload.get("automatic", False):
+                previous["status"] = "abandoned"
             previous["applied_thread_sequence"] = sequence
             attempt_id = payload["attempt_id"]
             state.model_attempts[attempt_id] = {
@@ -613,7 +661,7 @@ def _identity_v1(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     return payload
 
 
-_PAYLOAD_UPCASTERS = {1: _identity_v1, 2: _identity_v1, 3: _identity_v1, 4: _identity_v1}
+_PAYLOAD_UPCASTERS = {1: _identity_v1, 2: _identity_v1, 3: _identity_v1, 4: _identity_v1, 5: _identity_v1}
 
 
 def _advance(

@@ -42,6 +42,7 @@ def test_public_result_dto_is_frozen_and_keeps_thread_turn_identity() -> None:
         "thread_id",
         "validation_status",
         "validation_scope",
+        "model_error",
     )
     call = AgentToolCall(
         tool_call_id="call-1",

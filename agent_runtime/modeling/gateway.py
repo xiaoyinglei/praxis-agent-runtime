@@ -400,7 +400,11 @@ class LLMGateway:
             if key not in {"model", "messages", "tools", "max_completion_tokens"}
         }
         if request.settings.provider_options:
-            provider_kwargs["extra_body"] = {key: provider_kwargs.pop(key) for key in request.settings.provider_options}
+            # Initial settings and artifact-restored settings may have different
+            # insertion order. Keep the SDK's merged extension bytes stable too.
+            provider_kwargs["extra_body"] = {
+                key: provider_kwargs.pop(key) for key in sorted(request.settings.provider_options)
+            }
         max_completion_tokens = payload.get("max_completion_tokens")
         if isinstance(max_completion_tokens, int):
             # Route the canonical request limit through the gateway so context

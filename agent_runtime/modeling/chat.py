@@ -5,9 +5,11 @@ import os
 import re
 import threading
 from collections.abc import Iterator
+from dataclasses import replace
 from typing import Any, TypeVar, cast
 
 from agent_runtime.modeling.contracts import LLMProviderResult, LLMUsage
+from agent_runtime.modeling.failures import ModelCallFailed, ModelFailure, classify_model_failure
 from agent_runtime.modeling.openai_wire import parse_openai_usage
 
 T = TypeVar("T")
@@ -37,6 +39,7 @@ class OpenAICompatibleChatGenerator:
             base_url=base_url,
             api_key=api_key or "not-needed",
             timeout=timeout_seconds,
+            max_retries=0,
         )
         self._supports_tools = (
             (os.environ.get("RAG_NATIVE_TOOL_CALLING", "").lower() not in {"0", "false", "no", "off"})
@@ -141,6 +144,7 @@ class OpenAICompatibleChatGenerator:
         reported_usage = None
         provider_response_id = None
         response_started = False
+        output_started = False
         try:
             for response_chunk in stream:
                 observed_id = getattr(response_chunk, "id", None)
@@ -161,9 +165,11 @@ class OpenAICompatibleChatGenerator:
                 delta = choice.delta
                 content = getattr(delta, "content", None)
                 if content:
+                    output_started = True
                     yield {"type": "text_delta", "content": str(content), "provider_response_id": provider_response_id}
                 reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
                 if reasoning:
+                    output_started = True
                     yield {
                         "type": "thinking_delta",
                         "content": str(reasoning),
@@ -171,9 +177,11 @@ class OpenAICompatibleChatGenerator:
                     }
                 plan = getattr(delta, "plan", None)
                 if plan:
+                    output_started = True
                     yield {"type": "plan_delta", "content": str(plan), "provider_response_id": provider_response_id}
                 refusal = getattr(delta, "refusal", None)
                 if refusal:
+                    output_started = True
                     yield {
                         "type": "refusal_delta",
                         "content": str(refusal),
@@ -183,6 +191,7 @@ class OpenAICompatibleChatGenerator:
                     index = int(tool_call.index)
                     function = tool_call.function
                     if index not in tool_blocks:
+                        output_started = True
                         tool_id = str(tool_call.id or f"tool-{index}")
                         tool_name = str(function.name or "")
                         tool_blocks[index] = (tool_id, tool_name)
@@ -207,13 +216,26 @@ class OpenAICompatibleChatGenerator:
                     final_reason = _stream_stop_reason(str(finish_reason))
                     authoritative_stop = True
             if not authoritative_stop:
-                raise ConnectionError("OpenAI-compatible stream ended without a finish reason")
+                raise ModelCallFailed(
+                    ModelFailure(
+                        kind="transport_unknown",
+                        phase="stream",
+                        provider_outcome="unknown",
+                        billing_outcome="unknown",
+                        output_started=output_started,
+                    )
+                )
             yield {
                 "type": "message_stop",
                 "stop_reason": final_reason,
                 "usage": reported_usage,
                 "provider_response_id": provider_response_id,
             }
+        except Exception as exc:
+            failure = classify_model_failure(exc, output_started=output_started)
+            if failure.kind == "transport_unknown":
+                failure = replace(failure, phase="stream")
+            raise ModelCallFailed(failure) from None
         finally:
             close = getattr(stream, "close", None)
             if callable(close):

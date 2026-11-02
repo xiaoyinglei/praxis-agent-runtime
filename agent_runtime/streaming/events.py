@@ -36,6 +36,8 @@ class EventType(StrEnum):
 
     # Runtime decisions and execution facts; these are not provider events.
     MODEL_ATTEMPT_UPDATED = "model_attempt_updated"
+    MODEL_RETRY_SCHEDULED = "model_retry_scheduled"
+    MODEL_RETRY_CANCELLED = "model_retry_cancelled"
     TOOL_OPERATION_UPDATED = "tool_operation_updated"
     INTERACTION_REQUESTED = "interaction_requested"
     INTERACTION_RESOLVED = "interaction_resolved"
@@ -179,20 +181,20 @@ _TURN_EVENTS = frozenset(
         EventType.TURN_ABORTED,
     }
 )
-_ITEM_EVENTS = frozenset(
-    {EventType.ITEM_STARTED, EventType.ITEM_DELTA, EventType.ITEM_COMPLETED}
+_ITEM_EVENTS = frozenset({EventType.ITEM_STARTED, EventType.ITEM_DELTA, EventType.ITEM_COMPLETED})
+_RUNTIME_EVENTS = frozenset(
+    {
+        EventType.MODEL_ATTEMPT_UPDATED,
+        EventType.TOOL_OPERATION_UPDATED,
+        EventType.INTERACTION_REQUESTED,
+        EventType.INTERACTION_RESOLVED,
+        EventType.INTERACTION_INVALIDATED,
+        EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.CONTEXT_COMPACTION_COMPLETED,
+        EventType.COMPLETION_DECIDED,
+        EventType.VERIFICATION_COMPLETED,
+    }
 )
-_RUNTIME_EVENTS = frozenset({
-    EventType.MODEL_ATTEMPT_UPDATED,
-    EventType.TOOL_OPERATION_UPDATED,
-    EventType.INTERACTION_REQUESTED,
-    EventType.INTERACTION_RESOLVED,
-    EventType.INTERACTION_INVALIDATED,
-    EventType.CONTEXT_COMPACTION_STARTED,
-    EventType.CONTEXT_COMPACTION_COMPLETED,
-    EventType.COMPLETION_DECIDED,
-    EventType.VERIFICATION_COMPLETED,
-})
 
 
 @dataclass(frozen=True)
@@ -251,12 +253,21 @@ class StreamEvent:
             if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
                 raise ValueError("model attempt generation must be a positive integer")
             if required_string("status") not in {
-                "prepared", "retry_prepared", "dispatched", "responding", "completed", "rejected",
-                "cancelled", "unknown", "late_response",
+                "prepared",
+                "retry_prepared",
+                "dispatched",
+                "responding",
+                "completed",
+                "rejected",
+                "cancelled",
+                "unknown",
+                "late_response",
             }:
                 raise ValueError("unsupported model attempt status")
         elif self.type in {
-            EventType.INTERACTION_REQUESTED, EventType.INTERACTION_RESOLVED, EventType.INTERACTION_INVALIDATED,
+            EventType.INTERACTION_REQUESTED,
+            EventType.INTERACTION_RESOLVED,
+            EventType.INTERACTION_INVALIDATED,
         }:
             required_string("request_id")
             if self.type is EventType.INTERACTION_REQUESTED:

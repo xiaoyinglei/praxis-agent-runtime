@@ -72,7 +72,7 @@ uv run python scripts/verify_agent_rollout.py --database /path/to/rollout.sqlite
 
 主机控制信息使用 `StepControl` 和 `ModelMessage.runtime_metadata`，文本是单向渲染结果。用户即使粘贴相同标题或 JSON 也不能产生主机控制状态。完整 Step 快照和冻结 canonical/wire 请求存入引用完整性可审计的 artifact；replay 校验 request/context/tool/wire 四个 hash，发送冻结 wire，不重新序列化 provider 请求。凭据从当前可信连接取得，不写入 artifact。旧记录仅在其保存的快照、版本和 hash 能精确恢复时继续执行，历史读取与安全取消独立保留。
 
-写入协议为 payload schema 4；读取器仍支持既有 1–3 记录。首次可写打开安装 SQLite 最低 writer 协议门禁，旧二进制的 schema 3 INSERT 会在执行模型和工具之前被拒绝。升级前应按下文备份数据库和 artifact 目录；不要把数据库交回旧版本继续写入。
+写入协议为 payload schema 5；读取器仍支持既有 1–4 记录。首次可写打开安装 SQLite 最低 writer 协议门禁，包括此前已打开的连接，旧二进制的 schema 3/4 INSERT 会在执行模型和工具之前被拒绝。升级前应按下文备份数据库和 artifact 目录；不要把数据库交回旧版本继续写入。
 
 本次内核替换对照官方 [Codex 固定源码 a4c9194](https://github.com/openai/codex/tree/a4c9194247c6a1e79aa3e72cc6cd77238f2ed354)，Claude 参考仍为上文注明来源限制的历史镜像；不把 SDK 协议解析器当作完整执行内核源码。
 

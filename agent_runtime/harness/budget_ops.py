@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -212,15 +213,16 @@ def _append_budget_outcome(
         return
     reservation_id = str(row["reservation_id"])
     status = ReservationStatus(str(row["status"]))
-    if outcome == "settled":
+    if outcome in {"settled", "not_sent"}:
         if status not in {
             ReservationStatus.RESERVED,
             ReservationStatus.DISPATCHED,
             ReservationStatus.UNKNOWN,
         }:
             raise RuntimeError("budget reservation cannot be settled")
-        if usage is None:
+        if usage is None and outcome == "settled":
             raise RuntimeError("settled budget requires provider usage")
+        actual = resource_usage_from_model_usage(usage or {}) if outcome == "settled" else ResourceUsage()
         facts.append_fact(
             store,
             thread_id=str(operation["thread_id"]),
@@ -229,7 +231,10 @@ def _append_budget_outcome(
             producer=producer,
             payload={
                 "reservation_id": reservation_id,
-                "actual": resource_usage_from_model_usage(usage).to_dict(),
+                "actual": replace(
+                    actual,
+                    retries=ResourceUsage.from_dict(row["reserved"]).retries,
+                ).to_dict(),
             },
         )
         return

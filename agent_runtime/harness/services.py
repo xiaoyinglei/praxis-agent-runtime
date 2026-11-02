@@ -15,6 +15,7 @@ from agent_runtime.harness.completion import DeliveryCompletionGate
 from agent_runtime.harness.context import RolloutContextManager
 from agent_runtime.harness.context_recall import READ_CONTEXT_NAME, create_context_recall_tool
 from agent_runtime.harness.protocol import DEFAULT_MAX_STEPS, BoundHarnessModel, CompletionGate
+from agent_runtime.harness.retry_policy import RetryPolicy
 from agent_runtime.harness.tool_orchestrator import ToolOrchestrator, current_tool_turn_id
 from agent_runtime.harness.tool_router import DurableToolRouter
 from agent_runtime.project_instructions import instruction_snapshot
@@ -148,6 +149,7 @@ class SessionBindingProvider:
             "require_workspace_change": self._require_workspace_change,
             "acceptance_command": self._acceptance_command,
         }
+        binding["model_retry_policy"] = RetryPolicy().to_payload()
         binding["model_response_recovery"] = {"revision": "restart-step-v1", "max_retries": 1}
         binding["tool_failure_recovery"] = {"revision": "one-replan-v1"}
         binding["completion_continuation_policy"] = {"revision": "bounded-v1", "max_continuations": 8}

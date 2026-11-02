@@ -13,6 +13,7 @@ from agent_runtime.terminal_render import (
     TerminalToolEventDisplay,
     bounded_result_lines,
     display_rows,
+    format_model_failure,
     format_usage_summary,
     safe_terminal_text,
     web_error_message,
@@ -125,8 +126,11 @@ class Conversation:
                 continue
             if block.kind == "group" and block.inline and not self.details:
                 children = block.children
-                visible = [child for i, child in enumerate(children)
-                           if i >= len(children) - 5 or child.failed or child.operation_status == "running"]
+                visible = [
+                    child
+                    for i, child in enumerate(children)
+                    if i >= len(children) - 5 or child.failed or child.operation_status == "running"
+                ]
                 hidden = len(children) - len(visible)
                 if hidden:
                     rows.append((f"▸ 另有 {hidden} 项操作 · Ctrl+O 详情", block, "dim"))
@@ -170,6 +174,7 @@ class Conversation:
 
     def plain_text(self) -> str:
         return "\n".join(text for text, _, _ in self.rows())
+
 
 _TOOL_LABELS = {
     "read_file": "读取文件",
@@ -233,8 +238,9 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
 
     def activity_text(self) -> str:
         now = self._clock()
-        active = len({b.session_id or identity for identity, b in self._tool_blocks.items()
-                      if b.operation_status == "running"})
+        active = len(
+            {b.session_id or identity for identity, b in self._tool_blocks.items() if b.operation_status == "running"}
+        )
         status = self._activity_status
         if active > 1:
             status += f" · 另有 {active - 1} 项进行中"
@@ -246,8 +252,9 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
         return status
 
     def runtime_stats(self, *, compact: bool = False) -> str:
-        elapsed = max(0.0, self._elapsed_seconds + (
-            0.0 if self._started_at is None else self._clock() - self._started_at))
+        elapsed = max(
+            0.0, self._elapsed_seconds + (0.0 if self._started_at is None else self._clock() - self._started_at)
+        )
         timer = f"{elapsed:.0f} 秒"
         usage = self._usage
         if usage is None:
@@ -256,9 +263,11 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
         label = "已报告" if usage.usage_complete else "已报告部分"
         if compact:
             return f"{timer} · {label} {self._usage_count_text('total_tokens')} Token · 缓存 {cached}"
-        return (f"{timer} · {label} 输入 {self._usage_count_text('input_tokens')}"
-                f" · 输出 {self._usage_count_text('output_tokens')}"
-                f" · 缓存 {cached}")
+        return (
+            f"{timer} · {label} 输入 {self._usage_count_text('input_tokens')}"
+            f" · 输出 {self._usage_count_text('output_tokens')}"
+            f" · 缓存 {cached}"
+        )
 
     def activity_frame(self) -> str:
         # A small, fixed-width pulse driven by the same monotonic task clock.
@@ -272,13 +281,20 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
             self.turn_id = event.turn_id
         identity = event.item_id or event.data.get("tool_id")
         is_tool = event.item_kind in {TurnItemKind.TOOL, TurnItemKind.COMMAND} or event.type in {
-            EventType.TOOL_USE_START, EventType.TOOL_USE_PROGRESS,
-            EventType.TOOL_USE_RESULT, EventType.TOOL_USE_ERROR,
+            EventType.TOOL_USE_START,
+            EventType.TOOL_USE_PROGRESS,
+            EventType.TOOL_USE_RESULT,
+            EventType.TOOL_USE_ERROR,
         }
         self._target = None
         if is_tool and isinstance(identity, str):
-            lifecycle = event.type in {EventType.ITEM_STARTED, EventType.ITEM_COMPLETED,
-                                      EventType.TOOL_USE_START, EventType.TOOL_USE_RESULT, EventType.TOOL_USE_ERROR}
+            lifecycle = event.type in {
+                EventType.ITEM_STARTED,
+                EventType.ITEM_COMPLETED,
+                EventType.TOOL_USE_START,
+                EventType.TOOL_USE_RESULT,
+                EventType.TOOL_USE_ERROR,
+            }
             projected = (event.turn_id, identity, event.type)
             if lifecycle and projected in self._projected:
                 return
@@ -292,8 +308,11 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
                     self.group = self.view.add_group()
                     self.group.inline = True
                 result = event.data.get("result")
-                name = str(event.data.get("tool_name") or
-                           (result.get("tool_name") if isinstance(result, Mapping) else None) or "工具")
+                name = str(
+                    event.data.get("tool_name")
+                    or (result.get("tool_name") if isinstance(result, Mapping) else None)
+                    or "工具"
+                )
                 block = self.view.add_tool(self.group, "● " + _TOOL_LABELS.get(name, name))
                 block.tool_name = name
                 self._tool_blocks[key] = block
@@ -359,8 +378,11 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
         state = "success"
         if event.status is ItemStatus.OUTCOME_UNKNOWN or process_status == "outcome_unknown":
             state = "unknown"
-        elif (event.status is ItemStatus.CANCELLED or result.get("error_code") == "cancelled"
-              or process_status in {"cancelled", "canceled"}):
+        elif (
+            event.status is ItemStatus.CANCELLED
+            or result.get("error_code") == "cancelled"
+            or process_status in {"cancelled", "canceled"}
+        ):
             state = "cancelled"
         elif event.status is ItemStatus.FAILED or event.type is EventType.TOOL_USE_ERROR or result.get("is_error"):
             state = "failed"
@@ -388,8 +410,11 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
             if block.tool_name in {"web_search", "web_fetch"}:
                 summary = web_error_message(code)
             else:
-                summary = (known.get(str(code)) or known.get(str(error))
-                           or safe_terminal_text(str(error or "这一步未成功"))[:200])
+                summary = (
+                    known.get(str(code))
+                    or known.get(str(error))
+                    or safe_terminal_text(str(error or "这一步未成功"))[:200]
+                )
             block.preview = summary
             self._activity_status = "这一步失败，继续处理中"
         elif state == "unknown":
@@ -402,15 +427,24 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
             block.preview = "命令运行中" if block.session_id else "进行中"
             self._activity_status = "命令运行中" if block.session_id else "正在处理"
         else:
-            content = (output if isinstance(output, str)
-                       else process.get("stdout", process.get("content", process.get("text"))))
-            block.preview = ("\n".join(safe_terminal_text(content).splitlines()[:2])[:400]
-                             if isinstance(content, str) and content.strip() else "操作完成")
+            content = (
+                output
+                if isinstance(output, str)
+                else process.get("stdout", process.get("content", process.get("text")))
+            )
+            block.preview = (
+                "\n".join(safe_terminal_text(content).splitlines()[:2])[:400]
+                if isinstance(content, str) and content.strip()
+                else "操作完成"
+            )
             self._activity_status = "等待模型响应"
         if block.session_id and state != "running":
             for previous in (child for group in self.view.blocks for child in group.children):
-                if (previous is not block and previous.session_id == block.session_id
-                        and previous.operation_status == "running"):
+                if (
+                    previous is not block
+                    and previous.session_id == block.session_id
+                    and previous.operation_status == "running"
+                ):
                     previous.operation_status = state
                     previous.failed = block.failed
                     previous.preview = block.preview
@@ -444,9 +478,9 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
         self._context_status[key] = value
         if self._context_detail is None or self._context_detail not in self.view.blocks:
             self._context_detail = self.view._add(Block("diagnostic", title="上下文状态"))
-        self._context_detail.text = safe_terminal_text("\n".join(
-            line for name, line in self._context_status.items() if name != "request_settings"
-        ))
+        self._context_detail.text = safe_terminal_text(
+            "\n".join(line for name, line in self._context_status.items() if name != "request_settings")
+        )
         self._context_detail.trim(MAX_TEXT)
         self.view.invalidate()
 
@@ -460,6 +494,10 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
     def _write_line(self, value: str, *, record: bool = True) -> None:
         if record:
             self._record_detail(value)
+
+    def _write_runtime_notification(self, value: str) -> None:
+        self._record_detail(value)
+        self.view.message(safe_terminal_text(value) + "\n", "diagnostic")
 
     def _write_block(self, value: str) -> None:
         self._record_detail(value)
@@ -540,6 +578,8 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
         self._receipt.text = format_usage_summary(result.usage) + "\n"
         if result.status == "paused":
             self._receipt.text = "暂停时，" + self._receipt.text
+            if result.model_error is not None:
+                self._receipt.text = format_model_failure(result.model_error) + "\n" + self._receipt.text
             self._activity_status = "等待你的确认或回答"
             self.view.invalidate()
             return
@@ -552,9 +592,12 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
                     block.preview = "已取消"
         elif result.status == "failed":
             self._activity_status = "本轮未完成"
-            message = next((d.message for d in result.diagnostics if d.severity == "error"), "")
-            summary = safe_terminal_text(message).replace("\n", " ")[:200]
-            text = "! 本轮未完成" + ("：" + summary if summary else "；Ctrl+O 查看原因")
+            if result.model_error is not None:
+                text = "! 本轮未完成\n" + format_model_failure(result.model_error)
+            else:
+                message = next((d.message for d in result.diagnostics if d.severity == "error"), "")
+                summary = safe_terminal_text(message).replace("\n", " ")[:200]
+                text = "! 本轮未完成" + ("：" + summary if summary else "；Ctrl+O 查看原因")
             self._receipt.kind = "error"
         else:
             self._activity_status = "本轮已结束"
@@ -573,8 +616,8 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
             else:
                 text = ""
         if result.files:
-            text += ("\n" if text else "") + "文件引用：\n" + "\n".join(
-                safe_terminal_text(path) for path in result.files
+            text += (
+                ("\n" if text else "") + "文件引用：\n" + "\n".join(safe_terminal_text(path) for path in result.files)
             )
         self._receipt.text = (text + "\n" if text else "") + format_usage_summary(result.usage) + "\n"
         diagnostics = [f"{d.code}: {d.message}" for d in result.diagnostics]
@@ -583,8 +626,9 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
         if diagnostics:
             # Final technical causes remain inspectable without duplicating the notice.
             if not any(block.kind == "diagnostic" and block.title == result.turn_id for block in self.view.blocks):
-                self.view._add(Block("diagnostic", title=result.turn_id,
-                                     text=safe_terminal_text("\n".join(diagnostics)) + "\n"))
+                self.view._add(
+                    Block("diagnostic", title=result.turn_id, text=safe_terminal_text("\n".join(diagnostics)) + "\n")
+                )
         if any(block.operation_status == "running" for block in self._tool_blocks.values()):
             self._receipt.text += "仍有命令运行中；可在详情查看会话。\n"
         self.view.invalidate()

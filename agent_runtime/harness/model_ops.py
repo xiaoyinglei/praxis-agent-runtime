@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any
 from uuid import uuid4
 
@@ -31,6 +32,7 @@ from agent_runtime.harness.records import (
 )
 from agent_runtime.harness.runtime_store import RuntimeStore, owner_operation
 from agent_runtime.modeling.events import ModelOutput
+from agent_runtime.modeling.failures import ModelFailure
 from agent_runtime.streaming.events import (
     derive_model_public_item_id,
 )
@@ -215,6 +217,11 @@ def dispatch_model_attempt(
             raise KeyError(f"unknown model operation: {operation_id}")
         if operation["status"] != "prepared":
             raise RuntimeError(f"model operation is not prepared: {operation_id}")
+        from agent_runtime.harness.model_retry_ops import validate_scheduled_dispatch
+
+        validate_scheduled_dispatch(store, operation_id, dispatched_at)
+        if resource_request is not None and int(operation["generation"]) > 1:
+            resource_request = replace(resource_request, retries=1)
         turn_ops._assert_no_pending_cancellation(store, str(operation["turn_id"]))
         request_ref = operation["request_ref"]
         revision = store.request_input_revision(str(operation["turn_id"]), request_ref)
@@ -348,6 +355,7 @@ def dispatch_model_attempt(
                 "attempt_id": operation["active_attempt_id"],
                 "generation": operation["generation"],
                 "claim_owner": worker_id,
+                "dispatched_at": dispatched_at,
                 "lease_expires_at": dispatched_at + lease_seconds,
             },
         )
@@ -511,10 +519,11 @@ def reject_model_attempt(
     error_message: str | None = None,
     outputs: tuple[ModelOutput, ...] = (),
     budget_outcome: str = "released",
+    failure: ModelFailure | None = None,
 ) -> ModelAttemptSnapshot:
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError("model rejection reason must be non-empty")
-    if budget_outcome not in {"released", "unknown"}:
+    if budget_outcome not in {"released", "unknown", "settled"}:
         raise ValueError("model rejection budget_outcome is unsupported")
     if error_type is not None and (not isinstance(error_type, str) or not error_type.strip()):
         raise ValueError("model rejection error_type must be non-empty")
@@ -536,6 +545,10 @@ def reject_model_attempt(
             "generation": generation,
             "reason": reason,
         }
+        if failure is not None:
+            payload["failure"] = failure.to_payload()
+            payload["error_type"] = failure.kind
+            payload["error_message"] = failure.message
         if error_type is not None:
             payload["error_type"] = error_type.strip()[:120]
         if error_message is not None:
@@ -553,6 +566,7 @@ def reject_model_attempt(
             operation=operation,
             attempt_id=attempt_id,
             outcome=budget_outcome,
+            usage={} if budget_outcome == "settled" else None,
         )
         _close_started_model_outputs(
             store,
@@ -642,7 +656,9 @@ def cancel_model_attempt(
 
 
 @owner_operation
-def prepare_model_retry(store: RuntimeStore, operation_id: str) -> ModelAttemptSnapshot:
+def prepare_model_retry(
+    store: RuntimeStore, operation_id: str, *, automatic: bool = False, now: float | None = None
+) -> ModelAttemptSnapshot:
     row = store.tx.first("model_operations", where={"operation_id": operation_id})
     if row is None:
         raise KeyError(f"unknown model operation: {operation_id}")
@@ -651,8 +667,8 @@ def prepare_model_retry(store: RuntimeStore, operation_id: str) -> ModelAttemptS
         operation = store.tx.first("model_operations", where={"operation_id": operation_id})
         if operation is None:
             raise KeyError(f"unknown model operation: {operation_id}")
-        if operation["status"] != "unknown":
-            raise RuntimeError(f"model operation is not unknown: {operation_id}")
+        if operation["status"] != ("retry_wait" if automatic else "unknown"):
+            raise RuntimeError(f"model operation is not eligible for retry: {operation_id}")
         attempt_id = f"attempt_{uuid4().hex}"
         generation = operation["generation"] + 1
         facts.append_fact(
@@ -664,11 +680,17 @@ def prepare_model_retry(store: RuntimeStore, operation_id: str) -> ModelAttemptS
             payload={
                 "operation_id": operation_id,
                 "previous_attempt_id": operation["active_attempt_id"],
+                "automatic": automatic,
+                "prepared_at": time.time() if now is None else float(now),
                 "attempt_id": attempt_id,
                 "generation": generation,
             },
         )
         turn = store.tx.first("turns", where={"turn_id": operation["turn_id"]})
+        if automatic:
+            if turn is None or turn["status"] != "running":
+                raise RuntimeError("automatic model retry requires a running Turn")
+            return store.list_model_attempts(operation_id)[-1]
         if turn is None or turn["status"] not in {"paused", "interrupted"}:
             raise RuntimeError("model retry requires a paused or interrupted Turn")
         facts.append_fact(

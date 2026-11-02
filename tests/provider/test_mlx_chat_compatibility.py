@@ -59,7 +59,7 @@ def test_reasoning_tool_markup_does_not_become_executable_call():
 
 
 def test_usage_only_tail_is_preserved_and_missing_stop_is_recoverable():
-    from agent_runtime.harness.model_adapter import _is_uncertain_transport_failure
+    from agent_runtime.modeling.failures import ModelCallFailed, classify_model_failure
 
     chunks = [
         SimpleNamespace(
@@ -82,9 +82,13 @@ def test_usage_only_tail_is_preserved_and_missing_stop_is_recoverable():
             usage=None,
         )
     ]
-    with pytest.raises(ConnectionError) as error:
+    with pytest.raises(ModelCallFailed) as error:
         list(generator.stream_with_tools(messages=[], tools=[]))
-    assert _is_uncertain_transport_failure(error.value)
+    failure = classify_model_failure(error.value)
+    assert failure.kind == "transport_unknown"
+    assert failure.provider_outcome == failure.billing_outcome == "unknown"
+    assert failure.output_started
+    assert not failure.retryable
 
 
 def test_token_estimate_accounts_for_complete_tool_schema():

@@ -915,7 +915,7 @@ class RolloutStore:
                 turn_id,
                 sequence,
                 record_type,
-                4,
+                5,
                 producer,
                 payload_json,
                 payload_hash,
@@ -1474,14 +1474,14 @@ class RolloutStore:
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             self._connection.execute("""INSERT INTO store_metadata(key, value)
-                VALUES ('minimum_writer_schema', '4') ON CONFLICT(key) DO UPDATE SET
-                value = CAST(MAX(CAST(value AS INTEGER), 4) AS TEXT)""")
+                VALUES ('minimum_writer_schema', '5') ON CONFLICT(key) DO UPDATE SET
+                value = CAST(MAX(CAST(value AS INTEGER), 5) AS TEXT)""")
             required = int(
                 self._connection.execute(
                     "SELECT value FROM store_metadata WHERE key='minimum_writer_schema'"
                 ).fetchone()[0]
             )
-            if required > 4:
+            if required > 5:
                 raise RuntimeError(f"runtime writer schema {required} requires a newer version")
             self._connection.execute("""CREATE TRIGGER IF NOT EXISTS rollout_writer_protocol_guard
                 BEFORE INSERT ON rollout_records

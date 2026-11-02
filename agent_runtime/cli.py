@@ -37,6 +37,7 @@ from agent_runtime.model_admin import (
     ModelMutationOutcome,
 )
 from agent_runtime.model_probe import ModelProbeEvidence, ProbeLevel
+from agent_runtime.modeling.failures import ModelFailure
 from agent_runtime.models import (
     ModelNotAvailableError,
     ModelPolicyError,
@@ -51,6 +52,7 @@ from agent_runtime.setup_cli import setup
 from agent_runtime.terminal_input import CHAT_COMMANDS, TerminalComposer, resolve_pause_choice
 from agent_runtime.terminal_render import (
     TerminalToolEventDisplay,
+    format_model_failure,
     format_usage_summary,
     safe_terminal_text,
     web_error_message,
@@ -446,6 +448,10 @@ def _failure_title(stop_reason: str | None) -> str:
     if stop_reason == "model_step_budget_exhausted":
         return "本次执行已达到尝试次数上限，本轮未完成收尾。"
     capacity_failures = {
+        "model_retry_exhausted": "模型自动重试次数已耗尽，本轮未完成。",
+        "model_retry_deadline_exceeded": "模型自动重试已达到原定截止时间，本轮未完成。",
+        "model_retry_clock_invalid": "系统时钟倒退，已停止自动重试。",
+        "model_retry_budget_exhausted": "剩余预算不足，无法启动下一次模型重试。",
         "model_token_budget_exhausted": "本轮累计 Token 预算不足，无法继续执行或完成收尾。",
         "model_context_window_exceeded": "模型单次请求超出上下文窗口，压缩恢复后仍无法继续。",
         "context_summary_incomplete": "上下文摘要输出被截断，原始历史已保留；本轮无法完成必要压缩。",
@@ -473,13 +479,21 @@ def _display_failure(
     stop_reason: str | None,
     diagnostics: Sequence[AgentDiagnostic],
     verbose: bool,
+    model_error: ModelFailure | None = None,
 ) -> None:
-    print(f"\n{_failure_title(stop_reason)}")
+    if model_error is None:
+        print(f"\n{_failure_title(stop_reason)}")
+    else:
+        _display_model_failure(model_error)
     if verbose:
         if stop_reason:
             print(f"  stop_reason: {stop_reason}")
         for diagnostic in diagnostics:
             _print_diagnostic(diagnostic)
+
+
+def _display_model_failure(failure: ModelFailure) -> None:
+    print("\n" + format_model_failure(failure))
 
 
 def _display_agent_result(
@@ -496,6 +510,7 @@ def _display_agent_result(
             stop_reason=result.stop_reason,
             diagnostics=result.diagnostics,
             verbose=verbose,
+            model_error=result.model_error,
         )
     elif result.diagnostics and show_outcome:
         degraded = sum(1 for diagnostic in result.diagnostics if diagnostic.degraded)
@@ -504,6 +519,8 @@ def _display_agent_result(
         if verbose:
             for diagnostic in result.diagnostics:
                 _print_diagnostic(diagnostic)
+    if result.status == "paused" and result.model_error is not None and show_outcome:
+        _display_model_failure(result.model_error)
 
     if result.answer and not answer_streamed:
         print(f"\n{safe_terminal_text(result.answer)}")

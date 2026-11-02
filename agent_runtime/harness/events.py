@@ -249,7 +249,7 @@ class RolloutEventReader:
     def _project_records(self, records: tuple[RolloutRecord, ...]) -> tuple[tuple[RolloutRecord, StreamEvent], ...]:
         projected: list[tuple[RolloutRecord, StreamEvent]] = []
         for record in records:
-            if record.payload_schema_version not in {1, 2, 3, 4}:
+            if record.payload_schema_version not in {1, 2, 3, 4, 5}:
                 raise RuntimeError(f"unsupported event record schema: {record.payload_schema_version}")
             self._validate_public_item_ids(record)
             current = self._legacy_event_record(record) if record.payload_schema_version < 3 else record
@@ -489,6 +489,29 @@ class RolloutEventReader:
                 if key in payload
             }
             data["transition"] = record.record_type.removeprefix("tool_operation_")
+        elif record.record_type in {"model_retry_scheduled", "model_retry_cancelled"}:
+            event_type = (
+                EventType.MODEL_RETRY_SCHEDULED
+                if record.record_type == "model_retry_scheduled"
+                else EventType.MODEL_RETRY_CANCELLED
+            )
+            data = {
+                key: payload[key]
+                for key in (
+                    "operation_id",
+                    "attempt_id",
+                    "generation",
+                    "retry_number",
+                    "max_retries",
+                    "retry_at",
+                    "deadline_at",
+                    "delay_ms",
+                    "failure",
+                    "reason",
+                    "reason_code",
+                )
+                if key in payload
+            }
         elif record.record_type in _MODEL_ATTEMPT_TRANSITIONS:
             event_type = EventType.MODEL_ATTEMPT_UPDATED
             data = {
@@ -506,6 +529,7 @@ class RolloutEventReader:
                     "response_status",
                     "incomplete_reason",
                     "stop_reason",
+                    "failure",
                 )
                 if key in payload
             }

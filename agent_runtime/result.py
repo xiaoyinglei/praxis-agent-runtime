@@ -7,6 +7,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, cast
 
 from agent_runtime.knowledge import AgentCitation, AgentEvidence, agent_evidence_from_value
+from agent_runtime.modeling.failures import ModelFailure
 from agent_runtime.planning import AgentPlan, PlanEvent
 from agent_runtime.tools.tool import JsonValue
 
@@ -156,6 +157,7 @@ class AgentResult:
     # The runtime lifecycle is separate from validation of this narrow scope.
     validation_status: AgentValidationStatus = "not_evaluated"
     validation_scope: str | None = None
+    model_error: ModelFailure | None = None
 
     @classmethod
     def _from_harness(
@@ -168,6 +170,13 @@ class AgentResult:
         turn = store.read_turn(result.turn_id)
         thread = store.read_thread(result.thread_id)
         records = tuple(record for record in store.list_records(thread.thread_id) if record.turn_id == turn.turn_id)
+        model_failures = tuple(
+            (record.payload.get("operation_id"), ModelFailure.from_payload(failure))
+            for record in records
+            if record.record_type in {"model_attempt_rejected", "model_attempt_unknown"}
+            and isinstance((failure := record.payload.get("failure")), Mapping)
+        )
+        model_error = model_failures[-1][1] if model_failures and result.status != "completed" else None
         dispatched_ids = {
             record.payload["attempt_id"] for record in records if record.record_type == "model_attempt_dispatched"
         }
@@ -340,12 +349,23 @@ class AgentResult:
         if pause is None and turn.status in {"paused", "interrupted"}:
             unknown = [op for op in store.list_model_operations(result.turn_id) if op.status == "unknown"]
             if len(unknown) == 1:
+                failure = next(
+                    (
+                        failure
+                        for operation_id, failure in reversed(model_failures)
+                        if operation_id == unknown[0].operation_id
+                    ),
+                    None,
+                )
                 pause = AgentPause(
                     request_id=unknown[0].operation_id,
                     kind="model_retry",
                     question="模型响应中断。可重试本次模型请求，或结束这一轮。",
                     options=("retry", "abort"),
-                    context={"operation_id": unknown[0].operation_id},
+                    context={
+                        "operation_id": unknown[0].operation_id,
+                        **({} if failure is None else {"failure": failure.to_payload()}),
+                    },
                 )
         unknown_model_diagnostics = tuple(
             record
@@ -384,13 +404,21 @@ class AgentResult:
             )
         if rejected_model_diagnostics:
             rejected = rejected_model_diagnostics[-1]
+            recovered = any(
+                op.operation_id == rejected.payload["operation_id"]
+                and op.status == "completed"
+                and op.generation > rejected.payload["generation"]
+                for op in store.list_model_operations(result.turn_id)
+            )
             projected_diagnostics.append(
                 AgentDiagnostic(
-                    code="model_dispatch_rejected",
+                    code="model_dispatch_recovered" if recovered else "model_dispatch_rejected",
                     component="model",
-                    message=str(rejected.payload["error_message"]),
-                    severity="error",
-                    degraded=True,
+                    message=(
+                        "Model request recovered after retry." if recovered else str(rejected.payload["error_message"])
+                    ),
+                    severity="warning" if recovered else "error",
+                    degraded=not recovered,
                     error_type=str(rejected.payload["error_type"]),
                 )
             )
@@ -493,6 +521,7 @@ class AgentResult:
             thread_id=thread.thread_id,
             validation_status=cast(AgentValidationStatus, validation_status),
             validation_scope=validation_scope,
+            model_error=model_error,
         )
 
 

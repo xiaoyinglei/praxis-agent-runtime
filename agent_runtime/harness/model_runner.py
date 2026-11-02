@@ -13,7 +13,7 @@ from agent_runtime.budget import (
     BudgetLimitExceededError,
 )
 from agent_runtime.core.messages import model_message_payload
-from agent_runtime.harness import model_ops, turn_ops
+from agent_runtime.harness import model_ops, model_retry_ops, turn_ops
 from agent_runtime.harness.events import commit_and_publish
 from agent_runtime.harness.execution_context import StepContext
 from agent_runtime.harness.model_outputs import (
@@ -22,11 +22,12 @@ from agent_runtime.harness.model_outputs import (
     require_open_model_output,
     start_model_output,
 )
-from agent_runtime.harness.operation_values import TurnInputChangedError
+from agent_runtime.harness.operation_values import TurnCancellationPendingError, TurnInputChangedError
 from agent_runtime.harness.prepared_requests import frozen_request_payload
 from agent_runtime.harness.protocol import (
     ContextBudgetExceededError,
     ContextManager,
+    ContextSourceChangedError,
     HarnessModel,
     HarnessModelResponse,
     ModelContextOverflowError,
@@ -34,6 +35,7 @@ from agent_runtime.harness.protocol import (
     ModelDispatchOutcomeUnknownError,
     ModelDispatchPreflightError,
     ModelMessage,
+    ModelRetryScheduledError,
     PreparedModelCall,
     ReplayingHarnessModel,
     TurnResult,
@@ -49,6 +51,7 @@ from agent_runtime.modeling.events import (
     ModelResponseStarted,
     ModelStreamState,
 )
+from agent_runtime.modeling.failures import ModelCallFailed, ModelFailure, classify_model_failure
 from agent_runtime.streaming.events import (
     ItemDeltaKind,
     TurnItemKind,
@@ -306,7 +309,20 @@ class ModelRunner:
             await self._commit_cancellation(reject_undispatched)
             raise
         except TurnInputChangedError:
-            await self._commit(lambda: model_ops.supersede_prepared_model(self._store, operation.operation_id))
+            if await self._store.run_async(model_retry_ops.read_schedule, self._store, operation.operation_id):
+                await self._commit(
+                    partial(
+                        model_retry_ops.cancel_scheduled_retry,
+                        self._store,
+                        operation_id=operation.operation_id,
+                        reason="input changed before retry dispatch",
+                        reason_code="input_superseded",
+                    )
+                )
+            else:
+                await self._commit(lambda: model_ops.supersede_prepared_model(self._store, operation.operation_id))
+            raise
+        except TurnCancellationPendingError:
             raise
         except BudgetLimitExceededError as exc:
             return await self._fail_turn(
@@ -315,6 +331,21 @@ class ModelRunner:
                 reason_code="model_budget_limit_exceeded",
                 message=str(exc),
             )
+        except ContextSourceChangedError:
+            raise
+        except RuntimeError:
+            if not await self._store.run_async(model_retry_ops.read_schedule, self._store, operation.operation_id):
+                raise
+            await self._commit(
+                partial(
+                    model_retry_ops.fail_unstarted_retry,
+                    self._store,
+                    operation_id=operation.operation_id,
+                    reason_code="model_retry_dispatch_invalidated",
+                    message="Scheduled retry was invalidated before dispatch; no new provider call was made.",
+                )
+            )
+            return TurnResult(thread_id=thread_id, turn_id=turn_id, answer=None, status="failed")
         stream_state = ModelStreamState()
         output_item_ids: dict[str, str] = {}
 
@@ -407,6 +438,28 @@ class ModelRunner:
                     )
                 )
 
+        async def settle_failure(failure: ModelFailure) -> TurnResult:
+            # Observed output is authoritative even when an adapter omits its
+            # flag. Partial output cannot become a zero-usage transparent retry.
+            if stream_state.outputs:
+                failure = replace(failure, output_started=True, phase="stream")
+            action = await self._commit(
+                partial(
+                    model_retry_ops.record_failure,
+                    self._store,
+                    operation_id=operation.operation_id,
+                    attempt_id=attempt.attempt_id,
+                    generation=attempt.generation,
+                    failure=failure,
+                    outputs=stream_state.outputs,
+                )
+            )
+            if action == "scheduled":
+                raise ModelRetryScheduledError(operation.operation_id)
+            return TurnResult(
+                thread_id=thread_id, turn_id=turn_id, answer=None, status="paused" if action == "paused" else "failed"
+            )
+
         dispatch_started = time.monotonic()
         try:
             response = await self._model.dispatch(
@@ -425,6 +478,13 @@ class ModelRunner:
                     stop_reason=response.stop_reason,
                 )
         except ModelContextOverflowError as exc:
+            if stream_state.outputs:
+                return await settle_failure(
+                    exc.failure
+                    or ModelFailure(
+                        kind="context_overflow", phase="stream", provider_outcome="unknown", billing_outcome="unknown"
+                    )
+                )
             await self._commit(
                 partial(
                     partial(model_ops.reject_model_attempt, self._store),
@@ -433,6 +493,14 @@ class ModelRunner:
                     generation=attempt.generation,
                     reason=str(exc),
                     error_type="context_overflow",
+                    failure=exc.failure,
+                    budget_outcome=(
+                        "unknown"
+                        if exc.failure is not None and exc.failure.billing_outcome == "unknown"
+                        else "settled"
+                        if exc.failure is not None
+                        else "released"
+                    ),
                 )
             )
             if operation.request_ref.get("purpose") == "context_summary":
@@ -440,7 +508,11 @@ class ModelRunner:
                     thread_id=thread_id, turn_id=turn_id, reason_code="summary_context_overflow", message=str(exc)
                 )
             raise
+        except ModelCallFailed as exc:
+            return await settle_failure(exc.failure)
         except ModelDispatchPreflightError as exc:
+            if stream_state.outputs:
+                return await settle_failure(classify_model_failure(exc, output_started=True))
             await self._commit(
                 partial(
                     partial(model_ops.reject_model_attempt, self._store),
@@ -481,23 +553,15 @@ class ModelRunner:
                 answer=None,
                 status="cancelled",
             )
-        except (ModelDispatchOutcomeUnknownError, ConnectionError, TimeoutError, EventChannelClosed) as exc:
-            await self._commit(
-                partial(
-                    partial(model_ops.mark_model_attempt_unknown, self._store),
-                    operation_id=operation.operation_id,
-                    attempt_id=attempt.attempt_id,
-                    generation=attempt.generation,
-                    error_type=type(exc).__name__,
-                    error_message=(str(exc).strip() or "model dispatch raised without a message"),
-                    outputs=stream_state.outputs,
+        except (ModelDispatchOutcomeUnknownError, ConnectionError, TimeoutError, EventChannelClosed):
+            return await settle_failure(
+                ModelFailure(
+                    kind="transport_unknown",
+                    phase="stream" if stream_state.started else "connect",
+                    provider_outcome="unknown",
+                    billing_outcome="unknown",
+                    output_started=bool(stream_state.outputs),
                 )
-            )
-            return TurnResult(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                answer=None,
-                status="paused",
             )
         except asyncio.CancelledError as exc:
             error_type = type(exc).__name__
@@ -522,31 +586,7 @@ class ModelRunner:
             await self._commit_cancellation(record_unknown)
             raise
         except Exception as exc:
-            # The HarnessModel contract owns provider-outcome classification.
-            # Explicit transport/unknown failures are handled above. A generic
-            # exception is therefore a deterministic operation failure, but it
-            # still does not prove zero provider billing. Fail the Attempt/Turn
-            # while conservatively keeping the reservation as UNKNOWN exposure.
-            message = str(exc).strip() or "model dispatch failed with a known error"
-            await self._commit(
-                partial(
-                    partial(model_ops.reject_model_attempt, self._store),
-                    operation_id=operation.operation_id,
-                    attempt_id=attempt.attempt_id,
-                    generation=attempt.generation,
-                    reason=message,
-                    error_type=type(exc).__name__,
-                    error_message=message,
-                    outputs=stream_state.outputs,
-                    budget_outcome="unknown",
-                )
-            )
-            return await self._fail_turn(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                reason_code="model_dispatch_rejected",
-                message=message,
-            )
+            return await settle_failure(classify_model_failure(exc, output_started=bool(stream_state.outputs)))
         dispatch_ms = (time.monotonic() - dispatch_started) * 1000
         response = replace(
             response,

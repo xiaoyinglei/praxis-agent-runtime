@@ -29,12 +29,14 @@
 这套聊天边界对照了 [Codex thread/resume 与 turn/start 的公开契约](https://developers.openai.com/codex/app-server)、
 [Codex 历史重建源码](https://github.com/openai/codex/blob/8c076942cb70fba8e5c4732c23f1faabc4aed484/codex-rs/core/src/session/mod.rs#L1676)
 以及 [Claude Code 的已保存会话与活跃后台会话区分](https://code.claude.com/docs/en/sessions)。
-Claude Code 的公开 GitHub 仓库未提供这里所需的完整运行时源码，因此没有将其内部实现作为已核实证据。
+Claude Code 的公开 GitHub 仓库未提供这里所需的完整运行时源码。模型重试部分另核对了本地历史镜像，版本及证据边界见[模型错误与重试](model-failure-recovery.md)。
 
 新 Turn 对已知 `incomplete/max_output_tokens` 允许一次完整步骤重试，额度按整个 Turn 冻结，
 原步数、tokens 和费用预算照常扣除。截断的正文、reasoning 和工具调用不作为后续 assistant 消息重放，
 已完成工具结果保留；content_filter、未知终态和 summary 不走自动重试。重开进程不会重置额度，
 缺少该策略字段的旧 Turn 保持旧契约。缺失 provider 终态仍进入 unknown 的人工恢复路径。
+
+模型服务错误、持久化退避、未知费用与同一请求重放的规则见[模型错误与重试](model-failure-recovery.md)。
 
 ## 先恢复能力边界，再打开资源
 

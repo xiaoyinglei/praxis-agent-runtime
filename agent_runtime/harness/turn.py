@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from functools import partial
@@ -12,11 +13,12 @@ from uuid import uuid4
 
 from agent_runtime.approval import CommandGrant
 from agent_runtime.budget import (
+    BudgetLimitExceededError,
     PricingUnavailableError,
     budget_pressure_active,
 )
 from agent_runtime.core.messages import model_message_payload, restore_model_message
-from agent_runtime.harness import completion_ops, model_ops, tool_ops, turn_ops
+from agent_runtime.harness import completion_ops, model_ops, model_retry_ops, tool_ops, turn_ops
 from agent_runtime.harness.context_engine import ContextEngine, SummaryStoppedError
 from agent_runtime.harness.control import ContextSnapshot, StepControl, append_context_updates, append_runtime_state
 from agent_runtime.harness.events import commit_and_publish
@@ -38,6 +40,7 @@ from agent_runtime.harness.protocol import (
     HarnessModelResponse,
     ModelContextOverflowError,
     ModelMessage,
+    ModelRetryScheduledError,
     ModelToolCall,
     PreparedModelCall,
     ToolRouter,
@@ -569,7 +572,7 @@ class TurnRunner:
         return None
 
     async def _execute_saved_request(
-        self, *, turn_id: str, operation_id: str, retry: bool = False
+        self, *, turn_id: str, operation_id: str, retry: bool = False, automatic_retry: bool = False
     ) -> HarnessModelResponse | TurnResult | None:
         turn = await self._store.run_async(self.restore_turn_context, turn_id)
         operation = next(
@@ -577,7 +580,7 @@ class TurnRunner:
             for op in await self._store.run_async(self._store.list_model_operations, turn_id)
             if op.operation_id == operation_id
         )
-        expected = "unknown" if retry else "prepared"
+        expected = "retry_wait" if automatic_retry else "unknown" if retry else "prepared"
         if operation.status != expected:
             raise RuntimeError(f"saved model request changed: expected {expected}, got {operation.status}")
         if await self._commit(partial(self._context_engine.discard_stale_saved_summary, operation_id)):
@@ -591,7 +594,16 @@ class TurnRunner:
             operation.wire_hash,
         ):
             raise RuntimeError("saved model request cannot be reproduced exactly")
-        if retry:
+        if automatic_retry:
+            await self._commit(
+                partial(
+                    model_retry_ops.prepare_scheduled_retry,
+                    self._store,
+                    operation_id=operation_id,
+                    resource_request=prepared.resource_request,
+                )
+            )
+        elif retry:
 
             def admit_retry() -> None:
                 from agent_runtime.harness import compaction_jobs
@@ -616,6 +628,110 @@ class TurnRunner:
             )
         except TurnInputChangedError:
             return None
+        except ContextSourceChangedError:
+            await self._commit(partial(self._context_engine.discard_stale_saved_summary, operation_id))
+            return None
+
+    async def _wait_model_retry(self, *, turn_id: str, operation_id: str) -> TurnResult | None:
+        schedule = await self._store.run_async(model_retry_ops.read_schedule, self._store, operation_id)
+        if schedule is None:
+            raise RuntimeError("retry wait lost its canonical schedule")
+        now = time.time()
+        due = time.monotonic() + max(0.0, schedule["retry_at"] - now)
+        try:
+            while True:
+                now = time.time()
+                if now < schedule["observed_at"] or now > schedule["deadline_at"]:
+                    await self._commit(
+                        partial(
+                            model_retry_ops.fail_unstarted_retry,
+                            self._store,
+                            operation_id=operation_id,
+                            reason_code="model_retry_deadline_exceeded",
+                            message="Automatic retry deadline expired or its clock moved backwards.",
+                        )
+                    )
+                    return None
+                if await self._store.run_async(self._store.turn_cancellation_pending, turn_id):
+                    return None
+                operations = await self._store.run_async(self._store.list_model_operations, turn_id)
+                operation = next(op for op in operations if op.operation_id == operation_id)
+                revision = await self._store.run_async(
+                    self._store.request_input_revision, turn_id, operation.request_ref
+                )
+                if revision != await self._store.run_async(self._store.user_input_revision, turn_id):
+                    discarded = await self._commit(
+                        partial(self._context_engine.discard_stale_saved_summary, operation_id)
+                    )
+                    if not discarded:
+                        await self._commit(
+                            partial(
+                                model_retry_ops.cancel_scheduled_retry,
+                                self._store,
+                                operation_id=operation_id,
+                                reason_code="input_superseded",
+                                reason="new user input invalidated the waiting request",
+                            )
+                        )
+                    return None
+                remaining = due - time.monotonic()
+                if remaining <= 0:
+                    break
+                # Bound responsiveness to durable input/cancellation from another
+                # owner without restarting the persisted server-advice deadline.
+                await asyncio.sleep(min(remaining, 0.25))
+            return_value = await self._execute_saved_request(
+                turn_id=turn_id, operation_id=operation_id, automatic_retry=True
+            )
+            return return_value if isinstance(return_value, TurnResult) else None
+        except TurnCancellationPendingError:
+            return None
+        except TurnInputChangedError:
+            if await self._commit(partial(self._context_engine.discard_stale_saved_summary, operation_id)):
+                return None
+            await self._commit(
+                partial(
+                    model_retry_ops.cancel_scheduled_retry,
+                    self._store,
+                    operation_id=operation_id,
+                    reason_code="input_superseded",
+                    reason="input changed during retry admission",
+                )
+            )
+            return None
+        except ContextSourceChangedError:
+            if await self._commit(partial(self._context_engine.discard_stale_saved_summary, operation_id)):
+                return None
+            await self._commit(
+                partial(
+                    model_retry_ops.cancel_scheduled_retry,
+                    self._store,
+                    operation_id=operation_id,
+                    reason_code="context_source_superseded",
+                    reason="summary source changed",
+                )
+            )
+            return None
+        except BudgetLimitExceededError as exc:
+            await self._commit(
+                partial(
+                    model_retry_ops.fail_unstarted_retry,
+                    self._store,
+                    operation_id=operation_id,
+                    reason_code="model_retry_budget_exhausted",
+                    message=str(exc),
+                )
+            )
+            return None
+        except asyncio.CancelledError:
+
+            def record_wait_cancellation() -> None:
+                turn_ops.request_turn_cancellation(
+                    self._store, turn_id=turn_id, reason="cancelled during model retry wait"
+                )
+
+            await self._commit_cancellation(record_wait_cancellation)
+            raise
 
     async def _consume_response(self, *, turn_id: str, operation_id: str) -> TurnResult | None:
         """Continue after a crash between response commit and response handling."""
@@ -971,6 +1087,19 @@ class TurnRunner:
         while True:
             decision = await self._store.run_async(recovery_plan, self._store, turn_id)
             if decision.kind == ContinuationKind.CANCEL:
+                for operation in await self._store.run_async(self._store.list_model_operations, turn_id):
+                    schedule = await self._store.run_async(
+                        model_retry_ops.read_schedule, self._store, operation.operation_id
+                    )
+                    if operation.status in {"retry_wait", "prepared"} and schedule is not None:
+                        await self._commit(
+                            partial(
+                                model_retry_ops.cancel_scheduled_retry,
+                                self._store,
+                                operation_id=operation.operation_id,
+                                reason="Turn cancellation requested",
+                            )
+                        )
                 await self._commit(lambda: recover_owner_loss(self._store, turn_id, abort=True))
                 cancelled = await self._commit(lambda: turn_ops.cancel_turn(self._store, turn_id=turn_id))
                 return TurnResult(thread_id=thread_id, turn_id=turn_id, answer=None, status=cancelled.status)
@@ -990,6 +1119,16 @@ class TurnRunner:
                     return result
                 first_step = None
                 continue
+            if decision.kind == ContinuationKind.WAIT_RETRY:
+                assert decision.operation_id is not None
+                try:
+                    waiting_result = await self._wait_model_retry(turn_id=turn_id, operation_id=decision.operation_id)
+                except ModelRetryScheduledError:
+                    continue
+                if waiting_result is not None:
+                    return waiting_result
+                first_step = None
+                continue
             if decision.kind in {ContinuationKind.PREPARED_MODEL, ContinuationKind.RETRY_MODEL}:
                 if decision.kind == ContinuationKind.RETRY_MODEL and not permit_retry:
                     return TurnResult(thread_id=thread_id, turn_id=turn_id, answer=None, status=decision.status)
@@ -1000,7 +1139,7 @@ class TurnRunner:
                         operation_id=decision.operation_id,
                         retry=decision.kind == ContinuationKind.RETRY_MODEL,
                     )
-                except (ModelContextOverflowError, TurnCancellationPendingError):
+                except (ModelContextOverflowError, ModelRetryScheduledError, TurnCancellationPendingError):
                     continue
                 permit_retry = False
                 if isinstance(dispatched, TurnResult):
@@ -1089,6 +1228,8 @@ class TurnRunner:
                 context, prepared = await self._context_engine.prepare_or_resume(
                     turn_context, step=step, pressure_reason="provider_overflow" if reactive else None
                 )
+            except ModelRetryScheduledError:
+                continue
             except SummaryStoppedError as stopped:
                 return stopped.result
             except TurnCancellationPendingError:
@@ -1141,7 +1282,7 @@ class TurnRunner:
             except (TurnInputChangedError, TurnCancellationPendingError):
                 first_step = None
                 continue
-            except ModelContextOverflowError:
+            except (ModelContextOverflowError, ModelRetryScheduledError):
                 first_step = None
                 continue
             if isinstance(dispatched, TurnResult):

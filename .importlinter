@@ -66,6 +66,8 @@ source_modules =
     agent_runtime.harness.facts
     agent_runtime.harness.memory_ops
     agent_runtime.harness.model_ops
+    agent_runtime.harness.model_retry_ops
+    agent_runtime.harness.retry_policy
     agent_runtime.harness.operation_values
     agent_runtime.harness.tool_ops
     agent_runtime.harness.turn_ops

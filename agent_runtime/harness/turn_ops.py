@@ -346,6 +346,9 @@ def fail_turn(
             status="blocked",
             message=message.strip(),
         )
+        from agent_runtime.harness.compaction_jobs import finish_active_jobs
+
+        finish_active_jobs(store, turn_id=turn_id, status="failed")
         facts.append_fact(
             store,
             thread_id=turn["thread_id"],
@@ -584,6 +587,9 @@ def cancel_turn(store: RuntimeStore, *, turn_id: str) -> TurnSnapshot:
                         "status": "cancelled",
                     },
                 )
+        from agent_runtime.harness.compaction_jobs import finish_active_jobs
+
+        finish_active_jobs(store, turn_id=turn_id, status="cancelled")
         facts.append_fact(
             store,
             thread_id=thread_id,

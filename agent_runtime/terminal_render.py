@@ -15,6 +15,7 @@ from wcwidth import wcswidth
 if TYPE_CHECKING:
     from rich.live import Live
 
+from agent_runtime.modeling.failures import ModelFailure
 from agent_runtime.result import AgentUsage
 from agent_runtime.streaming.events import (
     EventType,
@@ -30,6 +31,24 @@ DEFAULT_COMMAND_HEAD_ROWS = 6
 DEFAULT_COMMAND_TAIL_ROWS = 3
 DEFAULT_PARTIAL_ROW_BYTES = 16 * 1024
 DEFAULT_PROGRESS_MESSAGES = 8
+
+
+def format_model_failure(failure: ModelFailure) -> str:
+    """Render only the structured, safe model failure facts."""
+    fields = [failure.kind, f"phase={failure.phase}"]
+    if failure.http_status is not None:
+        fields.append(f"HTTP {failure.http_status}")
+    if failure.provider_code is not None:
+        fields.append(f"code={failure.provider_code}")
+    if failure.request_id is not None:
+        fields.append(f"request_id={failure.request_id}")
+    return safe_terminal_text(
+        "模型请求失败: "
+        + " · ".join(fields)
+        + "\n  "
+        + failure.message
+        + f"\n  provider_outcome={failure.provider_outcome} · billing_outcome={failure.billing_outcome}"
+    )
 
 
 def format_usage_summary(usage: AgentUsage) -> str:
@@ -74,9 +93,8 @@ def web_error_message(code: object) -> str:
         return messages.get(code, f"联网操作失败（{safe_terminal_text(code)}）；/verbose 查看现有记录。")
     return "此次联网操作未成功。"
 
-_ANSI_ESCAPE = regex.compile(
-    r"(?:\x1b\][^\x07]*(?:\x07|\x1b\\))|(?:\x1b\[[0-?]*[ -/]*[@-~])"
-)
+
+_ANSI_ESCAPE = regex.compile(r"(?:\x1b\][^\x07]*(?:\x07|\x1b\\))|(?:\x1b\[[0-?]*[ -/]*[@-~])")
 _UNSAFE_CONTROL = regex.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 _GRAPHEME = regex.compile(r"\X")
 
@@ -121,9 +139,7 @@ class _BoundedPartialRow:
             clusters = _GRAPHEME.findall(combined)
             self._head = _prefix_within_bytes(clusters, self._max_bytes // 2)
             self._tail = _suffix_within_bytes(clusters, self._max_bytes // 2)
-            retained = len(_GRAPHEME.findall(self._head)) + len(
-                _GRAPHEME.findall(self._tail)
-            )
+            retained = len(_GRAPHEME.findall(self._head)) + len(_GRAPHEME.findall(self._tail))
             self._omitted = len(clusters) - retained
             return
 
@@ -187,9 +203,7 @@ class BoundedCommandPreview:
 
     @property
     def retained_bytes(self) -> int:
-        return self._partial.retained_bytes + sum(
-            len(line.encode("utf-8")) for line in self._tail
-        )
+        return self._partial.retained_bytes + sum(len(line.encode("utf-8")) for line in self._tail)
 
     def feed(self, delta: str) -> list[str]:
         if self._finished:
@@ -219,9 +233,7 @@ class BoundedCommandPreview:
         visible.extend(self._forced_markers)
         omitted = self._suppressed_rows - len(self._tail)
         if omitted > 0:
-            visible.append(
-                _omission_marker(omitted, unit="lines", width=self._width)
-            )
+            visible.append(_omission_marker(omitted, unit="lines", width=self._width))
         visible.extend(self._tail)
         self._tail.clear()
         self._forced_markers.clear()
@@ -235,9 +247,7 @@ class BoundedCommandPreview:
         for row in display_rows(head, width=self._width):
             visible.extend(self._accept_row(row))
         if omitted_chars:
-            self._forced_markers.append(
-                _omission_marker(omitted_chars, unit="chars", width=self._width)
-            )
+            self._forced_markers.append(_omission_marker(omitted_chars, unit="chars", width=self._width))
             for row in display_rows(tail, width=self._width):
                 visible.extend(self._accept_row(row))
         return visible
@@ -362,9 +372,7 @@ class TerminalToolEventDisplay:
         terminal_width = shutil.get_terminal_size(fallback=(100, 24)).columns
         self._width = max(1, width if width is not None else terminal_width)
         self._max_lifecycle_keys = max_lifecycle_keys
-        self._lifecycle: OrderedDict[
-            tuple[str, str, EventType], None
-        ] = OrderedDict()
+        self._lifecycle: OrderedDict[tuple[str, str, EventType], None] = OrderedDict()
         self._items: OrderedDict[tuple[str, str], _ItemDisplayState] = OrderedDict()
         self._plans: OrderedDict[tuple[str, int | str], None] = OrderedDict()
         self._verbose = False
@@ -489,9 +497,12 @@ class TerminalToolEventDisplay:
         self._model_attempts[identity] = (status, usage)
         if self._usage_baseline_attempts.get(identity) == "completed":
             return
-        attempts = [value for key, value in self._model_attempts.items()
-                    if self._usage_baseline_attempts.get(key) != "completed"
-                    and value[0] not in {"prepared", "retry_prepared", "rejected"}]
+        attempts = [
+            value
+            for key, value in self._model_attempts.items()
+            if self._usage_baseline_attempts.get(key) != "completed"
+            and value[0] not in {"prepared", "retry_prepared", "rejected"}
+        ]
         reported = [value for state, value in attempts if state == "completed"]
 
         def count(value: Mapping[str, object], key: str) -> int | None:
@@ -499,24 +510,33 @@ class TerminalToolEventDisplay:
             return number if isinstance(number, int) and not isinstance(number, bool) and number >= 0 else None
 
         baseline = self._usage_baseline
-        if baseline is None and not any(count(value, key) is not None for value in reported
-                                        for key in ("input_tokens", "output_tokens", "total_tokens")):
+        if baseline is None and not any(
+            count(value, key) is not None
+            for value in reported
+            for key in ("input_tokens", "output_tokens", "total_tokens")
+        ):
             return
         base = baseline or AgentUsage()
         self._usage_reported_fields = {
-            key for key in ("input_tokens", "output_tokens", "total_tokens")
+            key
+            for key in ("input_tokens", "output_tokens", "total_tokens")
             if baseline is not None or any(count(value, key) is not None for value in reported)
         }
-        if any(count(value, "input_tokens") is not None and count(value, "output_tokens") is not None
-               for value in reported):
+        if any(
+            count(value, "input_tokens") is not None and count(value, "output_tokens") is not None for value in reported
+        ):
             self._usage_reported_fields.add("total_tokens")
-        complete = (base.usage_complete and len(reported) == len(attempts)
-                    and all(count(value, key) is not None for value in reported
-                            for key in ("input_tokens", "output_tokens")))
+        complete = (
+            base.usage_complete
+            and len(reported) == len(attempts)
+            and all(count(value, key) is not None for value in reported for key in ("input_tokens", "output_tokens"))
+        )
 
         def optional_sum(key: str, *aliases: str) -> int | None:
-            values = [next((number for name in (key, *aliases)
-                            if (number := count(value, name)) is not None), None) for value in reported]
+            values = [
+                next((number for name in (key, *aliases) if (number := count(value, name)) is not None), None)
+                for value in reported
+            ]
             if baseline is not None:
                 values.insert(0, getattr(baseline, key))
             if not values or any(value is None for value in values):
@@ -527,16 +547,24 @@ class TerminalToolEventDisplay:
             base,
             input_tokens=base.input_tokens + sum(count(value, "input_tokens") or 0 for value in reported),
             output_tokens=base.output_tokens + sum(count(value, "output_tokens") or 0 for value in reported),
-            total_tokens=base.total_tokens + sum(
-                total if (total := count(value, "total_tokens")) is not None else
-                input_count + output_count if (input_count := count(value, "input_tokens")) is not None
-                and (output_count := count(value, "output_tokens")) is not None else 0 for value in reported),
+            total_tokens=base.total_tokens
+            + sum(
+                total
+                if (total := count(value, "total_tokens")) is not None
+                else input_count + output_count
+                if (input_count := count(value, "input_tokens")) is not None
+                and (output_count := count(value, "output_tokens")) is not None
+                else 0
+                for value in reported
+            ),
             cache_read_input_tokens=optional_sum("cache_read_input_tokens", "cached_input_tokens"),
             cache_write_input_tokens=optional_sum("cache_write_input_tokens", "cache_write_tokens"),
             reasoning_tokens=optional_sum("reasoning_tokens"),
-            model_calls=base.model_calls + sum(
+            model_calls=base.model_calls
+            + sum(
                 key not in self._usage_baseline_attempts and state not in {"prepared", "retry_prepared", "rejected"}
-                for key, (state, _) in self._model_attempts.items()),
+                for key, (state, _) in self._model_attempts.items()
+            ),
             usage_complete=complete,
         )
 
@@ -606,11 +634,15 @@ class TerminalToolEventDisplay:
         )
         if width is not None and wcswidth(second) > width:
             label = "本轮累计" if usage.usage_complete else "本轮不完整"
-            counts = [compact_count(getattr(usage, key)) if key in self._usage_reported_fields else "待报告"
-                      for key in ("input_tokens", "output_tokens", "total_tokens")]
-            second = (f"{label}≈ 入{counts[0]} 出{counts[1]} 共{counts[2]} "
-                      f"缓存入{compact_count(usage.cache_read_input_tokens)} "
-                      f"推理出{compact_count(usage.reasoning_tokens)}")
+            counts = [
+                compact_count(getattr(usage, key)) if key in self._usage_reported_fields else "待报告"
+                for key in ("input_tokens", "output_tokens", "total_tokens")
+            ]
+            second = (
+                f"{label}≈ 入{counts[0]} 出{counts[1]} 共{counts[2]} "
+                f"缓存入{compact_count(usage.cache_read_input_tokens)} "
+                f"推理出{compact_count(usage.reasoning_tokens)}"
+            )
         return first, second
 
     def _render_context_status(self, key: str, value: str) -> None:
@@ -653,6 +685,12 @@ class TerminalToolEventDisplay:
                 self._activity_status = "等待模型" if status != "retry_prepared" else "重试模型请求"
             elif status == "unknown":
                 self._activity_status = "模型结果待核对"
+        elif str(event.type) == "model_retry_scheduled":
+            self._render_model_retry(event)
+        elif event.type is EventType.TURN_CANCELLATION_REQUESTED:
+            self._activity_status = "正在停止，等待执行清理"
+        elif event.type is EventType.TURN_ABORTED:
+            self._activity_status = "本轮已中止"
         elif event.type is EventType.INTERACTION_REQUESTED:
             self._activity_status = "等待用户"
         elif event.type in {EventType.INTERACTION_RESOLVED, EventType.INTERACTION_INVALIDATED}:
@@ -666,7 +704,7 @@ class TerminalToolEventDisplay:
                 "capacity",
                 f"上下文政策 {policy.get('revision')}: 模型窗口={event.data.get('model_context_tokens', 'unknown')} · "
                 f"正文 guards={policy.get('max_item_bytes')}/{policy.get('max_total_bytes')} bytes · "
-                f"消息 guard={policy.get('max_messages')}"
+                f"消息 guard={policy.get('max_messages')}",
             )
         elif event.type is EventType.BUDGET_UPDATE:
             settings = event.data.get("effective_settings")
@@ -677,12 +715,15 @@ class TerminalToolEventDisplay:
                     effort = settings.get("reasoning_effort") or "未声明"
                     line = f"思考强度={effort} · 单次输出上限={output:,}"
                     if requested != output:
-                        reasons = {"model_max_output_tokens": "模型上限", "model_context_window": "上下文窗口",
-                                   "turn_output_token_limit": "本次执行剩余额度"}
+                        reasons = {
+                            "model_max_output_tokens": "模型上限",
+                            "model_context_window": "上下文窗口",
+                            "turn_output_token_limit": "本次执行剩余额度",
+                        }
                         raw_constraints = settings.get("output_constraints", ())
                         constraints = "、".join(
-                            reasons.get(str(reason), str(reason)) for reason in
-                            (raw_constraints if isinstance(raw_constraints, (list, tuple)) else ())
+                            reasons.get(str(reason), str(reason))
+                            for reason in (raw_constraints if isinstance(raw_constraints, (list, tuple)) else ())
                         )
                         line += f"（申请 {requested:,}；受{constraints}限制）"
                     self._request_settings = dict(settings)
@@ -701,7 +742,7 @@ class TerminalToolEventDisplay:
                     f"剩余 agent 步骤={status.get('agent_steps_remaining', 'unknown')} · "
                     f"模型请求={status.get('model_requests_remaining', 'unset')} · "
                     f"Web 请求={status.get('web_requests_remaining', 'unset')} · "
-                    f"token={status.get('tokens_remaining', 'unset')}"
+                    f"token={status.get('tokens_remaining', 'unset')}",
                 )
         elif event.type is EventType.CONTEXT_COMPACTION_COMPLETED or (
             event.type is EventType.COMPACT_LAYER and "trigger_reason" in event.data
@@ -715,7 +756,7 @@ class TerminalToolEventDisplay:
                 "compaction",
                 f"语义压缩 {data.get('trigger_reason', '')}: 输入 {data.get('before_input_tokens', 'unknown')} → "
                 f"{data.get('after_input_tokens', 'unknown')} · 摘要请求={data.get('summary_calls', 'unknown')} · "
-                f"token={data.get('summary_tokens', 'unknown')}"
+                f"token={data.get('summary_tokens', 'unknown')}",
             )
             if not self._verbose:
                 self._write_line("已整理较早对话，继续执行。")
@@ -725,6 +766,26 @@ class TerminalToolEventDisplay:
                 detail = event.data.get("detail")
                 suffix = f" — {detail}" if isinstance(detail, str) and detail else ""
                 self._write_line(f"↻ 恢复: {strategy}{suffix}")
+
+    def _render_model_retry(self, event: StreamEvent) -> None:
+        identity = (
+            f"retry:{event.data.get('attempt_id')}:{event.data.get('generation')}:{event.data.get('retry_number')}"
+        )
+        if not self._remember(event, identity):
+            return
+        failure_payload = event.data.get("failure")
+        failure = ModelFailure.from_payload(failure_payload) if isinstance(failure_payload, Mapping) else None
+        reason: str = "模型请求失败" if failure is None else failure.kind
+        if failure is not None and failure.http_status is not None:
+            reason += f" · HTTP {failure.http_status}"
+        self._activity_status = f"等待模型重试 {event.data.get('retry_number')}/{event.data.get('max_retries')}"
+        self._write_runtime_notification(
+            f"↻ 模型自动重试 {event.data.get('retry_number')}/{event.data.get('max_retries')} · "
+            f"等待 {event.data.get('delay_ms')} ms · {reason}"
+        )
+
+    def _write_runtime_notification(self, value: str) -> None:
+        self._write_line(safe_terminal_text(value))
 
     def begin_turn(self, *, reset: bool = True) -> None:
         self.finish()
@@ -740,8 +801,9 @@ class TerminalToolEventDisplay:
             self._usage_baseline_attempts.clear()
             self._usage_reported_fields.clear()
             self._context_projection = {}
-            self._context_status = {key: value for key, value in self._context_status.items()
-                                    if key == "request_settings"}
+            self._context_status = {
+                key: value for key, value in self._context_status.items() if key == "request_settings"
+            }
             self._elapsed_seconds = 0.0
             self._tool_count = 0
             self._changed_files.clear()
@@ -777,11 +839,7 @@ class TerminalToolEventDisplay:
         if event.item_id is None or not self._remember(event, event.item_id):
             return
         name_value = event.data.get("tool_name")
-        name = (
-            name_value
-            if isinstance(name_value, str) and name_value
-            else event.item_kind.value
-        )
+        name = name_value if isinstance(name_value, str) and name_value else event.item_kind.value
         state = _ItemDisplayState(name=name, kind=event.item_kind)
         if event.item_kind is TurnItemKind.COMMAND:
             state.command = BoundedCommandPreview(width=max(1, self._width - 2))
@@ -867,14 +925,14 @@ class TerminalToolEventDisplay:
             else event.item_kind.value
         )
         self._flush_item_state(state)
-        command_output_streamed = (
-            state is not None
-            and state.command_output_streamed
-        )
+        command_output_streamed = state is not None and state.command_output_streamed
         if event.status is ItemStatus.SUCCESS:
             structured = result.get("structured_content")
-            if (name in {"run_command", "manage_command"} and isinstance(structured, Mapping)
-                    and structured.get("status") == "running"):
+            if (
+                name in {"run_command", "manage_command"}
+                and isinstance(structured, Mapping)
+                and structured.get("status") == "running"
+            ):
                 handle = safe_terminal_text(str(structured.get("session_id", "")))
                 self._write_line(f"→ {name}: 运行中 ({handle})")
                 self._write_result(structured)
@@ -898,15 +956,12 @@ class TerminalToolEventDisplay:
             error = web_error_message(result.get("error_code"))
         suffix = f": {safe_terminal_text(error)}" if isinstance(error, str) else ""
         command_suffix = (
-            self._command_suffix(result)
-            if event.item_kind is TurnItemKind.COMMAND or name == "run_command"
-            else ""
+            self._command_suffix(result) if event.item_kind is TurnItemKind.COMMAND or name == "run_command" else ""
         )
         self._write_line(f"✗ {name}{command_suffix}{suffix}")
         structured = result.get("structured_content")
         if structured is not None and (
-            event.item_kind is not TurnItemKind.COMMAND and name != "run_command"
-            or not command_output_streamed
+            event.item_kind is not TurnItemKind.COMMAND and name != "run_command" or not command_output_streamed
         ):
             if name in {"web_search", "web_fetch"}:
                 self._write_error_result(structured)
@@ -964,13 +1019,7 @@ class TerminalToolEventDisplay:
             return
         state = self._items.pop((event.turn_id, tool_id), None)
         name_value = event.data.get("tool_name")
-        name = (
-            name_value
-            if isinstance(name_value, str) and name_value
-            else state.name
-            if state is not None
-            else "tool"
-        )
+        name = name_value if isinstance(name_value, str) and name_value else state.name if state is not None else "tool"
         self._flush_item_state(state)
         self._write_line(f"✓ {name}")
         result = event.data.get("result")
@@ -1065,11 +1114,7 @@ class TerminalToolEventDisplay:
         if result.get("truncated") is True:
             self._write_line("⚠ 工具结果已由 ACI 截断。")
         structured = result.get("structured_content")
-        if (
-            name == "run_command"
-            and isinstance(structured, Mapping)
-            and structured.get("truncated") is True
-        ):
+        if name == "run_command" and isinstance(structured, Mapping) and structured.get("truncated") is True:
             self._write_line("⚠ 命令输出达到工具预算，已保留头尾。")
 
     def _render_diff(self, metadata: object) -> None:
