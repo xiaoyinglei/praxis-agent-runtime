@@ -20,9 +20,12 @@ class ReadingModel(_UpdatePlanThenAnswerModel):
         step = prepared.request_ref["step"]
         if step == self.finish_at:
             return HarnessModelResponse.from_parts(text="finished", provider_response_id=None, usage={})
-        return HarnessModelResponse.from_parts(text="", provider_response_id=None, usage={}, tool_calls=(
-            ModelToolCall(id=f"read-{step}", name="read_file", arguments={"path": "example.py"}),
-        ))
+        return HarnessModelResponse.from_parts(
+            text="",
+            provider_response_id=None,
+            usage={},
+            tool_calls=(ModelToolCall(id=f"read-{step}", name="read_file", arguments={"path": "example.py"}),),
+        )
 
 
 @pytest.mark.anyio

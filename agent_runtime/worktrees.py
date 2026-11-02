@@ -39,7 +39,7 @@ from pathlib import Path
 
 from agent_runtime.git_delivery import BASE_CONFIG_SUFFIX, git_environment
 from agent_runtime.harness.ownership import ConversationBusyError, execution_owner, workspace_owner
-from agent_runtime.harness.state import RuntimeState
+from agent_runtime.harness.runtime_store import RuntimeStore
 from agent_runtime.harness.workspace_stores import registered_workspace_stores
 
 WORKTREE_BRANCH_PREFIX = "worktree/"
@@ -141,32 +141,48 @@ class WorktreeManager:
             raise WorktreeError("当前已在 agent worktree 中，不能嵌套创建；请回到主工作区。")
         revision = base if base is not None else "HEAD"
         base_commit = self._git_stdout(
-            source_root, "rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}",
+            source_root,
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            f"{revision}^{{commit}}",
             what="读取基准提交",
         )
         source_branch = self._git_stdout(
-            source_root, "symbolic-ref", "--quiet", "--short", "HEAD", check=False,
+            source_root,
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "HEAD",
+            check=False,
         )
         delivery_base = source_branch
         if base is not None:
-            explicit_ref = self._git_stdout(source_root, "rev-parse", "--symbolic-full-name",
-                                            "--verify", "--end-of-options", base, check=False)
-            delivery_base = (explicit_ref.removeprefix("refs/heads/")
-                             if explicit_ref.startswith("refs/heads/") else "")
+            explicit_ref = self._git_stdout(
+                source_root, "rev-parse", "--symbolic-full-name", "--verify", "--end-of-options", base, check=False
+            )
+            delivery_base = explicit_ref.removeprefix("refs/heads/") if explicit_ref.startswith("refs/heads/") else ""
         uncommitted = len(self._dirty_lines(source_root))
         bucket = self._allocate_bucket()
         worktree_root = bucket / source_root.name
         branch = self._available_branch(_sanitize_name(name))
         created = self._run_git(
-            source_root, "worktree", "add", "-b", branch, str(worktree_root), base_commit,
-            what="创建 worktree", timeout=300,
+            source_root,
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            str(worktree_root),
+            base_commit,
+            what="创建 worktree",
+            timeout=300,
         )
         if created.returncode != 0:
             _remove_empty_bucket(worktree_root)
             raise WorktreeError(f"创建 worktree 失败：{created.stderr.strip()[:400]}")
         try:
             managed = ManagedWorktree(
-                name=branch[len(WORKTREE_BRANCH_PREFIX):],
+                name=branch[len(WORKTREE_BRANCH_PREFIX) :],
                 root=worktree_root,
                 branch=branch,
                 base_commit=base_commit,
@@ -178,21 +194,32 @@ class WorktreeManager:
                 # Delivery branches forked from this worktree inherit the real
                 # upstream; GitDelivery reads this key when stacking a praxis branch.
                 self._run_git(
-                    source_root, "config",
-                    f"branch.{branch}{BASE_CONFIG_SUFFIX}", delivery_base,
-                    what="记录 worktree 基准分支", check=False,
+                    source_root,
+                    "config",
+                    f"branch.{branch}{BASE_CONFIG_SUFFIX}",
+                    delivery_base,
+                    what="记录 worktree 基准分支",
+                    check=False,
                 )
             included = self._copy_included_files(source_root, worktree_root)
         except BaseException:
             self._run_git(
-                source_root, "worktree", "remove", "--force", str(worktree_root),
-                check=False, what="回滚未完成的 worktree", timeout=120,
+                source_root,
+                "worktree",
+                "remove",
+                "--force",
+                str(worktree_root),
+                check=False,
+                what="回滚未完成的 worktree",
+                timeout=120,
             )
             _remove_empty_bucket(worktree_root)
             raise
         self.prune()
         return CreateReport(
-            worktree=managed, uncommitted_in_source=uncommitted, included_files=included,
+            worktree=managed,
+            uncommitted_in_source=uncommitted,
+            included_files=included,
         )
 
     def list(self) -> list[ManagedWorktree]:
@@ -257,9 +284,12 @@ class WorktreeManager:
         except WorktreeError:
             dirty = None
         ahead_output = self._run_git(
-            worktree.root, "rev-list", "--count",
+            worktree.root,
+            "rev-list",
+            "--count",
             f"{worktree.base_commit}..refs/heads/{worktree.branch}",
-            check=False, what="统计领先提交",
+            check=False,
+            what="统计领先提交",
         )
         ahead = int(ahead_output.stdout.strip()) if ahead_output.returncode == 0 else None
         return WorktreeInspection(worktree, exists=True, dirty_count=dirty, ahead_count=ahead)
@@ -276,7 +306,7 @@ class WorktreeManager:
                 for database in sorted(databases):
                     if not database.exists():
                         continue
-                    with RuntimeState.open_sync(database, read_only=True) as store:
+                    with RuntimeStore.open_sync(database, read_only=True) as store:
                         for thread in store.list_threads():
                             locks.enter_context(execution_owner(database, thread.thread_id))
                         if not force and any(
@@ -294,21 +324,25 @@ class WorktreeManager:
     def _assert_known_runtime_state(self, entry: ManagedWorktree, databases: set[Path]) -> None:
         known = {entry.root / PROVENANCE_RELATIVE_PATH}
         known.update(Path(str(database) + suffix) for database in databases for suffix in ("", "-wal", "-shm"))
-        companion_roots = {database.with_name(database.name + suffix) for database in databases
-                           for suffix in (".artifacts", ".locks")}
+        companion_roots = {
+            database.with_name(database.name + suffix) for database in databases for suffix in (".artifacts", ".locks")
+        }
         for path in (entry.root / ".praxis").rglob("*"):
             if not path.is_file() and not path.is_symlink():
                 continue
             if path in known or any(root in path.parents for root in companion_roots):
                 continue
-            raise WorktreeError(f"worktree 保留了未登记的运行状态 {path.relative_to(entry.root)}；"
-                                "确认放弃后使用 --force。")
+            raise WorktreeError(
+                f"worktree 保留了未登记的运行状态 {path.relative_to(entry.root)}；确认放弃后使用 --force。"
+            )
 
     def _remove_idle(self, entry: ManagedWorktree, *, force: bool) -> RemoveReport:
         inspection = self.inspect(entry)
         # An unreadable ahead count is not evidence of safety: require force.
         protected = inspection.exists and (
-            inspection.dirty_count is None or bool(inspection.dirty_count) or inspection.ahead_count is None
+            inspection.dirty_count is None
+            or bool(inspection.dirty_count)
+            or inspection.ahead_count is None
             or bool(inspection.ahead_count)
         )
         if protected and not force:
@@ -317,29 +351,32 @@ class WorktreeManager:
                 details.append(f"{inspection.dirty_count} 个未提交变更")
             if inspection.ahead_count:
                 details.append(f"{inspection.ahead_count} 个未合并提交")
-            raise WorktreeError(
-                f"worktree {entry.name} 有{'、'.join(details)}；确认放弃后使用 --force 删除。"
-            )
+            raise WorktreeError(f"worktree {entry.name} 有{'、'.join(details)}；确认放弃后使用 --force 删除。")
         cwd = entry.source_root if entry.source_root.is_dir() else entry.root
         # --force is always passed at the Git level: the protection decision was
         # already made above, and Git would otherwise refuse over this runtime's
         # own untracked .praxis state inside an otherwise clean worktree.
         removed = self._run_git(
-            cwd, "worktree", "remove", "--force", str(entry.root),
-            check=False, what="删除 worktree", timeout=120,
+            cwd,
+            "worktree",
+            "remove",
+            "--force",
+            str(entry.root),
+            check=False,
+            what="删除 worktree",
+            timeout=120,
         )
         if removed.returncode != 0 and inspection.exists:
             raise WorktreeError(f"删除 worktree 失败：{removed.stderr.strip()[:400]}")
         self._run_git(cwd, "worktree", "prune", check=False, what="清理 worktree 记录")
         branch_deleted = self._delete_branch(entry, force=force)
         _remove_empty_bucket(entry.root)
-        return RemoveReport(name=entry.name, root=entry.root, branch=entry.branch,
-                            branch_deleted=branch_deleted)
+        return RemoveReport(name=entry.name, root=entry.root, branch=entry.branch, branch_deleted=branch_deleted)
 
     def prune(self, *, keep: int = DEFAULT_KEEP_COUNT) -> builtins.list[RemoveReport]:
         """Remove the oldest clean worktrees beyond ``keep``; never forced."""
         removed: list[RemoveReport] = []
-        excess = self.list()[max(0, keep):]
+        excess = self.list()[max(0, keep) :]
         for entry in excess:
             try:
                 removed.append(self.remove(str(entry.root)))
@@ -350,13 +387,16 @@ class WorktreeManager:
     # --- Internals ---------------------------------------------------------------------
 
     def _common_git_directory(self, cwd: Path) -> Path:
-        result = self._git_stdout(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir",
-                                  what="读取仓库身份")
+        result = self._git_stdout(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir", what="读取仓库身份")
         return Path(result).resolve()
 
     def _repository_root(self) -> Path:
         completed = self._run_git(
-            self._source, "rev-parse", "--show-toplevel", check=False, what="定位仓库根",
+            self._source,
+            "rev-parse",
+            "--show-toplevel",
+            check=False,
+            what="定位仓库根",
         )
         if completed.returncode != 0:
             raise WorktreeError(f"当前目录不是 Git 仓库：{self._source}")
@@ -379,25 +419,45 @@ class WorktreeManager:
     def _available_branch(self, name: str) -> str:
         base = f"{WORKTREE_BRANCH_PREFIX}{name or f'session-{uuid.uuid4().hex[:8]}'}"
         branch, suffix = base, 1
-        while self._run_git(
-            self._source, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}",
-            check=False, what="检查分支占用",
-        ).returncode == 0:
+        while (
+            self._run_git(
+                self._source,
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                f"refs/heads/{branch}",
+                check=False,
+                what="检查分支占用",
+            ).returncode
+            == 0
+        ):
             suffix += 1
             branch = f"{base}-{suffix}"
         return branch
 
     def _delete_branch(self, entry: ManagedWorktree, *, force: bool) -> bool:
         cwd = entry.source_root if entry.source_root.is_dir() else self._root
-        exists = self._run_git(
-            cwd, "rev-parse", "--verify", "--quiet", f"refs/heads/{entry.branch}",
-            check=False, what="检查分支",
-        ).returncode == 0
+        exists = (
+            self._run_git(
+                cwd,
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                f"refs/heads/{entry.branch}",
+                check=False,
+                what="检查分支",
+            ).returncode
+            == 0
+        )
         if not exists:
             return True
         deleted = self._run_git(
-            cwd, "branch", "-D" if force else "-d", entry.branch,
-            check=False, what="删除分支",
+            cwd,
+            "branch",
+            "-D" if force else "-d",
+            entry.branch,
+            check=False,
+            what="删除分支",
         )
         return deleted.returncode == 0
 
@@ -412,22 +472,27 @@ class WorktreeManager:
         if not listing.is_file():
             return ()
         patterns = tuple(
-            line.strip() for line in listing.read_text(encoding="utf-8").splitlines()
+            line.strip()
+            for line in listing.read_text(encoding="utf-8").splitlines()
             if line.strip() and not line.lstrip().startswith("#")
         )
         if not patterns:
             return ()
         ignored = self._git_lines(
-            source_root, "ls-files", "--others", "--ignored", "--exclude-standard", "-z",
-            what="列出被忽略文件", timeout=120,
+            source_root,
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+            what="列出被忽略文件",
+            timeout=120,
         )
         matched = [path for path in ignored if _include_match(path, patterns)]
-        total = sum((source_root / path).stat().st_size for path in matched
-                    if (source_root / path).is_file())
+        total = sum((source_root / path).stat().st_size for path in matched if (source_root / path).is_file())
         if len(matched) > _MAX_INCLUDE_FILES or total > _MAX_INCLUDE_BYTES:
             raise WorktreeError(
-                f".worktreeinclude 匹配到 {len(matched)} 个文件（{total} 字节），超过复制上限；"
-                "请缩小匹配范围。"
+                f".worktreeinclude 匹配到 {len(matched)} 个文件（{total} 字节），超过复制上限；请缩小匹配范围。"
             )
         for relative in matched:
             source = source_root / relative
@@ -462,31 +527,48 @@ class WorktreeManager:
         return ", ".join(names) if names else "（无）"
 
     def _run_git(
-        self, cwd: Path, *arguments: str, check: bool = True, what: str, timeout: float = 60,
+        self,
+        cwd: Path,
+        *arguments: str,
+        check: bool = True,
+        what: str,
+        timeout: float = 60,
     ) -> subprocess.CompletedProcess[str]:
         if self._git is None:
             raise WorktreeError("未找到 git 命令；请安装 Git 后重试。")
         environment = git_environment()
         try:
             completed = subprocess.run(
-                (self._git, *arguments), cwd=cwd, env=environment,
-                capture_output=True, text=True, check=False, timeout=timeout,
+                (self._git, *arguments),
+                cwd=cwd,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
             )
         except subprocess.TimeoutExpired:
             raise WorktreeError(f"{what}超时（git {' '.join(arguments[:2])}）。") from None
         if check and completed.returncode != 0:
-            raise WorktreeError(
-                f"{what}失败：{completed.stderr.strip()[:400] or completed.stdout.strip()[:400]}"
-            )
+            raise WorktreeError(f"{what}失败：{completed.stderr.strip()[:400] or completed.stdout.strip()[:400]}")
         return completed
 
     def _git_stdout(
-        self, cwd: Path, *arguments: str, check: bool = True, what: str = "git",
+        self,
+        cwd: Path,
+        *arguments: str,
+        check: bool = True,
+        what: str = "git",
     ) -> str:
         return self._run_git(cwd, *arguments, check=check, what=what).stdout.strip()
 
     def _git_lines(
-        self, cwd: Path, *arguments: str, check: bool = True, what: str, timeout: float = 60,
+        self,
+        cwd: Path,
+        *arguments: str,
+        check: bool = True,
+        what: str,
+        timeout: float = 60,
     ) -> builtins.list[str]:
         completed = self._run_git(cwd, *arguments, check=check, what=what, timeout=timeout)
         if arguments[-1] == "-z":
@@ -516,8 +598,7 @@ def _write_provenance(worktree: ManagedWorktree) -> None:
     path = worktree.root / PROVENANCE_RELATIVE_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(worktree.provenance(), ensure_ascii=False, indent=2),
-                         encoding="utf-8")
+    temporary.write_text(json.dumps(worktree.provenance(), ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(temporary, path)
 
 

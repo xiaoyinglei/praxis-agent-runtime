@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime.harness import RuntimeState
+from agent_runtime.harness import RuntimeStore, memory_ops, turn_ops
 from agent_runtime.harness.memory import create_memory_tool, memory_snapshot
 from agent_runtime.harness.memory_management import create_memory_management_tool, remember_memory
 from agent_runtime.harness.tool_orchestrator import ToolOrchestrator
@@ -28,15 +28,16 @@ async def test_old_turn_cannot_mutate_unrelated_memory_at_reused_workspace_path(
     old, new = tmp_path / "old", tmp_path / "new"
     old.mkdir()
     new.mkdir()
-    async with await RuntimeState.open(old / "host.db") as store:
+    async with await RuntimeStore.open(old / "host.db") as store:
         original = remember_memory(store, old, key="runner", title="Runner", text="Use uv.")
-        thread = store.create_thread(workspace=old)
-        turn = store.start_turn(
+        thread = turn_ops.create_thread(store, workspace=old)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message=f"Please {action} the runner preference.",
             binding_manifest={"memory_snapshot": memory_snapshot(store, old, navigation_only=True)},
         )
-        store.relocate_memory(previous_workspace=old, workspace=new)
+        memory_ops.relocate_memory(store, previous_workspace=old, workspace=new)
         unrelated = remember_memory(store, old, key="runner", title="Runner", text="Use make.")
         assert original["version"] == unrelated["version"] == 1
         executor = ToolOrchestrator(
@@ -61,15 +62,16 @@ async def test_old_turn_memory_reads_stay_in_original_scope_after_path_reuse(tmp
     old, new = tmp_path / "old", tmp_path / "new"
     old.mkdir()
     new.mkdir()
-    async with await RuntimeState.open(old / "host.db") as store:
+    async with await RuntimeStore.open(old / "host.db") as store:
         original = remember_memory(store, old, key="runner", title="Runner", text="Use uv.")
-        thread = store.create_thread(workspace=old)
-        turn = store.start_turn(
+        thread = turn_ops.create_thread(store, workspace=old)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="Explain the runner preference.",
             binding_manifest={"memory_snapshot": memory_snapshot(store, old, navigation_only=True)},
         )
-        store.relocate_memory(previous_workspace=old, workspace=new)
+        memory_ops.relocate_memory(store, previous_workspace=old, workspace=new)
         unrelated = remember_memory(store, old, key="runner", title="Runner", text="Use make.")
         tools = {"read_memory": create_memory_tool(store), "manage_memory": create_memory_management_tool(store)}
         executor = ToolOrchestrator(

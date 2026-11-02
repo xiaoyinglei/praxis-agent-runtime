@@ -4,14 +4,14 @@ import json
 
 import pytest
 
-from agent_runtime.harness import RuntimeState
+from agent_runtime.harness import RuntimeStore, turn_ops
 
 
 def test_explicit_correction_is_versioned_and_forget_can_be_explicitly_reversed(tmp_path):
     from agent_runtime.harness.memory import delete_memory
     from agent_runtime.harness.memory_management import edit_memory, explain_memory, remember_memory
 
-    with RuntimeState.open_sync(tmp_path / "r.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "r.db") as store:
         first = remember_memory(
             store, tmp_path, key="tests", title="Test command", text="Use pytest.", kind="preference"
         )
@@ -38,7 +38,7 @@ def test_stale_manual_edit_is_rejected_without_creating_audit_turn(tmp_path):
     from agent_runtime.harness.memory_management import edit_memory, remember_memory
     from agent_runtime.harness.protocol import ContextSourceChangedError
 
-    with RuntimeState.open_sync(tmp_path / "r.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "r.db") as store:
         remember_memory(store, tmp_path, key="k", title="Title", text="first")
         before = store.list_turns()
         with pytest.raises(ContextSourceChangedError):
@@ -53,7 +53,7 @@ async def test_automatic_history_cannot_overwrite_explicit_correction(tmp_path):
     from agent_runtime.harness.memory_management import remember_memory
     from tests.agent.harness.test_cross_session_memory import MemoryModel, seed
 
-    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
+    async with await RuntimeStore.open(tmp_path / "r.db") as store:
         remember_memory(store, tmp_path, key="environment", title="Command runner", text="Use make.", kind="preference")
         seed(store, tmp_path, text="old source: use uv")
         result = await update_memory(store, workspace=tmp_path, model=MemoryModel(), binding={})
@@ -104,9 +104,10 @@ async def test_management_tool_uses_current_user_provenance_and_rejects_stale_wr
     from agent_runtime.tools.permissions import ToolExecutionContext
     from agent_runtime.tools.tool import ToolCall, ToolCallOrigin
 
-    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
-        thread = store.create_thread(workspace=tmp_path)
-        turn = store.start_turn(
+    async with await RuntimeStore.open(tmp_path / "r.db") as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="Remember the test runner is uv.",
             binding_manifest={"memory_snapshot": memory_snapshot(store, tmp_path, navigation_only=True)},
@@ -147,9 +148,10 @@ async def test_readonly_tool_policy_cannot_mutate_memory(tmp_path):
     from agent_runtime.tools.permissions import ToolExecutionContext
     from agent_runtime.tools.tool import ToolCall, ToolCallOrigin
 
-    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
-        thread = store.create_thread(workspace=tmp_path)
-        turn = store.start_turn(
+    async with await RuntimeStore.open(tmp_path / "r.db") as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="Remember uv.",
             binding_manifest={"memory_snapshot": memory_snapshot(store, tmp_path)},
@@ -196,16 +198,22 @@ async def test_empty_memory_exposes_version_through_read_for_first_explicit_writ
                 # Tool results use the normal ACI envelope; the version is not
                 # a volatile navigation field in every model request.
                 version = json.loads(json.loads(detail)["content"][0]["data"]["text"])["version"]
-                call = ModelToolCall(id="write", name="manage_memory", arguments={
-                    "action": "remember", "key": "runner", "text": "Use uv.", "expected_version": version})
+                call = ModelToolCall(
+                    id="write",
+                    name="manage_memory",
+                    arguments={"action": "remember", "key": "runner", "text": "Use uv.", "expected_version": version},
+                )
             else:
                 return HarnessModelResponse.from_parts(text="remembered", provider_response_id=None, usage={})
             return HarnessModelResponse.from_parts(text="", provider_response_id=None, usage={}, tool_calls=(call,))
 
     model = Model()
     async with await Session.open(
-        database=tmp_path / "r.db", workspace=tmp_path, model=model,
-        memory=MemoryConfig(generate_memories=False), require_workspace_change=False,
+        database=tmp_path / "r.db",
+        workspace=tmp_path,
+        model=model,
+        memory=MemoryConfig(generate_memories=False),
+        require_workspace_change=False,
         tool_execution_context=ToolExecutionContext(workspace_root=tmp_path, cwd=tmp_path, allow_write_tools=True),
     ) as session:
         result = await session.submit("Remember a new preference: use uv.")
@@ -213,8 +221,7 @@ async def test_empty_memory_exposes_version_through_read_for_first_explicit_writ
         assert all(not call.is_error for call in result.tool_calls)
         assert session.store.read_memory_state(tmp_path)["entries"][0]["text"] == "Use uv."
     navigation = [
-        message.content for message in model.requests[0].messages
-        if message.content.startswith("Cross-chat memory")
+        message.content for message in model.requests[0].messages if message.content.startswith("Cross-chat memory")
     ]
     assert len(navigation) == 1
     snapshot = json.loads(navigation[0].split("\n", 1)[1])

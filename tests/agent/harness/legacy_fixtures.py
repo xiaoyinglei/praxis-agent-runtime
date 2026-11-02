@@ -4,13 +4,15 @@ from collections.abc import Mapping
 from typing import Any
 from uuid import uuid4
 
+from agent_runtime.harness import artifact_ops, facts
+from agent_runtime.harness.operation_values import _json_object
 from agent_runtime.harness.records import ItemSnapshot
-from agent_runtime.harness.state import RuntimeState, _json_object, _state_operation
+from agent_runtime.harness.runtime_store import RuntimeStore, owner_operation
 
 
-@_state_operation
+@owner_operation
 def record_migrated_context_item(
-    store: RuntimeState,
+    store: RuntimeStore,
     *,
     turn_id: str,
     kind: str,
@@ -30,7 +32,7 @@ def record_migrated_context_item(
         raise ValueError(f"unsupported migrated Item kind: {kind}")
     frozen_payload = _json_object(payload, field="migrated Item payload")
     if kind == "tool_result":
-        store._validate_artifact_references(frozen_payload)
+        artifact_ops._validate_artifact_references(store, frozen_payload)
     item_id = f"item_{uuid4().hex}"
     public_projection = (
         {
@@ -49,14 +51,16 @@ def record_migrated_context_item(
             raise KeyError(f"unknown turn: {turn_id}")
         if turn["status"] != "running":
             raise RuntimeError("migrated Items require a running Turn")
-        store._append_and_reduce(
+        facts.append_fact(
+            store,
             thread_id=str(turn["thread_id"]),
             turn_id=turn_id,
             record_type="item_started",
             producer="migration",
             payload={"item_id": item_id, "kind": kind, **public_projection},
         )
-        store._append_and_reduce(
+        facts.append_fact(
+            store,
             thread_id=str(turn["thread_id"]),
             turn_id=turn_id,
             record_type="item_completed",

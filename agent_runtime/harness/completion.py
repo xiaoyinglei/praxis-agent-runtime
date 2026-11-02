@@ -8,14 +8,14 @@ from pathlib import Path
 
 from agent_runtime.harness.protocol import CompletionDecision, CompletionProposal
 from agent_runtime.harness.records import ItemSnapshot, ToolOperationSnapshot
-from agent_runtime.harness.state import RuntimeState
+from agent_runtime.harness.runtime_store import RuntimeStore
 from agent_runtime.harness.verification import assess_tool_verification
 
 
 class DeliveryCompletionGate:
     """Validate required workspace-change evidence, not answer correctness."""
 
-    def __init__(self, store: RuntimeState) -> None:
+    def __init__(self, store: RuntimeStore) -> None:
         self._store = store
 
     def evaluate(self, proposal: CompletionProposal) -> CompletionDecision:
@@ -90,8 +90,10 @@ class DeliveryCompletionGate:
                 feedback["command"] = command
                 feedback["working_dir"] = "."
             return CompletionDecision(
-                action="continue", reason=json.dumps(feedback, ensure_ascii=False),
-                validation_status="failed", validation_scope=scope,
+                action="continue",
+                reason=json.dumps(feedback, ensure_ascii=False),
+                validation_status="failed",
+                validation_scope=scope,
             )
 
         if not isinstance(require_change, bool) or (raw_command is not None and not command):
@@ -113,8 +115,12 @@ class DeliveryCompletionGate:
                         pending.add(session_id)
                     else:
                         pending.discard(session_id)
-            elif (operation.tool_name == "manage_command" and isinstance(session_id, str)
-                  and arguments.get("session_id") == session_id and session_id in launches):
+            elif (
+                operation.tool_name == "manage_command"
+                and isinstance(session_id, str)
+                and arguments.get("session_id") == session_id
+                and session_id in launches
+            ):
                 launch, original_arguments = launches[session_id]
                 if item.sequence > launch.sequence:
                     command_results.append((item, operation, original_arguments))
@@ -122,25 +128,31 @@ class DeliveryCompletionGate:
                         pending.discard(session_id)
         if pending:
             return reject(
-                "command_session_pending", "Observe the terminal command result with manage_command before finishing.",
-                "command_lifecycle", session_ids=sorted(pending),
+                "command_session_pending",
+                "Observe the terminal command result with manage_command before finishing.",
+                "command_lifecycle",
+                session_ids=sorted(pending),
             )
         if not require_change and command is None:
             return CompletionDecision(
-                action="accept", reason="The model turn ended; task acceptance was not evaluated.",
+                action="accept",
+                reason="The model turn ended; task acceptance was not evaluated.",
             )
 
         latest_change, result_order = self._v2_workspace_change_order(proposal.turn_id)
         if require_change and not latest_change:
             return reject(
-                "workspace_change_missing", "The requested workspace mutation has not been recorded.",
-                "workspace_change_recorded", next_action="Make the requested workspace change before finishing.",
+                "workspace_change_missing",
+                "The requested workspace mutation has not been recorded.",
+                "workspace_change_recorded",
+                next_action="Make the requested workspace change before finishing.",
             )
         if command is None:
             return CompletionDecision(
                 action="accept",
                 reason="The requested workspace mutation was recorded; task acceptance was not evaluated.",
-                validation_status="passed", validation_scope="workspace_change_recorded",
+                validation_status="passed",
+                validation_scope="workspace_change_recorded",
             )
 
         turn = self._store.read_turn(proposal.turn_id)
@@ -150,7 +162,8 @@ class DeliveryCompletionGate:
             actual_command = arguments.get("command")
             if (
                 not isinstance(actual_command, str)
-                or actual_command.strip() != command or item.item_id not in result_order
+                or actual_command.strip() != command
+                or item.item_id not in result_order
             ):
                 continue
             working_dir = arguments.get("working_dir")
@@ -175,13 +188,20 @@ class DeliveryCompletionGate:
         result = item.payload.get("structured_content")
         exit_code = result.get("exit_code") if isinstance(result, Mapping) else None
         if (
-            operation.status != "succeeded" or item.payload.get("is_error") is not False
-            or not isinstance(result, Mapping) or not isinstance(exit_code, int) or isinstance(exit_code, bool)
-            or exit_code != 0 or result.get("timed_out") or result.get("sandbox_error")
+            operation.status != "succeeded"
+            or item.payload.get("is_error") is not False
+            or not isinstance(result, Mapping)
+            or not isinstance(exit_code, int)
+            or isinstance(exit_code, bool)
+            or exit_code != 0
+            or result.get("timed_out")
+            or result.get("sandbox_error")
         ):
             return reject(
-                "acceptance_command_failed", "The latest configured acceptance command did not complete successfully.",
-                "acceptance_command", tool_call_id=operation.tool_call_id,
+                "acceptance_command_failed",
+                "The latest configured acceptance command did not complete successfully.",
+                "acceptance_command",
+                tool_call_id=operation.tool_call_id,
                 next_action="Inspect that execution's output, resolve the failure, and rerun command from working_dir.",
             )
         # A user-selected verifier may produce build outputs itself. Its own
@@ -189,14 +209,17 @@ class DeliveryCompletionGate:
         # mutation still requires a fresh execution of the frozen command.
         if result_order[item.item_id] < latest_change:
             return reject(
-                "acceptance_command_stale", "The workspace changed after the configured acceptance command succeeded.",
-                "acceptance_command", tool_call_id=operation.tool_call_id,
+                "acceptance_command_stale",
+                "The workspace changed after the configured acceptance command succeeded.",
+                "acceptance_command",
+                tool_call_id=operation.tool_call_id,
                 next_action="Rerun command exactly with run_command from working_dir against the updated workspace.",
             )
         return CompletionDecision(
             action="accept",
             reason="The configured acceptance command completed successfully after the latest workspace mutation.",
-            validation_status="passed", validation_scope="acceptance_command",
+            validation_status="passed",
+            validation_scope="acceptance_command",
         )
 
     def _v2_workspace_change_order(self, turn_id: str) -> tuple[int, dict[str, int]]:
@@ -208,9 +231,7 @@ class DeliveryCompletionGate:
         ancestry; unrelated work in the same workspace remains outside it.
         """
         turns = {turn.turn_id: turn for turn in self._store.list_turns()}
-        workspaces = {
-            thread.thread_id: Path(thread.workspace).resolve() for thread in self._store.list_threads()
-        }
+        workspaces = {thread.thread_id: Path(thread.workspace).resolve() for thread in self._store.list_threads()}
         workspace = workspaces[turns[turn_id].thread_id]
         children: dict[str, list[str]] = {}
         for child in turns.values():
@@ -232,14 +253,18 @@ class DeliveryCompletionGate:
             str(record.payload["item_id"]): record.record_id
             for thread_id in {turns[current].thread_id for current in family}
             for record in self._store.list_records(thread_id)
-            if record.turn_id in family and record.record_type == "item_completed"
+            if record.turn_id in family
+            and record.record_type == "item_completed"
             and record.producer in {"tool", "runtime"}
             and isinstance(record.payload.get("item_id"), str)
         }
         latest_change = max(
-            (result_order[item.item_id]
-             for current in family for item, operation, _arguments in self._trusted_v2_results(current)
-             if item.item_id in result_order and _is_workspace_change(item, self._write_origin(item, operation))),
+            (
+                result_order[item.item_id]
+                for current in family
+                for item, operation, _arguments in self._trusted_v2_results(current)
+                if item.item_id in result_order and _is_workspace_change(item, self._write_origin(item, operation))
+            ),
             default=0,
         )
         return latest_change, result_order
@@ -248,18 +273,26 @@ class DeliveryCompletionGate:
         metadata = item.payload.get("metadata")
         origin_id = metadata.get("runtime_workspace_origin_operation_id") if isinstance(metadata, Mapping) else None
         if isinstance(origin_id, str):
-            origin = next((candidate for candidate in self._store.list_tool_operations(operation.turn_id)
-                           if candidate.operation_id == origin_id), None)
+            origin = next(
+                (
+                    candidate
+                    for candidate in self._store.list_tool_operations(operation.turn_id)
+                    if candidate.operation_id == origin_id
+                ),
+                None,
+            )
             if origin is not None and origin.result_item_id is not None:
                 return origin
         return operation
 
     def _trusted_v2_results(
-        self, turn_id: str,
+        self,
+        turn_id: str,
     ) -> tuple[tuple[ItemSnapshot, ToolOperationSnapshot, Mapping[str, object]], ...]:
         items = {item.item_id: item for item in self._store.list_items(turn_id)}
         calls = {
-            item.payload.get("tool_call_id"): item for item in items.values()
+            item.payload.get("tool_call_id"): item
+            for item in items.values()
             if item.kind == "tool_call" and item.status == "completed" and item.producer == "model"
         }
         trusted = []
@@ -272,18 +305,26 @@ class DeliveryCompletionGate:
             item = items.get(operation.result_item_id)
             call = calls.get(operation.tool_call_id)
             if (
-                item is None or call is None or item.kind != "tool_result" or item.status != "completed"
-                or item.producer != "tool" or call.payload.get("tool_name") != operation.tool_name
+                item is None
+                or call is None
+                or item.kind != "tool_result"
+                or item.status != "completed"
+                or item.producer != "tool"
+                or call.payload.get("tool_name") != operation.tool_name
                 or item.payload.get("tool_name") != operation.tool_name
-                or item.payload.get("tool_call_id") != operation.tool_call_id or item.sequence <= call.sequence
+                or item.payload.get("tool_call_id") != operation.tool_call_id
+                or item.sequence <= call.sequence
                 or not isinstance(call.payload.get("arguments"), Mapping)
             ):
                 continue
             trusted.append((item, operation, call.payload["arguments"]))
         # A live owner can close while a Turn is paused. Its confirmed outcome
         # remains available after process handles and the Session are gone.
-        launches = {operation.operation_id: (item, operation, arguments)
-                    for item, operation, arguments in trusted if operation.tool_name == "run_command"}
+        launches = {
+            operation.operation_id: (item, operation, arguments)
+            for item, operation, arguments in trusted
+            if operation.tool_name == "run_command"
+        }
         for item in items.values():
             if item.kind != "tool_continuation" or item.producer != "runtime" or item.status != "completed":
                 continue
@@ -294,10 +335,13 @@ class DeliveryCompletionGate:
             launch, operation, arguments = source
             initial = launch.payload.get("structured_content")
             output = item.payload.get("structured_content")
-            if (item.payload.get("source_result_item_id") == launch.item_id
-                    and isinstance(initial, Mapping) and isinstance(output, Mapping)
-                    and item.payload.get("key") == initial.get("session_id") == output.get("session_id")
-                    and output.get("status") in {"completed", "cancelled"}):
+            if (
+                item.payload.get("source_result_item_id") == launch.item_id
+                and isinstance(initial, Mapping)
+                and isinstance(output, Mapping)
+                and item.payload.get("key") == initial.get("session_id") == output.get("session_id")
+                and output.get("status") in {"completed", "cancelled"}
+            ):
                 trusted.append((item, operation, arguments))
         return tuple(trusted)
 

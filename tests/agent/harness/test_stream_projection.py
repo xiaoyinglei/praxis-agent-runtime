@@ -9,16 +9,17 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime.harness import RolloutEventReader, RuntimeState
+from agent_runtime.harness import RolloutEventReader, RuntimeStore, budget_ops, facts, model_ops, tool_ops, turn_ops
 from agent_runtime.harness.model_outputs import complete_model_output, start_model_output
 from agent_runtime.harness.protocol import HarnessModelResponse
 from agent_runtime.modeling.events import ModelOutput
 from agent_runtime.streaming import events as stream_events
 
 
-def _start_turn(store: RuntimeState, workspace: Path) -> tuple[str, str]:
-    thread = store.create_thread(workspace=workspace)
-    turn = store.start_turn(
+def _start_turn(store: RuntimeStore, workspace: Path) -> tuple[str, str]:
+    thread = turn_ops.create_thread(store, workspace=workspace)
+    turn = turn_ops.start_turn(
+        store,
         thread_id=thread.thread_id,
         user_message="project this turn",
         binding_manifest={"model_id": "projection-test"},
@@ -27,12 +28,13 @@ def _start_turn(store: RuntimeState, workspace: Path) -> tuple[str, str]:
 
 
 def _complete_model_response(
-    store: RuntimeState,
+    store: RuntimeStore,
     *,
     turn_id: str,
     text: str,
 ) -> None:
-    operation = store.prepare_model_operation(
+    operation = model_ops.prepare_model_operation(
+        store,
         turn_id=turn_id,
         request_hash=f"request-{turn_id}",
         context_hash=f"context-{turn_id}",
@@ -40,12 +42,14 @@ def _complete_model_response(
         wire_hash=f"wire-{turn_id}",
         request_ref={"input_revision": 1, "request_id": f"request-{turn_id}"},
     )
-    attempt = store.dispatch_model_attempt(
+    attempt = model_ops.dispatch_model_attempt(
+        store,
         operation.operation_id,
         worker_id="projection-worker",
         lease_seconds=30.0,
     )
-    assert store.complete_model_attempt(
+    assert model_ops.complete_model_attempt(
+        store,
         operation_id=operation.operation_id,
         attempt_id=attempt.attempt_id,
         generation=attempt.generation,
@@ -72,8 +76,7 @@ def _completed_answer_count(projected: tuple[object, ...], answer: str) -> int:
             continue
         if (
             getattr(replayed, "event_type", None) == "item_completed"
-            and getattr(replayed, "data", {}).get("payload", {}).get("text")
-            == answer
+            and getattr(replayed, "data", {}).get("payload", {}).get("text") == answer
         ):
             count += 1
     return count
@@ -83,13 +86,9 @@ def test_unknown_internal_item_kind_fails_closed(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RuntimeState.open_sync(database) as store:
+    with RuntimeStore.open_sync(database) as store:
         thread_id, _turn_id = _start_turn(store, workspace)
-        record = next(
-            record
-            for record in store.list_records(thread_id)
-            if record.record_type == "item_started"
-        )
+        record = next(record for record in store.list_records(thread_id) if record.record_type == "item_started")
         payload = {"item_id": record.payload["item_id"], "kind": "future_internal_kind"}
         payload_json = json.dumps(
             payload,
@@ -117,14 +116,16 @@ def test_unknown_internal_item_kind_fails_closed(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("tampered_record", ["output_start", "output_completion", "plan_completion"])
 def test_public_item_ids_survive_reopen_and_mismatch_fails_closed(
-    tmp_path: Path, tampered_record: str,
+    tmp_path: Path,
+    tampered_record: str,
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RuntimeState.open_sync(database) as store:
+    with RuntimeStore.open_sync(database) as store:
         thread_id, turn_id = _start_turn(store, workspace)
-        operation = store.prepare_model_operation(
+        operation = model_ops.prepare_model_operation(
+            store,
             turn_id=turn_id,
             request_hash="request-hash",
             context_hash="context-hash",
@@ -133,9 +134,7 @@ def test_public_item_ids_survive_reopen_and_mismatch_fails_closed(
             request_ref={"input_revision": 1, "request_id": "request-1"},
         )
         prepared = next(
-            record
-            for record in store.list_records(thread_id)
-            if record.record_type == "model_operation_prepared"
+            record for record in store.list_records(thread_id) if record.record_type == "model_operation_prepared"
         )
         assert "public_item_ids" not in prepared.payload
         outputs = (
@@ -143,7 +142,8 @@ def test_public_item_ids_survive_reopen_and_mismatch_fails_closed(
             ModelOutput("plan", "plan", content="inspect then fix"),
             ModelOutput("text", "text", content="answer"),
         )
-        first_attempt = store.dispatch_model_attempt(
+        first_attempt = model_ops.dispatch_model_attempt(
+            store,
             operation.operation_id,
             worker_id="worker-1",
             lease_seconds=1.0,
@@ -151,12 +151,18 @@ def test_public_item_ids_survive_reopen_and_mismatch_fails_closed(
         )
         for output in outputs:
             start_model_output(
-                store, operation_id=operation.operation_id, attempt_id=first_attempt.attempt_id,
-                generation=first_attempt.generation, output=output,
+                store,
+                operation_id=operation.operation_id,
+                attempt_id=first_attempt.attempt_id,
+                generation=first_attempt.generation,
+                output=output,
             )
             complete_model_output(
-                store, operation_id=operation.operation_id, attempt_id=first_attempt.attempt_id,
-                generation=first_attempt.generation, output=output,
+                store,
+                operation_id=operation.operation_id,
+                attempt_id=first_attempt.attempt_id,
+                generation=first_attempt.generation,
+                output=output,
             )
         first_ids = {
             record.payload["output_id"]: record.payload["public_item_id"]
@@ -165,25 +171,30 @@ def test_public_item_ids_survive_reopen_and_mismatch_fails_closed(
         }
         assert set(first_ids) == {"reason", "plan", "text"}
         assert len(set(first_ids.values())) == len(outputs)
-        store.expire_model_attempt_dispatch(
+        model_ops.expire_model_attempt_dispatch(
+            store,
             operation_id=operation.operation_id,
             now=102.0,
         )
-        retry = store.prepare_model_retry(operation.operation_id)
+        retry = model_ops.prepare_model_retry(store, operation.operation_id)
         retried = next(
-            record
-            for record in store.list_records(thread_id)
-            if record.record_type == "model_retry_prepared"
+            record for record in store.list_records(thread_id) if record.record_type == "model_retry_prepared"
         )
         assert "public_item_ids" not in retried.payload
         assert retry.attempt_id != first_attempt.attempt_id
-        retry = store.dispatch_model_attempt(operation.operation_id, worker_id="worker-2")
-        assert store.complete_model_attempt(operation_id=operation.operation_id, attempt_id=retry.attempt_id,
-                                            generation=retry.generation, response=HarnessModelResponse(outputs=outputs))
+        retry = model_ops.dispatch_model_attempt(store, operation.operation_id, worker_id="worker-2")
+        assert model_ops.complete_model_attempt(
+            store,
+            operation_id=operation.operation_id,
+            attempt_id=retry.attempt_id,
+            generation=retry.generation,
+            response=HarnessModelResponse(outputs=outputs),
+        )
         retry_ids = {
             record.payload["output_id"]: record.payload["public_item_id"]
             for record in store.list_records(thread_id)
-            if record.record_type == "item_started" and record.payload.get("kind") == "model_output"
+            if record.record_type == "item_started"
+            and record.payload.get("kind") == "model_output"
             and record.payload["attempt_id"] == retry.attempt_id
         }
         assert retry_ids.keys() == first_ids.keys()
@@ -194,7 +205,8 @@ def test_public_item_ids_survive_reopen_and_mismatch_fails_closed(
                 expected_ids = retry_ids if record.payload["attempt_id"] == retry.attempt_id else first_ids
                 assert record.payload["public_item_id"] == expected_ids[record.payload["output_id"]]
 
-        store.record_tool_call(
+        tool_ops.record_tool_call(
+            store,
             turn_id=turn_id,
             tool_call_id="call-plan",
             tool_name="update_plan",
@@ -215,21 +227,21 @@ def test_public_item_ids_survive_reopen_and_mismatch_fails_closed(
             "error_code": None,
             "requires_reconciliation": False,
         }
-        store.record_tool_execution_state(status="prepared", **tool_values)
-        store.record_tool_execution_state(status="ready", **tool_values)
-        claim = store.claim_tool_operation(
+        tool_ops.record_tool_execution_state(store, status="prepared", **tool_values)
+        tool_ops.record_tool_execution_state(store, status="ready", **tool_values)
+        claim = tool_ops.claim_tool_operation(
+            store,
             operation_id="operation-plan",
             worker_id="worker-1",
             lease_seconds=30.0,
         )
         claimed = next(
-            record
-            for record in store.list_records(thread_id)
-            if record.record_type == "tool_operation_claimed"
+            record for record in store.list_records(thread_id) if record.record_type == "tool_operation_claimed"
         )
         operation_public_id = claimed.payload["public_item_id"]
         assert operation_public_id
-        assert store.commit_tool_operation_outcome(
+        assert tool_ops.commit_tool_operation_outcome(
+            store,
             operation_id="operation-plan",
             claim_generation=claim.claim_generation,
             fencing_token=str(claim.fencing_token),
@@ -238,7 +250,8 @@ def test_public_item_ids_survive_reopen_and_mismatch_fails_closed(
             error_code=None,
             requires_reconciliation=False,
         )
-        store.record_tool_result(
+        tool_ops.record_tool_result(
+            store,
             turn_id=turn_id,
             operation_id="operation-plan",
             result={
@@ -264,31 +277,44 @@ def test_public_item_ids_survive_reopen_and_mismatch_fails_closed(
         )
         plan_public_id = plan_completion.payload["public_item_id"]
         assert plan_public_id
-        selected_record = plan_completion if tampered_record == "plan_completion" else next(
-            record for record in store.list_records(thread_id)
-            if record.record_type == ("item_started" if tampered_record == "output_start" else "item_completed")
-            and record.payload.get("kind") == "model_output" and record.payload["attempt_id"] == retry.attempt_id
+        selected_record = (
+            plan_completion
+            if tampered_record == "plan_completion"
+            else next(
+                record
+                for record in store.list_records(thread_id)
+                if record.record_type == ("item_started" if tampered_record == "output_start" else "item_completed")
+                and record.payload.get("kind") == "model_output"
+                and record.payload["attempt_id"] == retry.attempt_id
+            )
         )
-        original_events = tuple((entry.event.item_id, entry.event.data)
-                                for entry in RolloutEventReader(store).read(thread_id))
+        original_events = tuple(
+            (entry.event.item_id, entry.event.data) for entry in RolloutEventReader(store).read(thread_id)
+        )
 
-    with RuntimeState.open_sync(database) as reopened:
+    with RuntimeStore.open_sync(database) as reopened:
         persisted = reopened.list_records(thread_id)
         assert {
             record.payload["output_id"]: record.payload["public_item_id"]
             for record in persisted
-            if record.record_type == "item_started" and record.payload.get("kind") == "model_output"
+            if record.record_type == "item_started"
+            and record.payload.get("kind") == "model_output"
             and record.payload["attempt_id"] == retry.attempt_id
         } == retry_ids
-        assert tuple((entry.event.item_id, entry.event.data)
-                     for entry in RolloutEventReader(reopened).read(thread_id)) == original_events
-        assert next(
-            record.payload["public_item_id"]
-            for record in persisted
-            if record.record_type == "item_completed"
-            and isinstance(record.payload.get("payload"), dict)
-            and "plan" in record.payload["payload"]
-        ) == plan_public_id
+        assert (
+            tuple((entry.event.item_id, entry.event.data) for entry in RolloutEventReader(reopened).read(thread_id))
+            == original_events
+        )
+        assert (
+            next(
+                record.payload["public_item_id"]
+                for record in persisted
+                if record.record_type == "item_completed"
+                and isinstance(record.payload.get("payload"), dict)
+                and "plan" in record.payload["payload"]
+            )
+            == plan_public_id
+        )
 
     with sqlite3.connect(database) as connection:
         connection.row_factory = sqlite3.Row
@@ -322,7 +348,7 @@ def test_public_item_ids_survive_reopen_and_mismatch_fails_closed(
             ),
         )
 
-    with RuntimeState.open_sync(database) as reopened:
+    with RuntimeStore.open_sync(database) as reopened:
         with pytest.raises(RuntimeError, match="persisted public Item ID mismatch"):
             RolloutEventReader(reopened).read(thread_id)
 
@@ -330,11 +356,11 @@ def test_public_item_ids_survive_reopen_and_mismatch_fails_closed(
 def test_accepted_answer_does_not_duplicate_model_response(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread_id, turn_id = _start_turn(store, workspace)
         _complete_model_response(store, turn_id=turn_id, text="one answer")
         source = store.list_model_operations(turn_id)[0].response_item_id
-        store.complete_turn(turn_id=turn_id, answer="one answer", source_item_id=source)
+        turn_ops.complete_turn(store, turn_id=turn_id, answer="one answer", source_item_id=source)
         assert not any(item.kind == "agent_message" for item in store.list_items(turn_id))
 
         projected = RolloutEventReader(store).read(thread_id)
@@ -344,16 +370,21 @@ def test_accepted_answer_does_not_duplicate_model_response(tmp_path: Path) -> No
 
 @pytest.mark.parametrize("same_answer", [False, True])
 def test_live_accepted_answer_uses_bounded_context_and_matches_replay(tmp_path: Path, monkeypatch, same_answer) -> None:
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread_id, turn_id = _start_turn(store, tmp_path)
         _complete_model_response(store, turn_id=turn_id, text="model answer")
         for _ in range(48):
-            store.reserve_resource_unit(turn_id, "reads", 256)
+            budget_ops.reserve_resource_unit(store, turn_id, "reads", 256)
         answer = "model answer" if same_answer else "runtime answer"
         source = store.list_model_operations(turn_id)[0].response_item_id if same_answer else None
-        mutation = store.capture_mutation(lambda: store.complete_turn(
-            turn_id=turn_id, answer=answer, source_item_id=source,
-        ))
+        mutation = store.capture_mutation(
+            lambda: turn_ops.complete_turn(
+                store,
+                turn_id=turn_id,
+                answer=answer,
+                source_item_id=source,
+            )
+        )
         sql_steps = 0
 
         def sql_step():
@@ -372,8 +403,11 @@ def test_live_accepted_answer_uses_bounded_context_and_matches_replay(tmp_path: 
                 live = RolloutEventReader(store).project_committed_batch(mutation.records)
             finally:
                 store.run_sync(lambda: store.persistence._connection.set_progress_handler(None, 0))
-        replayed = tuple(event for event in RolloutEventReader(store).read(thread_id)
-                         if event.record_id in {record.record_id for record in mutation.records})
+        replayed = tuple(
+            event
+            for event in RolloutEventReader(store).read(thread_id)
+            if event.record_id in {record.record_id for record in mutation.records}
+        )
         assert [(event.cursor, replace(event.event, sequence=0)) for event in live] == [
             (event.cursor, replace(event.event, sequence=0)) for event in replayed
         ]
@@ -384,16 +418,18 @@ def test_live_accepted_answer_uses_bounded_context_and_matches_replay(tmp_path: 
 def test_migrated_answer_projects_exactly_one_legacy_message(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             turn_id="legacy-turn",
             turn_producer="migration",
             user_message="legacy question",
             binding_manifest={"model_id": "legacy"},
         )
-        store.complete_turn(
+        turn_ops.complete_turn(
+            store,
             turn_id=turn.turn_id,
             answer="legacy answer",
             producer="migration",
@@ -405,10 +441,7 @@ def test_migrated_answer_projects_exactly_one_legacy_message(tmp_path: Path) -> 
         replayed
         for replayed in projected
         if (
-            (
-                replayed.event is not None
-                and replayed.event.type.value == "item_completed"
-            )
+            (replayed.event is not None and replayed.event.type.value == "item_completed")
             if hasattr(replayed, "event")
             else getattr(replayed, "event_type", None) == "item_completed"
         )
@@ -423,9 +456,10 @@ def test_command_execution_does_not_create_a_second_command_outcome(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread_id, turn_id = _start_turn(store, workspace)
-        store.record_tool_call(
+        tool_ops.record_tool_call(
+            store,
             turn_id=turn_id,
             tool_call_id="call-command",
             tool_name="run_command",
@@ -444,14 +478,16 @@ def test_command_execution_does_not_create_a_second_command_outcome(
             "error_code": None,
             "requires_reconciliation": False,
         }
-        store.record_tool_execution_state(status="prepared", **values)
-        store.record_tool_execution_state(status="ready", **values)
-        claim = store.claim_tool_operation(
+        tool_ops.record_tool_execution_state(store, status="prepared", **values)
+        tool_ops.record_tool_execution_state(store, status="ready", **values)
+        claim = tool_ops.claim_tool_operation(
+            store,
             operation_id="operation-command",
             worker_id="command-worker",
             lease_seconds=30.0,
         )
-        assert store.commit_tool_operation_outcome(
+        assert tool_ops.commit_tool_operation_outcome(
+            store,
             operation_id="operation-command",
             claim_generation=claim.claim_generation,
             fencing_token=str(claim.fencing_token),
@@ -468,7 +504,8 @@ def test_command_execution_does_not_create_a_second_command_outcome(
             "content": [],
             "attachments": [],
         }
-        store.record_tool_result(
+        tool_ops.record_tool_result(
+            store,
             turn_id=turn_id,
             operation_id="operation-command",
             result=result,
@@ -477,14 +514,16 @@ def test_command_execution_does_not_create_a_second_command_outcome(
 
         def transaction():
             with store.persistence.transaction():
-                store._append_and_reduce(
+                facts.append_fact(
+                    store,
                     thread_id=thread_id,
                     turn_id=turn_id,
                     record_type="item_started",
                     producer="tool",
                     payload={"item_id": duplicate_id, "kind": "command_execution"},
                 )
-                store._append_and_reduce(
+                facts.append_fact(
+                    store,
                     thread_id=thread_id,
                     turn_id=turn_id,
                     record_type="item_completed",
@@ -515,10 +554,8 @@ def test_command_execution_does_not_create_a_second_command_outcome(
             replayed
             for replayed in projected
             if replayed.event_type == "item_completed"
-            and starts.get(replayed.data.get("item_id"))
-            in {"tool_result", "command_execution"}
-            and replayed.data.get("payload", {}).get("tool_call_id")
-            == "call-command"
+            and starts.get(replayed.data.get("item_id")) in {"tool_result", "command_execution"}
+            and replayed.data.get("payload", {}).get("tool_call_id") == "call-command"
         ]
     assert len(outcomes) == 1
 
@@ -535,13 +572,9 @@ def test_live_timestamp_is_unix_epoch_and_replay_uses_committed_timestamp(
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread_id, _turn_id = _start_turn(store, workspace)
-        committed = next(
-            record
-            for record in store.list_records(thread_id)
-            if record.record_type == "turn_started"
-        )
+        committed = next(record for record in store.list_records(thread_id) if record.record_type == "turn_started")
         monkeypatch.setattr(stream_events, "_now_ms", lambda: 123)
 
         [replayed] = RolloutEventReader(store).read(thread_id)
@@ -552,14 +585,15 @@ def test_live_timestamp_is_unix_epoch_and_replay_uses_committed_timestamp(
 def test_transient_deltas_never_enter_rollout_records(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread_id, turn_id = _start_turn(store, workspace)
 
         with pytest.raises(ValueError, match="unsupported record type"):
 
             def transaction():
                 with store.persistence.transaction():
-                    store._append_and_reduce(
+                    facts.append_fact(
+                        store,
                         thread_id=thread_id,
                         turn_id=turn_id,
                         record_type="item_delta",
@@ -573,22 +607,21 @@ def test_transient_deltas_never_enter_rollout_records(tmp_path: Path) -> None:
 
             store.run_sync(transaction)
 
-        assert all(
-            record.record_type != "item_delta"
-            for record in store.list_records(thread_id)
-        )
+        assert all(record.record_type != "item_delta" for record in store.list_records(thread_id))
 
 
 def test_canonical_history_replays_with_persisted_public_ids(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
+    monkeypatch,
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RuntimeState.open_sync(database) as store:
+    with RuntimeStore.open_sync(database) as store:
         thread_id, turn_id = _start_turn(store, workspace)
         _complete_model_response(store, turn_id=turn_id, text="canonical model answer")
-        store.record_tool_call(
+        tool_ops.record_tool_call(
+            store,
             turn_id=turn_id,
             tool_call_id="canonical-call",
             tool_name="read_file",
@@ -607,14 +640,16 @@ def test_canonical_history_replays_with_persisted_public_ids(
             "error_code": None,
             "requires_reconciliation": False,
         }
-        store.record_tool_execution_state(status="prepared", **values)
-        store.record_tool_execution_state(status="ready", **values)
-        claim = store.claim_tool_operation(
+        tool_ops.record_tool_execution_state(store, status="prepared", **values)
+        tool_ops.record_tool_execution_state(store, status="ready", **values)
+        claim = tool_ops.claim_tool_operation(
+            store,
             operation_id="canonical-operation",
             worker_id="canonical-worker",
             lease_seconds=30.0,
         )
-        assert store.commit_tool_operation_outcome(
+        assert tool_ops.commit_tool_operation_outcome(
+            store,
             operation_id="canonical-operation",
             claim_generation=claim.claim_generation,
             fencing_token=str(claim.fencing_token),
@@ -623,7 +658,8 @@ def test_canonical_history_replays_with_persisted_public_ids(
             error_code=None,
             requires_reconciliation=False,
         )
-        store.record_tool_result(
+        tool_ops.record_tool_result(
+            store,
             turn_id=turn_id,
             operation_id="canonical-operation",
             result={
@@ -646,26 +682,21 @@ def test_canonical_history_replays_with_persisted_public_ids(
         first_replay = RolloutEventReader(store).read(thread_id)
         # A fresh reader per record exercises stateless, cross-batch identity
         # resolution, rather than relying on a warmed in-memory projection.
-        live = tuple(event for record in store.list_records(thread_id)
-                     for event in RolloutEventReader(store).project_committed_batch((record,)))
+        live = tuple(
+            event
+            for record in store.list_records(thread_id)
+            for event in RolloutEventReader(store).project_committed_batch((record,))
+        )
         assert [(event.cursor, replace(event.event, sequence=0)) for event in live] == [
             (event.cursor, replace(event.event, sequence=0)) for event in first_replay
         ]
 
-    with RuntimeState.open_sync(database) as reopened:
+    with RuntimeStore.open_sync(database) as reopened:
         assert reopened.verify().valid is True
         second_replay = RolloutEventReader(reopened).read(thread_id)
 
-    first_items = [
-        result.event
-        for result in first_replay
-        if result.event.item_kind is not None
-    ]
-    second_items = [
-        result.event
-        for result in second_replay
-        if result.event.item_kind is not None
-    ]
+    first_items = [result.event for result in first_replay if result.event.item_kind is not None]
+    second_items = [result.event for result in second_replay if result.event.item_kind is not None]
     assert [(event.type, event.item_kind, event.item_id) for event in first_items] == [
         (event.type, event.item_kind, event.item_id) for event in second_items
     ]
@@ -678,7 +709,7 @@ def test_canonical_history_replays_with_persisted_public_ids(
 def test_canonical_model_response_projects_one_message(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread_id, turn_id = _start_turn(store, workspace)
         _complete_model_response(store, turn_id=turn_id, text="model answer")
         response = next(item for item in store.list_items(turn_id) if item.kind == "model_response")
@@ -687,8 +718,11 @@ def test_canonical_model_response_projects_one_message(tmp_path: Path) -> None:
         assert response.payload["outputs"][0]["content"] == "model answer"
         replayed = RolloutEventReader(store).read(thread_id)
 
-    messages = [result.event for result in replayed
-                if result.event.item_kind is not None and result.event.item_kind.value == "agent_message"]
+    messages = [
+        result.event
+        for result in replayed
+        if result.event.item_kind is not None and result.event.item_kind.value == "agent_message"
+    ]
     assert [event.type.value for event in messages] == ["item_started", "item_completed"]
     assert messages[-1].data["content"] == "model answer"
 
@@ -697,12 +731,12 @@ def test_canonical_model_response_preserves_public_identity_after_rebuild(tmp_pa
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RuntimeState.open_sync(database) as store:
+    with RuntimeStore.open_sync(database) as store:
         thread_id, turn_id = _start_turn(store, workspace)
         _complete_model_response(store, turn_id=turn_id, text="canonical persisted answer")
         first_replay = RolloutEventReader(store).read(thread_id)
 
-    with RuntimeState.open_sync(database) as reopened:
+    with RuntimeStore.open_sync(database) as reopened:
         reopened.rebuild_projections()
         assert reopened.verify().valid is True
         replayed = RolloutEventReader(reopened).read(thread_id)
@@ -710,7 +744,10 @@ def test_canonical_model_response_preserves_public_identity_after_rebuild(tmp_pa
     assert [(event.cursor, replace(event.event, sequence=0)) for event in replayed] == [
         (event.cursor, replace(event.event, sequence=0)) for event in first_replay
     ]
-    messages = [result.event for result in replayed
-                if result.event.item_kind is not None and result.event.item_kind.value == "agent_message"]
+    messages = [
+        result.event
+        for result in replayed
+        if result.event.item_kind is not None and result.event.item_kind.value == "agent_message"
+    ]
     assert [event.type.value for event in messages] == ["item_started", "item_completed"]
     assert messages[-1].data["content"] == "canonical persisted answer"

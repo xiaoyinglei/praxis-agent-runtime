@@ -77,9 +77,7 @@ class DiscoveringKnowledgeModel(KnowledgeModel):
         self.visible_tools: list[tuple[str, ...]] = []
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
-        self.visible_tools.append(
-            tuple(tool.definition.name for tool in request.tools)
-        )
+        self.visible_tools.append(tuple(tool.definition.name for tool in request.tools))
         return super().prepare(request)
 
     async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
@@ -166,19 +164,13 @@ async def test_configured_knowledge_uses_the_durable_harness_tool_path(
         [operation] = runtime.store.list_tool_operations(result.turn_id)
         assert operation.tool_name == "search_knowledge"
         assert operation.status == "succeeded"
-        [tool_result] = [
-            item
-            for item in runtime.store.list_items(result.turn_id)
-            if item.kind == "tool_result"
-        ]
-        assert tool_result.payload["structured_content"]["citations"] == [
-            "doc-1#fact"
-        ]
+        [tool_result] = [item for item in runtime.store.list_items(result.turn_id) if item.kind == "tool_result"]
+        assert tool_result.payload["structured_content"]["citations"] == ["doc-1#fact"]
         binding = runtime.store.read_turn(result.turn_id).binding_manifest
         assert binding["knowledge_revision"] == "rag-corpus-v7"
         assert binding["tool_execution_revisions"] == {
             "search_knowledge": "integration-search-knowledge-v1:rag-corpus-v7",
-            "read_context": "context-recall-v5"
+            "read_context": "context-recall-v5",
         }
         public = AgentResult._from_harness(result, store=runtime.store)
         [public_call] = public.tool_calls
@@ -199,7 +191,9 @@ async def test_configured_knowledge_uses_the_durable_harness_tool_path(
 @pytest.mark.anyio
 @pytest.mark.parametrize("groundedness,insufficient", [(True, False), (False, True)])
 async def test_tool_grounding_flags_do_not_judge_the_final_answer(
-    tmp_path: Path, groundedness: bool, insufficient: bool,
+    tmp_path: Path,
+    groundedness: bool,
+    insufficient: bool,
 ) -> None:
     class ContradictingModel(KnowledgeModel):
         async def dispatch(self, prepared, *, event_sink: object = None):
@@ -207,7 +201,8 @@ async def test_tool_grounding_flags_do_not_judge_the_final_answer(
             if response.tool_calls:
                 return response
             return HarnessModelResponse.from_parts(
-                text="The retained fact is false.", provider_response_id="contradiction",
+                text="The retained fact is false.",
+                provider_response_id="contradiction",
                 usage={"input_tokens": 8, "output_tokens": 4},
             )
 
@@ -219,9 +214,12 @@ async def test_tool_grounding_flags_do_not_judge_the_final_answer(
         )
 
     async with await Session.open(
-        database=tmp_path / "rollout.sqlite3", workspace=tmp_path,
-        model=ContradictingModel(), completion_gate=AcceptGroundedAnswer(),
-        knowledge_runner=search, knowledge_revision="fixture-v1",
+        database=tmp_path / "rollout.sqlite3",
+        workspace=tmp_path,
+        model=ContradictingModel(),
+        completion_gate=AcceptGroundedAnswer(),
+        knowledge_runner=search,
+        knowledge_revision="fixture-v1",
         knowledge_config={"corpus": "fixture"},
     ) as runtime:
         result = await runtime.submit("answer from knowledge")
@@ -238,28 +236,37 @@ async def test_tool_grounding_flags_do_not_judge_the_final_answer(
 @pytest.mark.anyio
 @pytest.mark.parametrize("doc_id", [None, "policy-v3", "001", 7])
 async def test_public_knowledge_evidence_preserves_document_identifiers(
-    tmp_path: Path, doc_id: str | int | None,
+    tmp_path: Path,
+    doc_id: str | int | None,
 ) -> None:
     from agent_runtime import Agent
     from agent_runtime.knowledge import agent_citation_from_value
 
     async def search(_payload, execution_context):
         evidence = {
-            "evidence_id": "evidence-1", "citation_anchor": "fact#1",
-            "text": "The retained fact", "score": 0.9,
+            "evidence_id": "evidence-1",
+            "citation_anchor": "fact#1",
+            "text": "The retained fact",
+            "score": 0.9,
         }
         if doc_id is not None:
             evidence["doc_id"] = doc_id
-        return KnowledgeSearchOutput.model_validate({
-            "results": [evidence],
-            "citations": ["fact#1"],
-        })
+        return KnowledgeSearchOutput.model_validate(
+            {
+                "results": [evidence],
+                "citations": ["fact#1"],
+            }
+        )
 
     database = tmp_path / "rollout.sqlite3"
     async with await Session.open(
-        database=database, workspace=tmp_path, model=KnowledgeModel(),
-        completion_gate=AcceptGroundedAnswer(), knowledge_runner=search,
-        knowledge_revision="fixture-v1", knowledge_config={"corpus": "fixture"},
+        database=database,
+        workspace=tmp_path,
+        model=KnowledgeModel(),
+        completion_gate=AcceptGroundedAnswer(),
+        knowledge_runner=search,
+        knowledge_revision="fixture-v1",
+        knowledge_config={"corpus": "fixture"},
     ) as runtime:
         result = await runtime.submit("answer from knowledge")
         assert result.status == "done"
@@ -315,8 +322,7 @@ async def test_discoverable_knowledge_is_hidden_until_find_tools_result_is_commi
             ("find_tools", "read_context", "search_knowledge"),
         ]
         assert [
-            (operation.tool_name, operation.status)
-            for operation in runtime.store.list_tool_operations(result.turn_id)
+            (operation.tool_name, operation.status) for operation in runtime.store.list_tool_operations(result.turn_id)
         ] == [
             ("find_tools", "succeeded"),
             ("search_knowledge", "succeeded"),

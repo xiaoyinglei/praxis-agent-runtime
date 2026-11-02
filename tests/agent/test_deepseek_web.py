@@ -26,8 +26,12 @@ def hosted_tools(handler, *, before_request=None, sources=None, **client_options
 
     client = PublicWebClient(transport=httpx.MockTransport(handler), **client_options)
     tools = create_web_tools(
-        client, save_source=save, load_source=sources.__getitem__,
-        search_provider="deepseek", search_key="fake-deepseek-secret", before_request=before_request,
+        client,
+        save_source=save,
+        load_source=sources.__getitem__,
+        search_provider="deepseek",
+        search_key="fake-deepseek-secret",
+        before_request=before_request,
     )
     return {tool.definition.name: tool for tool in tools}, client, sources
 
@@ -45,19 +49,22 @@ async def test_open_uses_official_fetch_and_find_continues_saved_markdown_withou
     hits, reservations = [], []
     markdown = "# Guide\n\nIntro\n\n## API\n\nTarget endpoint\n\n[Reference](/reference)\n"
     payload = {"title": "Guide", "content": markdown}
-    tools, client, sources = hosted_tools(lambda req: hits.append(req) or httpx.Response(200, json=payload),
-                                         before_request=lambda: reservations.append(True))
+    tools, client, sources = hosted_tools(
+        lambda req: hits.append(req) or httpx.Response(200, json=payload),
+        before_request=lambda: reservations.append(True),
+    )
     try:
         args = {"url": "https://example.com/guide", "max_lines": 2}
         tool = tools["web_fetch"]
         executor = ToolExecutor(tools)
         blocked = await executor.execute(call("web_fetch", args), context=ToolExecutionContext())
         assert blocked.result.error_code == "approval_required" and hits == reservations == []
-        result = await executor.execute(call("web_fetch", args, "allowed"),
-                                        context=ToolExecutionContext(allow_web_tools=True))
+        result = await executor.execute(
+            call("web_fetch", args, "allowed"), context=ToolExecutionContext(allow_web_tools=True)
+        )
         assert not result.result.is_error, result.result.error_message
         output = result.result.structured_content
-        req, = hits
+        (req,) = hits
         assert req.method == "POST" and str(req.url) == "https://api.deepseek.com/v1/tools/fetch"
         assert json.loads(req.content) == {"url": args["url"]}
         assert req.headers["Authorization"] == "Bearer fake-deepseek-secret"
@@ -96,8 +103,9 @@ async def test_open_uses_official_fetch_and_find_continues_saved_markdown_withou
 @pytest.mark.parametrize("status", [401, 402, 403, 404, 429, 504])
 async def test_hosted_fetch_http_failure_never_falls_back_to_origin_or_browser(status):
     hits = []
-    tools, client, sources = hosted_tools(lambda req: hits.append(req) or httpx.Response(
-        status, json={"error": {"message": "fake-deepseek-secret"}}))
+    tools, client, sources = hosted_tools(
+        lambda req: hits.append(req) or httpx.Response(status, json={"error": {"message": "fake-deepseek-secret"}})
+    )
     try:
         result = await tools["web_fetch"].run({"url": "https://example.com/doc"})
         assert result["error_code"] == "http_error" and str(status) in result["error_message"]
@@ -109,9 +117,17 @@ async def test_hosted_fetch_http_failure_never_falls_back_to_origin_or_browser(s
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("payload", [{}, [], {"title": "Doc", "content": 42},
-    {"title": 42, "content": "Text"}, {"title": "Doc", "content": ""},
-    {"title": "Doc", "content": "Text", "extra": "fake-deepseek-secret"}])
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        [],
+        {"title": "Doc", "content": 42},
+        {"title": 42, "content": "Text"},
+        {"title": "Doc", "content": ""},
+        {"title": "Doc", "content": "Text", "extra": "fake-deepseek-secret"},
+    ],
+)
 async def test_hosted_fetch_malformed_or_empty_payload_is_not_a_successful_snapshot(payload):
     tools, client, sources = hosted_tools(lambda _: httpx.Response(200, json=payload))
     try:
@@ -133,9 +149,16 @@ async def test_hosted_fetch_budget_and_render_controls_are_checked_before_reques
 
     tools, client, _ = hosted_tools(lambda _: pytest.fail("Unexpected request"), before_request=exhausted)
     try:
-        result = await ToolExecutor(tools).execute(call("web_fetch", {
-            "url": "https://example.com/doc", "render": True,
-        }), context=ToolExecutionContext(allow_web_tools=True))
+        result = await ToolExecutor(tools).execute(
+            call(
+                "web_fetch",
+                {
+                    "url": "https://example.com/doc",
+                    "render": True,
+                },
+            ),
+            context=ToolExecutionContext(allow_web_tools=True),
+        )
         assert result.result.error_code == "web_request_budget_exceeded" and reservations == [True]
         output = await tools["web_fetch"].run({"url": "https://example.com/doc"})
         assert output["error_code"] == "web_request_budget_exceeded" and not output["request_attempted"]
@@ -148,8 +171,9 @@ async def test_hosted_fetch_budget_and_render_controls_are_checked_before_reques
 async def test_hosted_fetch_timeout_and_cancellation_close_stream_without_snapshot():
     for cancel in (False, True):
         stream = _Stream([b"{}"], delay=60)
-        tools, client, sources = hosted_tools(lambda _, body=stream: httpx.Response(200, stream=body),
-                                              timeout_seconds=60 if cancel else 0.01)
+        tools, client, sources = hosted_tools(
+            lambda _, body=stream: httpx.Response(200, stream=body), timeout_seconds=60 if cancel else 0.01
+        )
         try:
             task = asyncio.create_task(tools["web_fetch"].run({"url": "https://example.com/doc"}))
             await stream.started.wait()
@@ -186,12 +210,15 @@ async def test_hosted_fetch_network_error_does_not_contact_origin():
 async def test_hosted_fetch_enforces_target_and_service_permissions_before_budget(tmp_path, denied):
     from agent_runtime.permission_policy import NetworkPolicy, PermissionPolicy
 
-    tools, client, _ = hosted_tools(lambda _: pytest.fail("Unexpected request"),
-                                    before_request=lambda: pytest.fail("Unexpected reservation"))
+    tools, client, _ = hosted_tools(
+        lambda _: pytest.fail("Unexpected request"), before_request=lambda: pytest.fail("Unexpected reservation")
+    )
     policy = PermissionPolicy(network=NetworkPolicy(decision="allow", denied_domains=(denied,))).resolve(tmp_path)
     try:
-        result = await ToolExecutor(tools).execute(call("web_fetch", {"url": "https://example.com/doc"}),
-            context=ToolExecutionContext(permissions=policy, allow_web_tools=True))
+        result = await ToolExecutor(tools).execute(
+            call("web_fetch", {"url": "https://example.com/doc"}),
+            context=ToolExecutionContext(permissions=policy, allow_web_tools=True),
+        )
         assert result.result.is_error and result.trace.decision == "deny"
     finally:
         await client.aclose()
@@ -208,8 +235,9 @@ async def test_hosted_fetch_retains_source_limit_and_byte_budget_pagination():
         assert output["source_truncated"] and output["truncated"] and output["next_line"] is not None
         snapshot = json.loads(sources[output["source_id"]])
         assert len(snapshot["text"]) == MAX_SOURCE_CHARACTERS
-        next_page = await tools["web_fetch"].run({"source_id": output["source_id"],
-            "start_line": output["next_line"], "max_bytes": 4096})
+        next_page = await tools["web_fetch"].run(
+            {"source_id": output["source_id"], "start_line": output["next_line"], "max_bytes": 4096}
+        )
         assert next_page["content_hash"] == output["content_hash"] and not next_page["request_attempted"]
     finally:
         await client.aclose()
@@ -219,19 +247,34 @@ async def test_hosted_fetch_retains_source_limit_and_byte_budget_pagination():
 async def test_hosted_sdk_resume_and_new_session_find_keep_snapshot_identity(tmp_path, monkeypatch):
     import agent_runtime.tools.web_http as http_module
     from agent_runtime import Agent
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
     from tests.agent.test_web_product import FetchThenAnswer
 
     hits = []
     real_client = PublicWebClient
-    monkeypatch.setattr(http_module, "PublicWebClient", lambda **options: real_client(
-        **options, transport=httpx.MockTransport(lambda req: hits.append(req) or httpx.Response(
-            200, json={"title": "Doc", "content": "# Doc\n\nTarget evidence"}))))
+    monkeypatch.setattr(
+        http_module,
+        "PublicWebClient",
+        lambda **options: real_client(
+            **options,
+            transport=httpx.MockTransport(
+                lambda req: (
+                    hits.append(req)
+                    or httpx.Response(200, json={"title": "Doc", "content": "# Doc\n\nTarget evidence"})
+                )
+            ),
+        ),
+    )
     key = tmp_path / "search.key"
     key.write_text("fake-deepseek-secret")
     key.chmod(0o400)
-    options = dict(workspace_path=tmp_path / "workspace", checkpoint_db=tmp_path / "state.sqlite",
-                   enable_workspace_mcp=False, web_search_provider="deepseek", web_search_key_file=key)
+    options = dict(
+        workspace_path=tmp_path / "workspace",
+        checkpoint_db=tmp_path / "state.sqlite",
+        enable_workspace_mcp=False,
+        web_search_provider="deepseek",
+        web_search_key_file=key,
+    )
     first = Agent(**options)
     monkeypatch.setattr(first, "_model_factory", lambda: FetchThenAnswer({"url": "https://example.com/doc"}))
     paused = await first.run("Read public docs", require_workspace_change=False)
@@ -240,7 +283,7 @@ async def test_hosted_sdk_resume_and_new_session_find_keep_snapshot_identity(tmp
     monkeypatch.setattr(second, "_model_factory", lambda: FetchThenAnswer({"url": "https://example.com/doc"}))
     opened = await second.resume(paused.turn_id, "allow_once")
     assert opened.status == "done" and len(hits) == 1
-    async with (await RuntimeState.open(options["checkpoint_db"])) as store:
+    async with await RuntimeStore.open(options["checkpoint_db"]) as store:
         items = store.list_items(opened.turn_id)
         output = next(item.payload["structured_content"] for item in items if item.kind == "tool_result")
         source_id = output["source_id"]
@@ -253,9 +296,10 @@ async def test_hosted_sdk_resume_and_new_session_find_keep_snapshot_identity(tmp
     monkeypatch.setattr(third, "_model_factory", lambda: FetchThenAnswer({"source_id": source_id, "find": "Target"}))
     found = await third.run("Find in the saved source", require_workspace_change=False)
     assert found.status == "done" and len(hits) == 1
-    async with (await RuntimeState.open(options["checkpoint_db"])) as store:
-        output = next(item.payload["structured_content"] for item in store.list_items(found.turn_id)
-                      if item.kind == "tool_result")
+    async with await RuntimeStore.open(options["checkpoint_db"]) as store:
+        output = next(
+            item.payload["structured_content"] for item in store.list_items(found.turn_id) if item.kind == "tool_result"
+        )
         assert output["source_id"] == source_id and output["content_hash"] == digest
         assert output["request_budget"]["used"] == 0 and output["start_line"] == 3
         assert "Target evidence" in output["content"] and store.verify().valid

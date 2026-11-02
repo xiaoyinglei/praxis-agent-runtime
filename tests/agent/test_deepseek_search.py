@@ -17,8 +17,12 @@ from tests.agent.test_web_tools import call
 def deepseek_tools(handler, *, before_request=None, **client_options):
     client = PublicWebClient(transport=httpx.MockTransport(handler), **client_options)
     tools = create_web_tools(
-        client, save_source=lambda _: "", load_source=lambda _: b"",
-        search_provider="deepseek", search_key="fake-deepseek-secret", before_request=before_request,
+        client,
+        save_source=lambda _: "",
+        load_source=lambda _: b"",
+        search_provider="deepseek",
+        search_key="fake-deepseek-secret",
+        before_request=before_request,
     )
     return {tool.definition.name: tool for tool in tools}, client
 
@@ -26,29 +30,58 @@ def deepseek_tools(handler, *, before_request=None, **client_options):
 @pytest.mark.anyio
 async def test_deepseek_official_search_preserves_query_sources_and_uses_existing_permissions():
     hits, reservations = [], []
-    tools, client = deepseek_tools(lambda req: hits.append(req) or httpx.Response(200, json={"results": [
-        {"title": "Docs", "url": "https://example.com/docs", "snippet": "Short", "summary": "Long summary",
-         "content": "Not requested", "date": "2026-10-25T08:00:00Z", "authority": -1},
-        {"title": "Private", "url": "http://127.0.0.1/secret", "snippet": "Private", "summary": "Private"},
-    ]}), before_request=lambda: reservations.append(True))
+    tools, client = deepseek_tools(
+        lambda req: (
+            hits.append(req)
+            or httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "title": "Docs",
+                            "url": "https://example.com/docs",
+                            "snippet": "Short",
+                            "summary": "Long summary",
+                            "content": "Not requested",
+                            "date": "2026-10-25T08:00:00Z",
+                            "authority": -1,
+                        },
+                        {
+                            "title": "Private",
+                            "url": "http://127.0.0.1/secret",
+                            "snippet": "Private",
+                            "summary": "Private",
+                        },
+                    ]
+                },
+            )
+        ),
+        before_request=lambda: reservations.append(True),
+    )
     try:
-        query = ' Python OR Rust site:example.com after:2026-10-01 '
+        query = " Python OR Rust site:example.com after:2026-10-01 "
         tool = tools["web_search"]
         executor = ToolExecutor(tools)
         denied = await executor.execute(call("web_search", {"query": query}), context=ToolExecutionContext())
         assert denied.result.error_code == "approval_required"
         assert hits == reservations == []
-        result = await executor.execute(call("web_search", {"query": query}, "allowed"),
-                                        context=ToolExecutionContext(allow_web_tools=True))
+        result = await executor.execute(
+            call("web_search", {"query": query}, "allowed"), context=ToolExecutionContext(allow_web_tools=True)
+        )
         assert not result.result.is_error
         output = result.result.structured_content
         assert output["provider"] == "deepseek"
-        assert list(output["results"]) == [{
-            "title": "Docs", "url": "https://example.com/docs", "snippet": "Short",
-            "summary": "Long summary", "published_at": "2026-10-25T08:00:00Z",
-        }]
+        assert list(output["results"]) == [
+            {
+                "title": "Docs",
+                "url": "https://example.com/docs",
+                "snippet": "Short",
+                "summary": "Long summary",
+                "published_at": "2026-10-25T08:00:00Z",
+            }
+        ]
         assert output["request_attempted"] and output["network_bytes"] > 0
-        req, = hits
+        (req,) = hits
         assert req.method == "POST"
         assert str(req.url) == "https://api.deepseek.com/v1/tools/search"
         assert req.headers["Authorization"] == "Bearer fake-deepseek-secret"
@@ -64,11 +97,11 @@ async def test_deepseek_official_search_preserves_query_sources_and_uses_existin
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("arguments", [{"query": " "}, {"query": "查" * 129},
-                                        {"query": "docs", "freshness": "pw"}])
+@pytest.mark.parametrize("arguments", [{"query": " "}, {"query": "查" * 129}, {"query": "docs", "freshness": "pw"}])
 async def test_deepseek_rejects_unsupported_input_before_permission_budget_and_network(arguments):
-    tools, client = deepseek_tools(lambda _: pytest.fail("Unexpected request"),
-                                   before_request=lambda: pytest.fail("Unexpected budget reservation"))
+    tools, client = deepseek_tools(
+        lambda _: pytest.fail("Unexpected request"), before_request=lambda: pytest.fail("Unexpected budget reservation")
+    )
     try:
         result = await ToolExecutor(tools).execute(call("web_search", arguments), context=ToolExecutionContext())
         assert result.result.is_error and result.result.error_code == "invalid_arguments"
@@ -92,8 +125,9 @@ async def test_deepseek_empty_results_are_success_without_generated_answer():
 @pytest.mark.parametrize("status", [400, 401, 402, 403, 429, 500, 504])
 async def test_deepseek_http_error_is_not_empty_success_or_fallback(status):
     hits = []
-    tools, client = deepseek_tools(lambda req: hits.append(req) or httpx.Response(
-        status, json={"error": {"message": "fake-deepseek-secret"}}))
+    tools, client = deepseek_tools(
+        lambda req: hits.append(req) or httpx.Response(status, json={"error": {"message": "fake-deepseek-secret"}})
+    )
     try:
         result = await tools["web_search"].run({"query": "docs"})
         assert result["error_code"] == "http_error"
@@ -106,10 +140,18 @@ async def test_deepseek_http_error_is_not_empty_success_or_fallback(status):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("payload", [{}, {"results": {}}, {"results": [{"url": "https://example.com"}]},
-    {"results": [42]}, {"results": [{"title": "Docs", "snippet": "Text"}]},
-    {"results": [{"url": "https://example.com", "title": "Doc", "snippet": 42}]},
-    {"results": [], "extra": "fake-deepseek-secret"}])
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"results": {}},
+        {"results": [{"url": "https://example.com"}]},
+        {"results": [42]},
+        {"results": [{"title": "Docs", "snippet": "Text"}]},
+        {"results": [{"url": "https://example.com", "title": "Doc", "snippet": 42}]},
+        {"results": [], "extra": "fake-deepseek-secret"},
+    ],
+)
 async def test_deepseek_invalid_payload_is_not_evidence(payload):
     tools, client = deepseek_tools(lambda _: httpx.Response(200, json=payload))
     try:
@@ -142,12 +184,27 @@ async def test_deepseek_network_failure_can_retry_without_switching_provider():
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("summary,expected_truncated", [("Evidence " * 500, False), ("证据" * 20_000, True)],
-                         ids=["full-summary", "budgeted-summary"])
+@pytest.mark.parametrize(
+    "summary,expected_truncated",
+    [("Evidence " * 500, False), ("证据" * 20_000, True)],
+    ids=["full-summary", "budgeted-summary"],
+)
 async def test_deepseek_long_summary_uses_output_budget_instead_of_rejecting_valid_results(summary, expected_truncated):
-    tools, client = deepseek_tools(lambda _: httpx.Response(200, json={"results": [{
-        "title": "Doc", "url": "https://example.com/doc", "snippet": "Short", "summary": summary,
-    }]}))
+    tools, client = deepseek_tools(
+        lambda _: httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "title": "Doc",
+                        "url": "https://example.com/doc",
+                        "snippet": "Short",
+                        "summary": summary,
+                    }
+                ]
+            },
+        )
+    )
     try:
         output = await tools["web_search"].run({"query": "public docs"})
         assert output["error_code"] is None and output["result_status"] == "results"
@@ -198,26 +255,41 @@ async def test_deepseek_timeout_and_cancellation_close_stream():
         await client.aclose()
 
 
-@pytest.mark.parametrize("tool_name,arguments,response", [
-    ("web_search", {"query": "public docs"}, {"results": [
-        {"url": "https://example.com/docs", "title": "Docs", "snippet": "Evidence"}]}),
-    ("web_fetch", {"url": "https://example.com/docs"}, {"title": "Docs", "content": "# Docs\n\nEvidence"}),
-])
+@pytest.mark.parametrize(
+    "tool_name,arguments,response",
+    [
+        (
+            "web_search",
+            {"query": "public docs"},
+            {"results": [{"url": "https://example.com/docs", "title": "Docs", "snippet": "Evidence"}]},
+        ),
+        ("web_fetch", {"url": "https://example.com/docs"}, {"title": "Docs", "content": "# Docs\n\nEvidence"}),
+    ],
+)
 def test_deepseek_cli_runs_real_agent_tool_and_persists_sources(
-    tmp_path, monkeypatch, tool_name, arguments, response,
+    tmp_path,
+    monkeypatch,
+    tool_name,
+    arguments,
+    response,
 ):
     from typer.testing import CliRunner
 
     import agent_runtime.tools.web_http as http_module
     from agent_runtime import Agent
     from agent_runtime.cli import agent_app
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
     from tests.agent.test_web_product import FetchThenAnswer
 
     hits = []
     real_client = PublicWebClient
-    monkeypatch.setattr(http_module, "PublicWebClient", lambda **options: real_client(
-        **options, transport=httpx.MockTransport(lambda req: hits.append(req) or httpx.Response(200, json=response))))
+    monkeypatch.setattr(
+        http_module,
+        "PublicWebClient",
+        lambda **options: real_client(
+            **options, transport=httpx.MockTransport(lambda req: hits.append(req) or httpx.Response(200, json=response))
+        ),
+    )
     initialize = Agent.__init__
 
     def scripted_agent(self, *args, **kwargs):
@@ -231,13 +303,22 @@ def test_deepseek_cli_runs_real_agent_tool_and_persists_sources(
     key = tmp_path / "search.key"
     key.write_text("fake-deepseek-secret")
     key.chmod(0o400)
-    result = CliRunner().invoke(agent_app, [
-        "run", "Search public docs", "--non-interactive", "--no-require-workspace-change",
-        "--web-search-provider", "deepseek", "--web-search-key-file", str(key),
-    ])
+    result = CliRunner().invoke(
+        agent_app,
+        [
+            "run",
+            "Search public docs",
+            "--non-interactive",
+            "--no-require-workspace-change",
+            "--web-search-provider",
+            "deepseek",
+            "--web-search-key-file",
+            str(key),
+        ],
+    )
     assert result.exit_code == 0, result.output
     assert len(hits) == 1 and hits[0].url.host == "api.deepseek.com"
-    with RuntimeState.open_sync(workspace / ".praxis/checkpoints.sqlite") as store:
+    with RuntimeStore.open_sync(workspace / ".praxis/checkpoints.sqlite") as store:
         turn = store.list_turns()[0]
         items = store.list_items(turn.turn_id)
         output = next(item.payload["structured_content"] for item in items if item.kind == "tool_result")

@@ -9,9 +9,12 @@ import pytest
 
 from agent_runtime.harness import (
     RolloutEventReader,
-    RuntimeState,
+    RuntimeStore,
     ToolOrchestrator,
     ToolReconciliationOutcome,
+    model_ops,
+    tool_ops,
+    turn_ops,
 )
 from agent_runtime.streaming.events import EventType, ItemStatus, TurnItemKind
 from agent_runtime.tools.permissions import ToolExecutionContext
@@ -27,9 +30,10 @@ def test_reconciliation_item_parents_unknown_attempt_without_rerun(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     runner_calls = 1
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="reconcile an uncertain write",
             binding_manifest={"model_id": "test-model"},
@@ -46,14 +50,16 @@ def test_reconciliation_item_parents_unknown_attempt_without_rerun(
             "error_code": None,
             "requires_reconciliation": False,
         }
-        store.record_tool_execution_state(status="prepared", **values)
-        store.record_tool_execution_state(status="ready", **values)
-        claim = store.claim_tool_operation(
+        tool_ops.record_tool_execution_state(store, status="prepared", **values)
+        tool_ops.record_tool_execution_state(store, status="ready", **values)
+        claim = tool_ops.claim_tool_operation(
+            store,
             operation_id="operation-unknown",
             worker_id="worker-a",
             lease_seconds=30.0,
         )
-        assert store.commit_tool_operation_result(
+        assert tool_ops.commit_tool_operation_result(
+            store,
             turn_id=turn.turn_id,
             operation_id="operation-unknown",
             claim_generation=claim.claim_generation,
@@ -74,8 +80,7 @@ def test_reconciliation_item_parents_unknown_attempt_without_rerun(
         original_completed = next(
             replay.event
             for replay in RolloutEventReader(store).read(thread.thread_id)
-            if replay.event.type is EventType.ITEM_COMPLETED
-            and replay.event.item_kind is TurnItemKind.TOOL
+            if replay.event.type is EventType.ITEM_COMPLETED and replay.event.item_kind is TurnItemKind.TOOL
         )
         assert original_completed.status is ItemStatus.OUTCOME_UNKNOWN
 
@@ -99,22 +104,14 @@ def test_reconciliation_item_parents_unknown_attempt_without_rerun(
                 ),
             ),
         )
-        public = [
-            replay.event
-            for replay in RolloutEventReader(store).read(thread.thread_id)
-        ]
+        public = [replay.event for replay in RolloutEventReader(store).read(thread.thread_id)]
 
         original_completions = [
             event
             for event in public
-            if event.type is EventType.ITEM_COMPLETED
-            and event.item_id == original_completed.item_id
+            if event.type is EventType.ITEM_COMPLETED and event.item_id == original_completed.item_id
         ]
-        reconciliation = [
-            event
-            for event in public
-            if event.item_kind is TurnItemKind.RECONCILIATION
-        ]
+        reconciliation = [event for event in public if event.item_kind is TurnItemKind.RECONCILIATION]
         assert runner_calls == 1
         assert len(original_completions) == 1
         assert original_completions[0].status is ItemStatus.OUTCOME_UNKNOWN
@@ -122,10 +119,7 @@ def test_reconciliation_item_parents_unknown_attempt_without_rerun(
             EventType.ITEM_STARTED,
             EventType.ITEM_COMPLETED,
         ]
-        assert all(
-            event.parent_item_id == original_completed.item_id
-            for event in reconciliation
-        )
+        assert all(event.parent_item_id == original_completed.item_id for event in reconciliation)
         assert reconciliation[0].item_id != original_completed.item_id
         assert store.verify().valid is True
 
@@ -136,24 +130,27 @@ def test_fresh_process_interrupts_a_pre_dispatch_orphan_only_after_maintenance(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RuntimeState.open_sync(database) as crashed_process:
-        thread = crashed_process.create_thread(workspace=workspace)
-        turn = crashed_process.start_turn(
+    with RuntimeStore.open_sync(database) as crashed_process:
+        thread = turn_ops.create_thread(crashed_process, workspace=workspace)
+        turn = turn_ops.start_turn(
+            crashed_process,
             thread_id=thread.thread_id,
             user_message="crash after Turn creation",
             binding_manifest={"model_id": "model-v1"},
         )
 
-    with RuntimeState.open_sync(database) as recovery_process:
+    with RuntimeStore.open_sync(database) as recovery_process:
         with pytest.raises(RuntimeError, match="maintenance confirmation"):
-            recovery_process.interrupt_orphaned_turn(
+            turn_ops.interrupt_orphaned_turn(
+                recovery_process,
                 turn_id=turn.turn_id,
                 reason="operator observed the old worker is stopped",
                 maintenance_confirmed=False,
             )
         assert recovery_process.read_turn(turn.turn_id).status == "running"
 
-        interrupted = recovery_process.interrupt_orphaned_turn(
+        interrupted = turn_ops.interrupt_orphaned_turn(
+            recovery_process,
             turn_id=turn.turn_id,
             reason="operator observed the old worker is stopped",
             maintenance_confirmed=True,
@@ -172,14 +169,16 @@ def test_orphan_recovery_refuses_any_turn_with_a_durable_operation(tmp_path: Pat
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RuntimeState.open_sync(database) as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    with RuntimeStore.open_sync(database) as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="operation already prepared",
             binding_manifest={"model_id": "model-v1"},
         )
-        store.prepare_model_operation(
+        model_ops.prepare_model_operation(
+            store,
             turn_id=turn.turn_id,
             request_hash="r" * 64,
             context_hash="c" * 64,
@@ -188,9 +187,10 @@ def test_orphan_recovery_refuses_any_turn_with_a_durable_operation(tmp_path: Pat
             request_ref={"input_revision": 1, "request_id": "request-1"},
         )
 
-    with RuntimeState.open_sync(database) as recovery_process:
+    with RuntimeStore.open_sync(database) as recovery_process:
         with pytest.raises(RuntimeError, match="durable operations"):
-            recovery_process.interrupt_orphaned_turn(
+            turn_ops.interrupt_orphaned_turn(
+                recovery_process,
                 turn_id=turn.turn_id,
                 reason="worker stopped",
                 maintenance_confirmed=True,
@@ -204,9 +204,10 @@ def test_recovery_cli_records_an_interrupted_turn_in_a_fresh_process(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RuntimeState.open_sync(database) as crashed_process:
-        thread = crashed_process.create_thread(workspace=workspace)
-        turn = crashed_process.start_turn(
+    with RuntimeStore.open_sync(database) as crashed_process:
+        thread = turn_ops.create_thread(crashed_process, workspace=workspace)
+        turn = turn_ops.start_turn(
+            crashed_process,
             thread_id=thread.thread_id,
             user_message="crash before provider I/O",
             binding_manifest={"model_id": "model-v1"},
@@ -236,6 +237,6 @@ def test_recovery_cli_records_an_interrupted_turn_in_a_fresh_process(
         "thread_id": thread.thread_id,
         "turn_id": turn.turn_id,
     }
-    with RuntimeState.open_sync(database) as verified:
+    with RuntimeStore.open_sync(database) as verified:
         assert verified.read_turn(turn.turn_id).status == "interrupted"
         assert verified.verify().valid is True

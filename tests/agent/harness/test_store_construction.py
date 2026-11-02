@@ -27,7 +27,7 @@ def test_bare_store_rejects_operations_and_closes_safely(tmp_path):
     store = RolloutStore()
     try:
         with pytest.raises(RuntimeError, match="not opened"):
-            store.rows('threads')
+            store.rows("threads")
         with pytest.raises(RuntimeError, match="not opened"):
             with store:
                 pytest.fail("unopened store entered")
@@ -40,19 +40,21 @@ def test_sync_factory_opens_on_owner_and_preserves_read_only(tmp_path):
     database = tmp_path / "run.db"
     with RolloutStore.open_sync(database) as store:
         assert store._owner_thread != threading.get_ident()
+
         def write():
             with store.transaction():
-                store.put_metadata('construction-test', 'preserved')
+                store.put_metadata("construction-test", "preserved")
+
         store.run_sync(write)
     with RolloutStore.open_sync(database, read_only=True) as reader:
-        assert reader.metadata('construction-test') == 'preserved'
+        assert reader.metadata("construction-test") == "preserved"
         with pytest.raises(sqlite3.OperationalError, match="readonly"):
             reader.run_sync(lambda: _readonly_write(reader))
 
 
 def _readonly_write(store):
     with store.transaction():
-        store.put_metadata('construction-test', 'must not commit')
+        store.put_metadata("construction-test", "must not commit")
 
 
 @pytest.mark.anyio

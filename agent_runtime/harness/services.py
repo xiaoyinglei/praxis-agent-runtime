@@ -15,6 +15,7 @@ from agent_runtime.harness.completion import DeliveryCompletionGate
 from agent_runtime.harness.context import RolloutContextManager
 from agent_runtime.harness.context_recall import READ_CONTEXT_NAME, create_context_recall_tool
 from agent_runtime.harness.protocol import DEFAULT_MAX_STEPS, BoundHarnessModel, CompletionGate
+from agent_runtime.harness.retry_policy import RetryPolicy
 from agent_runtime.harness.tool_orchestrator import ToolOrchestrator, current_tool_turn_id
 from agent_runtime.harness.tool_router import DurableToolRouter
 from agent_runtime.project_instructions import instruction_snapshot
@@ -148,6 +149,7 @@ class SessionBindingProvider:
             "require_workspace_change": self._require_workspace_change,
             "acceptance_command": self._acceptance_command,
         }
+        binding["model_retry_policy"] = RetryPolicy().to_payload()
         binding["model_response_recovery"] = {"revision": "restart-step-v1", "max_retries": 1}
         binding["tool_failure_recovery"] = {"revision": "one-replan-v1"}
         binding["completion_continuation_policy"] = {"revision": "bounded-v1", "max_continuations": 8}
@@ -415,9 +417,11 @@ def configure_services(
                 if prior is not None and prior["root"] == snapshot["root"]:
                     # Refresh known scopes once for a new Turn. Do not silently
                     # drop nested guidance when only the root was bootstrapped.
-                    snapshot = extend_instructions(snapshot, session.tool_execution_context,
-                                                   (Path(snapshot["root"]) / scope / "AGENTS.md"
-                                                    for scope in prior["directories"]))
+                    snapshot = extend_instructions(
+                        snapshot,
+                        session.tool_execution_context,
+                        (Path(snapshot["root"]) / scope / "AGENTS.md" for scope in prior["directories"]),
+                    )
             return snapshot
 
     session.binding_provider = SessionBindingProvider(
@@ -435,6 +439,7 @@ def configure_services(
         model_token_budget_total=max_tokens_total,
         model_cost_budget_total_micros=max_cost_micros,
         project_instructions=project_instructions_for_turn,
-        request_settings=(None if session.model_control_plane is None else
-                          session.model_control_plane.request_settings),
+        request_settings=(
+            None if session.model_control_plane is None else session.model_control_plane.request_settings
+        ),
     )

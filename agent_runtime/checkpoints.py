@@ -47,7 +47,7 @@ from agent_runtime.workspace import (
 )
 
 if TYPE_CHECKING:
-    from agent_runtime.harness.state import RuntimeState
+    from agent_runtime.harness.runtime_store import RuntimeStore
 
 logger = logging.getLogger(__name__)
 
@@ -74,8 +74,14 @@ _GIT_CONFIG_OVERRIDES = (
 class CheckpointError(RuntimeError):
     """A checkpoint failed; restore errors describe the actual rollback outcome."""
 
-    def __init__(self, message: str, *, anchor_checkpoint_id: str = "",
-                 rollback_completed: bool | None = None, workspace_changed: bool | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        anchor_checkpoint_id: str = "",
+        rollback_completed: bool | None = None,
+        workspace_changed: bool | None = None,
+    ) -> None:
         super().__init__(message)
         self.anchor_checkpoint_id = anchor_checkpoint_id
         self.rollback_completed = rollback_completed
@@ -111,8 +117,7 @@ def _checkpoint_entry(checkpoint_id: str, timestamp: str, subject: str, message:
     # Read our single-line protocol from raw commit bytes. Git's generic trailer
     # formatter rewrites keys according to arbitrary trailer.* host settings.
     block = message.partition("\n\n")[2].rstrip().rsplit("\n\n", 1)[-1]
-    records = [line for line in block.splitlines()
-               if line.startswith(_METADATA_TRAILER + ":")]
+    records = [line for line in block.splitlines() if line.startswith(_METADATA_TRAILER + ":")]
     if records:
         # An explicit unsupported or corrupt version cannot fall back to title.
         if len(records) != 1:
@@ -125,20 +130,30 @@ def _checkpoint_entry(checkpoint_id: str, timestamp: str, subject: str, message:
             raise CheckpointError("unsupported checkpoint metadata version")
         trigger, turn_id = metadata.get("trigger"), metadata.get("turn_id")
         candidate_sequence = metadata.get("sequence")
-        if (trigger not in ("pre_write", "restore") or not isinstance(turn_id, str)
-                or type(candidate_sequence) is not int or candidate_sequence < 0):
+        if (
+            trigger not in ("pre_write", "restore")
+            or not isinstance(turn_id, str)
+            or type(candidate_sequence) is not int
+            or candidate_sequence < 0
+        ):
             raise CheckpointError("invalid checkpoint metadata fields")
         sequence = candidate_sequence
     else:
         # Version 0: the exact historical writer format, decoded in one place.
         # Old sanitized/truncated Turn IDs cannot recover their original text.
-        legacy = re.fullmatch(r"praxis-checkpoint (pre_write|restore)(?: ([A-Za-z0-9._-]{1,64}))? seq=([0-9]+)",
-                              subject)
+        legacy = re.fullmatch(
+            r"praxis-checkpoint (pre_write|restore)(?: ([A-Za-z0-9._-]{1,64}))? seq=([0-9]+)", subject
+        )
         if legacy is not None and f"{int(legacy[3]):06d}" == legacy[3]:
             trigger, turn_id, sequence = legacy[1], legacy[2] or "", int(legacy[3])
-    return CheckpointEntry(checkpoint_id=checkpoint_id.strip(),
-                           timestamp=float(timestamp) if timestamp.isdigit() else 0.0,
-                           subject=subject, sequence=sequence, trigger=trigger, turn_id=turn_id)
+    return CheckpointEntry(
+        checkpoint_id=checkpoint_id.strip(),
+        timestamp=float(timestamp) if timestamp.isdigit() else 0.0,
+        subject=subject,
+        sequence=sequence,
+        trigger=trigger,
+        turn_id=turn_id,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,8 +181,7 @@ class CheckpointService:
         retention_days: int = RETENTION_DAYS,
     ) -> None:
         self._workspace = Path(workspace_root).expanduser().resolve()
-        resolved_shadow = (Path(shadow_root) if shadow_root is not None
-                           else checkpoint_root_for(self._workspace))
+        resolved_shadow = Path(shadow_root) if shadow_root is not None else checkpoint_root_for(self._workspace)
         self._shadow = resolved_shadow.expanduser().resolve()
         self._retention_days = retention_days
         self._git_dir = self._shadow / ".git"
@@ -231,7 +245,10 @@ class CheckpointService:
         return environment
 
     def _run_git(
-        self, *arguments: str, check: bool = True, cwd: Path | None = None,
+        self,
+        *arguments: str,
+        check: bool = True,
+        cwd: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         completed = subprocess.run(
             self._git_argv(*arguments),
@@ -243,8 +260,7 @@ class CheckpointService:
         )
         if check and completed.returncode != 0:
             raise CheckpointError(
-                f"git {arguments[0]} failed ({completed.returncode}): "
-                f"{completed.stderr.strip()[:500]}"
+                f"git {arguments[0]} failed ({completed.returncode}): {completed.stderr.strip()[:500]}"
             )
         return completed
 
@@ -260,7 +276,9 @@ class CheckpointService:
             if not (self._git_dir / "HEAD").is_file():
                 subprocess.run(
                     [self._git, "-c", "core.hooksPath=", "init", "--quiet", str(self._shadow)],
-                    capture_output=True, text=True, check=True,
+                    capture_output=True,
+                    text=True,
+                    check=True,
                     env=self._git_environment(),
                 )
             marker = self._run_git("config", "--get", "praxis.marker", check=False)
@@ -304,9 +322,7 @@ class CheckpointService:
         return self._read_checkpoint(latest.stdout.strip())
 
     def _read_checkpoint(self, checkpoint_id: str) -> CheckpointEntry:
-        detail = self._run_git("show", "-s",
-            "--format=%H%x00%ct%x00%s%x00%B%x00",
-            checkpoint_id).stdout.split("\0")
+        detail = self._run_git("show", "-s", "--format=%H%x00%ct%x00%s%x00%B%x00", checkpoint_id).stdout.split("\0")
         return _checkpoint_entry(*detail[:4])
 
     def _snapshot_sync(self, *, trigger: str, turn_id: str) -> CheckpointSnapshot:
@@ -322,30 +338,43 @@ class CheckpointService:
                 if previous_tree == tree and self._checkpoint_modes(previous.checkpoint_id) == self._staged_modes:
                     return CheckpointSnapshot(
                         checkpoint_id=previous.checkpoint_id,
-                        trigger=trigger, turn_id=turn_id,
-                        tree_sha256=tree_sha, changed_file_count=0, created_new_commit=False,
+                        trigger=trigger,
+                        turn_id=turn_id,
+                        tree_sha256=tree_sha,
+                        changed_file_count=0,
+                        created_new_commit=False,
                     )
             changed = self._run_git(
-                "diff", "--name-only", "-z", previous.checkpoint_id if previous is not None
-                else self._empty_tree or "", tree,
+                "diff",
+                "--name-only",
+                "-z",
+                previous.checkpoint_id if previous is not None else self._empty_tree or "",
+                tree,
             ).stdout
             changed_paths = {path for path in changed.split("\0") if path}
             old_modes = {} if previous is None else self._checkpoint_modes(previous.checkpoint_id)
-            changed_paths.update(path for path in set(old_modes) | set(self._staged_modes)
-                                 if old_modes.get(path) != self._staged_modes.get(path))
+            changed_paths.update(
+                path
+                for path in set(old_modes) | set(self._staged_modes)
+                if old_modes.get(path) != self._staged_modes.get(path)
+            )
             changed_count = len(changed_paths)
             checkpoint_id = self._commit_tree(tree, trigger=trigger, turn_id=turn_id)
             return CheckpointSnapshot(
                 checkpoint_id=checkpoint_id,
-                trigger=trigger, turn_id=turn_id,
-                tree_sha256=tree_sha, changed_file_count=changed_count, created_new_commit=True,
+                trigger=trigger,
+                turn_id=turn_id,
+                tree_sha256=tree_sha,
+                changed_file_count=changed_count,
+                created_new_commit=True,
             )
 
     def _stage_current_tree(self) -> str:
         """Store raw blobs, without attributes, filters, ignore rules or checkout conversions."""
         self._run_git("read-tree", "--empty")
         paths = _filesystem_workspace_paths(
-            self._workspace, ignore_runtime_root=_has_temporary_runtime_layout(self._workspace),
+            self._workspace,
+            ignore_runtime_root=_has_temporary_runtime_layout(self._workspace),
         )
         entries: list[bytes] = []
         modes: dict[str, int] = {}
@@ -356,8 +385,9 @@ class CheckpointService:
             label = relative.as_posix()
             modes[label] = stat.S_IMODE(metadata.st_mode)
             if stat.S_ISLNK(metadata.st_mode):
-                blob = self._run_git_with_input("hash-object", "-w", "--stdin",
-                                                data=os.fsencode(os.readlink(path))).strip()
+                blob = self._run_git_with_input(
+                    "hash-object", "-w", "--stdin", data=os.fsencode(os.readlink(path))
+                ).strip()
                 entries.append(f"120000 {blob}\t".encode() + os.fsencode(label) + b"\0")
             elif stat.S_ISREG(metadata.st_mode):
                 regular.append(relative)
@@ -366,15 +396,21 @@ class CheckpointService:
         # Native Git hashes already-open file descriptors in bounded batches.
         # This avoids a process per file and never follows a renamed pathname.
         for offset in range(0, len(regular), 64):
-            chunk = regular[offset:offset + 64]
+            chunk = regular[offset : offset + 64]
             with ExitStack() as stack:
                 streams = [stack.enter_context(open_binary(self._workspace / relative)) for relative in chunk]
                 versions = [os.fstat(stream.fileno()) for stream in streams]
                 descriptors = tuple(stream.fileno() for stream in streams)
                 feed = "".join(f"/dev/fd/{descriptor}\n" for descriptor in descriptors).encode()
-                result = subprocess.run(self._git_argv("hash-object", "-w", "--no-filters", "--stdin-paths"),
-                                        cwd=self._workspace, env=self._git_environment(), input=feed,
-                                        capture_output=True, pass_fds=descriptors, check=False)
+                result = subprocess.run(
+                    self._git_argv("hash-object", "-w", "--no-filters", "--stdin-paths"),
+                    cwd=self._workspace,
+                    env=self._git_environment(),
+                    input=feed,
+                    capture_output=True,
+                    pass_fds=descriptors,
+                    check=False,
+                )
                 blobs = result.stdout.decode("ascii").splitlines()
                 if result.returncode or len(blobs) != len(chunk):
                     raise CheckpointError("could not snapshot raw file contents")
@@ -394,8 +430,9 @@ class CheckpointService:
         for line in message.splitlines():
             if line.startswith("praxis-modes-json: "):
                 value = json.loads(line.removeprefix("praxis-modes-json: "))
-                if not isinstance(value, dict) or any(not isinstance(k, str) or type(v) is not int
-                                                     or not 0 <= v <= 0o7777 for k, v in value.items()):
+                if not isinstance(value, dict) or any(
+                    not isinstance(k, str) or type(v) is not int or not 0 <= v <= 0o7777 for k, v in value.items()
+                ):
                     raise CheckpointError("invalid checkpoint permission manifest")
                 return value
         return {}  # Historical checkpoints preserve only the Git executable bit.
@@ -414,8 +451,13 @@ class CheckpointService:
         return entries
 
     def _blob_bytes(self, blob: str) -> bytes:
-        result = subprocess.run(self._git_argv("cat-file", "blob", blob), cwd=self._workspace,
-                                env=self._git_environment(), capture_output=True, check=False)
+        result = subprocess.run(
+            self._git_argv("cat-file", "blob", blob),
+            cwd=self._workspace,
+            env=self._git_environment(),
+            capture_output=True,
+            check=False,
+        )
         if result.returncode:
             raise CheckpointError("checkpoint blob is unavailable")
         return result.stdout
@@ -425,9 +467,12 @@ class CheckpointService:
         current_modes = self._staged_modes.copy()
         target = self._tree_entries(tree)
         deleted = sorted(set(current) - set(target), reverse=True)
-        restored = sorted(path for path, entry in target.items() if current.get(path) != entry
-                          or modes.get(path, 0o755 if entry[0] == "100755" else 0o644)
-                          != current_modes.get(path))
+        restored = sorted(
+            path
+            for path, entry in target.items()
+            if current.get(path) != entry
+            or modes.get(path, 0o755 if entry[0] == "100755" else 0o644) != current_modes.get(path)
+        )
         for relative in deleted:
             if not self._delete_workspace_file(relative):
                 raise CheckpointError(f"could not delete {relative}")
@@ -445,12 +490,19 @@ class CheckpointService:
             if mode == "120000":
                 atomic_symlink(path, os.fsdecode(self._blob_bytes(blob)))
             else:
+
                 def write_blob(stream: BinaryIO, object_id: str = blob) -> None:
-                    result = subprocess.run(self._git_argv("cat-file", "blob", object_id), cwd=self._workspace,
-                                            env=self._git_environment(), stdout=stream,
-                                            stderr=subprocess.PIPE, check=False)
+                    result = subprocess.run(
+                        self._git_argv("cat-file", "blob", object_id),
+                        cwd=self._workspace,
+                        env=self._git_environment(),
+                        stdout=stream,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                    )
                     if result.returncode:
                         raise CheckpointError("checkpoint blob is unavailable")
+
                 atomic_file(path, write_blob, mode=modes.get(relative, 0o755 if mode == "100755" else 0o644))
         return tuple(restored), tuple(sorted(deleted))
 
@@ -458,18 +510,36 @@ class CheckpointService:
         # Commit timestamps have one-second granularity; the ref count keeps
         # same-second checkpoints orderable for listings.
         sequence = self._run_git(
-            "for-each-ref", "--format=x", _CHECKPOINT_REF_PREFIX,
+            "for-each-ref",
+            "--format=x",
+            _CHECKPOINT_REF_PREFIX,
         ).stdout.count("\n")
-        subject = "praxis-checkpoint " + " ".join(
-            part for part in (trigger, _SUBJECT_SAFE.sub("_", turn_id)[:64]) if part
-        ) + f" seq={sequence:06d}"
+        subject = (
+            "praxis-checkpoint "
+            + " ".join(part for part in (trigger, _SUBJECT_SAFE.sub("_", turn_id)[:64]) if part)
+            + f" seq={sequence:06d}"
+        )
         message = subject + f"\n\nworkspace: {self._workspace}"
         message += "\npraxis-modes-json: " + json.dumps(self._staged_modes, sort_keys=True, ensure_ascii=True)
-        message += "\n\n" + _METADATA_TRAILER + ": " + json.dumps({
-            "version": 1, "trigger": trigger, "turn_id": turn_id, "sequence": sequence,
-        }, sort_keys=True, ensure_ascii=True)
+        message += (
+            "\n\n"
+            + _METADATA_TRAILER
+            + ": "
+            + json.dumps(
+                {
+                    "version": 1,
+                    "trigger": trigger,
+                    "turn_id": turn_id,
+                    "sequence": sequence,
+                },
+                sort_keys=True,
+                ensure_ascii=True,
+            )
+        )
         checkpoint_id = self._run_git_with_input(
-            "commit-tree", tree, data=message.encode(),
+            "commit-tree",
+            tree,
+            data=message.encode(),
         ).strip()
         self._run_git("update-ref", _CHECKPOINT_REF_PREFIX + checkpoint_id, checkpoint_id)
         self._run_git("update-ref", _LATEST_REF, checkpoint_id)
@@ -479,7 +549,11 @@ class CheckpointService:
         with self._lock(), workspace_write_lock(self._workspace):
             self._ensure_initialized()
             resolved = self._run_git(
-                "rev-parse", "--verify", "--quiet", f"{checkpoint_id}^{{commit}}", check=False,
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                f"{checkpoint_id}^{{commit}}",
+                check=False,
             )
             if resolved.returncode != 0:
                 raise CheckpointError(f"unknown checkpoint: {checkpoint_id}")
@@ -509,11 +583,13 @@ class CheckpointService:
                 state = "pre-restore state recovered" if rolled_back else "workspace may be partially restored"
                 raise CheckpointError(
                     f"restore failed; {state}; recovery checkpoint {anchor}: {error}",
-                    anchor_checkpoint_id=anchor, rollback_completed=rolled_back,
+                    anchor_checkpoint_id=anchor,
+                    rollback_completed=rolled_back,
                     workspace_changed=not rolled_back,
                 ) from error
-            return RestoreResult(target_checkpoint_id=target, restored=restored, deleted=deleted,
-                                 anchor_checkpoint_id=anchor)
+            return RestoreResult(
+                target_checkpoint_id=target, restored=restored, deleted=deleted, anchor_checkpoint_id=anchor
+            )
 
     def _prune_empty_parents(self, relative: str) -> None:
         """Remove directories left empty by deletions, up to the workspace root."""
@@ -542,7 +618,7 @@ class CheckpointService:
         path = Path(relative)
         if path.is_absolute() or ".." in path.parts or not path.parts:
             return False
-        resolved = (self._workspace / path)
+        resolved = self._workspace / path
         try:
             resolved.resolve(strict=False)
         except (OSError, RuntimeError):
@@ -553,21 +629,24 @@ class CheckpointService:
         if not self._git_dir.is_dir() or self._git is None:
             return ()
         listing = self._run_git(
-            "for-each-ref", "--format=%(objectname)%00%(committerdate:unix)%00%(subject)%00"
-            "%(contents)%00",
-            _CHECKPOINT_REF_PREFIX, check=False,
+            "for-each-ref",
+            "--format=%(objectname)%00%(committerdate:unix)%00%(subject)%00%(contents)%00",
+            _CHECKPOINT_REF_PREFIX,
+            check=False,
         )
         if listing.returncode != 0:
             return ()
         fields = listing.stdout.split("\0")
         if fields.pop().strip() or len(fields) % 4:
             raise CheckpointError("invalid checkpoint listing format")
-        entries = [_checkpoint_entry(*fields[offset:offset + 4]) for offset in range(0, len(fields), 4)]
-        return tuple(sorted(
-            entries,
-            key=lambda entry: (entry.timestamp, entry.sequence, entry.checkpoint_id),
-            reverse=True,
-        ))
+        entries = [_checkpoint_entry(*fields[offset : offset + 4]) for offset in range(0, len(fields), 4)]
+        return tuple(
+            sorted(
+                entries,
+                key=lambda entry: (entry.timestamp, entry.sequence, entry.checkpoint_id),
+                reverse=True,
+            )
+        )
 
     def _prune_sync(self, now: float | None) -> None:
         if not self._git_dir.is_dir() or self._git is None:
@@ -575,7 +654,11 @@ class CheckpointService:
         try:
             with self._lock():
                 recorded = self._run_git(
-                    "config", "--get", _WORKSPACE_CONFIG_KEY, check=False, cwd=self._shadow,
+                    "config",
+                    "--get",
+                    _WORKSPACE_CONFIG_KEY,
+                    check=False,
+                    cwd=self._shadow,
                 )
                 if recorded.returncode == 0 and recorded.stdout.strip():
                     if not Path(recorded.stdout.strip()).is_dir():
@@ -593,7 +676,9 @@ class CheckpointService:
                 if latest_expired:
                     self._run_git("update-ref", "-d", _LATEST_REF, check=False)
                 self._run_git(
-                    "gc", "--prune=" + time.strftime("%Y-%m-%d", time.gmtime(cutoff)), "--quiet",
+                    "gc",
+                    "--prune=" + time.strftime("%Y-%m-%d", time.gmtime(cutoff)),
+                    "--quiet",
                     check=False,
                 )
         except (CheckpointError, OSError) as error:
@@ -651,7 +736,7 @@ def _numeric(value: object, default: float = 0.0) -> float:
     return default
 
 
-def thread_checkpoint_rows(store: RuntimeState, thread_id: str) -> list[dict[str, object]]:
+def thread_checkpoint_rows(store: RuntimeStore, thread_id: str) -> list[dict[str, object]]:
     """Join recorded checkpoint items with their Turns for user-facing listings."""
     rows: list[dict[str, object]] = []
     for turn in store.list_turns(thread_id):
@@ -665,18 +750,19 @@ def thread_checkpoint_rows(store: RuntimeState, thread_id: str) -> list[dict[str
             payload = item.payload
             if item.kind != "workspace_checkpoint" or item.status != "completed":
                 continue
-            rows.append({
-                "checkpoint_id": payload.get("checkpoint_id"),
-                "turn_id": turn_id,
-                "trigger": payload.get("trigger"),
-                "tree_sha256": payload.get("tree_sha256"),
-                "changed_file_count": payload.get("changed_file_count", 0),
-                "wall_time": payload.get("wall_time", 0.0),
-                "sequence": item.sequence,
-                "turn_input": " ".join(user_message.split())[:80],
-            })
-    rows.sort(key=lambda row: (_numeric(row.get("wall_time")), int(_numeric(row.get("sequence")))),
-              reverse=True)
+            rows.append(
+                {
+                    "checkpoint_id": payload.get("checkpoint_id"),
+                    "turn_id": turn_id,
+                    "trigger": payload.get("trigger"),
+                    "tree_sha256": payload.get("tree_sha256"),
+                    "changed_file_count": payload.get("changed_file_count", 0),
+                    "wall_time": payload.get("wall_time", 0.0),
+                    "sequence": item.sequence,
+                    "turn_input": " ".join(user_message.split())[:80],
+                }
+            )
+    rows.sort(key=lambda row: (_numeric(row.get("wall_time")), int(_numeric(row.get("sequence")))), reverse=True)
     return rows
 
 

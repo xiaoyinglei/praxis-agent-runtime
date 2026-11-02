@@ -9,7 +9,7 @@ import typer
 
 from agent_runtime import cli
 from agent_runtime.agent import Agent
-from agent_runtime.harness import RuntimeState
+from agent_runtime.harness import RuntimeStore, turn_ops
 from agent_runtime.result import (
     AgentPause,
     AgentResult,
@@ -25,16 +25,13 @@ def _persist_cli_turn(
     binding_manifest: Mapping[str, object] | None = None,
 ) -> str:
     workspace.mkdir(exist_ok=True)
-    with RuntimeState.open_sync(database) as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    with RuntimeStore.open_sync(database) as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="CLI resume fixture",
-            binding_manifest=(
-                {"model_id": None}
-                if binding_manifest is None
-                else binding_manifest
-            ),
+            binding_manifest=({"model_id": None} if binding_manifest is None else binding_manifest),
         )
     return turn.turn_id
 
@@ -152,7 +149,6 @@ def test_schema_v3_resume_reads_only_outer_model_id(
     assert facade_options[0]["model"] is None
 
 
-
 @pytest.mark.parametrize("action", ["continue", "retry"])
 def test_cli_resume_rejects_legacy_outer_model_alias_for_provider_actions(
     tmp_path: Path,
@@ -183,14 +179,15 @@ def test_cli_abort_releases_legacy_paused_turn_without_binding_projection(
     database = tmp_path / "agent.sqlite"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(database) as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    with RuntimeStore.open_sync(database) as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="legacy paused turn",
             binding_manifest={"model_alias": "removed-legacy-model"},
         )
-        store.pause_turn(turn_id=turn.turn_id, reason="legacy turn needs cancellation")
+        turn_ops.pause_turn(store, turn_id=turn.turn_id, reason="legacy turn needs cancellation")
     monkeypatch.chdir(workspace)
 
     with pytest.raises(typer.Exit) as exc_info:
@@ -202,7 +199,7 @@ def test_cli_abort_releases_legacy_paused_turn_without_binding_projection(
         )
 
     assert exc_info.value.exit_code == 1
-    with RuntimeState.open_sync(database) as store:
+    with RuntimeStore.open_sync(database) as store:
         assert store.read_turn(turn.turn_id).status == "cancelled"
         assert store.read_thread(thread.thread_id).active_turn_id is None
 
@@ -214,9 +211,10 @@ async def test_public_resume_rejects_explicit_unavailable_session_model_before_i
     database = tmp_path / "agent.sqlite"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    async with (await RuntimeState.open(database)) as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    async with await RuntimeStore.open(database) as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="legacy paused turn",
             binding_manifest={
@@ -224,7 +222,8 @@ async def test_public_resume_rejects_explicit_unavailable_session_model_before_i
                 "model_alias": "definitely-removed-alias",
             },
         )
-        clarification = store.request_clarification(
+        clarification = turn_ops.request_clarification(
+            store,
             turn_id=turn.turn_id,
             question="which target?",
         )
@@ -272,8 +271,13 @@ def test_agent_recover_without_action_prints_pending_recovery_info(
     class _Facade:
         async def recovery_state(self, passed_turn_id: str):
             assert passed_turn_id == turn_id
-            return {"actions": ["allow_once", "deny", "abort"], "reason_code": "tool_approval_required",
-                    "evidence_ids": [request.request_id], "request_id": request.request_id, "requires_input": False}
+            return {
+                "actions": ["allow_once", "deny", "abort"],
+                "reason_code": "tool_approval_required",
+                "evidence_ids": [request.request_id],
+                "request_id": request.request_id,
+                "requires_input": False,
+            }
 
         async def pending_input(
             self,
@@ -317,8 +321,13 @@ def test_agent_recover_without_pending_request_uses_the_recovery_plan(
     class _Facade:
         async def recovery_state(self, passed_turn_id: str):
             assert passed_turn_id == turn_id
-            return {"actions": ["continue", "abort"], "reason_code": "before_first_dispatch",
-                    "evidence_ids": [turn_id], "request_id": None, "requires_input": False}
+            return {
+                "actions": ["continue", "abort"],
+                "reason_code": "before_first_dispatch",
+                "evidence_ids": [turn_id],
+                "request_id": None,
+                "requires_input": False,
+            }
 
         async def pending_input(
             self,
@@ -347,11 +356,11 @@ def test_recover_inspection_prints_only_real_actions(tmp_path, monkeypatch, caps
     database = tmp_path / "run.sqlite"
     workspace = tmp_path / "workspace"
     turn_id = _persist_cli_turn(database, workspace)
-    with RuntimeState.open_sync(database) as store:
+    with RuntimeStore.open_sync(database) as store:
         if kind == "choice":
-            request = store.request_choice(turn_id=turn_id, question="Which output?", options=("csv", "xlsx"))
+            request = turn_ops.request_choice(store, turn_id=turn_id, question="Which output?", options=("csv", "xlsx"))
         else:
-            store.pause_turn(turn_id=turn_id, reason="no continuation")
+            turn_ops.pause_turn(store, turn_id=turn_id, reason="no continuation")
         before = store.list_records(store.read_turn(turn_id).thread_id)
     monkeypatch.setattr(Agent, "session", lambda *_args, **_kwargs: pytest.fail("inspection opens live runtime"))
     with pytest.raises(typer.Exit) as stopped:
@@ -367,7 +376,7 @@ def test_recover_inspection_prints_only_real_actions(tmp_path, monkeypatch, caps
     else:
         assert "--action continue" not in output
         assert "no_resume_point" in output
-    with RuntimeState.open_sync(database) as store:
+    with RuntimeStore.open_sync(database) as store:
         assert store.list_records(store.read_turn(turn_id).thread_id) == before
 
 

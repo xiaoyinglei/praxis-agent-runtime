@@ -11,7 +11,7 @@ from typer.testing import CliRunner
 
 from agent_runtime import Agent
 from agent_runtime.cli import agent_app
-from agent_runtime.harness import RuntimeState
+from agent_runtime.harness import RuntimeStore
 from agent_runtime.tools.web_http import PublicWebClient, PublicWebError
 from tests.agent.test_web_http import _NumericBackend, _SocketStream
 from tests.agent.test_web_product import FetchThenAnswer
@@ -19,8 +19,17 @@ from tests.agent.test_web_product import FetchThenAnswer
 
 @pytest.fixture
 def clean_proxy_env(monkeypatch):
-    for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy",
-                 "NO_PROXY", "no_proxy", "PRAXIS_WEB_PROXY"):
+    for name in (
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+        "PRAXIS_WEB_PROXY",
+    ):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -45,8 +54,9 @@ def test_proxy_environment_precedence(clean_proxy_env, monkeypatch):
     assert Agent().web_proxy_url is None
 
 
-@pytest.mark.parametrize("proxy", ["socks5://127.0.0.1:7892", "http://u:secret@proxy.test:8080",
-                                   "http://proxy.test:8080/path", "not-a-url"])
+@pytest.mark.parametrize(
+    "proxy", ["socks5://127.0.0.1:7892", "http://u:secret@proxy.test:8080", "http://proxy.test:8080/path", "not-a-url"]
+)
 def test_invalid_proxy_fails_without_disclosing_configuration(proxy, clean_proxy_env):
     with pytest.raises(ValueError) as caught:
         Agent(web_proxy_url=proxy)
@@ -61,10 +71,12 @@ class ProxyStream(_SocketStream):
 
     async def start_tls(self, ssl_context, server_hostname=None, timeout=None):
         import ssl
+
         assert ssl_context.verify_mode == ssl.CERT_REQUIRED
         assert ssl_context.check_hostname
-        self.response = (b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\n"
-                         b"Connection: close\r\n\r\nok")
+        self.response = (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nok"
+        )
         return await super().start_tls(ssl_context, server_hostname, timeout)
 
 
@@ -97,6 +109,7 @@ def test_no_proxy_returns_to_strict_dns_checks(monkeypatch):
     async def run():
         async def resolve(*args, **kwargs):
             import socket
+
             return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("127.0.0.1", 443))]
 
         monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", resolve)
@@ -140,7 +153,7 @@ async def test_agent_executor_fetch_uses_proxy_and_records_mode(tmp_path, monkey
     monkeypatch.setattr(agent, "_model_factory", lambda: model)
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9000")
     result = await agent.run("Read my project", allow_web_tools=True, require_workspace_change=False)
-    async with (await RuntimeState.open(agent.checkpoint_db)) as store:
+    async with await RuntimeStore.open(agent.checkpoint_db) as store:
         output = next(i.payload for i in store.list_items(result.turn_id) if i.kind == "tool_result")
         assert output["is_error"] is False
         assert output["structured_content"]["connection_mode"] == "trusted_proxy"
@@ -228,12 +241,15 @@ def test_proxy_redirect_cannot_reach_private_literal():
     asyncio.run(run())
 
 
-@pytest.mark.parametrize(("no_proxy", "url", "mode"), [
-    ("example.com:443", "https://example.com", "direct"),
-    ("example.com:80", "https://example.com", "trusted_proxy"),
-    ("example.com", "https://badexample.com", "trusted_proxy"),
-    ("*", "https://github.com", "direct"),
-])
+@pytest.mark.parametrize(
+    ("no_proxy", "url", "mode"),
+    [
+        ("example.com:443", "https://example.com", "direct"),
+        ("example.com:80", "https://example.com", "trusted_proxy"),
+        ("example.com", "https://badexample.com", "trusted_proxy"),
+        ("*", "https://github.com", "direct"),
+    ],
+)
 def test_no_proxy_port_and_domain_boundaries(no_proxy, url, mode):
     import httpx
 

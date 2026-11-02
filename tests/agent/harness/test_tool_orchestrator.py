@@ -19,9 +19,11 @@ from agent_runtime.harness import (
     ModelToolCall,
     PreparedModelCall,
     RolloutContextManager,
-    RuntimeState,
+    RuntimeStore,
     Session,
     ToolOrchestrator,
+    tool_ops,
+    turn_ops,
 )
 from agent_runtime.harness.tool_orchestrator import ToolApprovalRequiredError
 from agent_runtime.harness.tool_router import DurableToolRouter
@@ -51,7 +53,7 @@ from agent_runtime.tools.tool import (
 
 
 def _read_tool(
-    store: RuntimeState | None = None,
+    store: RuntimeStore | None = None,
     workspace: Path | None = None,
 ) -> Tool:
     schema: Mapping[str, JsonValue] = {
@@ -111,9 +113,10 @@ def _read_tool(
 def test_read_only_tool_operation_is_durable_before_runner_io(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="read a file",
             binding_manifest={"model_id": "test-model"},
@@ -162,7 +165,8 @@ def test_read_only_tool_operation_is_durable_before_runner_io(tmp_path: Path) ->
         assert store.verify().valid is True
 
         with pytest.raises(ValueError, match="unsupported"):
-            store.record_tool_execution_state(
+            tool_ops.record_tool_execution_state(
+                store,
                 turn_id=turn.turn_id,
                 operation_id=operation.operation_id,
                 tool_call_id=operation.tool_call_id,
@@ -199,9 +203,10 @@ async def test_public_tool_item_starts_only_after_approval_and_fenced_claim(
     )
     dispatcher = TurnEventDispatcher(capacity=16)
     stream = dispatcher.subscribe_controlling()
-    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    async with await RuntimeStore.open(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="approve one write",
             binding_manifest={"model_id": "test-model"},
@@ -233,9 +238,7 @@ async def test_public_tool_item_starts_only_after_approval_and_fenced_claim(
         before_events = []
         while not stream.empty:
             before_events.append(stream.receive_nowait())
-        assert not any(
-            event.type is EventType.ITEM_STARTED for event in before_events
-        )
+        assert not any(event.type is EventType.ITEM_STARTED for event in before_events)
         [before_approval] = store.list_tool_operations(turn.turn_id)
         assert before_approval.status == "awaiting_approval"
         assert before_approval.claim_generation == 0
@@ -249,18 +252,12 @@ async def test_public_tool_item_starts_only_after_approval_and_fenced_claim(
             public_events.append(stream.receive_nowait())
 
         assert result.is_error is False
-        tool_events = [
-            event
-            for event in public_events
-            if event.item_kind is TurnItemKind.TOOL
-        ]
+        tool_events = [event for event in public_events if event.item_kind is TurnItemKind.TOOL]
         assert [event.type for event in tool_events] == [
             EventType.ITEM_STARTED,
             EventType.ITEM_COMPLETED,
         ]
-        assert all(
-            event.item_kind is TurnItemKind.TOOL for event in tool_events
-        )
+        assert all(event.item_kind is TurnItemKind.TOOL for event in tool_events)
         assert tool_events[0].item_id == tool_events[1].item_id
         [claimed] = store.list_tool_operations(turn.turn_id)
         assert claimed.claim_generation == 1
@@ -296,9 +293,10 @@ async def test_harness_tool_progress_backpressures_runner_through_dispatcher(
     )
     dispatcher = TurnEventDispatcher(capacity=1)
     stream = dispatcher.subscribe_controlling()
-    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    async with await RuntimeStore.open(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="stream tool progress",
             binding_manifest={"model_id": "test-model"},
@@ -322,9 +320,7 @@ async def test_harness_tool_progress_backpressures_runner_through_dispatcher(
                 exposed_tool_names=("read_file",),
             ),
         )
-        running = asyncio.create_task(
-            orchestrator.execute(turn_id=turn.turn_id, call=call)
-        )
+        running = asyncio.create_task(orchestrator.execute(turn_id=turn.turn_id, call=call))
 
         before_execution = []
         while True:
@@ -362,9 +358,7 @@ async def test_harness_tool_progress_backpressures_runner_through_dispatcher(
             "first:README.md",
             "second:README.md",
         ]
-        assert {started.item_id, first.item_id, second.item_id, completed.item_id} == {
-            started.item_id
-        }
+        assert {started.item_id, first.item_id, second.item_id, completed.item_id} == {started.item_id}
         assert completed.type is EventType.ITEM_COMPLETED
 
 
@@ -398,9 +392,10 @@ async def test_harness_command_item_receives_stdout_before_completion_and_distin
     )
     dispatcher = TurnEventDispatcher(capacity=16)
     stream = dispatcher.subscribe_controlling()
-    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    async with await RuntimeStore.open(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="run one command",
             binding_manifest={"model_id": "test-model"},
@@ -434,11 +429,20 @@ async def test_harness_command_item_receives_stdout_before_completion_and_distin
         assert result.is_error is False
         operation_events = [event for event in public_events if event.type is EventType.TOOL_OPERATION_UPDATED]
         assert [event.data["transition"] for event in operation_events] == [
-            "prepared", "status_changed", "outcome_committed",
+            "prepared",
+            "status_changed",
+            "outcome_committed",
         ]
-        public_events = [event for event in public_events if event.type in {
-            EventType.ITEM_STARTED, EventType.ITEM_DELTA, EventType.ITEM_COMPLETED,
-        }]
+        public_events = [
+            event
+            for event in public_events
+            if event.type
+            in {
+                EventType.ITEM_STARTED,
+                EventType.ITEM_DELTA,
+                EventType.ITEM_COMPLETED,
+            }
+        ]
         assert {event.data["operation_id"] for event in operation_events} == {public_events[0].data["operation_id"]}
         assert operation_events[-1].data["status"] == "succeeded"
         assert [event.type for event in public_events] == [
@@ -455,9 +459,7 @@ async def test_harness_command_item_receives_stdout_before_completion_and_distin
             "stdout-line\n",
             "stderr-line\n",
         ]
-        assert all(
-            event.item_kind is TurnItemKind.COMMAND for event in public_events
-        )
+        assert all(event.item_kind is TurnItemKind.COMMAND for event in public_events)
         assert len({event.item_id for event in public_events}) == 1
 
 
@@ -468,9 +470,10 @@ async def test_legacy_turn_remains_readable_after_twelve_inspections(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    async with (await RuntimeState.open(database)) as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    async with await RuntimeStore.open(database) as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="fix the implementation",
             binding_manifest={
@@ -535,9 +538,10 @@ async def test_read_only_processes_are_not_blocked_by_inspection_counts(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    async with await RuntimeStore.open(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="fix the implementation",
             binding_manifest={
@@ -624,18 +628,23 @@ async def test_read_only_processes_are_not_blocked_by_inspection_counts(
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("policy", [
-    {"require_workspace_change": False},
-    {"revision": "completion-v2", "require_workspace_change": True},
-])
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"require_workspace_change": False},
+        {"revision": "completion-v2", "require_workspace_change": True},
+    ],
+)
 async def test_turns_without_legacy_delivery_policy_keep_inspection_available(
-    tmp_path: Path, policy,
+    tmp_path: Path,
+    policy,
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    async with await RuntimeStore.open(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="analyze the implementation",
             binding_manifest={
@@ -677,6 +686,7 @@ async def test_turns_without_legacy_delivery_policy_keep_inspection_available(
         )
         assert router.select(turn_id=turn.turn_id, messages=()) == (tool,)
 
+
 def test_recovery_reuses_committed_tool_call_and_reenters_full_preflight(
     tmp_path: Path,
 ) -> None:
@@ -702,14 +712,16 @@ def test_recovery_reuses_committed_tool_call_and_reenters_full_preflight(
             exposed_tool_names=("read_file",),
         ),
     )
-    with RuntimeState.open_sync(database) as crashed_process:
-        thread = crashed_process.create_thread(workspace=workspace)
-        turn = crashed_process.start_turn(
+    with RuntimeStore.open_sync(database) as crashed_process:
+        thread = turn_ops.create_thread(crashed_process, workspace=workspace)
+        turn = turn_ops.start_turn(
+            crashed_process,
             thread_id=thread.thread_id,
             user_message="read once after recovery",
             binding_manifest={"model_id": "test-model"},
         )
-        crashed_process.record_tool_call(
+        tool_ops.record_tool_call(
+            crashed_process,
             turn_id=turn.turn_id,
             tool_call_id=call.tool_call_id,
             tool_name=call.tool_name,
@@ -721,7 +733,7 @@ def test_recovery_reuses_committed_tool_call_and_reenters_full_preflight(
             },
         )
 
-    with RuntimeState.open_sync(database) as recovered_process:
+    with RuntimeStore.open_sync(database) as recovered_process:
         result = asyncio.run(
             ToolOrchestrator(
                 store=recovered_process,
@@ -791,9 +803,10 @@ def test_normalization_failure_preserves_runner_success_and_never_replays_side_e
             exposed_tool_names=("read_file",),
         ),
     )
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="run once",
             binding_manifest={"model_id": "test-model"},
@@ -823,7 +836,8 @@ def test_normalization_failure_preserves_runner_success_and_never_replays_side_e
         assert store.verify().valid is True
 
         with pytest.raises(RuntimeError, match="already has an operation"):
-            store.record_tool_execution_state(
+            tool_ops.record_tool_execution_state(
+                store,
                 turn_id=turn.turn_id,
                 operation_id="op_duplicate",
                 tool_call_id=operation.tool_call_id,
@@ -921,9 +935,11 @@ async def test_candidate_sdk_runs_model_tool_result_model_loop(tmp_path: Path, m
             "tool",
         ]
         assert "Runtime budget status" not in str(model.requests[1].messages)
-        assert runtime.store.list_model_operations(result.turn_id)[1].request_ref["budget_status"][
-            "agent_steps_remaining"] > 0
-        assert model.requests[1].messages[:len(model.requests[0].messages)] == model.requests[0].messages
+        assert (
+            runtime.store.list_model_operations(result.turn_id)[1].request_ref["budget_status"]["agent_steps_remaining"]
+            > 0
+        )
+        assert model.requests[1].messages[: len(model.requests[0].messages)] == model.requests[0].messages
         [tool_message] = [message for message in model.requests[1].messages if message.role == "tool"]
         assert tool_message.tool_call_id == "call-1"
         assert runtime.store.list_tool_operations(result.turn_id)[0].status == "succeeded"
@@ -940,7 +956,8 @@ async def test_candidate_sdk_runs_model_tool_result_model_loop(tmp_path: Path, m
 
 @pytest.mark.anyio
 async def test_tool_context_pairing_and_provider_request_hash_survive_restart(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
+    monkeypatch,
 ) -> None:
     monkeypatch.setattr("agent_runtime.harness.turn.capture_runtime_clock", lambda: {"date": "2026-10-20"})
     workspace = tmp_path / "workspace"
@@ -986,7 +1003,7 @@ async def test_tool_context_pairing_and_provider_request_hash_survive_restart(
             binding_manifest={"model_id": "tool-model"},
         )
     )
-    async with (await RuntimeState.open(database)) as reopened:
+    async with await RuntimeStore.open(database) as reopened:
         messages_after = RolloutContextManager(reopened).build(result.turn_id)
         prepared_after = provider_model.prepare(
             HarnessModelRequest(
@@ -1049,9 +1066,10 @@ async def test_remote_cancellation_pauses_for_reconciliation_and_cannot_redispat
             exposed_tool_names=("read_file",),
         ),
     )
-    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    async with await RuntimeStore.open(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="invoke remote operation once",
             binding_manifest={"model_id": "test-model"},
@@ -1093,6 +1111,7 @@ async def test_remote_cancellation_pauses_for_reconciliation_and_cannot_redispat
 @pytest.mark.parametrize("bad_arguments", [{}, {"path": "../outside"}])
 async def test_identical_invalid_tool_failures_stop_before_step_budget(tmp_path, correct_arguments, bad_arguments):
     from agent_runtime.terminal_ui import Conversation, ConversationEventDisplay
+
     class RepeatingModel(ToolThenAnswerModel):
         async def dispatch(self, prepared, *, event_sink: object = None):
             count = len(self.requests)
@@ -1116,9 +1135,14 @@ async def test_identical_invalid_tool_failures_stop_before_step_budget(tmp_path,
     display.begin_turn()
     registry = ToolRegistry()
     registry.register(_read_tool(workspace=tmp_path))
-    async with await Session.open(database=tmp_path / "repeat.sqlite", workspace=tmp_path,
-                                  model=model, tools=registry.freeze(), max_steps=16,
-                                  completion_gate=AcceptToolAnswer()) as session:
+    async with await Session.open(
+        database=tmp_path / "repeat.sqlite",
+        workspace=tmp_path,
+        model=model,
+        tools=registry.freeze(),
+        max_steps=16,
+        completion_gate=AcceptToolAnswer(),
+    ) as session:
         result = await session.submit("show code", event_sink=display)
         if correct_arguments:
             assert result.status == "done"
@@ -1150,12 +1174,18 @@ async def test_read_only_calls_do_not_hide_repeated_identical_failure(tmp_path):
                     ),
                 ),
             )
+
     model = Model()
     registry = ToolRegistry()
     registry.register(_read_tool(workspace=tmp_path))
-    async with await Session.open(database=tmp_path / "interleaved.sqlite", workspace=tmp_path,
-                                  model=model, tools=registry.freeze(), max_steps=8,
-                                  completion_gate=AcceptToolAnswer()) as session:
+    async with await Session.open(
+        database=tmp_path / "interleaved.sqlite",
+        workspace=tmp_path,
+        model=model,
+        tools=registry.freeze(),
+        max_steps=8,
+        completion_gate=AcceptToolAnswer(),
+    ) as session:
         result = await session.submit("read the file")
         assert result.stop_reason == "repeated_tool_failure"
         assert len(model.requests) == 7
@@ -1163,29 +1193,54 @@ async def test_read_only_calls_do_not_hide_repeated_identical_failure(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "changed,external,expected", [(False, False, True), (True, False, False), (False, True, False)],
+    "changed,external,expected",
+    [(False, False, True), (True, False, False), (False, True, False)],
 )
 def test_failure_streak_respects_real_changes_and_external_effects(changed, external, expected):
     from types import SimpleNamespace
 
-    from agent_runtime.harness.turn import TurnExecutor
+    from agent_runtime.harness.turn import TurnRunner
 
     items, operations = [], []
     for index in range(5):
         failed = index % 2 == 0
         name = "run_command" if failed else "execute_python"
         call_id, result_id = f"call-{index}", f"result-{index}"
-        items.append(SimpleNamespace(kind="tool_call", status="completed", payload={
-            "tool_call_id": call_id, "tool_name": name, "arguments": {"command": "python demo.py"} if failed else {},
-        }))
-        items.append(SimpleNamespace(kind="tool_result", status="completed", item_id=result_id, payload={
-            "tool_call_id": call_id, "tool_name": name, "is_error": failed, "retryable": False,
-            "error_code": "command_failed" if failed else None, "error_message": "TypeError" if failed else None,
-            "metadata": {"workspace_tree_changed": changed if not failed else False},
-        }))
-        operations.append(SimpleNamespace(tool_call_id=call_id, result_item_id=result_id,
-                                          effects=["network"] if external else ["write_workspace", "execute_process"]))
-    executor = TurnExecutor.__new__(TurnExecutor)
+        items.append(
+            SimpleNamespace(
+                kind="tool_call",
+                status="completed",
+                payload={
+                    "tool_call_id": call_id,
+                    "tool_name": name,
+                    "arguments": {"command": "python demo.py"} if failed else {},
+                },
+            )
+        )
+        items.append(
+            SimpleNamespace(
+                kind="tool_result",
+                status="completed",
+                item_id=result_id,
+                payload={
+                    "tool_call_id": call_id,
+                    "tool_name": name,
+                    "is_error": failed,
+                    "retryable": False,
+                    "error_code": "command_failed" if failed else None,
+                    "error_message": "TypeError" if failed else None,
+                    "metadata": {"workspace_tree_changed": changed if not failed else False},
+                },
+            )
+        )
+        operations.append(
+            SimpleNamespace(
+                tool_call_id=call_id,
+                result_item_id=result_id,
+                effects=["network"] if external else ["write_workspace", "execute_process"],
+            )
+        )
+    executor = TurnRunner.__new__(TurnRunner)
     executor._store = SimpleNamespace(list_items=lambda _: items, list_tool_operations=lambda _: operations)
     assert executor._repeated_tool_failure("turn") is expected
 
@@ -1205,10 +1260,13 @@ async def test_cancelled_local_tool_commits_outcome_before_turn_can_abort(tmp_pa
         finally:
             cleaned.set()
 
-    tool = replace(_read_tool(workspace=workspace), run=run, concurrency_safe=parallel,
-                   timeout_seconds=30)
-    async with await Session.open(database=tmp_path / "rollout.sqlite3", workspace=workspace,
-                                  model=ToolThenAnswerModel(), tools={"read_file": tool}) as runtime:
+    tool = replace(_read_tool(workspace=workspace), run=run, concurrency_safe=parallel, timeout_seconds=30)
+    async with await Session.open(
+        database=tmp_path / "rollout.sqlite3",
+        workspace=workspace,
+        model=ToolThenAnswerModel(),
+        tools={"read_file": tool},
+    ) as runtime:
         task = asyncio.create_task(runtime.submit("read README"))
         await asyncio.wait_for(started.wait(), 3)
         task.cancel()

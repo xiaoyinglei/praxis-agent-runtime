@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, Protocol, cast, runtime_checkable
 
 from agent_runtime.budget import ResourceUsage
 from agent_runtime.core.messages import (
@@ -19,6 +19,7 @@ from agent_runtime.core.messages import (
     outputs_tool_calls,
     restore_model_message,
 )
+from agent_runtime.harness.control import StepControl
 from agent_runtime.harness.records import ItemSnapshot
 from agent_runtime.modeling.events import (
     ModelEventSink,
@@ -27,6 +28,7 @@ from agent_runtime.modeling.events import (
     output_to_payload,
     validate_model_outputs,
 )
+from agent_runtime.modeling.failures import ModelFailure
 from agent_runtime.tools.tool import Tool, _thaw_json, json_schema_output
 
 DEFAULT_MAX_STEPS = 128
@@ -47,6 +49,7 @@ class HarnessModelRequest:
     input_token_limit: int | None = None
     output_token_limit: int | None = None
     continuation_summary_role: str | None = None
+    control: StepControl = field(default_factory=StepControl)
 
 
 class ModelDispatchPreflightError(RuntimeError):
@@ -55,6 +58,18 @@ class ModelDispatchPreflightError(RuntimeError):
 
 class ModelContextOverflowError(ModelDispatchPreflightError):
     """A definite context-limit rejection; eligible for one durable compaction retry."""
+
+    def __init__(self, message: str, *, failure: ModelFailure | None = None) -> None:
+        self.failure = failure
+        super().__init__(message)
+
+
+class ModelRetryScheduledError(RuntimeError):
+    """Internal control transfer to the durable Turn retry wait state."""
+
+    def __init__(self, operation_id: str) -> None:
+        self.operation_id = operation_id
+        super().__init__("model retry is durably scheduled")
 
 
 class ModelDispatchOutcomeUnknownError(RuntimeError):
@@ -74,6 +89,7 @@ class PreparedModelCall:
     request_ref: Mapping[str, Any]
     resource_request: ResourceUsage = ResourceUsage()
     dispatch_payload: object = field(default=None, repr=False, compare=False)
+    frozen_payload: Mapping[str, Any] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +194,13 @@ class HarnessModel(Protocol):
         *,
         event_sink: ModelEventSink | None = None,
     ) -> HarnessModelResponse: ...
+
+
+@runtime_checkable
+class ReplayingHarnessModel(HarnessModel, Protocol):
+    """Optional codec capability; custom models need only prepare and dispatch."""
+
+    def replay(self, payload: Mapping[str, Any], *, request: HarnessModelRequest) -> PreparedModelCall: ...
 
 
 @dataclass(frozen=True, slots=True)

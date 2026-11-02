@@ -15,7 +15,8 @@ from agent_runtime.harness import (
     ModelEventSink,
     PreparedModelCall,
     RolloutEventReader,
-    RuntimeState,
+    RuntimeStore,
+    turn_ops,
 )
 from agent_runtime.streaming import events
 from agent_runtime.streaming import sink as stream_sinks
@@ -52,10 +53,7 @@ def test_v2_protocol_types_and_wire_values_are_public() -> None:
     assert events.EventType.TURN_STARTED.value == "turn_started"
     assert events.EventType.TURN_PAUSED.value == "turn_paused"
     assert events.EventType.TURN_RESUMED.value == "turn_resumed"
-    assert (
-        events.EventType.TURN_CANCELLATION_REQUESTED.value
-        == "turn_cancellation_requested"
-    )
+    assert events.EventType.TURN_CANCELLATION_REQUESTED.value == "turn_cancellation_requested"
     assert events.EventType.TURN_COMPLETED.value == "turn_completed"
     assert events.EventType.TURN_ABORTED.value == "turn_aborted"
     assert events.EventType.ITEM_STARTED.value == "item_started"
@@ -111,9 +109,7 @@ def test_v2_stream_event_has_explicit_item_contract() -> None:
     assert completed.type is events.EventType.ITEM_COMPLETED
     assert completed.status is events.ItemStatus.SUCCESS
     assert {started.turn_id, delta.turn_id, completed.turn_id} == {"turn-1"}
-    assert {started.item_id, delta.item_id, completed.item_id} == {
-        "agent:turn-1:1"
-    }
+    assert {started.item_id, delta.item_id, completed.item_id} == {"agent:turn-1:1"}
 
 
 def test_v2_stream_event_rejects_invalid_field_combinations() -> None:
@@ -157,10 +153,7 @@ def test_v2_turn_lifecycle_events_are_not_item_scoped() -> None:
         events.EventType.TURN_CANCELLATION_REQUESTED,
         events.EventType.TURN_ABORTED,
     ]
-    assert all(
-        event.item_id is None
-        for event in (started, paused, resumed, cancelling, aborted)
-    )
+    assert all(event.item_id is None for event in (started, paused, resumed, cancelling, aborted))
 
 
 class _LiveSink:
@@ -216,9 +209,7 @@ async def test_full_controlling_queue_close_wakes_blocked_emitter() -> None:
     dispatcher = stream_sinks.TurnEventDispatcher(capacity=1)
     stream = dispatcher.subscribe_controlling()
     await dispatcher.emit(events.turn_started("turn-close"))
-    blocked_emit = asyncio.create_task(
-        dispatcher.emit(events.turn_completed("turn-close"))
-    )
+    blocked_emit = asyncio.create_task(dispatcher.emit(events.turn_completed("turn-close")))
     await asyncio.sleep(0)
     assert blocked_emit.done() is False
 
@@ -243,9 +234,10 @@ async def test_raising_sink_cannot_rollback_committed_event(tmp_path: Path) -> N
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    async with (await RuntimeState.open(database)) as store:
-        thread = store.create_thread(workspace=workspace)
-        store.start_turn(
+    async with await RuntimeStore.open(database) as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             turn_id="turn-committed-before-sink",
             user_message="commit before delivery",
@@ -258,7 +250,7 @@ async def test_raising_sink_cannot_rollback_committed_event(tmp_path: Path) -> N
         with pytest.raises(stream_sinks.EventChannelClosed, match="sink failed"):
             await dispatcher.emit(committed)
 
-    async with (await RuntimeState.open(database)) as reopened:
+    async with await RuntimeStore.open(database) as reopened:
         replayed = RolloutEventReader(reopened).read(thread.thread_id)
         assert replayed[0].event == committed
         assert reopened.verify().valid is True
@@ -284,9 +276,10 @@ async def test_never_returning_sink_is_cancelled_within_grace() -> None:
 def test_harness_rollout_reader_returns_canonical_stream_events(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=workspace)
-        store.start_turn(
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             turn_id="turn-v2",
             user_message="hello",
@@ -321,8 +314,11 @@ class _StaticHarnessModel:
         event_sink: ModelEventSink | None = None,
     ) -> HarnessModelResponse:
         del prepared
-        response = HarnessModelResponse.from_parts(text="canonical answer", provider_response_id="response-v2",
-                                        usage={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})
+        response = HarnessModelResponse.from_parts(
+            text="canonical answer",
+            provider_response_id="response-v2",
+            usage={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
         if event_sink is not None:
             await emit_response(event_sink, response)
         return response
@@ -348,10 +344,18 @@ async def test_harness_public_stream_uses_canonical_v2_items(tmp_path: Path) -> 
         require_workspace_change=False,
     )
 
-    assert [event.type for event in sink.events if event.type in {
-        events.EventType.TURN_STARTED, events.EventType.ITEM_STARTED, events.EventType.ITEM_DELTA,
-        events.EventType.ITEM_COMPLETED, events.EventType.TURN_COMPLETED,
-    }] == [
+    assert [
+        event.type
+        for event in sink.events
+        if event.type
+        in {
+            events.EventType.TURN_STARTED,
+            events.EventType.ITEM_STARTED,
+            events.EventType.ITEM_DELTA,
+            events.EventType.ITEM_COMPLETED,
+            events.EventType.TURN_COMPLETED,
+        }
+    ] == [
         events.EventType.TURN_STARTED,
         events.EventType.ITEM_STARTED,
         events.EventType.ITEM_DELTA,
@@ -403,6 +407,7 @@ async def test_passive_cursor_advances_only_after_reading() -> None:
 @pytest.mark.anyio
 async def test_cancelling_emit_closes_its_controlling_sink_task() -> None:
     entered, stopped = asyncio.Event(), asyncio.Event()
+
     class Sink:
         async def emit(self, event):
             entered.set()
@@ -410,6 +415,7 @@ async def test_cancelling_emit_closes_its_controlling_sink_task() -> None:
                 await asyncio.Event().wait()
             finally:
                 stopped.set()
+
     dispatcher = stream_sinks.TurnEventDispatcher()
     dispatcher.subscribe_controlling_sink(Sink())
     emission = asyncio.create_task(dispatcher.emit(events.turn_started("cancel-sink")))

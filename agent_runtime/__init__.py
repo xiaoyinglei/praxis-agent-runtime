@@ -6,6 +6,7 @@ from agent_runtime.harness.events import ReplayEvent
 from agent_runtime.harness.memory import MemoryConfig
 from agent_runtime.harness.session import Session
 from agent_runtime.knowledge import RAGKnowledgeConfig
+from agent_runtime.modeling.failures import ModelFailure
 from agent_runtime.models import ModelNotAvailableError, ModelSpec
 from agent_runtime.permission_policy import NetworkPolicy, NetworkRule, PathRule, PermissionPolicy, ToolRule
 from agent_runtime.planning import AgentPlan, PlanEvent, PlanStep
@@ -40,6 +41,7 @@ __all__ = [
     "ItemDeltaKind",
     "ItemStatus",
     "ModelNotAvailableError",
+    "ModelFailure",
     "ModelSpec",
     "MemoryConfig",
     "NetworkPolicy",

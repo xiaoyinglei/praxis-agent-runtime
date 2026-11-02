@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 
 from agent_runtime.core.generation_settings import ModelRequestPreferences, ReasoningCapabilities
-from agent_runtime.harness import GatewayHarnessModel, HarnessModelRequest, ModelMessage
+from agent_runtime.harness import GatewayHarnessModel, HarnessModelRequest, ModelMessage, turn_ops
 from agent_runtime.model_definition import RequestDefaultsDefinition
 from agent_runtime.modeling.contracts import LLMCallStage
 from agent_runtime.modeling.gateway import LLMGateway
@@ -166,7 +166,8 @@ async def test_live_settings_freeze_at_next_request_and_restore_from_rollout(tmp
         session.model_control_plane = plane
         session.binding_provider._request_settings = plane.request_settings
         session.configure_request(reasoning_effort="high", max_output_tokens=65536)
-        turn = session.store.start_turn(
+        turn = turn_ops.start_turn(
+            session.store,
             thread_id=session.thread_id,
             user_message="work",
             binding_manifest=session.binding_provider.snapshot(thread_id=session.thread_id, turn_id="turn-x"),
@@ -207,7 +208,7 @@ def test_cli_request_settings_commands_use_shared_validator_without_model_io(tmp
 async def test_saved_request_reprepares_with_original_wire_after_live_change(tmp_path):
     from types import SimpleNamespace
 
-    from agent_runtime.harness import RolloutContextManager, RuntimeState, TurnExecutor
+    from agent_runtime.harness import RolloutContextManager, RuntimeStore, TurnRunner
     from tests.agent.harness.test_thread_manager import AcceptPlainAnswer
 
     plane = _control_plane(tmp_path)
@@ -226,14 +227,15 @@ async def test_saved_request_reprepares_with_original_wire_after_live_change(tmp
         resolved, capabilities=replace(resolved.capabilities, reasoning=plane.catalog.definition("capable").reasoning)
     )
     model = GatewayHarnessModel(model_id="capable", resolved=resolved, instructions=("Work",))
-    async with (await RuntimeState.open(tmp_path / "rollout.db")) as store:
-        thread = store.create_thread(workspace=tmp_path)
-        turn = store.start_turn(
+    async with await RuntimeStore.open(tmp_path / "rollout.db") as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="Work",
             binding_manifest={"model_id": "capable", "request_settings": plane.request_settings()},
         )
-        runner = TurnExecutor(
+        runner = TurnRunner(
             thread_id=thread.thread_id,
             store=store,
             model=model,
@@ -241,10 +243,10 @@ async def test_saved_request_reprepares_with_original_wire_after_live_change(tmp
             completion_gate=AcceptPlainAnswer(),
         )
         context = runner.restore_turn_context(turn.turn_id)
-        first = await runner._prepare_step(runner.capture_step_context(context, step=1))
+        first = await runner._model_runner.prepare(runner.capture_step_context(context, step=1))
         plane.configure_request(reasoning_effort="low", max_output_tokens=16384)
         saved = runner.restore_step_context(context, SimpleNamespace(request_ref=first.request_ref))
-        replay = await runner._prepare_step(saved)
+        replay = await runner._model_runner.prepare(saved)
         assert replay.wire_hash == first.wire_hash
         assert replay.request_hash == first.request_hash
         assert replay.request_ref["effective_settings"]["reasoning_effort"] == "high"

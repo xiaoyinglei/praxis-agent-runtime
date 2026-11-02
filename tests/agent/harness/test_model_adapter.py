@@ -24,8 +24,9 @@ from agent_runtime.harness import (
     HarnessModelRequest,
     ModelMessage,
     RolloutContextManager,
-    RuntimeState,
+    RuntimeStore,
     Session,
+    turn_ops,
 )
 from agent_runtime.model_definition import (
     ModelCapabilities,
@@ -124,7 +125,8 @@ async def _stream_gateway_fragments(kwargs, fragments):
     )
     await emit(ModelResponseCompleted(usage=usage.model_dump(mode="json"), stop_reason="stop"))
     return AgentModelResponse(
-        stop_reason=StopReason.END_TURN, raw_stop_reason="stop",
+        stop_reason=StopReason.END_TURN,
+        raw_stop_reason="stop",
         usage=usage,
         outputs=state.outputs,
         provider_wire_hash=serialize_openai_request(request).provider_wire_hash,
@@ -146,10 +148,16 @@ class NativeTextDeltaGateway(CapturingGateway):
 
 class NativeReasoningPlanGateway(CapturingGateway):
     async def agenerate_model_request(self, **kwargs: object) -> AgentModelResponse:
-        return await _stream_gateway_fragments(kwargs, (
-            ("reasoning", "inspect "), ("reasoning", "evidence"),
-            ("plan", "patch "), ("plan", "and verify"), ("text", "real gateway answer"),
-        ))
+        return await _stream_gateway_fragments(
+            kwargs,
+            (
+                ("reasoning", "inspect "),
+                ("reasoning", "evidence"),
+                ("plan", "patch "),
+                ("plan", "and verify"),
+                ("text", "real gateway answer"),
+            ),
+        )
 
 
 class FastSyncStreamingProvider:
@@ -285,6 +293,7 @@ class BudgetAwareCapturingGateway(CapturingGateway):
         )
         return await super().agenerate_model_request(**kwargs)
 
+
 def _resolved_model(
     *,
     gateway: object,
@@ -302,11 +311,7 @@ def _resolved_model(
     token_accounting: object | None = None,
 ) -> ResolvedModel:
     return ResolvedModel(
-        generator=(
-            object()
-            if generator is None
-            else generator
-        ),
+        generator=(object() if generator is None else generator),
         gateway=gateway,  # type: ignore[arg-type]
         model_id=model_id,
         provider=provider,
@@ -314,15 +319,9 @@ def _resolved_model(
             context_window_tokens=context_window_tokens,
             max_output_tokens=max_output_tokens,
             supports_native_tools=supports_native_tools,
-            supports_structured_output=(
-                supports_structured_output
-            ),
+            supports_structured_output=(supports_structured_output),
         ),
-        token_accounting=(
-            token_accounting
-            if token_accounting is not None
-            else CharacterAccounting()
-        ),  # type: ignore[arg-type]
+        token_accounting=(token_accounting if token_accounting is not None else CharacterAccounting()),  # type: ignore[arg-type]
         request_defaults=RequestDefaultsDefinition(
             temperature=temperature,
             top_p=top_p,
@@ -331,6 +330,7 @@ def _resolved_model(
         ),
         generation_config=GenerationConfig(),
     )
+
 
 def test_model_settings_preserve_unknown_model_output_limit() -> None:
     gateway = CapturingGateway()
@@ -367,13 +367,14 @@ def test_model_settings_preserve_unknown_model_output_limit() -> None:
 
     assert request.settings.max_output_tokens is None
 
+
 def test_gateway_adapter_prepares_canonical_wire_before_provider_io() -> None:
     gateway = CapturingGateway()
     resolved = _resolved_model(
-    gateway=gateway,
-    max_output_tokens=256,
-    temperature=0.0,
-)
+        gateway=gateway,
+        max_output_tokens=256,
+        temperature=0.0,
+    )
     model = GatewayHarnessModel(
         model_id="test-model",
         resolved=resolved,
@@ -409,10 +410,10 @@ def test_gateway_adapter_prepares_canonical_wire_before_provider_io() -> None:
 def test_gateway_adapter_returns_known_incomplete_response_on_max_tokens() -> None:
     gateway = MaxTokensGateway()
     resolved = _resolved_model(
-    gateway=gateway,
-    max_output_tokens=256,
-    temperature=0.0,
-)
+        gateway=gateway,
+        max_output_tokens=256,
+        temperature=0.0,
+    )
     model = GatewayHarnessModel(
         model_id="test-model",
         resolved=resolved,
@@ -539,19 +540,12 @@ async def test_native_reasoning_and_plan_deltas_use_distinct_completed_items(
             EventType.ITEM_DELTA,
             EventType.ITEM_COMPLETED,
         ]
-        assert {event.item_id for event in channel_events} == {
-            channel_events[0].item_id
-        }
-        assert "".join(
-            str(event.data["delta"])
-            for event in channel_events
-            if event.type is EventType.ITEM_DELTA
-        ) == content
-        assert all(
-            event.delta_kind is delta_kind
-            for event in channel_events
-            if event.type is EventType.ITEM_DELTA
+        assert {event.item_id for event in channel_events} == {channel_events[0].item_id}
+        assert (
+            "".join(str(event.data["delta"]) for event in channel_events if event.type is EventType.ITEM_DELTA)
+            == content
         )
+        assert all(event.delta_kind is delta_kind for event in channel_events if event.type is EventType.ITEM_DELTA)
         assert channel_events[-1].data["content"] == content
         assert channel_events[0].item_id is not None
         item_ids.add(channel_events[0].item_id)
@@ -580,10 +574,10 @@ async def test_harness_backpressure_reaches_sync_provider_bridge(
     model = BoundGatewayHarnessModel(
         model_id="test-model",
         resolved=_resolved_model(
-    gateway=gateway,
-    generator=provider,
-    max_output_tokens=2_048,
-),
+            gateway=gateway,
+            generator=provider,
+            max_output_tokens=2_048,
+        ),
         instructions=("Answer the user directly.",),
     )
     dispatcher = TurnEventDispatcher(capacity=1)
@@ -636,10 +630,10 @@ async def test_nonstreaming_provider_emits_one_full_delta_without_slicing() -> N
     model = GatewayHarnessModel(
         model_id="test-model",
         resolved=_resolved_model(
-    gateway=gateway,
-    generator=provider,
-    max_output_tokens=256,
-),
+            gateway=gateway,
+            generator=provider,
+            max_output_tokens=256,
+        ),
         instructions=("Answer the user directly.",),
     )
     prepared = model.prepare(
@@ -666,12 +660,12 @@ async def test_nonstreaming_provider_emits_one_full_delta_without_slicing() -> N
 def test_gateway_adapter_requests_durable_compaction_before_provider_dispatch() -> None:
     gateway = BudgetAwareCapturingGateway(max_input_tokens=9_000)
     resolved = _resolved_model(
-    gateway=gateway,
-    context_window_tokens=32_768,
-    max_output_tokens=256,
-    temperature=0.0,
-    token_accounting=gateway.token_accounting,
-)
+        gateway=gateway,
+        context_window_tokens=32_768,
+        max_output_tokens=256,
+        temperature=0.0,
+        token_accounting=gateway.token_accounting,
+    )
     model = GatewayHarnessModel(
         model_id="test-model",
         resolved=resolved,
@@ -708,9 +702,9 @@ def test_unchanged_stable_prefix_keeps_identical_provider_wire_bytes() -> None:
     model = GatewayHarnessModel(
         model_id="test-model",
         resolved=_resolved_model(
-    gateway=gateway,
-    max_output_tokens=256,
-),
+            gateway=gateway,
+            max_output_tokens=256,
+        ),
         instructions=("Stable system instruction.",),
     )
     first = model.prepare(
@@ -803,20 +797,22 @@ def test_compaction_changes_the_actual_provider_wire_and_preserves_critical_fact
     model = GatewayHarnessModel(
         model_id="test-model",
         resolved=_resolved_model(
-    gateway=gateway,
-    max_output_tokens=256,
-),
+            gateway=gateway,
+            max_output_tokens=256,
+        ),
         instructions=("Answer the user directly.",),
     )
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=workspace)
-        first = store.start_turn(
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        first = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="obsolete provider-visible question",
             binding_manifest={"model_id": "test-model"},
         )
-        store.complete_turn(turn_id=first.turn_id, answer="obsolete answer")
-        second = store.start_turn(
+        turn_ops.complete_turn(store, turn_id=first.turn_id, answer="obsolete answer")
+        second = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="current provider-visible question",
             binding_manifest={"model_id": "test-model"},
@@ -929,6 +925,7 @@ def test_control_plane_adapter_dispatches_the_turns_frozen_model_binding() -> No
             max_output_tokens=256,
         ),
     }
+
     class FrozenControlPlane:
         def __init__(self) -> None:
             self.current = "model-a"
@@ -994,15 +991,16 @@ def test_control_plane_adapter_dispatches_the_turns_frozen_model_binding() -> No
 def test_legacy_binding_replays_but_provider_resume_fails_closed(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             turn_id="turn-legacy",
             user_message="legacy history",
             binding_manifest={"schema_version": 1, "model_alias": "legacy-model"},
         )
-        store.complete_turn(turn_id=turn.turn_id, answer="durable legacy answer")
+        turn_ops.complete_turn(store, turn_id=turn.turn_id, answer="durable legacy answer")
 
         assert store.read_turn(turn.turn_id).binding_manifest["model_alias"] == "legacy-model"
         assert store.verify().valid is True
@@ -1176,11 +1174,20 @@ async def test_candidate_sdk_crosses_control_plane_gateway_and_rollout_store(
 
 def test_coding_instructions_include_real_workspace_in_provider_request(tmp_path):
     from agent_runtime.builtin.generic import coding_instructions
-    model = GatewayHarnessModel(model_id="test-model", resolved=_resolved_model(gateway=CapturingGateway()),
-                                instructions=coding_instructions(tmp_path))
-    prepared = model.prepare(HarnessModelRequest(thread_id="thread", turn_id="turn",
-                             messages=(ModelMessage(role="user", body="Explain MoE with Python"),),
-                             binding_manifest={"model_id": "test-model"}))
+
+    model = GatewayHarnessModel(
+        model_id="test-model",
+        resolved=_resolved_model(gateway=CapturingGateway()),
+        instructions=coding_instructions(tmp_path),
+    )
+    prepared = model.prepare(
+        HarnessModelRequest(
+            thread_id="thread",
+            turn_id="turn",
+            messages=(ModelMessage(role="user", body="Explain MoE with Python"),),
+            binding_manifest={"model_id": "test-model"},
+        )
+    )
     wire = serialize_openai_request(prepared.dispatch_payload.request)
     text = str(wire)
     assert str(tmp_path) in text
@@ -1189,13 +1196,21 @@ def test_coding_instructions_include_real_workspace_in_provider_request(tmp_path
 
 
 def test_runtime_clock_is_visible_and_stable_when_repreparing_saved_request():
-    clock = {"current_time": "2032-03-04T23:55:00+09:00", "current_date": "2032-03-04",
-             "timezone": "Asia/Tokyo", "utc_offset": "+09:00"}
-    model = GatewayHarnessModel(model_id="test-model", resolved=_resolved_model(gateway=CapturingGateway()),
-                                instructions=("Answer directly.",))
-    request = HarnessModelRequest(thread_id="thread", turn_id="turn",
-                                  messages=(ModelMessage(role="user", body="Explain yesterday's results."),),
-                                  binding_manifest={"model_id": "test-model", "runtime_clock": clock})
+    clock = {
+        "current_time": "2032-03-04T23:55:00+09:00",
+        "current_date": "2032-03-04",
+        "timezone": "Asia/Tokyo",
+        "utc_offset": "+09:00",
+    }
+    model = GatewayHarnessModel(
+        model_id="test-model", resolved=_resolved_model(gateway=CapturingGateway()), instructions=("Answer directly.",)
+    )
+    request = HarnessModelRequest(
+        thread_id="thread",
+        turn_id="turn",
+        messages=(ModelMessage(role="user", body="Explain yesterday's results."),),
+        binding_manifest={"model_id": "test-model", "runtime_clock": clock},
+    )
     first = model.prepare(request)
     repeated = model.prepare(request)
     wire = str(serialize_openai_request(first.dispatch_payload.request))
@@ -1205,9 +1220,15 @@ def test_runtime_clock_is_visible_and_stable_when_repreparing_saved_request():
 
 
 def test_legacy_request_does_not_acquire_a_new_clock_when_reprepared():
-    model = GatewayHarnessModel(model_id="test-model", resolved=_resolved_model(gateway=CapturingGateway()),
-                                instructions=("Answer directly.",))
-    prepared = model.prepare(HarnessModelRequest(thread_id="thread", turn_id="turn",
-                             messages=(ModelMessage(role="user", body="hello"),),
-                             binding_manifest={"model_id": "test-model"}))
+    model = GatewayHarnessModel(
+        model_id="test-model", resolved=_resolved_model(gateway=CapturingGateway()), instructions=("Answer directly.",)
+    )
+    prepared = model.prepare(
+        HarnessModelRequest(
+            thread_id="thread",
+            turn_id="turn",
+            messages=(ModelMessage(role="user", body="hello"),),
+            binding_manifest={"model_id": "test-model"},
+        )
+    )
     assert "Current runtime clock facts:" not in str(serialize_openai_request(prepared.dispatch_payload.request))

@@ -12,9 +12,10 @@ from agent_runtime.harness import (
     HarnessModelRequest,
     HarnessModelResponse,
     PreparedModelCall,
-    RuntimeState,
+    RuntimeStore,
     Session,
     TurnResult,
+    turn_ops,
 )
 from agent_runtime.result import AgentResult, AgentToolCall
 
@@ -41,6 +42,7 @@ def test_public_result_dto_is_frozen_and_keeps_thread_turn_identity() -> None:
         "thread_id",
         "validation_status",
         "validation_scope",
+        "model_error",
     )
     call = AgentToolCall(
         tool_call_id="call-1",
@@ -102,8 +104,9 @@ async def test_interrupted_model_exposes_public_retry_prompt(tmp_path):
             return await super().dispatch(prepared)
 
     model = InterruptedModel()
-    async with await Session.open(database=tmp_path / "retry.sqlite", workspace=tmp_path,
-                                  model=model, completion_gate=AcceptPublicAnswer()) as session:
+    async with await Session.open(
+        database=tmp_path / "retry.sqlite", workspace=tmp_path, model=model, completion_gate=AcceptPublicAnswer()
+    ) as session:
         paused = await session.submit("answer")
         assert paused.status == "paused"
         assert paused.pause is not None
@@ -160,13 +163,15 @@ async def test_failed_result_projects_canonical_terminal_reason(tmp_path: Path) 
         model=PublicAnswerModel(),
         completion_gate=AcceptPublicAnswer(),
     ) as runtime:
-        thread = runtime.store.create_thread(workspace=workspace)
-        turn = runtime.store.start_turn(
+        thread = turn_ops.create_thread(runtime.store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            runtime.store,
             thread_id=thread.thread_id,
             user_message="exhaust the step budget",
             binding_manifest={"model_id": "public-model"},
         )
-        failed = runtime.store.fail_turn(
+        failed = turn_ops.fail_turn(
+            runtime.store,
             turn_id=turn.turn_id,
             reason_code="model_step_budget_exhausted",
             message="Turn exhausted its frozen model step budget.",
@@ -204,13 +209,15 @@ async def test_public_pause_projects_the_frozen_choice_question_and_options(
         model=PublicAnswerModel(),
         completion_gate=AcceptPublicAnswer(),
     ) as runtime:
-        thread = runtime.store.create_thread(workspace=workspace)
-        turn = runtime.store.start_turn(
+        thread = turn_ops.create_thread(runtime.store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            runtime.store,
             thread_id=thread.thread_id,
             user_message="pick a target",
             binding_manifest={"model_id": "public-model"},
         )
-        interaction = runtime.store.request_choice(
+        interaction = turn_ops.request_choice(
+            runtime.store,
             turn_id=turn.turn_id,
             question="Which target?",
             options=("staging", "production"),
@@ -257,5 +264,5 @@ async def test_completed_result_is_read_after_disconnect_without_rerunning_model
     with patch.object(reader, "_model_factory", side_effect=AssertionError("read must not open a model")):
         replayed = await reader.read_result(committed.turn_id)
     assert replayed == committed
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         assert store.verify().valid is True

@@ -13,8 +13,9 @@ from agent_runtime.harness import (
     HarnessModelRequest,
     HarnessModelResponse,
     PreparedModelCall,
-    RuntimeState,
+    RuntimeStore,
     Session,
+    turn_ops,
 )
 from agent_runtime.harness.context_recall import create_context_recall_tool
 
@@ -75,13 +76,11 @@ async def test_harness_facade_uses_composed_thread_manager_path(tmp_path: Path) 
             "require_workspace_change": False,
             "acceptance_command": None,
         }
-        assert binding["mcp_policy"] == {
-            "workspace_discovery_enabled": True
-        }
+        assert binding["mcp_policy"] == {"workspace_discovery_enabled": True}
         assert binding["tool_execution_policy"] == {
             "active_skill_ids": [],
             "allow_execute_tools": False,
-        "allow_web_tools": False,
+            "allow_web_tools": False,
             "allow_write_tools": False,
             "auto_approve_sandboxed": False,
             "approval_mode": "ask",
@@ -99,9 +98,10 @@ async def test_full_audit_detects_non_head_projection_log_drift(tmp_path: Path) 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    async with (await RuntimeState.open(database)) as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    async with await RuntimeStore.open(database) as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="canonical",
             binding_manifest={"model_id": "test-model"},
@@ -116,14 +116,14 @@ async def test_full_audit_detects_non_head_projection_log_drift(tmp_path: Path) 
     # Opening validates the current head without scanning every historical Item.
     # The explicit full audit must still detect corruption of an older projection.
     async with await Session.open(
-            database=database,
-            workspace=workspace,
-            model=PlainModel(),
-            completion_gate=AcceptAnswer(),
-        ) as runtime:
+        database=database,
+        workspace=workspace,
+        model=PlainModel(),
+        completion_gate=AcceptAnswer(),
+    ) as runtime:
         report = await runtime.store.run_async(runtime.store.verify)
         assert report.valid is False
         assert any("projection" in error for error in report.errors)
 
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         assert store.verify().valid is False

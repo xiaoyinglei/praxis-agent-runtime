@@ -8,7 +8,7 @@ Existing Turns retain their saved policy and request layout.
 
 1. `RolloutContextManager` projects the visible conversation, including committed
    project and memory updates, completed tool groups and compaction replacements.
-2. `TurnExecutor.capture_step_context` restores the Turn's frozen project rules
+2. `TurnRunner.capture_step_context` restores the Turn's frozen project rules
    and trusted scoped discoveries, compares them with the last visible snapshot,
    and appends changed snapshots. A new snapshot replaces the earlier snapshot
    of that kind, including removed project scopes.
@@ -86,3 +86,25 @@ reopen, fork cutoffs, and memory removal/opt-out boundaries. The memory manageme
 test executes an initial read followed by a versioned explicit write through the
 normal tool interface. Tests use deterministic model responses and require no
 paid provider call.
+
+
+## Durable compaction jobs
+
+`ContextPolicy` separates hard input admission, the configured working-context
+soft target, and cumulative Turn headroom. Crossing a soft target alone does not
+reject a request when there is no reducible history. Optional compaction failure
+keeps original evidence; hard admission still applies before dispatch.
+
+`ContextEngine` persists a job, its source identity, summary tree and completed
+nodes. The ordinary budget ledger holds both summary allowance (Hs) and a final
+continuation allowance (Hc). Each attempt atomically transfers its allowance to
+a reservation. A completed node can be reused after reopen; unknown provider
+outcomes retain uncertain exposure. Explicit retries require fresh admission.
+The replacement, prepared continuation, reservation and installed job state
+commit in one transaction. Partial candidates never replace original history.
+
+A source change invalidates an obsolete saved summary before replay. Unsent work
+releases known unused holds; abandoning an unknown result preserves its uncertain
+reservation. Job accounting and summary receipts do not themselves count as a
+new user/context source. Unchanged-source conflicts fail explicitly instead of
+spinning a retry loop.

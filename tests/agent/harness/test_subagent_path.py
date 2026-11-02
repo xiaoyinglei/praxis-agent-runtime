@@ -58,9 +58,7 @@ class ParentChildModel:
             request_ref={
                 "request_id": f"{request.turn_id}:{request.step}",
                 "toolset_revision": digest,
-                "exposed_tool_names": [
-                    tool.definition.name for tool in request.tools
-                ],
+                "exposed_tool_names": [tool.definition.name for tool in request.tools],
             },
             dispatch_payload=request,
         )
@@ -75,9 +73,7 @@ class ParentChildModel:
                 provider_response_id="child-response",
                 usage={"input_tokens": 2, "output_tokens": 2},
             )
-        tool_messages = [
-            message for message in request.messages if message.role == "tool"
-        ]
+        tool_messages = [message for message in request.messages if message.role == "tool"]
         if not tool_messages:
             return HarnessModelResponse.from_parts(
                 text="",
@@ -151,21 +147,15 @@ async def test_subagent_tool_runs_an_independent_durable_thread(tmp_path: Path) 
         assert completed.answer == "parent used child conclusion"
         threads = runtime.store.list_threads()
         assert len(threads) == 2
-        child_thread = next(
-            thread for thread in threads if thread.thread_id != completed.thread_id
-        )
+        child_thread = next(thread for thread in threads if thread.thread_id != completed.thread_id)
         child_turn_id = child_thread.head_turn_id
         assert child_turn_id is not None
         child_binding = runtime.store.read_turn(child_turn_id).binding_manifest
         assert child_binding["model_step_budget"] == 2
         assert child_binding["model_token_budget_total"] == 123
-        assert child_binding["completion_policy"] == {
-            "require_workspace_change": False
-        }
+        assert child_binding["completion_policy"] == {"require_workspace_change": False}
         assert [
-            item_text(item)
-            for item in runtime.store.list_context_items(child_turn_id)
-            if item.kind == "user_message"
+            item_text(item) for item in runtime.store.list_context_items(child_turn_id) if item.kind == "user_message"
         ] == [
             "child task: inspect only the supplied context\n\n"
             "Context supplied by the parent agent:\n"
@@ -174,8 +164,7 @@ async def test_subagent_tool_runs_an_independent_durable_thread(tmp_path: Path) 
         parent_results = [
             item
             for item in runtime.store.list_items(completed.turn_id)
-            if item.kind == "tool_result"
-            and item.payload.get("tool_name") == "task"
+            if item.kind == "tool_result" and item.payload.get("tool_name") == "task"
         ]
         assert parent_results[0].payload["metadata"]["child_turn_id"] == child_turn_id
         assert runtime.store.verify().valid is True

@@ -13,7 +13,7 @@ from agent_runtime.budget import (
     pressure_threshold_for_limit,
     protected_tokens_for_limit,
 )
-from agent_runtime.harness import RolloutContextManager
+from agent_runtime.harness import RolloutContextManager, model_ops, turn_ops
 from agent_runtime.harness.protocol import (
     CompletionDecision,
     CompletionProposal,
@@ -22,8 +22,8 @@ from agent_runtime.harness.protocol import (
     ModelMessage,
     PreparedModelCall,
 )
-from agent_runtime.harness.session import TurnExecutor
-from agent_runtime.harness.state import RuntimeState
+from agent_runtime.harness.runtime_store import RuntimeStore
+from agent_runtime.harness.session import TurnRunner
 from tests.agent.harness.test_model_adapter import (
     CapturingGateway,
     CharacterAccounting,
@@ -73,8 +73,9 @@ class PressureModel:
         )
 
 
-def _prepare(store: RuntimeState, turn_id: str, request_id: str):
-    return store.prepare_model_operation(
+def _prepare(store: RuntimeStore, turn_id: str, request_id: str):
+    return model_ops.prepare_model_operation(
+        store,
         turn_id=turn_id,
         request_hash=f"request:{request_id}",
         context_hash=f"context:{request_id}",
@@ -95,9 +96,10 @@ def test_protected_tail_formula_is_deterministic() -> None:
 def test_normal_remaining_excludes_protected_tail(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="test",
             binding_manifest={"model_token_budget_total": 100},
@@ -108,22 +110,25 @@ def test_normal_remaining_excludes_protected_tail(tmp_path: Path) -> None:
 def test_dispatch_requires_explicit_access_to_protected_tail(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="test",
             binding_manifest={"model_token_budget_total": 100},
         )
         blocked = _prepare(store, turn.turn_id, "blocked")
         with pytest.raises(BudgetLimitExceededError):
-            store.dispatch_model_attempt(
+            model_ops.dispatch_model_attempt(
+                store,
                 blocked.operation_id,
                 resource_request=ResourceUsage(input_tokens=95, model_calls=1),
             )
 
         allowed = _prepare(store, turn.turn_id, "allowed")
-        attempt = store.dispatch_model_attempt(
+        attempt = model_ops.dispatch_model_attempt(
+            store,
             allowed.operation_id,
             resource_request=ResourceUsage(input_tokens=95, model_calls=1),
             allow_protected_budget=True,
@@ -137,10 +142,10 @@ def test_session_switches_to_pressure_before_using_protected_tail(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=workspace)
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
         model = PressureModel()
-        session = TurnExecutor(
+        session = TurnRunner(
             thread_id=thread.thread_id,
             store=store,
             model=model,
@@ -183,13 +188,15 @@ def _gateway_model(*, input_tokens: int | None = None, gateway: CapturingGateway
     return model, gateway
 
 
-def _settle_prior_usage(store: RuntimeState, turn_id: str, tokens: int) -> None:
+def _settle_prior_usage(store: RuntimeStore, turn_id: str, tokens: int) -> None:
     operation = _prepare(store, turn_id, "prior-work")
-    attempt = store.dispatch_model_attempt(
+    attempt = model_ops.dispatch_model_attempt(
+        store,
         operation.operation_id,
         resource_request=ResourceUsage(input_tokens=tokens, model_calls=1),
     )
-    store.complete_model_attempt(
+    model_ops.complete_model_attempt(
+        store,
         operation_id=operation.operation_id,
         attempt_id=attempt.attempt_id,
         generation=attempt.generation,
@@ -198,26 +205,38 @@ def _settle_prior_usage(store: RuntimeState, turn_id: str, tokens: int) -> None:
         ),
     )
 
+    from agent_runtime.harness.execution_facts import response_handled
+
+    completed = next(op for op in store.list_model_operations(turn_id) if op.operation_id == operation.operation_id)
+    response_handled(
+        store,
+        turn_id=turn_id,
+        operation_id=operation.operation_id,
+        response_item_id=completed.response_item_id,
+        disposition="prior_work_consumed",
+    )
+
 
 def test_gateway_session_finishes_with_remaining_budget_from_failed_trial(tmp_path: Path) -> None:
     """The real adapter must fit its wire and reservation, not just signal pressure."""
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite") as store:
-        thread = store.create_thread(workspace=tmp_path)
-        turn = store.start_turn(
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite") as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="finish verified work",
             binding_manifest={"model_token_budget_total": 80_000},
         )
         _settle_prior_usage(store, turn.turn_id, 43_330)
         model, gateway = _gateway_model(input_tokens=9_492)
-        runner = TurnExecutor(
+        runner = TurnRunner(
             thread_id=thread.thread_id,
             store=store,
             model=model,
             context_manager=StaticContext(),
             completion_gate=AcceptAnswer(),
         )
-        result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
+        result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
 
         assert result.status == "completed"
         assert result.answer == "real gateway answer"
@@ -237,37 +256,49 @@ def test_gateway_session_finishes_with_remaining_budget_from_failed_trial(tmp_pa
 def test_pressure_cap_is_remeasured_and_recovers_identical_wire_after_reopen(tmp_path: Path) -> None:
     database = tmp_path / "rollout.sqlite"
     model, gateway = _gateway_model()
-    with RuntimeState.open_sync(database) as store:
-        thread = store.create_thread(workspace=tmp_path)
-        turn = store.start_turn(
+    with RuntimeStore.open_sync(database) as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="finish",
             binding_manifest={"model_token_budget_total": 2_000},
         )
-        runner = TurnExecutor(
-            thread_id=thread.thread_id, store=store, model=model,
-            context_manager=StaticContext(), completion_gate=AcceptAnswer(),
+        runner = TurnRunner(
+            thread_id=thread.thread_id,
+            store=store,
+            model=model,
+            context_manager=StaticContext(),
+            completion_gate=AcceptAnswer(),
         )
         context = runner.capture_step_context(runner.restore_turn_context(turn.turn_id), step=1, budget_pressure=True)
-        prepared = asyncio.run(runner._prepare_step(context))
+        prepared = asyncio.run(runner._model_runner.prepare(context))
         assert prepared.resource_request.total_tokens <= 2_000
-        operation = store.prepare_model_operation(
-            turn_id=turn.turn_id, request_hash=prepared.request_hash, context_hash=prepared.context_hash,
-            tool_hash=prepared.tool_hash, wire_hash=prepared.wire_hash, request_ref=prepared.request_ref,
+        operation = model_ops.prepare_model_operation(
+            store,
+            turn_id=turn.turn_id,
+            request_hash=prepared.request_hash,
+            context_hash=prepared.context_hash,
+            tool_hash=prepared.tool_hash,
+            wire_hash=prepared.wire_hash,
+            request_ref=prepared.request_ref,
         )
         assert not gateway.requests
 
-    with RuntimeState.open_sync(database) as store:
-        runner = TurnExecutor(
-            thread_id=thread.thread_id, store=store, model=model,
-            context_manager=StaticContext(), completion_gate=AcceptAnswer(),
+    with RuntimeStore.open_sync(database) as store:
+        runner = TurnRunner(
+            thread_id=thread.thread_id,
+            store=store,
+            model=model,
+            context_manager=StaticContext(),
+            completion_gate=AcceptAnswer(),
         )
         restored = runner.restore_step_context(runner.restore_turn_context(turn.turn_id), operation)
-        reproduced = asyncio.run(runner._prepare_step(restored))
+        reproduced = asyncio.run(runner._model_runner.prepare(restored))
         assert reproduced.wire_hash == prepared.wire_hash
         assert reproduced.request_hash == prepared.request_hash
         assert restored.output_token_limit == prepared.resource_request.output_tokens
-        result = asyncio.run(runner.recover_prepared_model(turn_id=turn.turn_id))
+        result = asyncio.run(runner.drive(action="continue", turn_id=turn.turn_id))
         assert result.status == "completed"
         assert gateway.requests[0].settings.max_output_tokens == restored.output_token_limit
         assert store.verify().valid
@@ -275,33 +306,45 @@ def test_pressure_cap_is_remeasured_and_recovers_identical_wire_after_reopen(tmp
 
 @pytest.mark.parametrize("budget", [None, 100_000])
 def test_sufficient_budget_keeps_configured_output_ceiling(tmp_path: Path, budget: int | None) -> None:
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite") as store:
-        thread = store.create_thread(workspace=tmp_path)
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite") as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
         model, gateway = _gateway_model(input_tokens=9_492)
-        runner = TurnExecutor(
-            thread_id=thread.thread_id, store=store, model=model,
-            context_manager=StaticContext(), completion_gate=AcceptAnswer(),
+        runner = TurnRunner(
+            thread_id=thread.thread_id,
+            store=store,
+            model=model,
+            context_manager=StaticContext(),
+            completion_gate=AcceptAnswer(),
         )
-        result = asyncio.run(runner.run(
-            turn_id="ample-budget", user_message="finish",
-            binding_manifest={"model_token_budget_total": budget},
-        ))
+        result = asyncio.run(
+            runner.run(
+                turn_id="ample-budget",
+                user_message="finish",
+                binding_manifest={"model_token_budget_total": budget},
+            )
+        )
         assert result.status == "completed"
         assert gateway.requests[0].settings.max_output_tokens == 32_768
 
 
 def test_input_without_output_headroom_stops_before_provider_io(tmp_path: Path) -> None:
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite") as store:
-        thread = store.create_thread(workspace=tmp_path)
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite") as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
         model, gateway = _gateway_model(input_tokens=1_000)
-        runner = TurnExecutor(
-            thread_id=thread.thread_id, store=store, model=model,
-            context_manager=RolloutContextManager(store), completion_gate=AcceptAnswer(),
+        runner = TurnRunner(
+            thread_id=thread.thread_id,
+            store=store,
+            model=model,
+            context_manager=RolloutContextManager(store),
+            completion_gate=AcceptAnswer(),
         )
-        result = asyncio.run(runner.run(
-            turn_id="unfit-budget", user_message="finish",
-            binding_manifest={"model_token_budget_total": 1_000},
-        ))
+        result = asyncio.run(
+            runner.run(
+                turn_id="unfit-budget",
+                user_message="finish",
+                binding_manifest={"model_token_budget_total": 1_000},
+            )
+        )
         assert result.status == "failed"
         assert result.answer is None
         assert not gateway.requests
@@ -311,39 +354,52 @@ def test_input_without_output_headroom_stops_before_provider_io(tmp_path: Path) 
 
 
 def test_pressure_keeps_explicit_output_limit_and_joint_summary_plan(tmp_path: Path) -> None:
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite") as store:
-        thread = store.create_thread(workspace=tmp_path)
-        turn = store.start_turn(
-            thread_id=thread.thread_id, user_message="finish",
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite") as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(
+            store,
+            thread_id=thread.thread_id,
+            user_message="finish",
             binding_manifest={"model_token_budget_total": 10_000},
         )
         model, gateway = _gateway_model(input_tokens=9_492)
-        runner = TurnExecutor(
-            thread_id=thread.thread_id, store=store, model=model,
-            context_manager=StaticContext(), completion_gate=AcceptAnswer(),
+        runner = TurnRunner(
+            thread_id=thread.thread_id,
+            store=store,
+            model=model,
+            context_manager=StaticContext(),
+            completion_gate=AcceptAnswer(),
         )
         context = runner.capture_step_context(runner.restore_turn_context(turn.turn_id), step=1, budget_pressure=True)
-        explicit = asyncio.run(runner._prepare_step(replace(context, output_token_limit=37)))
+        explicit = asyncio.run(runner._model_runner.prepare(replace(context, output_token_limit=37)))
         assert explicit.resource_request.output_tokens == 37
         plan = {"continuation_token_reserve": 42_260}
-        joint = asyncio.run(runner._prepare_step(replace(context, compaction_plan=plan, output_token_limit=32_768)))
+        joint = asyncio.run(
+            runner._model_runner.prepare(replace(context, compaction_plan=plan, output_token_limit=32_768))
+        )
         assert joint.resource_request.output_tokens == 32_768
         assert joint.request_ref["compaction_plan"] == plan
         assert not gateway.requests
 
 
 def test_capped_incomplete_answer_is_not_accepted_as_completion(tmp_path: Path) -> None:
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite") as store:
-        thread = store.create_thread(workspace=tmp_path)
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite") as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
         model, gateway = _gateway_model(input_tokens=9_492, gateway=MaxTokensGateway())
-        runner = TurnExecutor(
-            thread_id=thread.thread_id, store=store, model=model,
-            context_manager=StaticContext(), completion_gate=AcceptAnswer(),
+        runner = TurnRunner(
+            thread_id=thread.thread_id,
+            store=store,
+            model=model,
+            context_manager=StaticContext(),
+            completion_gate=AcceptAnswer(),
         )
-        result = asyncio.run(runner.run(
-            turn_id="incomplete-budget", user_message="finish",
-            binding_manifest={"model_token_budget_total": 10_000},
-        ))
+        result = asyncio.run(
+            runner.run(
+                turn_id="incomplete-budget",
+                user_message="finish",
+                binding_manifest={"model_token_budget_total": 10_000},
+            )
+        )
         assert gateway.requests[0].settings.max_output_tokens == 508
         assert result.status == "failed"
         assert result.answer is None

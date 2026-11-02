@@ -5,13 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime.harness import RuntimeState
+from agent_runtime.harness import RuntimeStore, completion_ops, turn_ops
 from agent_runtime.harness.rollout import _projection_hash
-from agent_runtime.harness.state import _state_operation
+from agent_runtime.harness.runtime_store import owner_operation
 
 
-@_state_operation
-def _settings_work(store: RuntimeState, thread_id: str) -> int:
+@owner_operation
+def _settings_work(store: RuntimeStore, thread_id: str) -> int:
     steps = 0
 
     def progress() -> int:
@@ -21,14 +21,14 @@ def _settings_work(store: RuntimeState, thread_id: str) -> int:
 
     store.run_sync(lambda: store.persistence._connection.set_progress_handler(progress, 1))
     try:
-        store.update_session_settings(thread_id, {"model_alias": "test"})
+        turn_ops.update_session_settings(store, thread_id, {"model_alias": "test"})
     finally:
         store.run_sync(lambda: store.persistence._connection.set_progress_handler(None, 0))
     return steps
 
 
-@_state_operation
-def _legacy_metadata(store: RuntimeState, thread_id: str) -> None:
+@owner_operation
+def _legacy_metadata(store: RuntimeStore, thread_id: str) -> None:
     digest = _projection_hash(store.persistence._load_projection_state(thread_id), thread_id)
     store.run_sync(
         lambda: store.persistence._connection.execute(
@@ -48,12 +48,12 @@ def _legacy_metadata(store: RuntimeState, thread_id: str) -> None:
 
 
 def test_settings_event_work_does_not_grow_with_historical_turns(tmp_path: Path) -> None:
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=tmp_path)
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
         small = _settings_work(store, thread.thread_id)
         for _ in range(100):
-            turn = store.start_turn(thread_id=thread.thread_id, user_message="u" * 4096, binding_manifest={})
-            store.complete_turn(turn_id=turn.turn_id, answer="a" * 4096)
+            turn = turn_ops.start_turn(store, thread_id=thread.thread_id, user_message="u" * 4096, binding_manifest={})
+            turn_ops.complete_turn(store, turn_id=turn.turn_id, answer="a" * 4096)
         statements: list[str] = []
         store.run_sync(lambda: store.persistence._connection.set_trace_callback(statements.append))
         large = _settings_work(store, thread.thread_id)
@@ -65,17 +65,18 @@ def test_settings_event_work_does_not_grow_with_historical_turns(tmp_path: Path)
 
 
 def test_item_creation_does_not_load_previous_item_payloads(tmp_path: Path) -> None:
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        turn = store.start_turn(
-            thread_id=store.create_thread(workspace=tmp_path).thread_id,
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        turn = turn_ops.start_turn(
+            store,
+            thread_id=turn_ops.create_thread(store, workspace=tmp_path).thread_id,
             user_message="history" * 4096,
             binding_manifest={},
         )
         for _ in range(20):
-            store.record_final_proposal(turn_id=turn.turn_id, answer="proposal" * 4096)
+            completion_ops.record_final_proposal(store, turn_id=turn.turn_id, answer="proposal" * 4096)
         statements: list[str] = []
         store.run_sync(lambda: store.persistence._connection.set_trace_callback(statements.append))
-        item = store.record_final_proposal(turn_id=turn.turn_id, answer="next")
+        item = completion_ops.record_final_proposal(store, turn_id=turn.turn_id, answer="next")
         store.run_sync(lambda: store.persistence._connection.set_trace_callback(None))
 
         assert item.sequence == 22
@@ -86,9 +87,9 @@ def test_item_creation_does_not_load_previous_item_payloads(tmp_path: Path) -> N
 
 
 def test_record_envelope_corruption_is_detected_without_projection_difference(tmp_path: Path) -> None:
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=tmp_path)
-        store.update_session_settings(thread.thread_id, {"model_alias": "test"})
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn_ops.update_session_settings(store, thread.thread_id, {"model_alias": "test"})
         store.run_sync(
             lambda: store.persistence._connection.execute(
                 "UPDATE rollout_records SET producer = 'model' WHERE record_type = 'session_settings_updated'"
@@ -99,19 +100,19 @@ def test_record_envelope_corruption_is_detected_without_projection_difference(tm
 
 def test_legacy_readonly_verification_then_atomic_upgrade(tmp_path: Path) -> None:
     database = tmp_path / "rollout.sqlite3"
-    with RuntimeState.open_sync(database) as store:
-        thread = store.create_thread(workspace=tmp_path)
-        turn = store.start_turn(thread_id=thread.thread_id, user_message="old snapshot", binding_manifest={})
-        store.complete_turn(turn_id=turn.turn_id, answer="preserved")
+    with RuntimeStore.open_sync(database) as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(store, thread_id=thread.thread_id, user_message="old snapshot", binding_manifest={})
+        turn_ops.complete_turn(store, turn_id=turn.turn_id, answer="preserved")
         _legacy_metadata(store, thread.thread_id)
-    with RuntimeState.open_sync(database, read_only=True) as store:
+    with RuntimeStore.open_sync(database, read_only=True) as store:
         assert store.verify().valid
         columns = store.run_sync(
             lambda: {row["name"] for row in store.persistence._connection.execute("PRAGMA table_info(projection_meta)")}
         )
         assert "hash_version" not in columns
-    with RuntimeState.open_sync(database) as store:
-        store.update_session_settings(thread.thread_id, {"model_alias": "new"})
+    with RuntimeStore.open_sync(database) as store:
+        turn_ops.update_session_settings(store, thread.thread_id, {"model_alias": "new"})
         metadata = store.run_sync(
             lambda: store.persistence._connection.execute("SELECT * FROM projection_meta").fetchone()
         )
@@ -125,18 +126,18 @@ def test_legacy_readonly_verification_then_atomic_upgrade(tmp_path: Path) -> Non
 
 def test_corrupt_legacy_metadata_is_not_erased_by_upgrade(tmp_path: Path) -> None:
     database = tmp_path / "rollout.sqlite3"
-    with RuntimeState.open_sync(database) as store:
-        thread = store.create_thread(workspace=tmp_path)
+    with RuntimeStore.open_sync(database) as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
         _legacy_metadata(store, thread.thread_id)
         store.run_sync(
             lambda: store.persistence._connection.execute(
                 "UPDATE projection_meta SET canonical_hash = ?", ("0" * 64,)
             ).close()
         )
-    with RuntimeState.open_sync(database) as store:
+    with RuntimeStore.open_sync(database) as store:
         records = store.list_records(thread.thread_id)
         with pytest.raises(RuntimeError, match="integrity"):
-            store.update_session_settings(thread.thread_id, {"model_alias": "must not commit"})
+            turn_ops.update_session_settings(store, thread.thread_id, {"model_alias": "must not commit"})
         assert store.list_records(thread.thread_id) == records
         assert store.projection_hashes()[thread.thread_id] == "0" * 64
         assert not store.verify().valid
@@ -144,10 +145,10 @@ def test_corrupt_legacy_metadata_is_not_erased_by_upgrade(tmp_path: Path) -> Non
 
 def test_legacy_upgrade_and_append_roll_back_together(tmp_path: Path) -> None:
     database = tmp_path / "rollout.sqlite3"
-    with RuntimeState.open_sync(database) as store:
-        thread = store.create_thread(workspace=tmp_path)
+    with RuntimeStore.open_sync(database) as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
         _legacy_metadata(store, thread.thread_id)
-    with RuntimeState.open_sync(database) as store:
+    with RuntimeStore.open_sync(database) as store:
         records = store.list_records(thread.thread_id)
         metadata = dict(
             store.run_sync(lambda: store.persistence._connection.execute("SELECT * FROM projection_meta").fetchone())
@@ -160,7 +161,7 @@ def test_legacy_upgrade_and_append_roll_back_together(tmp_path: Path) -> None:
             ).close()
         )
         with pytest.raises(sqlite3.IntegrityError, match="forced failure"):
-            store.update_session_settings(thread.thread_id, {"model_alias": "must roll back"})
+            turn_ops.update_session_settings(store, thread.thread_id, {"model_alias": "must roll back"})
         assert (
             dict(
                 store.run_sync(
@@ -174,20 +175,20 @@ def test_legacy_upgrade_and_append_roll_back_together(tmp_path: Path) -> None:
 
 
 def test_unknown_digest_version_fails_closed(tmp_path: Path) -> None:
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=tmp_path)
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
         store.run_sync(
             lambda: store.persistence._connection.execute("UPDATE projection_meta SET hash_version = 999").close()
         )
         assert not store.verify().valid
         with pytest.raises(RuntimeError, match="hash version"):
-            store.update_session_settings(thread.thread_id, {"model_alias": "no"})
+            turn_ops.update_session_settings(store, thread.thread_id, {"model_alias": "no"})
 
 
 @pytest.mark.parametrize("version", [2.5, "invalid"])
 def test_malformed_digest_version_is_not_coerced_into_a_known_version(tmp_path: Path, version: object) -> None:
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        store.create_thread(workspace=tmp_path)
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        turn_ops.create_thread(store, workspace=tmp_path)
         store.run_sync(
             lambda: store.persistence._connection.execute(
                 "UPDATE projection_meta SET hash_version = ?", (version,)
@@ -197,9 +198,10 @@ def test_malformed_digest_version_is_not_coerced_into_a_known_version(tmp_path: 
 
 
 def test_streaming_verification_detects_extra_and_missing_projection_rows(tmp_path: Path) -> None:
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        turn = store.start_turn(
-            thread_id=store.create_thread(workspace=tmp_path).thread_id,
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        turn = turn_ops.start_turn(
+            store,
+            thread_id=turn_ops.create_thread(store, workspace=tmp_path).thread_id,
             user_message="original",
             binding_manifest={},
         )
@@ -216,15 +218,15 @@ def test_streaming_verification_detects_extra_and_missing_projection_rows(tmp_pa
 
 
 def test_interleaved_threads_and_fork_have_independent_rebuildable_hashes(tmp_path: Path) -> None:
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        parent = store.create_thread(workspace=tmp_path)
-        other = store.create_thread(workspace=tmp_path)
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        parent = turn_ops.create_thread(store, workspace=tmp_path)
+        other = turn_ops.create_thread(store, workspace=tmp_path)
         for thread in (parent, other, parent):
-            turn = store.start_turn(thread_id=thread.thread_id, user_message="history", binding_manifest={})
-            store.complete_turn(turn_id=turn.turn_id, answer="answer")
-        child = store.fork_thread(from_turn_id=turn.turn_id)
+            turn = turn_ops.start_turn(store, thread_id=thread.thread_id, user_message="history", binding_manifest={})
+            turn_ops.complete_turn(store, turn_id=turn.turn_id, answer="answer")
+        child = turn_ops.fork_thread(store, from_turn_id=turn.turn_id)
         before = store.projection_hashes()
-        store.update_session_settings(child.thread_id, {"model_alias": "child"})
+        turn_ops.update_session_settings(store, child.thread_id, {"model_alias": "child"})
         after = store.projection_hashes()
         assert before[parent.thread_id] == after[parent.thread_id]
         assert before[other.thread_id] == after[other.thread_id]
@@ -237,9 +239,9 @@ def test_interleaved_threads_and_fork_have_independent_rebuildable_hashes(tmp_pa
 
 @pytest.mark.parametrize("corrupt", ["true", "1.0"])
 def test_streaming_verification_preserves_strict_json_types(tmp_path: Path, corrupt: str) -> None:
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=tmp_path)
-        store.update_session_settings(thread.thread_id, {"value": 1})
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn_ops.update_session_settings(store, thread.thread_id, {"value": 1})
         store.run_sync(
             lambda: store.persistence._connection.execute(
                 "UPDATE threads SET settings_json = ?", ('{"value":' + corrupt + "}\u0020",)

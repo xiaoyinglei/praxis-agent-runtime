@@ -120,7 +120,7 @@ def test_symlink_target_requires_read_permission(tmp_path):
 @pytest.mark.anyio
 async def test_execute_python_publish_runs_as_cancellable_blocking_phase(tmp_path, monkeypatch):
     launcher = tmp_path / "bwrap"
-    launcher.write_text('#!/bin/sh\nexit 0\n')
+    launcher.write_text("#!/bin/sh\nexit 0\n")
     launcher.chmod(0o755)
     monkeypatch.setattr(shell, "_SANDBOX_PLATFORM", "linux")
     monkeypatch.setattr(shell, "_BWRAP_PATH", str(launcher))
@@ -134,9 +134,14 @@ async def test_execute_python_publish_runs_as_cancellable_blocking_phase(tmp_pat
     monkeypatch.setattr(shell, "_commit_linux_workspace_view", probing_commit)
     workspace = open_workspace(tmp_path / "workspace", create=True)
 
-    result = await shell._execute_managed_python(workspace, shell.ManagedPythonInput(
-        code="pass", workspace_write=True,
-    ), termination_grace_seconds=0.1)
+    result = await shell._execute_managed_python(
+        workspace,
+        shell.ManagedPythonInput(
+            code="pass",
+            workspace_write=True,
+        ),
+        termination_grace_seconds=0.1,
+    )
 
     assert result.sandbox_error is None
     assert result.workspace_published is True
@@ -156,13 +161,26 @@ async def test_startup_failure_does_not_publish_with_opt_in(tmp_path, monkeypatc
     monkeypatch.setattr(shell, "_BWRAP_PATH", str(launcher))
     workspace = open_workspace(tmp_path / "workspace", create=True)
     if python:
-        result = await shell._execute_managed_python(workspace, shell.ManagedPythonInput(
-            code="pass", workspace_write=True, publish_on_failure=True, output_paths=["result"],
-        ), termination_grace_seconds=0.1)
+        result = await shell._execute_managed_python(
+            workspace,
+            shell.ManagedPythonInput(
+                code="pass",
+                workspace_write=True,
+                publish_on_failure=True,
+                output_paths=["result"],
+            ),
+            termination_grace_seconds=0.1,
+        )
     else:
-        result = await shell._run_command(workspace, shell.RunCommandInput(
-            command="true", workspace_write=True, publish_on_failure=True,
-        ), termination_grace_seconds=0.1)
+        result = await shell._run_command(
+            workspace,
+            shell.RunCommandInput(
+                command="true",
+                workspace_write=True,
+                publish_on_failure=True,
+            ),
+            termination_grace_seconds=0.1,
+        )
     assert result.sandbox_error == "sandbox_start_failed"
     assert result.workspace_published is False
 
@@ -184,17 +202,18 @@ async def test_real_linux_partial_publication_is_explicit_and_still_checked(tmp_
         code += "import time; time.sleep(60)"
     else:
         code += 'Path("alias").symlink_to("/etc/passwd")'
-    options = dict(workspace_write=True, publish_on_failure=publish,
-                   timeout_seconds=1 if failure == "timeout" else 10)
+    options = dict(workspace_write=True, publish_on_failure=publish, timeout_seconds=1 if failure == "timeout" else 10)
     if python:
         result = await shell._execute_managed_python(
-            workspace, shell.ManagedPythonInput(code=code, output_paths=["source"], **options),
+            workspace,
+            shell.ManagedPythonInput(code=code, output_paths=["source"], **options),
             termination_grace_seconds=0.1,
         )
         normalized = shell._normalize_managed_python_output(result)
     else:
         result = await shell._run_command(
-            workspace, shell.RunCommandInput(command="python3 -c " + shlex.quote(code), **options),
+            workspace,
+            shell.RunCommandInput(command="python3 -c " + shlex.quote(code), **options),
             termination_grace_seconds=0.1,
         )
         normalized = shell._normalize_command_output(result)
@@ -218,15 +237,26 @@ async def test_real_linux_configure_and_incremental_make_after_timeout(tmp_path)
         "first.o: source.in\n\tcp build/source.in first.o\n\techo first >> count\n"
         "second.o: source.in\n\tcp build/source.in second.o\n\techo second >> count\n"
     )
-    first = await shell._run_command(workspace, shell.RunCommandInput(
-        command="mkdir build && ln -s ../source.in build/source.in && make first.o && sleep 60",
-        workspace_write=True, publish_on_failure=True, timeout_seconds=1,
-    ), termination_grace_seconds=0.1)
+    first = await shell._run_command(
+        workspace,
+        shell.RunCommandInput(
+            command="mkdir build && ln -s ../source.in build/source.in && make first.o && sleep 60",
+            workspace_write=True,
+            publish_on_failure=True,
+            timeout_seconds=1,
+        ),
+        termination_grace_seconds=0.1,
+    )
     assert first.timed_out and first.workspace_published, first.stderr
     assert (workspace.root / "count").read_text().splitlines() == ["first"]
-    second = await shell._run_command(workspace, shell.RunCommandInput(
-        command="make all", workspace_write=True,
-    ), termination_grace_seconds=0.1)
+    second = await shell._run_command(
+        workspace,
+        shell.RunCommandInput(
+            command="make all",
+            workspace_write=True,
+        ),
+        termination_grace_seconds=0.1,
+    )
     assert second.exit_code == 0 and second.workspace_published, second.stderr
     assert (workspace.root / "count").read_text().splitlines() == ["first", "second"]
 
@@ -241,30 +271,49 @@ async def test_real_linux_cancellation_discards_even_with_failure_publication(tm
     workspace = open_workspace(tmp_path / "workspace", create=True)
     (workspace.root / "source").write_text("before")
     ready = asyncio.Event()
-    code = ('from pathlib import Path; import time; Path("source").write_text("after"); '
-            'print("ready", flush=True); time.sleep(60)')
+    code = (
+        'from pathlib import Path; import time; Path("source").write_text("after"); '
+        'print("ready", flush=True); time.sleep(60)'
+    )
     if python:
         # Wait for a scratch signal because managed Python does not stream stdout.
-        code = code.replace('print("ready", flush=True)',
-                            'import os; Path(os.environ["TMPDIR"], "ready").touch()')
-        pending = shell._execute_managed_python(workspace, shell.ManagedPythonInput(
-            code=code, workspace_write=True, publish_on_failure=True, output_paths=["source"],
-        ), termination_grace_seconds=0.1)
+        code = code.replace('print("ready", flush=True)', 'import os; Path(os.environ["TMPDIR"], "ready").touch()')
+        pending = shell._execute_managed_python(
+            workspace,
+            shell.ManagedPythonInput(
+                code=code,
+                workspace_write=True,
+                publish_on_failure=True,
+                output_paths=["source"],
+            ),
+            termination_grace_seconds=0.1,
+        )
     else:
+
         async def progress(event):
             if "ready" in event.content:
                 ready.set()
-        pending = shell._run_command(workspace, shell.RunCommandInput(
-            command="python3 -c " + shlex.quote(code), workspace_write=True, publish_on_failure=True,
-        ), termination_grace_seconds=0.1, progress_sink=progress)
+
+        pending = shell._run_command(
+            workspace,
+            shell.RunCommandInput(
+                command="python3 -c " + shlex.quote(code),
+                workspace_write=True,
+                publish_on_failure=True,
+            ),
+            termination_grace_seconds=0.1,
+            progress_sink=progress,
+        )
     task = asyncio.create_task(pending)
     try:
         if python:
+
             async def await_signal():
                 while not list(workspace.scratch.glob("run-python-*/ready")):
                     if task.done():
                         pytest.fail(str(task.result()))
                     await asyncio.sleep(0.02)
+
             await asyncio.wait_for(await_signal(), 10)
         else:
             await asyncio.wait_for(ready.wait(), 10)
@@ -286,19 +335,28 @@ def test_public_linux_approval_recovery_publishes_partial_build_as_tool_failure(
     from typer.testing import CliRunner
 
     from agent_runtime import Agent, cli
-    from agent_runtime.harness import HarnessModelResponse, ModelToolCall, RuntimeState
+    from agent_runtime.harness import HarnessModelResponse, ModelToolCall, RuntimeStore
     from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel
 
     class BuildOnce(PatchThenAnswerModel):
         async def dispatch(self, prepared, **kwargs):
             if prepared.request_ref["request_id"].endswith(":step:1"):
-                return HarnessModelResponse.from_parts(text="", provider_response_id=None,
-                    usage={"input_tokens": 5, "output_tokens": 3}, tool_calls=(ModelToolCall(
-                        id="build", name="run_command", arguments={
-                            "command": "printf artifact > built; exit 7",
-                            "workspace_write": True, "publish_on_failure": True,
-                        },
-                    ),))
+                return HarnessModelResponse.from_parts(
+                    text="",
+                    provider_response_id=None,
+                    usage={"input_tokens": 5, "output_tokens": 3},
+                    tool_calls=(
+                        ModelToolCall(
+                            id="build",
+                            name="run_command",
+                            arguments={
+                                "command": "printf artifact > built; exit 7",
+                                "workspace_write": True,
+                                "publish_on_failure": True,
+                            },
+                        ),
+                    ),
+                )
             return HarnessModelResponse.from_parts(
                 text="Build failed; partial artifact retained.",
                 provider_response_id=None,
@@ -320,23 +378,37 @@ def test_public_linux_approval_recovery_publishes_partial_build_as_tool_failure(
         assert result.validation_status == "not_evaluated"
     else:
         original = cli._create_agent_facade
+
         def create(**kwargs):
             agent = original(**kwargs)
             monkeypatch.setattr(agent, "_model_factory", BuildOnce)
             return agent
+
         monkeypatch.setattr(cli, "_create_agent_facade", create)
         monkeypatch.chdir(workspace)
         runner = CliRunner()
-        runner.invoke(cli.agent_app, ["run", "Build", "--max-steps", "3", "--disable-workspace-mcp",
-                                     "--non-interactive", "--rollout-db", str(database)])
-        with RuntimeState.open_sync(database) as store:
+        runner.invoke(
+            cli.agent_app,
+            [
+                "run",
+                "Build",
+                "--max-steps",
+                "3",
+                "--disable-workspace-mcp",
+                "--non-interactive",
+                "--rollout-db",
+                str(database),
+            ],
+        )
+        with RuntimeStore.open_sync(database) as store:
             turn = store.list_turns()[-1]
             assert turn.status == "paused"
-        result = runner.invoke(cli.agent_app, ["recover", turn.turn_id, "--action", "allow_once",
-                                              "--rollout-db", str(database)])
+        result = runner.invoke(
+            cli.agent_app, ["recover", turn.turn_id, "--action", "allow_once", "--rollout-db", str(database)]
+        )
         assert result.exit_code == 0, result.output
     assert (workspace / "built").read_text() == "artifact"
-    with RuntimeState.open_sync(database) as store:
+    with RuntimeStore.open_sync(database) as store:
         turn = store.list_turns()[-1]
         results = [i.payload for i in store.list_items(turn.turn_id) if i.kind == "tool_result"]
         assert len(results) == 1

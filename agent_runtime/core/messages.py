@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import uuid4
@@ -155,8 +155,13 @@ class ModelMessage:
     body: str | tuple[ModelOutput, ...]
     tool_call_id: str | None = None
     context_category: Literal["continuation_summary"] | None = None
+    runtime_metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        metadata = json_schema_output(None, dict(self.runtime_metadata))
+        object.__setattr__(self, "runtime_metadata", metadata)
+        if metadata and self.role != "context":
+            raise ValueError("runtime metadata is only valid for host context messages")
         if self.role not in {"system", "user", "assistant", "tool", "context"}:
             raise ValueError(f"unsupported model message role: {self.role}")
         if self.role == "assistant":
@@ -232,6 +237,7 @@ def restore_model_message(payload: Mapping[str, Any]) -> ModelMessage:
         body=body,
         tool_call_id=payload.get("tool_call_id"),
         context_category=payload.get("context_category"),
+        runtime_metadata=payload.get("runtime_metadata", {}),
     )
 
 
@@ -325,6 +331,10 @@ def model_message_payload(message: ModelMessage) -> Mapping[str, JsonValue]:
         else cast(JsonValue, tuple(output_to_payload(output) for output in message.body)),
         "tool_call_id": message.tool_call_id,
         "context_category": message.context_category,
+        **(
+            {"runtime_metadata": cast(JsonValue, _thaw_json(message.runtime_metadata))}
+            if message.runtime_metadata else {}
+        ),
     }
 
 

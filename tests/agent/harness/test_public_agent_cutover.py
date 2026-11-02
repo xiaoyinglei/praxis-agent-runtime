@@ -17,8 +17,9 @@ from agent_runtime.harness import (
     ModelToolCall,
     PreparedModelCall,
     RolloutEventReader,
-    RuntimeState,
+    RuntimeStore,
     Session,
+    turn_ops,
 )
 from agent_runtime.harness import session as harness_session
 from agent_runtime.streaming.events import EventType, StreamEvent, TurnItemKind
@@ -131,7 +132,7 @@ async def test_public_read_result_after_disconnect_never_constructs_model_runtim
     replayed = await agent.read_result(committed.turn_id)
 
     assert replayed == committed
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         assert store.verify().valid is True
 
 
@@ -215,7 +216,7 @@ async def test_public_agent_can_explicitly_disable_workspace_mcp_discovery_and_f
     )
 
     assert result.status == "done"
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         assert store.read_turn(result.turn_id).binding_manifest["mcp_policy"] == {"workspace_discovery_enabled": False}
 
 
@@ -252,7 +253,9 @@ async def test_public_followup_uses_current_mcp_configuration_and_requires_curre
 
     with pytest.raises(PermissionError, match="workspace MCP config is not trusted"):
         await fresh_process_agent.run(
-            "follow up", previous_turn_id=first.turn_id, require_workspace_change=False,
+            "follow up",
+            previous_turn_id=first.turn_id,
+            require_workspace_change=False,
         )
 
 
@@ -360,7 +363,7 @@ async def test_public_step_budget_and_legacy_alias_freeze_the_same_limit(tmp_pat
     monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
     result = await agent.run("direct answer", require_workspace_change=False, **limits)
     assert result.status == "done"
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         assert store.read_turn(result.turn_id).binding_manifest["model_step_budget"] == 2
 
 
@@ -400,9 +403,7 @@ class AcknowledgedStreamCancelModel(PublicHarnessModel):
         try:
             await asyncio.Future()
         except asyncio.CancelledError as exc:
-            raise ModelDispatchCancelledError(
-                "provider acknowledged stream cancellation"
-            ) from exc
+            raise ModelDispatchCancelledError("provider acknowledged stream cancellation") from exc
 
 
 class BlockingResumeModel(PatchThenAnswerModel):
@@ -484,7 +485,7 @@ async def test_public_agent_uses_rollout_harness_not_legacy_service(
     assert result.status == "done"
     assert result.thread_id != result.turn_id
     assert result.workspace_path == str(workspace.resolve())
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         assert store.read_turn(result.turn_id).thread_id == result.thread_id
         assert store.verify().valid is True
     assert_answer_event_contract(events)
@@ -524,7 +525,7 @@ async def test_public_resume_approves_the_same_durable_harness_turn(
     assert resumed.status == "done"
     assert resumed.answer == "patched through replacement harness"
     assert target.read_text(encoding="utf-8") == "after"
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         [operation] = store.list_tool_operations(paused.turn_id)
         assert operation.status == "succeeded"
         assert store.verify().valid is True
@@ -545,14 +546,17 @@ async def test_public_resume_restores_the_frozen_tool_execution_policy(
         assert workspace.root == target.parent
         assert request.workspace_write is True
         assert request.output_paths == ["value.txt"]
-        assert request.code == (
-            "from pathlib import Path\nPath('value.txt').write_text('after')"
-        )
+        assert request.code == ("from pathlib import Path\nPath('value.txt').write_text('after')")
         executions.append(request)
         target.write_text("after", encoding="utf-8")
         return shell.ManagedPythonOutput(
-            stdout="", stderr="", exit_code=0, timed_out=False,
-            truncated=False, duration_ms=0, python_version="3.12.0",
+            stdout="",
+            stderr="",
+            exit_code=0,
+            timed_out=False,
+            truncated=False,
+            duration_ms=0,
+            python_version="3.12.0",
         )
 
     # Exercise policy and durable approval independently of macOS Seatbelt.
@@ -575,7 +579,7 @@ async def test_public_resume_restores_the_frozen_tool_execution_policy(
     assert paused.status == "paused"
     assert executions == []
     assert target.read_text(encoding="utf-8") == "before"
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         policy = store.read_turn(paused.turn_id).binding_manifest["tool_execution_policy"]
         assert policy["allow_write_tools"] is True
         assert policy["allow_execute_tools"] is True
@@ -608,7 +612,7 @@ async def test_public_abort_cancels_only_a_safely_paused_turn(
 
     assert cancelled.status == "failed"
     assert target.read_text(encoding="utf-8") == "before"
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         assert store.read_turn(paused.turn_id).status == "cancelled"
         assert store.list_tool_operations(paused.turn_id)[0].status == "cancelled"
         assert store.list_interactions(paused.turn_id)[0].status == "resolved"
@@ -635,7 +639,7 @@ async def test_public_agent_freezes_and_durably_enforces_model_budget(
 
     assert result.status == "failed"
     assert result.answer and "尚未完成" in result.answer
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         turn = store.read_turn(result.turn_id)
         assert turn.status == "failed"
         assert turn.binding_manifest["model_step_budget"] == 1
@@ -688,7 +692,7 @@ async def test_public_agent_binds_explicit_workspace_mcp_trust_to_the_turn(
 
     result = await agent.run("use the exact trusted config", require_workspace_change=False)
 
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         policy = store.read_turn(result.turn_id).binding_manifest["mcp_policy"]
     assert policy == {
         "workspace_discovery_enabled": True,
@@ -726,7 +730,7 @@ async def test_public_agent_references_files_without_copying_as_canonical_input_
     ]
     assert len(attachment_messages) == 1
     assert "brief.txt" in attachment_messages[0]
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         input_items = [item for item in store.list_items(result.turn_id) if item.kind == "input_file"]
         assert len(input_items) == 1
         assert input_items[0].payload["path"] == str(source.resolve())
@@ -734,8 +738,9 @@ async def test_public_agent_references_files_without_copying_as_canonical_input_
         assert not list((workspace / ".praxis/runtime/input_files").rglob("brief.txt"))
         from agent_runtime.permission_policy import ResolvedPermissions
 
-        policy = ResolvedPermissions.model_validate(store.read_turn(result.turn_id).binding_manifest[
-            "tool_execution_policy"]["permissions"])
+        policy = ResolvedPermissions.model_validate(
+            store.read_turn(result.turn_id).binding_manifest["tool_execution_policy"]["permissions"]
+        )
         assert policy.path_access(source)
         assert not policy.path_access(source, write=True)
         assert not policy.path_access(source.with_name("unselected.txt"))
@@ -793,8 +798,11 @@ async def test_attachment_symlink_cannot_bypass_lexical_deny(tmp_path, monkeypat
     source.write_text("private")
     link = tmp_path / "forbidden.txt"
     link.symlink_to(source)
-    agent = Agent(checkpoint_db=tmp_path / "denied.sqlite3", workspace_path=workspace,
-                  permissions=PermissionPolicy(filesystem=(PathRule(path=str(link), access="deny"),)))
+    agent = Agent(
+        checkpoint_db=tmp_path / "denied.sqlite3",
+        workspace_path=workspace,
+        permissions=PermissionPolicy(filesystem=(PathRule(path=str(link), access="deny"),)),
+    )
     monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
     async with agent.session(require_workspace_change=False) as session:
         with pytest.raises(PermissionError):
@@ -811,14 +819,22 @@ async def test_original_attachment_is_readable_by_real_tools_and_live_deny_revok
     second = tmp_path / "second.txt"
     first.write_text("ORIGINAL_CONTENT_731")
     second.write_text("SECOND_CONTENT_912")
+
     class ReadingModel(CapturingPublicModel):
         def prepare(self, request):
             prepared = super().prepare(request)
             from dataclasses import replace
-            return replace(prepared, request_ref={**prepared.request_ref,
-                "request_id": f"{request.turn_id}:{request.step}",
-                "toolset_revision": toolset_revision_for_tools(request.tools),
-                "exposed_tool_names": [tool.definition.name for tool in request.tools]})
+
+            return replace(
+                prepared,
+                request_ref={
+                    **prepared.request_ref,
+                    "request_id": f"{request.turn_id}:{request.step}",
+                    "toolset_revision": toolset_revision_for_tools(request.tools),
+                    "exposed_tool_names": [tool.definition.name for tool in request.tools],
+                },
+            )
+
         async def dispatch(self, prepared, *, event_sink=None):
             if len(self.requests) == 1:
                 return HarnessModelResponse.from_parts(
@@ -828,6 +844,7 @@ async def test_original_attachment_is_readable_by_real_tools_and_live_deny_revok
                     tool_calls=(ModelToolCall(id="read-original", name="read_file", arguments={"path": str(first)}),),
                 )
             return await super().dispatch(prepared, event_sink=event_sink)
+
     model = ReadingModel()
     agent = Agent(checkpoint_db=tmp_path / "read.sqlite3", workspace_path=workspace)
     monkeypatch.setattr(agent, "_model_factory", lambda: model)
@@ -872,8 +889,9 @@ async def test_failed_file_steering_does_not_leave_authority_without_receipt(tmp
         finally:
             model.release.set()
             await task
-        assert any("external.txt" in message.content for message in model.requests[-1].messages
-                   if message.role == "context")
+        assert any(
+            "external.txt" in message.content for message in model.requests[-1].messages if message.role == "context"
+        )
         assert session.store.verify().valid
 
 
@@ -888,10 +906,12 @@ async def test_session_attachment_ceiling_is_checked_before_hashing_file(tmp_pat
     source.write_text("no read authority")
     opened = []
     real_open = Path.open
+
     def track_open(path, *args, **kwargs):
         if path == source:
             opened.append(path)
         return real_open(path, *args, **kwargs)
+
     agent = Agent(checkpoint_db=tmp_path / "ceil.sqlite3", workspace_path=workspace)
     monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
     ceiling = PermissionPolicy(filesystem=(PathRule(path=str(source), access="deny"),)).resolve(workspace)
@@ -993,11 +1013,9 @@ async def test_confirmed_stream_cancel_commits_request_then_turn_aborted(
     await asyncio.wait_for(model.dispatch_started.wait(), timeout=1.0)
     await stream.aclose()
 
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         replayed = [
-            entry.event
-            for entry in RolloutEventReader(store).read_global()
-            if entry.event.turn_id == started.turn_id
+            entry.event for entry in RolloutEventReader(store).read_global() if entry.event.turn_id == started.turn_id
         ]
         turn = store.read_turn(started.turn_id)
         thread = store.read_thread(turn.thread_id)
@@ -1038,11 +1056,9 @@ async def test_unconfirmed_stream_cancel_retains_interrupted_turn_for_reconcilia
     await asyncio.wait_for(model.dispatch_started.wait(), timeout=1.0)
     await stream.aclose()
 
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         replayed = [
-            entry.event
-            for entry in RolloutEventReader(store).read_global()
-            if entry.event.turn_id == started.turn_id
+            entry.event for entry in RolloutEventReader(store).read_global() if entry.event.turn_id == started.turn_id
         ]
         turn = store.read_turn(started.turn_id)
         thread = store.read_thread(turn.thread_id)
@@ -1124,14 +1140,14 @@ async def test_public_stream_awaits_post_commit_batch_without_record_listener_qu
                 sink_started.set()
                 await release_sink.wait()
 
-    original_init = RuntimeState.__init__
+    original_init = RuntimeStore.__init__
 
-    def reject_record_listener(self: RuntimeState, *args: object, **kwargs: object) -> None:
+    def reject_record_listener(self: RuntimeStore, *args: object, **kwargs: object) -> None:
         assert kwargs.get("record_listener") is None
         original_init(self, *args, **kwargs)
 
-    monkeypatch.setattr(RuntimeState, "__init__", reject_record_listener)
-    monkeypatch.setattr(harness_session, "RuntimeState", RuntimeState)
+    monkeypatch.setattr(RuntimeStore, "__init__", reject_record_listener)
+    monkeypatch.setattr(harness_session, "RuntimeStore", RuntimeStore)
     monkeypatch.setattr(agent, "_model_factory", lambda: model)
     running = asyncio.create_task(
         agent.run(
@@ -1145,7 +1161,7 @@ async def test_public_stream_awaits_post_commit_batch_without_record_listener_qu
         async with asyncio.timeout(5):
             await sink_started.wait()
             assert model.dispatch_started.is_set() is False
-            async with (await RuntimeState.open(database)) as committed_store:
+            async with await RuntimeStore.open(database) as committed_store:
                 turns = committed_store.list_turns()
                 assert len(turns) == 1
                 assert turns[0].status == "running"
@@ -1176,12 +1192,16 @@ async def test_interleaved_threads_publish_only_their_transaction_batches(
     second_stream = second_dispatcher.subscribe_controlling()
     async with (
         await Session.open(
-            database=tmp_path / "praxis.sqlite3", workspace=workspace,
-            model=PublicHarnessModel(), event_dispatcher=first_dispatcher,
+            database=tmp_path / "praxis.sqlite3",
+            workspace=workspace,
+            model=PublicHarnessModel(),
+            event_dispatcher=first_dispatcher,
         ) as first_session,
         await Session.open(
-            database=tmp_path / "praxis.sqlite3", workspace=workspace,
-            model=PublicHarnessModel(), event_dispatcher=second_dispatcher,
+            database=tmp_path / "praxis.sqlite3",
+            workspace=workspace,
+            model=PublicHarnessModel(),
+            event_dispatcher=second_dispatcher,
         ) as second_session,
     ):
         first, second = await asyncio.gather(
@@ -1273,7 +1293,7 @@ async def test_cli_arun_sink_and_astream_share_identical_v2_lifecycle(
         (tmp_path / "cli.sqlite3", cli_result, cli_capture.events),
         (tmp_path / "sink.sqlite3", sink_result, sink_capture.events),
     ):
-        async with (await RuntimeState.open(database)) as store:
+        async with await RuntimeStore.open(database) as store:
             replayed = RolloutEventReader(store).read(result.thread_id)
         assert [(event.type, event.item_id) for event in live] == [
             (entry.event.type, entry.event.item_id) for entry in replayed
@@ -1385,9 +1405,10 @@ async def test_public_abort_of_interrupted_turn_does_not_construct_model_runtime
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "praxis.sqlite3"
-    async with (await RuntimeState.open(database)) as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    async with await RuntimeStore.open(database) as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="legacy interrupted work",
             binding_manifest={
@@ -1395,7 +1416,8 @@ async def test_public_abort_of_interrupted_turn_does_not_construct_model_runtime
                 "legacy_resume_compatible": False,
             },
         )
-        store.interrupt_orphaned_turn(
+        turn_ops.interrupt_orphaned_turn(
+            store,
             turn_id=turn.turn_id,
             reason="legacy worker stopped",
             maintenance_confirmed=True,
@@ -1411,7 +1433,7 @@ async def test_public_abort_of_interrupted_turn_does_not_construct_model_runtime
 
     assert result.status == "failed"
     assert result.stop_reason == "cancelled"
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         assert store.read_turn(turn.turn_id).status == "cancelled"
 
 
@@ -1423,9 +1445,10 @@ async def test_public_resume_rejects_incompatible_migrated_turn_before_runtime(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "praxis.sqlite3"
-    async with (await RuntimeState.open(database)) as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(
+    async with await RuntimeStore.open(database) as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="legacy approval",
             binding_manifest={
@@ -1434,7 +1457,7 @@ async def test_public_resume_rejects_incompatible_migrated_turn_before_runtime(
                 "legacy_approvals_invalidated": True,
             },
         )
-        store.pause_turn(turn_id=turn.turn_id, reason="legacy approval invalidated")
+        turn_ops.pause_turn(store, turn_id=turn.turn_id, reason="legacy approval invalidated")
     agent = Agent(checkpoint_db=database, workspace_path=workspace)
 
     def fail_model_construction() -> object:
@@ -1445,7 +1468,7 @@ async def test_public_resume_rejects_incompatible_migrated_turn_before_runtime(
     with pytest.raises(RuntimeError, match="incompatible legacy Turn"):
         await agent.resume(turn.turn_id, "allow_once")
 
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         assert store.read_turn(turn.turn_id).status == "paused"
         assert store.read_thread(thread.thread_id).active_turn_id == turn.turn_id
 

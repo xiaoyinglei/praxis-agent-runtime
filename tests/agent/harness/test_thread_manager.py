@@ -13,8 +13,9 @@ from agent_runtime.harness import (
     HarnessModelResponse,
     ModelMessage,
     PreparedModelCall,
-    RuntimeState,
+    RuntimeStore,
     Session,
+    turn_ops,
 )
 from agent_runtime.harness.protocol import item_text
 from agent_runtime.modeling.events import ModelOutput
@@ -76,7 +77,8 @@ class RotatingBindingProvider:
 
 @pytest.mark.anyio
 async def test_session_creates_distinct_turns_with_fresh_bindings_and_shared_history(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path,
+    monkeypatch,
 ) -> None:
     monkeypatch.setattr("agent_runtime.harness.turn.capture_runtime_clock", lambda: {"date": "2026-10-20"})
     model = EchoHistoryModel()
@@ -85,17 +87,23 @@ async def test_session_creates_distinct_turns_with_fresh_bindings_and_shared_his
         second = await session.submit("second")
         assert first.thread_id == second.thread_id == session.thread_id
         assert first.turn_id != second.turn_id
-        assert model.requests[0].messages[-1].content.startswith(
-            "Runtime state update (changed fields; latest value wins):")
+        assert (
+            model.requests[0]
+            .messages[-1]
+            .content.startswith("Runtime state update (changed fields; latest value wins):")
+        )
         state = json.loads(model.requests[0].messages[-1].content.splitlines()[1])
         assert state["resource_reminder"] is None
         assert "Runtime budget status" not in state
-        assert session.store.list_model_operations(first.turn_id)[0].request_ref["budget_status"][
-            "agent_steps_remaining"] > 0
+        assert (
+            session.store.list_model_operations(first.turn_id)[0].request_ref["budget_status"]["agent_steps_remaining"]
+            > 0
+        )
         assert model.requests[1].messages == (
             *model.requests[0].messages,
             ModelMessage(
-                role="assistant",  body=(ModelOutput("text", "text", content="answer-1"),),
+                role="assistant",
+                body=(ModelOutput("text", "text", content="answer-1"),),
             ),
             ModelMessage(role="user", body="second"),
         )
@@ -109,12 +117,13 @@ async def test_session_creates_distinct_turns_with_fresh_bindings_and_shared_his
 async def test_clarification_continues_with_current_model_when_initial_model_is_unavailable(tmp_path: Path) -> None:
     model = EchoHistoryModel()
     async with await Session.open(database=tmp_path / "rollout.sqlite3", workspace=tmp_path, model=model) as session:
-        turn = session.store.start_turn(
+        turn = turn_ops.start_turn(
+            session.store,
             thread_id=session.thread_id,
             user_message="ambiguous",
             binding_manifest={"model_id": "unavailable"},
         )
-        session.store.request_clarification(turn_id=turn.turn_id, question="which target?")
+        turn_ops.request_clarification(session.store, turn_id=turn.turn_id, question="which target?")
         resumed = await session.resume(turn.turn_id, "continue", user_input="A")
         assert resumed.status == "done"
         assert len(model.requests) == 1
@@ -133,13 +142,17 @@ async def test_opening_from_non_head_turn_forks_with_exact_history(tmp_path: Pat
         async with await Session.open(**options, previous_turn_id=first.turn_id) as branch:
             result = await branch.submit("branch")
             assert result.thread_id != first.thread_id
-            assert model.requests[0].messages[-1].content.startswith(
-                "Runtime state update (changed fields; latest value wins):")
+            assert (
+                model.requests[0]
+                .messages[-1]
+                .content.startswith("Runtime state update (changed fields; latest value wins):")
+            )
             assert branch.store.read_thread(branch.thread_id).fork_turn_id == first.turn_id
             assert model.requests[2].messages == (
                 *model.requests[0].messages,
                 ModelMessage(
-                    role="assistant",  body=(ModelOutput("text", "text", content="answer-1"),),
+                    role="assistant",
+                    body=(ModelOutput("text", "text", content="answer-1"),),
                 ),
                 ModelMessage(role="user", body="branch"),
             )
@@ -160,29 +173,33 @@ async def test_child_binding_and_durable_turn_share_identity(tmp_path: Path) -> 
 def test_fork_from_non_head_turn_has_an_exact_history_cutoff(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        source = store.create_thread(workspace=workspace)
-        first = store.start_turn(
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        source = turn_ops.create_thread(store, workspace=workspace)
+        first = turn_ops.start_turn(
+            store,
             thread_id=source.thread_id,
             user_message="source-one",
             binding_manifest={"model_id": "model-v1"},
         )
-        store.complete_turn(turn_id=first.turn_id, answer="answer-one")
-        second = store.start_turn(
+        turn_ops.complete_turn(store, turn_id=first.turn_id, answer="answer-one")
+        second = turn_ops.start_turn(
+            store,
             thread_id=source.thread_id,
             user_message="source-two",
             binding_manifest={"model_id": "model-v1"},
         )
-        store.complete_turn(turn_id=second.turn_id, answer="answer-two")
-        third = store.start_turn(
+        turn_ops.complete_turn(store, turn_id=second.turn_id, answer="answer-two")
+        third = turn_ops.start_turn(
+            store,
             thread_id=source.thread_id,
             user_message="source-three",
             binding_manifest={"model_id": "model-v1"},
         )
-        store.complete_turn(turn_id=third.turn_id, answer="answer-three")
+        turn_ops.complete_turn(store, turn_id=third.turn_id, answer="answer-three")
 
-        fork = store.fork_thread(from_turn_id=first.turn_id)
-        branch = store.start_turn(
+        fork = turn_ops.fork_thread(store, from_turn_id=first.turn_id)
+        branch = turn_ops.start_turn(
+            store,
             thread_id=fork.thread_id,
             user_message="branch-only",
             binding_manifest={"model_id": "model-v2"},

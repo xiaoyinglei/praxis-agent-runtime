@@ -33,9 +33,7 @@ class FakeSkillRuntime:
             "skill_id": "project:test-skill",
             "source": "project",
             "fingerprint": "skill-fingerprint-v1",
-            "instructions": (
-                "Use references/info.txt. This prose must never grant write permission."
-            ),
+            "instructions": ("Use references/info.txt. This prose must never grant write permission."),
             "args": None,
         }
 
@@ -60,15 +58,9 @@ class SkillAssetModel:
             raise RuntimeError("skill-model binding revision changed")
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
-        invoke_skill = next(
-            tool for tool in request.tools if tool.definition.name == "invoke_skill"
-        )
-        assert invoke_skill.definition.input_schema["properties"]["name"]["enum"] == (
-            "project:test-skill",
-        )
-        digest = hashlib.sha256(
-            repr((request.step, request.messages)).encode()
-        ).hexdigest()
+        invoke_skill = next(tool for tool in request.tools if tool.definition.name == "invoke_skill")
+        assert invoke_skill.definition.input_schema["properties"]["name"]["enum"] == ("project:test-skill",)
+        digest = hashlib.sha256(repr((request.step, request.messages)).encode()).hexdigest()
         return PreparedModelCall(
             request_hash=digest,
             context_hash=digest,
@@ -77,9 +69,7 @@ class SkillAssetModel:
             request_ref={
                 "request_id": f"{request.turn_id}:{request.step}",
                 "toolset_revision": digest,
-                "exposed_tool_names": [
-                    tool.definition.name for tool in request.tools
-                ],
+                "exposed_tool_names": [tool.definition.name for tool in request.tools],
             },
             dispatch_payload=request,
         )
@@ -87,18 +77,14 @@ class SkillAssetModel:
     async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         request = prepared.dispatch_payload
         assert isinstance(request, HarnessModelRequest)
-        tool_messages = [
-            message for message in request.messages if message.role == "tool"
-        ]
+        tool_messages = [message for message in request.messages if message.role == "tool"]
         if not tool_messages:
             call = ModelToolCall(
                 id="invoke-skill",
                 name="invoke_skill",
                 arguments={"name": "project:test-skill"},
             )
-        elif not any(
-            "workspace_path" in message.content for message in tool_messages
-        ):
+        elif not any("workspace_path" in message.content for message in tool_messages):
             call = ModelToolCall(
                 id="materialize-skill",
                 name="materialize_skill_asset",
@@ -153,14 +139,7 @@ async def test_skill_activation_is_durable_but_never_grants_write_permission(
         assert paused.status == "paused"
         assert paused.pause.request_id is not None
         destination = (
-            workspace
-            / ".praxis"
-            / "runtime"
-            / "scratch"
-            / "skills"
-            / "project_test-skill"
-            / "references"
-            / "info.txt"
+            workspace / ".praxis" / "runtime" / "scratch" / "skills" / "project_test-skill" / "references" / "info.txt"
         )
         assert not destination.exists()
 

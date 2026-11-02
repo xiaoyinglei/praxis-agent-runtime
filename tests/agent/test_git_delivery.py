@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from agent_runtime.git_delivery import CheckRun, DeliveryError, GitDelivery
+from agent_runtime.harness import turn_ops
 
 pytestmark = pytest.mark.anyio
 
@@ -31,7 +32,10 @@ def repo(tmp_path: Path) -> Path:
 
 def _git(repo: Path, *arguments: str, check: bool = True) -> str:
     completed = subprocess.run(
-        ["git", "-C", str(repo), *arguments], capture_output=True, text=True, check=check,
+        ["git", "-C", str(repo), *arguments],
+        capture_output=True,
+        text=True,
+        check=check,
     )
     return completed.stdout
 
@@ -73,7 +77,10 @@ async def test_pull_request_absence_uses_successful_structured_query(repo: Path)
     assert delivery._gh_view_pull_request("praxis/task") is None
     assert calls == [("pr", "list", "--head", "praxis/task", "--state", "open", "--limit", "1", "--json", "url")]
     delivery._gh_output = lambda *args: subprocess.CompletedProcess(
-        args, 0, '[{"url":"https://github.com/o/r/pull/7"}]', "",
+        args,
+        0,
+        '[{"url":"https://github.com/o/r/pull/7"}]',
+        "",
     )
     assert delivery._gh_view_pull_request("praxis/task") == "https://github.com/o/r/pull/7"
 
@@ -152,8 +159,7 @@ async def test_explicit_branch_name_is_honored_and_refused_when_taken(repo: Path
     stacked = await delivery.commit("again", branch_name="praxis/feature")
     assert stacked.created_branch is False
     # Reusing an existing name from another branch is refused.
-    _git(repo, "switch", "-q", "master" if (repo / ".git" / "refs" / "heads" / "master").exists()
-         else "main")
+    _git(repo, "switch", "-q", "master" if (repo / ".git" / "refs" / "heads" / "master").exists() else "main")
     (repo / "c.txt").write_text("c\n")
     with pytest.raises(DeliveryError, match="分支已存在"):
         await delivery.commit("third", branch_name="praxis/feature")
@@ -175,8 +181,7 @@ async def test_in_progress_merge_is_refused(repo: Path) -> None:
     _git(repo, "checkout", "-q", "-b", "other")
     (repo / "base.txt").write_text("other view\n")
     _git(repo, "commit", "-q", "-am", "other change")
-    _git(repo, "checkout", "-q", "master" if (repo / ".git" / "refs" / "heads" / "master").exists()
-         else "main")
+    _git(repo, "checkout", "-q", "master" if (repo / ".git" / "refs" / "heads" / "master").exists() else "main")
     (repo / "base.txt").write_text("main view\n")
     _git(repo, "commit", "-q", "-am", "main change")
     _git(repo, "merge", "other", check=False)  # conflicts on purpose
@@ -212,11 +217,12 @@ async def test_ignored_files_do_not_count_as_changes(repo: Path) -> None:
 
 async def test_agent_facade_commit_requires_idle_turns(repo: Path, tmp_path: Path) -> None:
     from agent_runtime.agent import Agent
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
 
-    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
-        thread = store.create_thread(workspace=repo)
-        store.start_turn(
+    async with await RuntimeStore.open(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=repo)
+        turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="still running",
             binding_manifest={"model_id": "test-model"},
@@ -229,16 +235,17 @@ async def test_agent_facade_commit_requires_idle_turns(repo: Path, tmp_path: Pat
 
 async def test_agent_facade_commit_returns_delivery_summary(repo: Path, tmp_path: Path) -> None:
     from agent_runtime.agent import Agent
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
 
-    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
-        thread = store.create_thread(workspace=repo)
-        turn_id = store.start_turn(
+    async with await RuntimeStore.open(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=repo)
+        turn_id = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="mutate",
             binding_manifest={"model_id": "test-model"},
         ).turn_id
-        store.complete_turn(turn_id=turn_id, answer="done")
+        turn_ops.complete_turn(store, turn_id=turn_id, answer="done")
     (repo / "a.txt").write_text("a\n")
     agent = Agent(workspace_path=repo, checkpoint_db=tmp_path / "rollout.sqlite3")
     status = await agent.commit_status()
@@ -266,7 +273,8 @@ def _fake_gh(delivery: GitDelivery, existing: str | None = None) -> dict[str, st
 def _bare_remote(tmp_path: Path, name: str) -> Path:
     remote = tmp_path / name
     subprocess.run(
-        ["git", "init", "--quiet", "--bare", "-b", "main", str(remote)], check=True,
+        ["git", "init", "--quiet", "--bare", "-b", "main", str(remote)],
+        check=True,
     )
     return remote
 
@@ -371,14 +379,15 @@ async def test_push_failure_surfaces_credential_hint(repo: Path, tmp_path: Path)
 
 async def test_agent_facade_open_pull_request_requires_idle_turns(repo: Path, tmp_path: Path) -> None:
     from agent_runtime.agent import Agent
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
 
     remote = _bare_remote(tmp_path, "remote-github.com.git")
     _git(repo, "remote", "add", "origin", str(remote))
     _git(repo, "push", "-q", "-u", "origin", "HEAD")
-    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
-        thread = store.create_thread(workspace=repo)
-        store.start_turn(
+    async with await RuntimeStore.open(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=repo)
+        turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="running",
             binding_manifest={"model_id": "test-model"},
@@ -477,22 +486,28 @@ async def test_gh_pr_checks_parses_real_gh_json_states(repo: Path) -> None:
 
     delivery = GitDelivery(repo)
     delivery._require_gh = lambda: None  # type: ignore[method-assign]
-    payload = json_module.dumps([
-        {"name": "macos", "state": "SUCCESS", "bucket": "pass", "workflow": "ci", "link": "u"},
-        {"name": "linux", "state": "FAILURE", "bucket": "fail", "workflow": "ci", "link": "u"},
-        {"name": "lint", "state": "IN_PROGRESS", "bucket": "pending", "workflow": "ci", "link": "u"},
-        {"name": "audit", "state": "CANCELLED", "bucket": "cancel", "workflow": "ci", "link": "u"},
-    ])
+    payload = json_module.dumps(
+        [
+            {"name": "macos", "state": "SUCCESS", "bucket": "pass", "workflow": "ci", "link": "u"},
+            {"name": "linux", "state": "FAILURE", "bucket": "fail", "workflow": "ci", "link": "u"},
+            {"name": "lint", "state": "IN_PROGRESS", "bucket": "pending", "workflow": "ci", "link": "u"},
+            {"name": "audit", "state": "CANCELLED", "bucket": "cancel", "workflow": "ci", "link": "u"},
+        ]
+    )
 
     def fake_output(*arguments: str):
         return subprocess_module.CompletedProcess(
-            arguments, 0, stdout=payload, stderr="",
+            arguments,
+            0,
+            stdout=payload,
+            stderr="",
         )
 
     delivery._gh_output = fake_output  # type: ignore[method-assign]
     checks = delivery._gh_pr_checks("praxis/x")
     assert tuple(check.state for check in checks) == ("pass", "fail", "pending", "cancel")
     from agent_runtime.git_delivery import PullRequestChecks
+
     report = PullRequestChecks(branch="praxis/x", pull_request_url=None, checks=checks)
     assert report.overall == "fail"
 
@@ -503,10 +518,12 @@ async def test_unknown_raw_check_state_is_never_reported_as_pass(repo: Path) -> 
 
     delivery = GitDelivery(repo)
     delivery._require_gh = lambda: None  # type: ignore[method-assign]
-    payload = json_module.dumps([
-        # A future gh/GitHub status we have never seen, without a bucket field.
-        {"name": "future", "state": "SOME_NEW_STATUS", "workflow": "ci", "link": "u"},
-    ])
+    payload = json_module.dumps(
+        [
+            # A future gh/GitHub status we have never seen, without a bucket field.
+            {"name": "future", "state": "SOME_NEW_STATUS", "workflow": "ci", "link": "u"},
+        ]
+    )
 
     def fake_output(*arguments: str):
         return subprocess_module.CompletedProcess(arguments, 0, stdout=payload, stderr="")
@@ -515,6 +532,7 @@ async def test_unknown_raw_check_state_is_never_reported_as_pass(repo: Path) -> 
     checks = delivery._gh_pr_checks("praxis/x")
     assert checks[0].state == "pending"
     from agent_runtime.git_delivery import PullRequestChecks
+
     report = PullRequestChecks(branch="praxis/x", pull_request_url=None, checks=checks)
     assert report.overall == "pending"
 
@@ -531,11 +549,13 @@ async def test_hung_git_subprocess_is_bounded_by_timeout(repo: Path) -> None:
 
 
 async def test_hung_gh_subprocess_raises_delivery_error(
-    repo: Path, monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def hanging_run(*_args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
         raise subprocess.TimeoutExpired(
-            cmd="gh pr view", timeout=float(kwargs.get("timeout") or 0),
+            cmd="gh pr view",
+            timeout=float(kwargs.get("timeout") or 0),
         )
 
     monkeypatch.setattr("agent_runtime.git_delivery.subprocess.run", hanging_run)
@@ -648,14 +668,23 @@ async def test_failure_logs_use_failed_checks_and_matching_head(repo: Path) -> N
         CheckRun("current", "fail", "CI", "https://github.com/o/r/actions/runs/123/job/1"),
         CheckRun("external", "fail", "external", "https://ci.example/run/999"),
     )
+
     def output(*args):
         calls.append(args)
         if args[:2] == ("run", "list"):
-            return subprocess.CompletedProcess(args, 0, json.dumps([
-                {"databaseId": 123, "name": "CI", "conclusion": "failure", "headSha": head},
-                {"databaseId": 999, "name": "OLD", "conclusion": "failure", "headSha": "b" * 40},
-            ]), "")
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                json.dumps(
+                    [
+                        {"databaseId": 123, "name": "CI", "conclusion": "failure", "headSha": head},
+                        {"databaseId": 999, "name": "OLD", "conclusion": "failure", "headSha": "b" * 40},
+                    ]
+                ),
+                "",
+            )
         return subprocess.CompletedProcess(args, 0, "current failure log", "")
+
     delivery._gh_output = output
     logs = delivery._failure_log_excerpts("praxis/task", 4000, head_commit=head, checks=failed)
     assert logs == (("CI", "current failure log"),)
@@ -703,10 +732,12 @@ async def test_install_does_not_unlink_another_gits_new_index_lock(repo: Path, m
     (repo / "base.txt").write_text("approved")
     replace = os.replace
     lock = repo / ".git/index.lock"
+
     def install(source, destination):
         replace(source, destination)
         if Path(destination) == repo / ".git/index":
             lock.write_bytes(b"another operation")
+
     monkeypatch.setattr("agent_runtime.git_delivery.os.replace", install)
     await GitDelivery(repo).commit("install")
     assert lock.read_bytes() == b"another operation"
@@ -732,11 +763,13 @@ async def test_pull_preview_content_and_identity_use_one_frozen_commit(repo: Pat
     (repo / "base.txt").write_text("first")
     initial = await delivery.commit("first")
     _fake_gh(delivery)
+
     def change_head_while_reading_pr(branch):
         (repo / "base.txt").write_text("later")
         _git(repo, "add", "base.txt")
         _git(repo, "commit", "-qm", "later")
         return None
+
     delivery._gh_view_pull_request = change_head_while_reading_pr
     preview = await delivery.pull_request_status()
     assert preview.commit_subjects == ("first",)

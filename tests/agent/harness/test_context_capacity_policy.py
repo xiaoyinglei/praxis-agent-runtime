@@ -1,5 +1,6 @@
 import pytest
 
+from agent_runtime.harness import context_ops, turn_ops
 from agent_runtime.modeling.contracts import DEFAULT_LLM_STAGE_BUDGETS, LLMCallStage, LLMStageBudget
 from agent_runtime.modeling.gateway import LLMGateway
 from tests.agent.harness.test_model_adapter import CharacterAccounting
@@ -94,13 +95,10 @@ def test_one_million_window_admits_64k_and_reports_policy():
     assert projection["explicit_input_cap"] is None
 
 
-def test_soft_threshold_triggers_before_hard_limit():
-    from agent_runtime.harness import ContextCompactionRequiredError
-
-    with pytest.raises(ContextCompactionRequiredError) as failure:
-        prepared_request(1048576, 950000)
-    assert failure.value.max_input_tokens == 943718
-    assert failure.value.reason_code == "token_threshold"
+def test_soft_threshold_is_reported_separately_from_hard_admission():
+    projection = prepared_request(1048576, 950000).request_ref["context_projection"]
+    assert projection["input_tokens"] > projection["auto_compact_limit"]
+    assert projection["input_tokens"] < projection["effective_input_limit"]
 
 
 def test_explicit_cap_still_triggers_on_full_request():
@@ -141,13 +139,14 @@ def test_web_elision_preserves_fetch_cursor(cursor, body_budget, visible_end):
 
 
 def test_semantic_source_restores_fact_hidden_by_old_elision(tmp_path):
-    from agent_runtime.harness import RolloutContextManager, RuntimeState
+    from agent_runtime.harness import RolloutContextManager, RuntimeStore
     from tests.agent.harness.test_compaction_consistency import long_history
     from tests.agent.harness.test_tool_result_elision import exchange
 
-    with RuntimeState.open_sync(tmp_path / "source.db") as store:
-        thread = store.create_thread(workspace=tmp_path)
-        turn = store.start_turn(
+    with RuntimeStore.open_sync(tmp_path / "source.db") as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="task",
             binding_manifest={"context_capacity_policy": {"revision": "context-capacity-v2"}},
@@ -171,13 +170,14 @@ def test_semantic_source_restores_fact_hidden_by_old_elision(tmp_path):
 
 
 def test_new_turn_body_guards_and_explicit_lower_guard(tmp_path):
-    from agent_runtime.harness import RolloutContextManager, RuntimeState
+    from agent_runtime.harness import RolloutContextManager, RuntimeStore
     from agent_runtime.modeling.contracts import ContextCapacityPolicy
     from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
 
-    with RuntimeState.open_sync(tmp_path / "guards.db") as store:
-        thread = store.create_thread(workspace=tmp_path)
-        turn = store.start_turn(
+    with RuntimeStore.open_sync(tmp_path / "guards.db") as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="task",
             binding_manifest={"context_capacity_policy": ContextCapacityPolicy().model_dump()},
@@ -189,13 +189,14 @@ def test_new_turn_body_guards_and_explicit_lower_guard(tmp_path):
 
 
 def capacity_runner(store, path, *, tokens=200000, window=1048576, messages=3, summary=None, policy=None):
-    from agent_runtime.harness import GatewayHarnessModel, RolloutContextManager, TurnExecutor
+    from agent_runtime.harness import GatewayHarnessModel, RolloutContextManager, TurnRunner
     from agent_runtime.modeling.contracts import ContextCapacityPolicy
     from tests.agent.harness.test_compaction_consistency import Accept
     from tests.agent.harness.test_model_adapter import BudgetAwareCapturingGateway, _resolved_model
 
-    thread = store.create_thread(workspace=path)
-    turn = store.start_turn(
+    thread = turn_ops.create_thread(store, workspace=path)
+    turn = turn_ops.start_turn(
+        store,
         thread_id=thread.thread_id,
         user_message="synthetic task",
         binding_manifest={
@@ -225,7 +226,7 @@ def capacity_runner(store, path, *, tokens=200000, window=1048576, messages=3, s
             )
 
         model.dispatch = dispatch
-    runner = TurnExecutor(
+    runner = TurnRunner(
         thread_id=thread.thread_id,
         store=store,
         model=model,
@@ -238,14 +239,14 @@ def capacity_runner(store, path, *, tokens=200000, window=1048576, messages=3, s
 def test_message_guard_with_1m_window_and_200k_budget_can_summarize(tmp_path):
     import asyncio
 
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
     from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
 
-    with RuntimeState.open_sync(tmp_path / "reserve.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "reserve.db") as store:
         runner, turn, model_gateway = capacity_runner(store, tmp_path)
         for index in range(8):
             seed(store, turn_id=turn.turn_id, kind="agent_message", payload={"text": f"fact {index}: " + "x" * 8000})
-        result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
+        result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "completed", result
         operations = store.list_model_operations(turn.turn_id)
         assert [op.request_ref["purpose"] for op in operations] == ["context_summary", "agent_step"]
@@ -259,14 +260,14 @@ def test_message_guard_with_1m_window_and_200k_budget_can_summarize(tmp_path):
 def test_auto_compaction_uses_summary_even_when_elision_would_fit(tmp_path):
     import asyncio
 
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
     from tests.agent.harness.test_tool_result_elision import exchange
 
-    with RuntimeState.open_sync(tmp_path / "semantic-first.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "semantic-first.db") as store:
         runner, turn, _ = capacity_runner(store, tmp_path, messages=5)
         for index in range(3):
             exchange(store, turn.turn_id, str(index), "evidence " * 2000)
-        result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
+        result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "completed", result
         compacted = [item for item in store.list_items(turn.turn_id) if item.kind == "context_compaction"]
         assert compacted and all(item.payload["algorithm_revision"].startswith("semantic-") for item in compacted)
@@ -276,13 +277,13 @@ def test_auto_compaction_uses_summary_even_when_elision_would_fit(tmp_path):
 def test_oversized_serialized_summary_stops_before_continuation(tmp_path):
     import asyncio
 
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
     from tests.agent.harness.test_compaction_consistency import long_history
 
-    with RuntimeState.open_sync(tmp_path / "oversized.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "oversized.db") as store:
         runner, turn, model_gateway = capacity_runner(store, tmp_path, summary="\\" * 20000)
         long_history(store, turn)
-        result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
+        result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "failed"
         assert len(model_gateway.requests) == 1
         assert not any(item.kind == "context_compaction" for item in store.list_items(turn.turn_id))
@@ -317,11 +318,11 @@ def test_acquisition_ranges_merge_only_same_source_version_and_keep_gaps():
 def test_retained_web_exchange_keeps_canonical_acquisition_references(tmp_path):
     import json
 
-    from agent_runtime.harness import RolloutContextManager, RuntimeState
+    from agent_runtime.harness import RolloutContextManager, RuntimeStore
     from tests.agent.harness.test_compaction_consistency import long_history
     from tests.agent.harness.test_tool_result_elision import exchange
 
-    with RuntimeState.open_sync(tmp_path / "retained-web.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "retained-web.db") as store:
         _, turn, _ = capacity_runner(store, tmp_path, messages=2000)
         long_history(store, turn)
         item = exchange(
@@ -360,13 +361,13 @@ def test_retained_web_exchange_keeps_canonical_acquisition_references(tmp_path):
 def test_small_window_summary_tree_measures_each_leaf_and_merge(tmp_path):
     import asyncio
 
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
     from tests.agent.harness.test_compaction_consistency import long_history
 
-    with RuntimeState.open_sync(tmp_path / "tree.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "tree.db") as store:
         runner, turn, model_gateway = capacity_runner(store, tmp_path, window=8192)
         long_history(store, turn)
-        result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
+        result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "completed", result
         summaries = [
             op for op in store.list_model_operations(turn.turn_id) if op.request_ref["purpose"] == "context_summary"
@@ -383,16 +384,16 @@ def test_small_window_summary_tree_measures_each_leaf_and_merge(tmp_path):
 def test_large_window_summary_leaves_respect_frozen_materialization_guard(tmp_path):
     import asyncio
 
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
     from agent_runtime.modeling.contracts import ContextCapacityPolicy
     from tests.agent.harness.test_compaction_consistency import long_history
 
-    with RuntimeState.open_sync(tmp_path / "materialization.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "materialization.db") as store:
         runner, turn, model_gateway = capacity_runner(
             store, tmp_path, policy=ContextCapacityPolicy(max_item_bytes=5000, max_messages=3)
         )
         long_history(store, turn)
-        result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
+        result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "completed", result
         summaries = [
             op for op in store.list_model_operations(turn.turn_id) if op.request_ref["purpose"] == "context_summary"
@@ -410,18 +411,18 @@ def test_large_window_summary_leaves_respect_frozen_materialization_guard(tmp_pa
 def test_indivisible_summary_work_unit_over_byte_guard_never_dispatches(tmp_path):
     import asyncio
 
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
     from agent_runtime.modeling.contracts import ContextCapacityPolicy
     from tests.agent.harness.test_compaction_consistency import long_history
     from tests.agent.harness.test_tool_result_elision import exchange
 
-    with RuntimeState.open_sync(tmp_path / "indivisible.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "indivisible.db") as store:
         runner, turn, model_gateway = capacity_runner(
             store, tmp_path, policy=ContextCapacityPolicy(max_item_bytes=5000)
         )
         long_history(store, turn)
         original = exchange(store, turn.turn_id, "large", "canonical evidence " * 1000)
-        result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
+        result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "failed"
         assert not model_gateway.requests and not store.list_model_operations(turn.turn_id)
         assert store.read_item(original.item_id).payload == original.payload
@@ -431,13 +432,13 @@ def test_indivisible_summary_work_unit_over_byte_guard_never_dispatches(tmp_path
 def test_merge_exceeding_reserved_node_limit_is_not_dispatched(tmp_path):
     import asyncio
 
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
     from tests.agent.harness.test_compaction_consistency import long_history
 
-    with RuntimeState.open_sync(tmp_path / "merge-too-large.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "merge-too-large.db") as store:
         runner, turn, model_gateway = capacity_runner(store, tmp_path, window=8192, summary="x" * 3300)
         long_history(store, turn)
-        result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
+        result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "failed"
         assert len(model_gateway.requests) == 2  # two leaves; no unreserved merge or continuation
         assert not any(item.kind == "context_compaction" for item in store.list_items(turn.turn_id))
@@ -447,16 +448,16 @@ def test_merge_exceeding_reserved_node_limit_is_not_dispatched(tmp_path):
 def test_budget_planning_can_drop_redundant_latest_exchange_before_summary(tmp_path):
     import asyncio
 
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
     from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
     from tests.agent.harness.test_tool_result_elision import exchange
 
-    with RuntimeState.open_sync(tmp_path / "tail-budget.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "tail-budget.db") as store:
         runner, turn, model_gateway = capacity_runner(store, tmp_path, tokens=150000, messages=4)
         for _index in range(8):
             seed(store, turn_id=turn.turn_id, kind="agent_message", payload={"text": "x" * 8000})
         exchange(store, turn.turn_id, "latest", "LAST_EXCHANGE_FACT " + "y" * 20000)
-        result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
+        result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "completed", result
         summary = store.list_model_operations(turn.turn_id)[0]
         assert summary.request_ref["compaction_plan"]["retained_tail_messages"] == 0
@@ -467,14 +468,14 @@ def test_budget_planning_can_drop_redundant_latest_exchange_before_summary(tmp_p
 def test_capacity_and_compaction_are_visible_in_replayed_events(tmp_path):
     import asyncio
 
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
     from agent_runtime.harness.events import RolloutEventReader
     from tests.agent.harness.test_compaction_consistency import long_history
 
-    with RuntimeState.open_sync(tmp_path / "events.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "events.db") as store:
         runner, turn, _ = capacity_runner(store, tmp_path)
         long_history(store, turn)
-        asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
+        asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
         events = RolloutEventReader(store).read(runner.thread_id)
         started = next(event for event in events if event.event_type == "turn_started")
         assert started.data["context_capacity_policy"]["revision"] == "context-capacity-v2"
@@ -563,10 +564,16 @@ async def test_context_details_are_available_on_request_without_chat_noise(capsy
     view = Conversation()
     display = ConversationEventDisplay(view)
     for remaining in (15, 14):
-        await display.emit(StreamEvent(type=EventType.BUDGET_UPDATE, turn_id="turn", data={
-            "context_projection": {"effective_input_limit": 1015296, "auto_compact_limit": 943718},
-            "budget_status": {"agent_steps_remaining": remaining},
-        }))
+        await display.emit(
+            StreamEvent(
+                type=EventType.BUDGET_UPDATE,
+                turn_id="turn",
+                data={
+                    "context_projection": {"effective_input_limit": 1015296, "auto_compact_limit": 943718},
+                    "budget_status": {"agent_steps_remaining": remaining},
+                },
+            )
+        )
     assert "1015296" not in view.plain_text() and "压缩阈值" not in view.plain_text()
     display.show_context_status()
     rendered = capsys.readouterr().out
@@ -575,9 +582,16 @@ async def test_context_details_are_available_on_request_without_chat_noise(capsy
     display.set_verbose(True)
     assert "剩余 agent 步骤=14" in view.plain_text()
     assert "剩余 agent 步骤=15" not in view.plain_text()
-    await display.emit(StreamEvent(type=EventType.BUDGET_UPDATE, turn_id="turn", data={
-        "context_projection": {"effective_input_limit": 999}, "budget_status": {},
-    }))
+    await display.emit(
+        StreamEvent(
+            type=EventType.BUDGET_UPDATE,
+            turn_id="turn",
+            data={
+                "context_projection": {"effective_input_limit": 999},
+                "budget_status": {},
+            },
+        )
+    )
     assert "输入上限=999" in view.plain_text()
     assert "输入上限=1015296" not in view.plain_text()
     display.set_verbose(False)
@@ -591,11 +605,11 @@ async def test_context_details_are_available_on_request_without_chat_noise(capsy
 
 
 def test_retained_exchange_is_semantically_covered_on_next_summary(tmp_path):
-    from agent_runtime.harness import RolloutContextManager, RuntimeState
+    from agent_runtime.harness import RolloutContextManager, RuntimeStore
     from tests.agent.harness.test_compaction_consistency import long_history
     from tests.agent.harness.test_tool_result_elision import exchange
 
-    with RuntimeState.open_sync(tmp_path / "retained-coverage.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "retained-coverage.db") as store:
         _, turn, _ = capacity_runner(store, tmp_path, messages=2000)
         long_history(store, turn)
         recent = exchange(store, turn.turn_id, "recent", "RECENT_CANONICAL_GOLD")
@@ -618,11 +632,11 @@ def test_retained_exchange_is_semantically_covered_on_next_summary(tmp_path):
 def test_capacity_plan_reuses_completed_summary_after_crash_before_commit(tmp_path, monkeypatch):
     import asyncio
 
-    from agent_runtime.harness import RolloutContextManager, RuntimeState, TurnExecutor
+    from agent_runtime.harness import RolloutContextManager, RuntimeStore, TurnRunner
     from tests.agent.harness.test_compaction_consistency import Accept, long_history
 
     path = tmp_path / "crash.db"
-    with RuntimeState.open_sync(path) as store:
+    with RuntimeStore.open_sync(path) as store:
         runner, turn, original_gateway = capacity_runner(store, tmp_path)
         long_history(store, turn)
         context = runner.restore_turn_context(turn.turn_id)
@@ -632,21 +646,21 @@ def test_capacity_plan_reuses_completed_summary_after_crash_before_commit(tmp_pa
 
         monkeypatch.setattr(runner._context_manager, "commit_compaction", crash)
         with pytest.raises(RuntimeError, match="simulated crash"):
-            asyncio.run(runner._prepare_compacted_step(context, step=1))
+            asyncio.run(runner._context_engine._prepare_compacted_step(context, step=1))
         assert len(original_gateway.requests) == 1
         [operation] = store.list_model_operations(turn.turn_id)
         assert operation.status == "completed"
         prepared_hash = operation.request_hash
         model = runner._model
-    with RuntimeState.open_sync(path) as store:
-        reopened = TurnExecutor(
+    with RuntimeStore.open_sync(path) as store:
+        reopened = TurnRunner(
             thread_id=context.thread_id,
             store=store,
             model=model,
             context_manager=RolloutContextManager(store),
             completion_gate=Accept(),
         )
-        result = asyncio.run(reopened.run_turn(reopened.restore_turn_context(turn.turn_id), start_step=1))
+        result = asyncio.run(reopened.drive(reopened.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "completed"
         assert len(original_gateway.requests) == 2  # cached summary, only continuation dispatched
         assert store.list_model_operations(turn.turn_id)[0].request_hash == prepared_hash
@@ -656,14 +670,14 @@ def test_capacity_plan_reuses_completed_summary_after_crash_before_commit(tmp_pa
 def test_new_policy_insufficient_budget_preserves_originals_without_dispatch(tmp_path):
     import asyncio
 
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
     from tests.agent.harness.test_compaction_consistency import long_history
 
-    with RuntimeState.open_sync(tmp_path / "no-budget.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "no-budget.db") as store:
         runner, turn, model_gateway = capacity_runner(store, tmp_path, tokens=2000)
         long_history(store, turn)
         original_items = store.list_context_items(turn.turn_id)
-        result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
+        result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "failed"
         assert not model_gateway.requests
         assert not store.list_model_operations(turn.turn_id)
@@ -674,13 +688,13 @@ def test_new_policy_insufficient_budget_preserves_originals_without_dispatch(tmp
 def test_new_policy_stale_candidate_and_incomplete_preserved_exchange_are_rejected(tmp_path):
     import json
 
-    from agent_runtime.harness import RolloutContextManager, RuntimeState
+    from agent_runtime.harness import RolloutContextManager, RuntimeStore
     from agent_runtime.harness.protocol import ContextSourceChangedError
     from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
     from tests.agent.harness.test_compaction_consistency import long_history
     from tests.agent.harness.test_tool_result_elision import exchange
 
-    with RuntimeState.open_sync(tmp_path / "cas.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "cas.db") as store:
         _, turn, _ = capacity_runner(store, tmp_path, messages=2000)
         long_history(store, turn)
         recent = exchange(store, turn.turn_id, "recent", "recent evidence")
@@ -691,7 +705,8 @@ def test_new_policy_stale_candidate_and_incomplete_preserved_exchange_are_reject
         )
         payload = json.loads(candidate.payload_json)
         with pytest.raises(ValueError, match="original call"):
-            store.record_context_compaction(
+            context_ops.record_context_compaction(
+                store,
                 turn_id=turn.turn_id,
                 covered_item_ids=tuple(payload["covered_item_ids"]),
                 preserved_item_ids=(recent.item_id,),
@@ -705,3 +720,32 @@ def test_new_policy_stale_candidate_and_incomplete_preserved_exchange_are_reject
             manager.commit_compaction(candidate)
         assert not any(item.kind == "context_compaction" for item in store.list_items(turn.turn_id))
         assert store.verify().valid
+
+
+def test_soft_target_reads_the_authenticated_definition_shape():
+    from agent_runtime.harness.model_adapter import GatewayHarnessModel
+    from agent_runtime.harness.protocol import HarnessModelRequest, ModelMessage
+    from agent_runtime.modeling.contracts import ContextCapacityPolicy
+    from tests.agent.harness.test_model_adapter import _resolved_model
+
+    model = gateway(1048576)
+    resolved = _resolved_model(gateway=model, token_accounting=model.token_accounting, context_window_tokens=1048576)
+    adapter = GatewayHarnessModel(model_id="test-model", resolved=resolved, instructions=("Static policy",))
+    prepared = adapter.prepare(
+        HarnessModelRequest(
+            thread_id="thread",
+            turn_id="turn",
+            messages=(ModelMessage(role="user", body="x" * 6000),),
+            binding_manifest={
+                "binding": {
+                    "definition": {
+                        "context_capacity_policy": ContextCapacityPolicy().model_dump(),
+                        "auto_compact_token_limit": 5000,
+                    }
+                }
+            },
+        )
+    )
+    assert prepared.request_ref["context_projection"]["auto_compact_limit"] == 5000
+    assert prepared.resource_request.input_tokens > 5000
+    assert prepared.request_ref["context_projection"]["soft_limit_exceeded"]

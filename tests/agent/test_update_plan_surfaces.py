@@ -13,7 +13,7 @@ from agent_runtime.harness import (
     ItemSnapshot,
     ModelToolCall,
     PreparedModelCall,
-    RuntimeState,
+    RuntimeStore,
 )
 from agent_runtime.result import AgentResult
 
@@ -39,9 +39,7 @@ class _UpdatePlanThenAnswerModel:
         return {"model_id": "plan-test", "model_revision": "v1"}
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
-        digest = hashlib.sha256(
-            f"{request.turn_id}:{request.step}".encode()
-        ).hexdigest()
+        digest = hashlib.sha256(f"{request.turn_id}:{request.step}".encode()).hexdigest()
         return PreparedModelCall(
             request_hash=digest,
             context_hash=digest,
@@ -50,9 +48,7 @@ class _UpdatePlanThenAnswerModel:
             request_ref={
                 "request_id": f"{request.turn_id}:step:{request.step}",
                 "toolset_revision": toolset_revision_for_tools(request.tools),
-                "exposed_tool_names": [
-                    tool.definition.name for tool in request.tools
-                ],
+                "exposed_tool_names": [tool.definition.name for tool in request.tools],
                 "step": request.step,
             },
         )
@@ -96,7 +92,7 @@ async def _run_plan_turn(
         "Make update_plan durable.",
         require_workspace_change=False,
     )
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         items = tuple(store.list_items(result.turn_id))
     return result, items
 
@@ -128,16 +124,10 @@ async def test_harness_update_plan_projects_public_result_and_rollout_truth(
     ]
 
     update_call = next(
-        item
-        for item in items
-        if item.kind == "tool_call"
-        and item.payload.get("tool_name") == "update_plan"
+        item for item in items if item.kind == "tool_call" and item.payload.get("tool_name") == "update_plan"
     )
     update_result = next(
-        item
-        for item in items
-        if item.kind == "tool_result"
-        and item.payload.get("tool_name") == "update_plan"
+        item for item in items if item.kind == "tool_result" and item.payload.get("tool_name") == "update_plan"
     )
     assert update_call.payload["arguments"] == _PLAN_ARGUMENTS
     assert update_result.payload["is_error"] is False
@@ -177,15 +167,12 @@ async def test_failed_turn_projects_the_canonical_plan_not_raw_tool_claims(
         max_turns=1,
         require_workspace_change=False,
     )
-    async with (await RuntimeState.open(database)) as store:
-        plan_item = [
-            item for item in store.list_items(result.turn_id) if item.kind == "plan_state"
-        ][-1]
+    async with await RuntimeStore.open(database) as store:
+        plan_item = [item for item in store.list_items(result.turn_id) if item.kind == "plan_state"][-1]
 
     assert result.status == "failed"
     assert result.plan is not None
     assert result.plan.status == "blocked"
     assert [(step.step_id, step.status) for step in result.plan.steps] == [
-        (step["step_id"], step["status"])
-        for step in plan_item.payload["plan"]["steps"]
+        (step["step_id"], step["status"]) for step in plan_item.payload["plan"]["steps"]
     ]

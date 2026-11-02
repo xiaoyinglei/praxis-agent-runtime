@@ -13,9 +13,11 @@ from agent_runtime.harness import (
     GatewayHarnessModel,
     ModelMessage,
     RolloutContextManager,
-    RuntimeState,
+    RuntimeStore,
     ToolOrchestrator,
-    TurnExecutor,
+    TurnRunner,
+    model_ops,
+    turn_ops,
 )
 from agent_runtime.modeling.contracts import ContextCapacityPolicy, LLMStageBudget, normalize_llm_usage
 from agent_runtime.modeling.gateway import AgentModelResponse, model_request_input_text
@@ -122,8 +124,9 @@ def file_runner(
         def select(self, **_):
             return tools
 
-    thread = store.create_thread(workspace=tmp_path)
-    turn = store.start_turn(
+    thread = turn_ops.create_thread(store, workspace=tmp_path)
+    turn = turn_ops.start_turn(
+        store,
         thread_id=thread.thread_id,
         user_message=f"Create and inspect {path}.\n" + "constraint: preserve public data.\n" * 1400,
         binding_manifest={
@@ -135,7 +138,7 @@ def file_runner(
     )
     if prior_usage:
         _settle_prior_usage(store, turn.turn_id, prior_usage)
-    runner = TurnExecutor(
+    runner = TurnRunner(
         thread_id=thread.thread_id,
         store=store,
         model=model,
@@ -155,15 +158,15 @@ def file_runner(
 @pytest.mark.parametrize("prior_usage", [0, 699_862])
 def test_affordable_file_work_continues_with_measured_usage_and_frozen_replay(tmp_path, path, body, prior_usage):
     database = tmp_path / "rollout.db"
-    with RuntimeState.open_sync(database) as store:
+    with RuntimeStore.open_sync(database) as store:
         runner, turn, gateway = file_runner(store, tmp_path, path=path, body=body, prior_usage=prior_usage)
         prepared = asyncio.run(
-            runner._prepare_step(runner.capture_step_context(runner.restore_turn_context(turn.turn_id), step=1))
+            runner._model_runner.prepare(runner.capture_step_context(runner.restore_turn_context(turn.turn_id), step=1))
         )
         if prior_usage:
             assert prepared.resource_request.total_tokens * 2 > 900_000 - prior_usage - 8192
             assert prepared.resource_request.total_tokens < 900_000 - prior_usage - 8192
-        result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
+        result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "completed"
         assert (tmp_path / path).is_file(), "affordable tools were withdrawn before executing the requested action"
         assert (tmp_path / path).read_text() == body
@@ -174,11 +177,11 @@ def test_affordable_file_work_continues_with_measured_usage_and_frozen_replay(tm
         assert store.read_budget_state(turn.turn_id).used.total_tokens <= 900_000
         assert store.verify().valid
         context = runner.restore_turn_context(turn.turn_id)
-    with RuntimeState.open_sync(database) as reopened:
+    with RuntimeStore.open_sync(database) as reopened:
         runner._store = reopened
         runner._context_manager = RolloutContextManager(reopened)
         for op in operations:
-            replay = asyncio.run(runner._prepare_step(runner.restore_step_context(context, op)))
+            replay = asyncio.run(runner._model_runner.prepare(runner.restore_step_context(context, op)))
             assert (replay.request_hash, replay.context_hash, replay.tool_hash, replay.wire_hash) == (
                 op.request_hash,
                 op.context_hash,
@@ -188,9 +191,9 @@ def test_affordable_file_work_continues_with_measured_usage_and_frozen_replay(tm
 
 
 def test_last_affordable_tool_result_survives_budget_stop_without_more_provider_io(tmp_path):
-    with RuntimeState.open_sync(tmp_path / "rollout.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "rollout.db") as store:
         runner, turn, gateway = file_runner(store, tmp_path, budget=100_000, consume_ceiling=True)
-        result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
+        result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert (tmp_path / "result.txt").read_text() == "verified\n"
         assert result.status == "failed"
         assert store.read_turn(turn.turn_id).terminal_reason_code == "model_token_budget_exhausted"
@@ -203,9 +206,9 @@ def test_last_affordable_tool_result_survives_budget_stop_without_more_provider_
 
 
 def test_unaffordable_input_performs_no_provider_or_tool_io(tmp_path):
-    with RuntimeState.open_sync(tmp_path / "rollout.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "rollout.db") as store:
         runner, turn, gateway = file_runner(store, tmp_path, budget=20_000)
-        result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
+        result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "failed"
         assert not gateway.requests
         assert not store.list_tool_operations(turn.turn_id)
@@ -216,7 +219,7 @@ def test_unaffordable_input_performs_no_provider_or_tool_io(tmp_path):
 
 @pytest.mark.parametrize("revision", ["working-context-v1", "working-context-v2"])
 def test_output_cap_accounts_for_changed_input_limits_without_provider_io(tmp_path, revision):
-    with RuntimeState.open_sync(tmp_path / "run.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "run.db") as store:
         runner, turn, gateway = file_runner(store, tmp_path, budget=100_000)
 
         def effective_budget(stage, *, kwargs=None):
@@ -241,7 +244,7 @@ def test_output_cap_accounts_for_changed_input_limits_without_provider_io(tmp_pa
         previous_limits = first.request_ref.get("runtime_input_update")
         if previous_limits is not None:
             step = replace(step, messages=(*step.messages, ModelMessage(role="context", body=previous_limits)))
-        prepared = asyncio.run(runner._prepare_step(step))
+        prepared = asyncio.run(runner._model_runner.prepare(step))
         assert prepared.resource_request.total_tokens <= 100_000
         assert 0 < prepared.resource_request.output_tokens < 65_536
         if revision == "working-context-v1":
@@ -253,7 +256,8 @@ def test_output_cap_accounts_for_changed_input_limits_without_provider_io(tmp_pa
         assert not gateway.requests
         assert store.read_budget_state(turn.turn_id).used.total_tokens == 0
         assert prepared.request_ref["step_snapshot"]["output_token_limit"] == prepared.resource_request.output_tokens
-        operation = store.prepare_model_operation(
+        operation = model_ops.prepare_model_operation(
+            store,
             turn_id=turn.turn_id,
             request_hash=prepared.request_hash,
             context_hash=prepared.context_hash,
@@ -262,10 +266,10 @@ def test_output_cap_accounts_for_changed_input_limits_without_provider_io(tmp_pa
             request_ref=prepared.request_ref,
         )
         context = runner.restore_turn_context(turn.turn_id)
-    with RuntimeState.open_sync(tmp_path / "run.db") as reopened:
+    with RuntimeStore.open_sync(tmp_path / "run.db") as reopened:
         runner._store = reopened
         runner._context_manager = RolloutContextManager(reopened)
-        replay = asyncio.run(runner._prepare_step(runner.restore_step_context(context, operation)))
+        replay = asyncio.run(runner._model_runner.prepare(runner.restore_step_context(context, operation)))
         assert (replay.request_hash, replay.context_hash, replay.tool_hash, replay.wire_hash) == (
             operation.request_hash,
             operation.context_hash,
@@ -277,15 +281,16 @@ def test_output_cap_accounts_for_changed_input_limits_without_provider_io(tmp_pa
 
 def test_old_prepared_final_only_snapshot_keeps_exact_request_after_reopen(tmp_path):
     database = tmp_path / "rollout.db"
-    with RuntimeState.open_sync(database) as store:
+    with RuntimeStore.open_sync(database) as store:
         runner, turn, gateway = file_runner(store, tmp_path)
         context = runner.restore_turn_context(turn.turn_id)
         step = runner.capture_step_context(context, step=1, budget_pressure=True)
         step = replace(
             step, tools=(), binding_manifest={**step.binding_manifest, "runtime_budget_phase": "final_answer"}
         )
-        prepared = asyncio.run(runner._prepare_step(step))
-        op = store.prepare_model_operation(
+        prepared = asyncio.run(runner._model_runner.prepare(step))
+        op = model_ops.prepare_model_operation(
+            store,
             turn_id=turn.turn_id,
             request_hash=prepared.request_hash,
             context_hash=prepared.context_hash,
@@ -293,11 +298,11 @@ def test_old_prepared_final_only_snapshot_keeps_exact_request_after_reopen(tmp_p
             wire_hash=prepared.wire_hash,
             request_ref=prepared.request_ref,
         )
-    with RuntimeState.open_sync(database) as store:
+    with RuntimeStore.open_sync(database) as store:
         runner._store = store
         runner._context_manager = RolloutContextManager(store)
         restored = runner.restore_step_context(context, op)
-        replay = asyncio.run(runner._prepare_step(restored))
+        replay = asyncio.run(runner._model_runner.prepare(restored))
         assert restored.tools == ()
         assert restored.binding_manifest["runtime_budget_phase"] == "final_answer"
         assert replay.request_ref["budget_finalization"] is True

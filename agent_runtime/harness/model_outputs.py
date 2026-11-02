@@ -10,13 +10,14 @@ from collections.abc import Mapping
 from typing import Any
 from uuid import uuid4
 
+from agent_runtime.harness import facts
 from agent_runtime.harness.records import ItemSnapshot
-from agent_runtime.harness.state import RuntimeState, _state_operation
+from agent_runtime.harness.runtime_store import RuntimeStore, owner_operation
 from agent_runtime.modeling.events import ModelOutput, output_from_payload, output_to_payload
 from agent_runtime.streaming.events import derive_model_public_item_id
 
 
-def _active_attempt(state: RuntimeState, operation_id: str, attempt_id: str, generation: int) -> Mapping[str, Any]:
+def _active_attempt(state: RuntimeStore, operation_id: str, attempt_id: str, generation: int) -> Mapping[str, Any]:
     operation = state.persistence.first("model_operations", where={"operation_id": operation_id})
     if operation is None:
         raise KeyError(f"unknown model operation: {operation_id}")
@@ -29,7 +30,7 @@ def _active_attempt(state: RuntimeState, operation_id: str, attempt_id: str, gen
     return operation
 
 
-def _starts(state: RuntimeState, attempt_id: str) -> tuple[Mapping[str, Any], ...]:
+def _starts(state: RuntimeStore, attempt_id: str) -> tuple[Mapping[str, Any], ...]:
     attempt = state.persistence.first("model_attempts", where={"attempt_id": attempt_id})
     if attempt is None:
         raise KeyError(f"unknown model attempt: {attempt_id}")
@@ -44,7 +45,7 @@ def _starts(state: RuntimeState, attempt_id: str) -> tuple[Mapping[str, Any], ..
     )
 
 
-def _start(state: RuntimeState, attempt_id: str, output_id: str) -> Mapping[str, Any] | None:
+def _start(state: RuntimeStore, attempt_id: str, output_id: str) -> Mapping[str, Any] | None:
     rows = [row["payload"] for row in _starts(state, attempt_id) if row["payload"]["output_id"] == output_id]
     if len(rows) > 1:
         raise RuntimeError("model output has duplicate durable starts")
@@ -62,9 +63,9 @@ def _channel(output: ModelOutput) -> str:
     }[output.kind]
 
 
-@_state_operation
+@owner_operation
 def record_model_response_started(
-    state: RuntimeState,
+    state: RuntimeStore,
     *,
     operation_id: str,
     attempt_id: str,
@@ -73,7 +74,8 @@ def record_model_response_started(
 ) -> None:
     with state.persistence.transaction():
         operation = _active_attempt(state, operation_id, attempt_id, generation)
-        state._append_and_reduce(
+        facts.append_fact(
+            state,
             thread_id=operation["thread_id"],
             turn_id=operation["turn_id"],
             record_type="model_response_started",
@@ -87,9 +89,9 @@ def record_model_response_started(
         )
 
 
-@_state_operation
+@owner_operation
 def start_model_output(
-    state: RuntimeState,
+    state: RuntimeStore,
     *,
     operation_id: str,
     attempt_id: str,
@@ -103,7 +105,8 @@ def start_model_output(
         if _start(state, attempt_id, output.output_id) is not None:
             raise RuntimeError("model output already started")
         item_id = f"item_{uuid4().hex}"
-        state._append_and_reduce(
+        facts.append_fact(
+            state,
             thread_id=operation["thread_id"],
             turn_id=operation["turn_id"],
             record_type="item_started",
@@ -128,9 +131,9 @@ def start_model_output(
     return state.read_item(item_id)
 
 
-@_state_operation
+@owner_operation
 def require_open_model_output(
-    state: RuntimeState,
+    state: RuntimeStore,
     *,
     operation_id: str,
     attempt_id: str,
@@ -152,9 +155,9 @@ def require_open_model_output(
         raise RuntimeError("model delta requires an open output")
 
 
-@_state_operation
+@owner_operation
 def complete_model_output(
-    state: RuntimeState,
+    state: RuntimeStore,
     *,
     operation_id: str,
     attempt_id: str,
@@ -175,7 +178,8 @@ def complete_model_output(
             output.tool_name,
         ):
             raise RuntimeError("model output identity changed")
-        state._append_and_reduce(
+        facts.append_fact(
+            state,
             thread_id=operation["thread_id"],
             turn_id=operation["turn_id"],
             record_type="item_completed",
@@ -189,8 +193,8 @@ def complete_model_output(
     return state.read_item(str(start["item_id"]))
 
 
-@_state_operation
-def read_model_outputs(state: RuntimeState, *, attempt_id: str) -> tuple[ModelOutput, ...]:
+@owner_operation
+def read_model_outputs(state: RuntimeStore, *, attempt_id: str) -> tuple[ModelOutput, ...]:
     outputs = []
     for row in _starts(state, attempt_id):
         start = row["payload"]
@@ -199,9 +203,9 @@ def read_model_outputs(state: RuntimeState, *, attempt_id: str) -> tuple[ModelOu
     return tuple(outputs)
 
 
-@_state_operation
+@owner_operation
 def close_model_outputs(
-    state: RuntimeState,
+    state: RuntimeStore,
     *,
     attempt_id: str,
     status: str,
@@ -218,7 +222,8 @@ def close_model_outputs(
             if state.read_item(start["item_id"]).status != "started":
                 continue
             output = partial_by_id.get(start["output_id"], output_from_payload(start["output"]))
-            state._append_and_reduce(
+            facts.append_fact(
+                state,
                 thread_id=row["thread_id"],
                 turn_id=row["turn_id"],
                 record_type="item_completed",
@@ -232,9 +237,9 @@ def close_model_outputs(
             )
 
 
-@_state_operation
+@owner_operation
 def finish_model_outputs(
-    state: RuntimeState,
+    state: RuntimeStore,
     *,
     operation_id: str,
     attempt_id: str,

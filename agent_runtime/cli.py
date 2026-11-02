@@ -24,7 +24,7 @@ from agent_runtime.command_cli import commands
 from agent_runtime.connection_manager import connections_command
 from agent_runtime.core.llm_config import ModelProvider
 from agent_runtime.core.llm_registry import UnknownModelIdError
-from agent_runtime.harness import RuntimeState, TurnSnapshot
+from agent_runtime.harness import RuntimeStore, TurnSnapshot
 from agent_runtime.harness.ownership import ConversationBusyError
 from agent_runtime.history import ChatSessionSummary, list_chat_sessions, read_chat_messages
 from agent_runtime.knowledge import RAGKnowledgeConfig
@@ -37,6 +37,7 @@ from agent_runtime.model_admin import (
     ModelMutationOutcome,
 )
 from agent_runtime.model_probe import ModelProbeEvidence, ProbeLevel
+from agent_runtime.modeling.failures import ModelFailure
 from agent_runtime.models import (
     ModelNotAvailableError,
     ModelPolicyError,
@@ -51,6 +52,7 @@ from agent_runtime.setup_cli import setup
 from agent_runtime.terminal_input import CHAT_COMMANDS, TerminalComposer, resolve_pause_choice
 from agent_runtime.terminal_render import (
     TerminalToolEventDisplay,
+    format_model_failure,
     format_usage_summary,
     safe_terminal_text,
     web_error_message,
@@ -104,7 +106,8 @@ def _open_cli_worktree(name: str | None) -> CreateReport:
 @worktree_app.command("list")
 def worktree_list(
     root: Annotated[
-        Path | None, typer.Option("--root", envvar="PRAXIS_WORKTREE_ROOT", help="worktree 根目录"),
+        Path | None,
+        typer.Option("--root", envvar="PRAXIS_WORKTREE_ROOT", help="worktree 根目录"),
     ] = None,
 ) -> None:
     """列出托管 worktree 与状态；不调用模型或执行工具。"""
@@ -115,17 +118,19 @@ def worktree_list(
         rows = []
         for entry in manager.list():
             inspection = manager.inspect(entry)
-            rows.append({
-                "name": entry.name,
-                "root": str(entry.root),
-                "branch": entry.branch,
-                "base_commit": entry.base_commit,
-                "source_root": str(entry.source_root),
-                "created_at": entry.created_at,
-                "exists": inspection.exists,
-                "dirty_count": inspection.dirty_count,
-                "ahead_count": inspection.ahead_count,
-            })
+            rows.append(
+                {
+                    "name": entry.name,
+                    "root": str(entry.root),
+                    "branch": entry.branch,
+                    "base_commit": entry.base_commit,
+                    "source_root": str(entry.source_root),
+                    "created_at": entry.created_at,
+                    "exists": inspection.exists,
+                    "dirty_count": inspection.dirty_count,
+                    "ahead_count": inspection.ahead_count,
+                }
+            )
     except WorktreeError as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(1) from None
@@ -136,10 +141,12 @@ def worktree_list(
 def worktree_remove(
     name: Annotated[str, typer.Argument(help="worktree 名称或检出路径")],
     force: Annotated[
-        bool, typer.Option("--force", help="放弃未提交变更与未合并提交后删除"),
+        bool,
+        typer.Option("--force", help="放弃未提交变更与未合并提交后删除"),
     ] = False,
     root: Annotated[
-        Path | None, typer.Option("--root", envvar="PRAXIS_WORKTREE_ROOT", help="worktree 根目录"),
+        Path | None,
+        typer.Option("--root", envvar="PRAXIS_WORKTREE_ROOT", help="worktree 根目录"),
     ] = None,
 ) -> None:
     """删除托管 worktree；有未提交变更或未合并提交时需要 --force。"""
@@ -150,21 +157,29 @@ def worktree_remove(
     except WorktreeError as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(1) from None
-    typer.echo(json.dumps({
-        "name": report.name,
-        "root": str(report.root),
-        "branch": report.branch,
-        "branch_deleted": report.branch_deleted,
-    }, ensure_ascii=False, indent=2))
+    typer.echo(
+        json.dumps(
+            {
+                "name": report.name,
+                "root": str(report.root),
+                "branch": report.branch,
+                "branch_deleted": report.branch_deleted,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 @worktree_app.command("prune")
 def worktree_prune(
     keep: Annotated[
-        int, typer.Option("--keep", min=1, help="保留最近多少个托管 worktree"),
+        int,
+        typer.Option("--keep", min=1, help="保留最近多少个托管 worktree"),
     ] = 15,
     root: Annotated[
-        Path | None, typer.Option("--root", envvar="PRAXIS_WORKTREE_ROOT", help="worktree 根目录"),
+        Path | None,
+        typer.Option("--root", envvar="PRAXIS_WORKTREE_ROOT", help="worktree 根目录"),
     ] = None,
 ) -> None:
     """清理最旧的干净 worktree；脏的或有未合并提交的不会被删除。"""
@@ -175,11 +190,21 @@ def worktree_prune(
     except WorktreeError as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(1) from None
-    typer.echo(json.dumps([
-        {"name": report.name, "root": str(report.root), "branch": report.branch,
-         "branch_deleted": report.branch_deleted}
-        for report in reports
-    ], ensure_ascii=False, indent=2))
+    typer.echo(
+        json.dumps(
+            [
+                {
+                    "name": report.name,
+                    "root": str(report.root),
+                    "branch": report.branch,
+                    "branch_deleted": report.branch_deleted,
+                }
+                for report in reports
+            ],
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 @agent_app.command("permissions")
@@ -202,22 +227,29 @@ def agent_permissions(
         raise typer.BadParameter(str(error), param_hint="--permissions") from None
     result = effective.explain()
     if path is not None:
-        result.update(decision="allow" if effective.path_access(path, write=write) else "deny",
-                      reason=effective.path_reason(path, write=write))
+        result.update(
+            decision="allow" if effective.path_access(path, write=write) else "deny",
+            reason=effective.path_reason(path, write=write),
+        )
     elif tool is not None:
-        result.update(decision=effective.tool_decision(tool) or "default",
-                      reason="tool rule; actual effects and targets are checked at execution")
+        result.update(
+            decision=effective.tool_decision(tool) or "default",
+            reason="tool rule; actual effects and targets are checked at execution",
+        )
     elif url is not None:
         result.update(decision=effective.network_decision(url), reason="network destination rule")
     print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
 model_app.add_typer(model_trust_app, name="trust", help="管理冻结模型绑定的本地信任域。")
 logger = logging.getLogger(__name__)
 
 
 @agent_app.command("memory")
 def agent_memory(
-    action: Annotated[Literal["status", "configure", "update", "delete", "remember", "edit", "explain", "relocate"],
-                      typer.Argument()] = "status",
+    action: Annotated[
+        Literal["status", "configure", "update", "delete", "remember", "edit", "explain", "relocate"], typer.Argument()
+    ] = "status",
     workspace: Annotated[Path, typer.Option("--workspace")] = Path("."),
     checkpoint_db: Annotated[Path, typer.Option("--checkpoint-db")] = DEFAULT_CHECKPOINT_PATH,
     use: Annotated[bool | None, typer.Option("--use/--no-use")] = None,
@@ -233,8 +265,13 @@ def agent_memory(
     """工作区跨聊天记忆：检查、配置、有限更新或删除；默认不开启。"""
     from agent_runtime import Agent, MemoryConfig
 
-    agent = Agent(workspace_path=workspace, checkpoint_db=checkpoint_db, model=model,
-                  model_session_path=None, enable_workspace_mcp=False)
+    agent = Agent(
+        workspace_path=workspace,
+        checkpoint_db=checkpoint_db,
+        model=model,
+        model_session_path=None,
+        enable_workspace_mcp=False,
+    )
     if action == "status":
         result = agent.memories()
     elif action == "relocate":
@@ -247,10 +284,12 @@ def agent_memory(
     elif action == "configure":
         if use is None and generate is None:
             raise typer.BadParameter("configure requires --use/--no-use or --generate/--no-generate")
-        with RuntimeState.open_sync(checkpoint_db) as store:
+        with RuntimeStore.open_sync(checkpoint_db) as store:
             state = store.read_memory_state(workspace)
-        config = MemoryConfig(use_memories=state["use_memories"] if use is None else use,
-                              generate_memories=state["generate_memories"] if generate is None else generate)
+        config = MemoryConfig(
+            use_memories=state["use_memories"] if use is None else use,
+            generate_memories=state["generate_memories"] if generate is None else generate,
+        )
         state = agent.configure_memory(config)
         result = {"version": state["version"], **config.model_dump()}
     elif action == "delete":
@@ -271,8 +310,9 @@ def agent_memory(
                 if text is None:
                     raise typer.BadParameter(f"{action} requires --text")
                 if action == "remember":
-                    state = agent.remember_memory(key, text, title=title, kind=kind or "fact",
-                                                  expected_version=expected_version)
+                    state = agent.remember_memory(
+                        key, text, title=title, kind=kind or "fact", expected_version=expected_version
+                    )
                 else:
                     state = agent.edit_memory(key, text, title=title, kind=kind, expected_version=expected_version)
                 entries = cast(Sequence[Mapping[str, object]], state["entries"])
@@ -300,8 +340,11 @@ def agent_history(
     from agent_runtime.history import list_history_turns, read_history
 
     try:
-        rows = (list_history_turns(checkpoint_db, limit=limit) if not any((turn_id, call_id, item_id)) else
-                read_history(checkpoint_db, turn_id=turn_id, tool_call_id=call_id, item_id=item_id, limit=limit))
+        rows = (
+            list_history_turns(checkpoint_db, limit=limit)
+            if not any((turn_id, call_id, item_id))
+            else read_history(checkpoint_db, turn_id=turn_id, tool_call_id=call_id, item_id=item_id, limit=limit)
+        )
     except (OSError, ValueError, KeyError, sqlite3.Error):
         raise typer.BadParameter("历史数据库或指定记录不可读取；请检查路径和 ID。") from None
     typer.echo(json.dumps(rows, ensure_ascii=False, indent=2))
@@ -405,6 +448,10 @@ def _failure_title(stop_reason: str | None) -> str:
     if stop_reason == "model_step_budget_exhausted":
         return "本次执行已达到尝试次数上限，本轮未完成收尾。"
     capacity_failures = {
+        "model_retry_exhausted": "模型自动重试次数已耗尽，本轮未完成。",
+        "model_retry_deadline_exceeded": "模型自动重试已达到原定截止时间，本轮未完成。",
+        "model_retry_clock_invalid": "系统时钟倒退，已停止自动重试。",
+        "model_retry_budget_exhausted": "剩余预算不足，无法启动下一次模型重试。",
         "model_token_budget_exhausted": "本轮累计 Token 预算不足，无法继续执行或完成收尾。",
         "model_context_window_exceeded": "模型单次请求超出上下文窗口，压缩恢复后仍无法继续。",
         "context_summary_incomplete": "上下文摘要输出被截断，原始历史已保留；本轮无法完成必要压缩。",
@@ -432,13 +479,21 @@ def _display_failure(
     stop_reason: str | None,
     diagnostics: Sequence[AgentDiagnostic],
     verbose: bool,
+    model_error: ModelFailure | None = None,
 ) -> None:
-    print(f"\n{_failure_title(stop_reason)}")
+    if model_error is None:
+        print(f"\n{_failure_title(stop_reason)}")
+    else:
+        _display_model_failure(model_error)
     if verbose:
         if stop_reason:
             print(f"  stop_reason: {stop_reason}")
         for diagnostic in diagnostics:
             _print_diagnostic(diagnostic)
+
+
+def _display_model_failure(failure: ModelFailure) -> None:
+    print("\n" + format_model_failure(failure))
 
 
 def _display_agent_result(
@@ -455,6 +510,7 @@ def _display_agent_result(
             stop_reason=result.stop_reason,
             diagnostics=result.diagnostics,
             verbose=verbose,
+            model_error=result.model_error,
         )
     elif result.diagnostics and show_outcome:
         degraded = sum(1 for diagnostic in result.diagnostics if diagnostic.degraded)
@@ -463,14 +519,15 @@ def _display_agent_result(
         if verbose:
             for diagnostic in result.diagnostics:
                 _print_diagnostic(diagnostic)
+    if result.status == "paused" and result.model_error is not None and show_outcome:
+        _display_model_failure(result.model_error)
 
     if result.answer and not answer_streamed:
         print(f"\n{safe_terminal_text(result.answer)}")
 
     if result.status == "done" and show_outcome:
         scope = (
-            f"（范围: {safe_terminal_text(result.validation_scope)}）"
-            if result.validation_scope is not None else ""
+            f"（范围: {safe_terminal_text(result.validation_scope)}）" if result.validation_scope is not None else ""
         )
         print(f"\n验证状态: {result.validation_status}{scope}")
         if result.validation_status == "not_evaluated":
@@ -496,6 +553,7 @@ def _display_agent_result(
 
     if verbose:
         usage = result.usage
+
         def milliseconds(value: float | None) -> str:
             return "unknown" if value is None else f"{value:.0f}ms"
 
@@ -579,7 +637,9 @@ async def _handle_ui_pause(result: AgentResult, ui: TerminalChatApp) -> str | No
 
 
 async def _handle_cli_pause(
-    result: AgentResult, *, approval_mode: ApprovalMode | None = None,
+    result: AgentResult,
+    *,
+    approval_mode: ApprovalMode | None = None,
     set_approval_mode: Callable[[ApprovalMode], None] | None = None,
 ) -> str | None:
     """TTY approval uses a selector; plain input remains available for pipes."""
@@ -599,16 +659,22 @@ async def _handle_cli_pause(
             values.append(("permissions", APPROVAL_CHOICES["permissions"]))
         while True:
             action = await radiolist_dialog(
-                title="操作审批", text=safe_terminal_text("\n".join(details)), values=values,
+                title="操作审批",
+                text=safe_terminal_text("\n".join(details)),
+                values=values,
                 default="deny" if "deny" in request.options else request.options[0],
-                ok_text="确认", cancel_text="取消",
+                ok_text="确认",
+                cancel_text="取消",
             ).run_async()
             if action != "permissions":
                 return action
             selected = await radiolist_dialog(
-                title="选择审批模式", text="应用到当前任务并按新策略重新检查；明确禁令和沙箱仍有效。",
-                values=list(APPROVAL_MODES.items()), default=approval_mode,
-                ok_text="应用", cancel_text="返回审批",
+                title="选择审批模式",
+                text="应用到当前任务并按新策略重新检查；明确禁令和沙箱仍有效。",
+                values=list(APPROVAL_MODES.items()),
+                default=approval_mode,
+                ok_text="应用",
+                cancel_text="返回审批",
             ).run_async()
             if selected is not None and selected != approval_mode and set_approval_mode is not None:
                 set_approval_mode(cast(ApprovalMode, selected))
@@ -865,7 +931,8 @@ async def _run_facade_command(
         while result.status == "paused" and interactive_approval:
             display.finish()
             action = await _handle_cli_pause(
-                result, approval_mode=getattr(facade, "approval_mode", None) or "auto",
+                result,
+                approval_mode=getattr(facade, "approval_mode", None) or "auto",
                 set_approval_mode=lambda mode: setattr(facade, "approval_mode", mode),
             )
             if action is None:
@@ -873,11 +940,16 @@ async def _run_facade_command(
             display.begin_turn()
             if result.pause is not None and result.pause.kind in {"clarification", "choice"}:
                 result = await facade.resume(
-                    result.turn_id, "continue", user_input=action, event_sink=display,
+                    result.turn_id,
+                    "continue",
+                    user_input=action,
+                    event_sink=display,
                 )
             else:
                 result = await facade.resume(
-                    result.turn_id, action, event_sink=display,
+                    result.turn_id,
+                    action,
+                    event_sink=display,
                 )
         return result
     finally:
@@ -944,13 +1016,23 @@ def _print_chat_help() -> None:
 
 def _chat_session_label(session: ChatSessionSummary) -> str:
     timestamp = datetime.fromtimestamp(session.updated_at_ms / 1000).astimezone().strftime("%Y-%m-%d %H:%M")
-    state = {"completed": "已完成", "failed": "失败", "cancelled": "已取消",
-             "running": "处理中", "paused": "暂停", "interrupted": "中断"}.get(session.status, session.status)
+    state = {
+        "completed": "已完成",
+        "failed": "失败",
+        "cancelled": "已取消",
+        "running": "处理中",
+        "paused": "暂停",
+        "interrupted": "中断",
+    }.get(session.status, session.status)
     return safe_terminal_text(f"{timestamp} · {state} · {session.title} · {session.thread_id}")
 
 
 async def _select_chat_session(
-    database: Path, workspace: Path, *, selector: str, ui: TerminalChatApp | None,
+    database: Path,
+    workspace: Path,
+    *,
+    selector: str,
+    ui: TerminalChatApp | None,
 ) -> ChatSessionSummary | None:
     try:
         sessions = await asyncio.to_thread(list_chat_sessions, database, workspace=workspace)
@@ -999,8 +1081,7 @@ def _print_chat_recovery(session: ChatSessionSummary, pending: AgentResult | Non
                 print(safe_terminal_text(f"  {call.tool_name}: {call.args_preview}"))
             if request.options:
                 if request.kind == "tool_approval":
-                    print("可选择: " + " / ".join(APPROVAL_CHOICES.get(choice, choice)
-                                               for choice in request.options))
+                    print("可选择: " + " / ".join(APPROVAL_CHOICES.get(choice, choice) for choice in request.options))
                     print("继续后会显示审批选择面板；/new 开始新聊天。")
                 else:
                     print("可直接回复: " + ", ".join(request.options))
@@ -1028,12 +1109,19 @@ async def _chat_facade_loop(
 
         initial_model = "历史聊天" if resume_thread_id is not None else facade.current_model().id
         ui = TerminalChatApp(model=initial_model, workspace=str(facade.workspace_path or Path.cwd()), ui_mode=ui_mode)
-        await ui.run(lambda: _chat_facade_loop(
-            facade, max_tokens_total=max_tokens_total, max_turns=max_turns,
-            previous_turn_id=previous_turn_id, allow_write_tools=allow_write_tools,
-            resume_thread_id=resume_thread_id,
-            allow_execute_tools=allow_execute_tools, allow_web_tools=allow_web_tools, _ui=ui,
-        ))
+        await ui.run(
+            lambda: _chat_facade_loop(
+                facade,
+                max_tokens_total=max_tokens_total,
+                max_turns=max_turns,
+                previous_turn_id=previous_turn_id,
+                allow_write_tools=allow_write_tools,
+                resume_thread_id=resume_thread_id,
+                allow_execute_tools=allow_execute_tools,
+                allow_web_tools=allow_web_tools,
+                _ui=ui,
+            )
+        )
         return
     event_display = _ui.display if _ui else _CLIToolEventDisplay(interactive=False)
     composer = TerminalComposer() if _ui is None else None
@@ -1080,12 +1168,18 @@ async def _chat_facade_loop(
             nonlocal chat_approval_mode
             database = facade.checkpoint_db or DEFAULT_CHECKPOINT_PATH
             selected = await _select_chat_session(
-                database, Path(default_chat_workspace), selector=selector, ui=_ui,
+                database,
+                Path(default_chat_workspace),
+                selector=selector,
+                ui=_ui,
             )
             if selected is None:
                 return False
-            messages = await asyncio.to_thread(read_chat_messages,
-                database, thread_id=selected.thread_id, workspace=Path(default_chat_workspace),
+            messages = await asyncio.to_thread(
+                read_chat_messages,
+                database,
+                thread_id=selected.thread_id,
+                workspace=Path(default_chat_workspace),
             )
             await stack.aclose()
             stack.callback(event_display.finish)
@@ -1109,8 +1203,11 @@ async def _chat_facade_loop(
                 for kind, text in messages:
                     prefix = "❯ " if kind == "user" else "Praxis\n" if kind == "answer" else ""
                     print(prefix + safe_terminal_text(text) + "\n")
-            pending = (await facade.read_result(selected.active_turn_id)
-                       if selected.active_turn_id and selected.status in {"paused", "interrupted"} else None)
+            pending = (
+                await facade.read_result(selected.active_turn_id)
+                if selected.active_turn_id and selected.status in {"paused", "interrupted"}
+                else None
+            )
             _print_chat_recovery(selected, pending)
             return True
 
@@ -1128,19 +1225,30 @@ async def _chat_facade_loop(
                 anchor = selected_chat.head_turn_id
                 if anchor is not None:
                     metadata = await asyncio.to_thread(
-                        _cli_turn, facade.checkpoint_db or DEFAULT_CHECKPOINT_PATH, anchor,
+                        _cli_turn,
+                        facade.checkpoint_db or DEFAULT_CHECKPOINT_PATH,
+                        anchor,
                     )
                     facade.knowledge = metadata.runtime.knowledge
-            opened = await stack.enter_async_context(facade.session(
-                **({"_frozen_turn_id": frozen_turn_id} if frozen_turn_id is not None else {
-                    "previous_turn_id": previous_turn_id if selected_chat is None else None,
-                    "thread_id": selected_chat.thread_id if selected_chat is not None else None,
-                }),
-                max_turns=max_turns, max_tokens_total=max_tokens_total,
-                require_workspace_change=False, allow_write_tools=allow_write_tools,
-                allow_execute_tools=allow_execute_tools, allow_web_tools=allow_web_tools,
-                **({"approval_mode": chat_approval_mode} if chat_approval_mode is not None else {}),
-            ))
+            opened = await stack.enter_async_context(
+                facade.session(
+                    **(
+                        {"_frozen_turn_id": frozen_turn_id}
+                        if frozen_turn_id is not None
+                        else {
+                            "previous_turn_id": previous_turn_id if selected_chat is None else None,
+                            "thread_id": selected_chat.thread_id if selected_chat is not None else None,
+                        }
+                    ),
+                    max_turns=max_turns,
+                    max_tokens_total=max_tokens_total,
+                    require_workspace_change=False,
+                    allow_write_tools=allow_write_tools,
+                    allow_execute_tools=allow_execute_tools,
+                    allow_web_tools=allow_web_tools,
+                    **({"approval_mode": chat_approval_mode} if chat_approval_mode is not None else {}),
+                )
+            )
             session = opened
             model_id = opened.current_model().id
             if _ui:
@@ -1175,9 +1283,13 @@ async def _chat_facade_loop(
                 raise ValueError("审批模式必须为 ask、auto 或 full")
             previous = session.tool_execution_context.approval_mode if session else chat_approval_mode
             if session is not None:
-                session.update_tool_policy(approval_mode=cast(ApprovalMode, mode),
-                                           allow_write_tools=False, allow_execute_tools=False,
-                                           allow_web_tools=False, auto_approve_sandboxed=False)
+                session.update_tool_policy(
+                    approval_mode=cast(ApprovalMode, mode),
+                    allow_write_tools=False,
+                    allow_execute_tools=False,
+                    allow_web_tools=False,
+                    auto_approve_sandboxed=False,
+                )
             chat_approval_mode = cast(ApprovalMode, mode)
             facade.approval_mode = chat_approval_mode
             if _ui:
@@ -1201,6 +1313,7 @@ async def _chat_facade_loop(
 
         if _ui is not None:
             _ui.on_permissions = choose_approval_mode
+
             async def receive_input(text: str) -> str | None:
                 assert _ui is not None
                 if text.split(maxsplit=1)[0] in {"/effort", "/output"}:
@@ -1214,8 +1327,9 @@ async def _chat_facade_loop(
                 if files:
                     if session is None:
                         raise RuntimeError("当前操作尚无可接收附件的会话；输入已保留")
-                    receipt = await session.steer(guidance or "补充输入文件，请结合当前任务读取。",
-                                                  expected_turn_id=turn_id, files=files)
+                    receipt = await session.steer(
+                        guidance or "补充输入文件，请结合当前任务读取。", expected_turn_id=turn_id, files=files
+                    )
                 else:
                     receipt = await receiver.steer(text, expected_turn_id=turn_id)
                 return receipt.item_id
@@ -1245,9 +1359,11 @@ async def _chat_facade_loop(
             if query == "/web":
                 from agent_runtime.web_cli import configure_search
 
-                if ((last_result is not None and last_result.status in {"paused", "interrupted"})
-                        or (selected_chat is not None and selected_chat.active_turn_id
-                            and selected_chat.status in {"paused", "interrupted"})):
+                if (last_result is not None and last_result.status in {"paused", "interrupted"}) or (
+                    selected_chat is not None
+                    and selected_chat.active_turn_id
+                    and selected_chat.status in {"paused", "interrupted"}
+                ):
                     print("请先处理暂停的任务，或用 /new 开始新聊天后设置搜索。")
                     continue
                 if _ui is None and not _is_tty(sys.stdin):
@@ -1257,11 +1373,17 @@ async def _chat_facade_loop(
                     current_model = (session or facade).current_model()
                     provider = facade.web_search_provider or "deepseek"
                     key_file = facade.web_search_key_file
-                    configuration = (await _ui.setup_search(current_model, provider=provider, key_file=key_file)
-                                     if _ui else await asyncio.to_thread(
-                                         configure_search, workspace=Path(default_chat_workspace), model=current_model,
-                                         provider=provider, key_file=key_file,
-                                     ))
+                    configuration = (
+                        await _ui.setup_search(current_model, provider=provider, key_file=key_file)
+                        if _ui
+                        else await asyncio.to_thread(
+                            configure_search,
+                            workspace=Path(default_chat_workspace),
+                            model=current_model,
+                            provider=provider,
+                            key_file=key_file,
+                        )
+                    )
                     # Tool definitions belong to the next Turn. Reopen idle
                     # resources while keeping the transcript anchor and model.
                     if session is not None:
@@ -1313,8 +1435,14 @@ async def _chat_facade_loop(
                         continue
                     if query == "/permissions grants":
                         grants = session.approval_grants() if session is not None else ()
-                        print("当前会话授权：" + ("\n" + "\n".join(safe_terminal_text(grant.label) for grant in grants)
-                                             if grants else "无"))
+                        print(
+                            "当前会话授权："
+                            + (
+                                "\n" + "\n".join(safe_terminal_text(grant.label) for grant in grants)
+                                if grants
+                                else "无"
+                            )
+                        )
                         continue
                     if query == "/permissions revoke":
                         if session is not None:
@@ -1343,8 +1471,10 @@ async def _chat_facade_loop(
                         if session is not None:
                             session.reload_permissions()
                     elif query != "/permissions show":
-                        print("用法: /permissions [mode ask|auto|full | grants | revoke | show | "
-                              "load <文件> | profile <名称> | reload]")
+                        print(
+                            "用法: /permissions [mode ask|auto|full | grants | revoke | show | "
+                            "load <文件> | profile <名称> | reload]"
+                        )
                         continue
                     effective = session.permissions() if session is not None else facade.effective_permissions()
                     print(json.dumps(effective.explain(), ensure_ascii=False, indent=2))
@@ -1353,8 +1483,7 @@ async def _chat_facade_loop(
                 continue
             if query == "/rewind" or query.startswith("/rewind "):
                 argument = query.removeprefix("/rewind").strip()
-                current_thread = (selected_chat.thread_id if selected_chat
-                                  else getattr(session, "thread_id", None))
+                current_thread = selected_chat.thread_id if selected_chat else getattr(session, "thread_id", None)
                 try:
                     from agent_runtime.checkpoints import CheckpointError, _numeric
 
@@ -1378,8 +1507,7 @@ async def _chat_facade_loop(
                             index = int(argument)
                             selected_row = rows[index - 1] if 1 <= index <= len(rows) else None
                         else:
-                            matches = [row for row in rows
-                                       if str(row["checkpoint_id"]).startswith(argument)]
+                            matches = [row for row in rows if str(row["checkpoint_id"]).startswith(argument)]
                             if len(matches) > 1:
                                 print(f"检查点前缀匹配多个结果（{len(matches)} 个），请输入更长的前缀。")
                                 continue
@@ -1402,23 +1530,28 @@ async def _chat_facade_loop(
                         selected_row = rows[int(answer) - 1]
                     if _ui:
                         confirmed = await _ui.choose_menu(
-                            ["确认回滚", "取消"], title="回滚前会先把当前状态保存为检查点",
+                            ["确认回滚", "取消"],
+                            title="回滚前会先把当前状态保存为检查点",
                         )
                         if confirmed != "确认回滚":
                             continue
                     else:
-                        confirm = (await asyncio.to_thread(
-                            input,
-                            "回滚会把工作区文件恢复到该检查点（之后新增的文件会被删除；"
-                            "当前状态会先保存为检查点）。确认回滚？[y/N] ",
-                        )).strip()
+                        confirm = (
+                            await asyncio.to_thread(
+                                input,
+                                "回滚会把工作区文件恢复到该检查点（之后新增的文件会被删除；"
+                                "当前状态会先保存为检查点）。确认回滚？[y/N] ",
+                            )
+                        ).strip()
                         if confirm.casefold() not in {"y", "yes"}:
                             continue
                     rewind_result = await facade.rewind(str(selected_row["checkpoint_id"]))
                     restored = [str(path) for path in cast("list[object]", rewind_result.get("restored", ()))]
                     deleted = [str(path) for path in cast("list[object]", rewind_result.get("deleted", ()))]
-                    print(f"已回滚到 {str(rewind_result.get('target_checkpoint_id', ''))[:12]}："
-                          f"还原 {len(restored)} 个文件，删除 {len(deleted)} 个文件。")
+                    print(
+                        f"已回滚到 {str(rewind_result.get('target_checkpoint_id', ''))[:12]}："
+                        f"还原 {len(restored)} 个文件，删除 {len(deleted)} 个文件。"
+                    )
                     anchor = str(rewind_result.get("restore_anchor_id") or "")
                     if anchor:
                         print(f"回滚前状态已保存为检查点 {anchor[:12]}；再次 /rewind 可撤销本次回滚。")
@@ -1459,14 +1592,19 @@ async def _chat_facade_loop(
                         if confirmed != "确认提交":
                             continue
                     else:
-                        confirm = (await asyncio.to_thread(
-                            input, "确认提交以上变更到 praxis/* 分支？[y/N] ",
-                        )).strip()
+                        confirm = (
+                            await asyncio.to_thread(
+                                input,
+                                "确认提交以上变更到 praxis/* 分支？[y/N] ",
+                            )
+                        ).strip()
                         if confirm.casefold() not in {"y", "yes"}:
                             continue
                     delivery = await facade.commit(message, expected_preview_id=str(status["preview_id"]))
-                    print(f"已提交 {str(delivery.get('commit_id'))[:12]} 到分支 "
-                          f"{delivery.get('branch')}（{delivery.get('changed_file_count')} 个文件）。")
+                    print(
+                        f"已提交 {str(delivery.get('commit_id'))[:12]} 到分支 "
+                        f"{delivery.get('branch')}（{delivery.get('changed_file_count')} 个文件）。"
+                    )
                 except DeliveryInterruptedError as error:
                     print(safe_terminal_text(str(error)))
                 except (DeliveryError, OSError, RuntimeError) as error:
@@ -1482,8 +1620,7 @@ async def _chat_facade_loop(
                     subjects = cast("list[object]", pr_status.get("commit_subjects", ()))
                     paths = cast("list[object]", pr_status.get("changed_paths", ()))
                     existing = pr_status.get("open_pull_request_url")
-                    print(f"分支 {pr_status.get('branch')} → origin，基准 "
-                          f"{pr_status.get('base_branch')}：")
+                    print(f"分支 {pr_status.get('branch')} → origin，基准 {pr_status.get('base_branch')}：")
                     for subject in subjects[:15]:
                         print(f"  提交 {safe_terminal_text(str(subject))}")
                     for changed_path in paths[:20]:
@@ -1492,8 +1629,7 @@ async def _chat_facade_loop(
                         print(f"  …另有 {len(paths) - 20} 个文件")
                     uncommitted = int(_numeric(pr_status.get("uncommitted_count")))
                     if uncommitted:
-                        print(f"提示：工作区还有 {uncommitted} 项未提交变更，不会包含在本 PR 中"
-                              "（可先 /commit）。")
+                        print(f"提示：工作区还有 {uncommitted} 项未提交变更，不会包含在本 PR 中（可先 /commit）。")
                     if isinstance(existing, str) and existing:
                         print(f"该分支已有 Pull Request：{existing}")
                     if not title and _ui:
@@ -1507,13 +1643,17 @@ async def _chat_facade_loop(
                         if confirmed != "确认推送并创建":
                             continue
                     else:
-                        confirm = (await asyncio.to_thread(
-                            input, "确认推送并创建 Pull Request？[y/N] ",
-                        )).strip()
+                        confirm = (
+                            await asyncio.to_thread(
+                                input,
+                                "确认推送并创建 Pull Request？[y/N] ",
+                            )
+                        ).strip()
                         if confirm.casefold() not in {"y", "yes"}:
                             continue
                     pull_request = await facade.open_pull_request(
-                        title=title or None, expected_preview_id=str(pr_status["preview_id"]),
+                        title=title or None,
+                        expected_preview_id=str(pr_status["preview_id"]),
                     )
                     verb = "已创建" if pull_request.get("created") else "已更新"
                     print(f"{verb} Pull Request：{pull_request.get('url')}")
@@ -1547,21 +1687,22 @@ async def _chat_facade_loop(
                         print(f"等待 CI 完成（最长 {int(wait_seconds)} 秒，Ctrl+C 取消）…")
                     try:
                         report = await facade.pull_request_checks(
-                            branch, include_failure_logs=True,
+                            branch,
+                            include_failure_logs=True,
                             wait_seconds=wait_seconds,
                         )
                     except KeyboardInterrupt:
                         print("已取消等待；可再次运行 /checks 查看当前状态。")
                         continue
-                    state_icons = {"pass": "✅", "fail": "❌", "pending": "⏳",
-                                   "skipping": "⏸", "cancel": "⛔"}
+                    state_icons = {"pass": "✅", "fail": "❌", "pending": "⏳", "skipping": "⏸", "cancel": "⛔"}
                     checks = cast("list[dict[str, object]]", report.get("checks", ()))
-                    print(f"分支 {report.get('branch')} 的 PR 检查"
-                          f"（{report.get('pull_request_url') or 'PR'}）：")
+                    print(f"分支 {report.get('branch')} 的 PR 检查（{report.get('pull_request_url') or 'PR'}）：")
                     for check in checks:
                         icon = state_icons.get(str(check.get("state")), "·")
-                        print(f"  {icon} {safe_terminal_text(str(check.get('name', '')))}"
-                              f"（{safe_terminal_text(str(check.get('workflow', '')))}）")
+                        print(
+                            f"  {icon} {safe_terminal_text(str(check.get('name', '')))}"
+                            f"（{safe_terminal_text(str(check.get('workflow', '')))}）"
+                        )
                     overall = str(report.get("overall"))
                     if overall == "pass":
                         print(f"CI 全部通过 ✅（{len(checks)} 项）。")
@@ -1572,8 +1713,7 @@ async def _chat_facade_loop(
                     if overall == "pending":
                         print("仍在进行中；可用 /checks --wait 继续等待。")
                         continue
-                    failed = [check for check in checks
-                              if str(check.get("state")) in {"fail", "cancel"}]
+                    failed = [check for check in checks if str(check.get("state")) in {"fail", "cancel"}]
                     failure_logs = cast("list[dict[str, object]]", report.get("failure_logs", ()))
                     for entry in failure_logs:
                         logs = str(entry.get("logs", ""))
@@ -1588,22 +1728,24 @@ async def _chat_facade_loop(
                         if confirmed != "交给 agent 分析修复":
                             continue
                     else:
-                        confirm = (await asyncio.to_thread(
-                            input, "把失败详情交给 agent 分析修复？[y/N] ",
-                        )).strip()
+                        confirm = (
+                            await asyncio.to_thread(
+                                input,
+                                "把失败详情交给 agent 分析修复？[y/N] ",
+                            )
+                        ).strip()
                         if confirm.casefold() not in {"y", "yes"}:
                             continue
                     ci_message = compose_ci_failure_message(
                         branch=str(report.get("branch")),
                         head_commit=str(report.get("head_commit") or ""),
                         pull_request_url=(
-                            str(report["pull_request_url"])
-                            if isinstance(report.get("pull_request_url"), str) else None
+                            str(report["pull_request_url"]) if isinstance(report.get("pull_request_url"), str) else None
                         ),
-                        failed=[(str(check.get("name", "")), str(check.get("workflow", "")))
-                                for check in failed],
-                        failure_logs=[(str(entry.get("workflow", "")), str(entry.get("logs", "")))
-                                      for entry in failure_logs],
+                        failed=[(str(check.get("name", "")), str(check.get("workflow", ""))) for check in failed],
+                        failure_logs=[
+                            (str(entry.get("workflow", "")), str(entry.get("logs", ""))) for entry in failure_logs
+                        ],
                     )
                 except (DeliveryError, OSError, RuntimeError) as error:
                     print("读取 CI 状态失败: " + safe_terminal_text(str(error)))
@@ -1625,8 +1767,14 @@ async def _chat_facade_loop(
                 clock = capture_runtime_clock()
                 print(f"当前时间: {clock['current_time']} · {clock['timezone']}")
                 print(f"详细输出: {'开' if verbose else '关'}")
-                print("网页网络: " + ("可信代理（上游解析域名，NO_PROXY 命中时严格直连）"
-                                      if getattr(facade, "web_proxy_url", None) else "严格直连"))
+                print(
+                    "网页网络: "
+                    + (
+                        "可信代理（上游解析域名，NO_PROXY 命中时严格直连）"
+                        if getattr(facade, "web_proxy_url", None)
+                        else "严格直连"
+                    )
+                )
                 event_display.show_context_status()
                 if last_result is not None:
                     print(f"验证状态: {last_result.validation_status}")
@@ -1686,7 +1834,8 @@ async def _chat_facade_loop(
                 model_control = session or facade
                 if _ui and query in {"/model", "/model list"}:
                     selected = await _ui.choose_model(
-                        [spec.id for spec in model_control.models()], model_id,
+                        [spec.id for spec in model_control.models()],
+                        model_id,
                     )
                     if selected is None:
                         continue
@@ -1717,9 +1866,18 @@ async def _chat_facade_loop(
             if selected_chat is not None:
                 # Refresh the durable active slot before opening any resources. Another
                 # process may have started a Turn since the conversation was selected.
-                latest = next((chat for chat in await asyncio.to_thread(list_chat_sessions,
-                    facade.checkpoint_db or DEFAULT_CHECKPOINT_PATH, workspace=Path(default_chat_workspace),
-                ) if chat.thread_id == selected_chat.thread_id), None)
+                latest = next(
+                    (
+                        chat
+                        for chat in await asyncio.to_thread(
+                            list_chat_sessions,
+                            facade.checkpoint_db or DEFAULT_CHECKPOINT_PATH,
+                            workspace=Path(default_chat_workspace),
+                        )
+                        if chat.thread_id == selected_chat.thread_id
+                    ),
+                    None,
+                )
                 if latest is None:
                     print("会话已不可读取；请重新 /resume 选择。")
                     continue
@@ -1752,7 +1910,9 @@ async def _chat_facade_loop(
                             continue
                     if saved_result is not None and saved_action != "abort":
                         metadata = await asyncio.to_thread(
-                            _cli_turn, facade.checkpoint_db or DEFAULT_CHECKPOINT_PATH, saved_result.turn_id,
+                            _cli_turn,
+                            facade.checkpoint_db or DEFAULT_CHECKPOINT_PATH,
+                            saved_result.turn_id,
                         )
                         facade.knowledge = metadata.runtime.knowledge
             if saved_result is None:
@@ -1769,14 +1929,18 @@ async def _chat_facade_loop(
                     resume_options: _ResumeOptions = (
                         {"files": list(pending_files)} if pending_files and saved_action != "abort" else {}
                     )
-                    submission = resume_driver.resume(saved_result.turn_id, saved_action,
-                        user_input=saved_input, event_sink=event_display,
-                        **resume_options)
+                    submission = resume_driver.resume(
+                        saved_result.turn_id,
+                        saved_action,
+                        user_input=saved_input,
+                        event_sink=event_display,
+                        **resume_options,
+                    )
                 else:
                     assert session is not None
-                    submission = session.submit(query, event_sink=event_display, **(
-                        {"files": list(pending_files)} if pending_files else {}
-                    ))
+                    submission = session.submit(
+                        query, event_sink=event_display, **({"files": list(pending_files)} if pending_files else {})
+                    )
                 result = await _ui.operation(submission) if _ui else await submission
                 event_display.update_usage(result.usage)
                 if saved_result is None or saved_action != "abort":
@@ -1803,11 +1967,24 @@ async def _chat_facade_loop(
                 else:
                     print("\n" + format_usage_summary(result.usage))
                 text_answer = result.pause is not None and result.pause.kind in {"clarification", "choice"}
-                pending_steering = bool(_ui and result.pause and result.pause.kind == "tool_approval"
-                                        and any([await asyncio.to_thread(facade.input_status, identity) == "pending"
-                                                 for identity in _ui._input_receipts]))
-                action = ("continue" if pending_steering
-                          else await _handle_ui_pause(result, _ui) if _ui else await _handle_cli_pause(result))
+                pending_steering = bool(
+                    _ui
+                    and result.pause
+                    and result.pause.kind == "tool_approval"
+                    and any(
+                        [
+                            await asyncio.to_thread(facade.input_status, identity) == "pending"
+                            for identity in _ui._input_receipts
+                        ]
+                    )
+                )
+                action = (
+                    "continue"
+                    if pending_steering
+                    else await _handle_ui_pause(result, _ui)
+                    if _ui
+                    else await _handle_cli_pause(result)
+                )
                 if action is None:
                     if _ui:
                         cancelled = await _cancel_ui_execution(resume_driver, _ui, result.turn_id)
@@ -1820,7 +1997,10 @@ async def _chat_facade_loop(
                 event_display.begin_turn(reset=False)
                 if text_answer:
                     resumption = resume_driver.resume(
-                        result.turn_id, "continue", user_input=action, event_sink=event_display,
+                        result.turn_id,
+                        "continue",
+                        user_input=action,
+                        event_sink=event_display,
                     )
                 else:
                     resumption = resume_driver.resume(result.turn_id, action, event_sink=event_display)
@@ -1989,22 +2169,12 @@ def model_show(
     print(f"base_url: {entry.spec.base_url or '<default>'}")
     print(f"api_key_env: {entry.spec.api_key_env or '<none>'}")
     print(f"tokenizer_model: {entry.definition.tokenizer_model or '<default>'}")
-    print(
-        f"context_window_tokens: "
-        f"{entry.definition.context_window_tokens}"
-    )
+    print(f"context_window_tokens: {entry.definition.context_window_tokens}")
 
-
-    print(
-        f"max_output_tokens: "
-        f"{entry.definition.max_output_tokens}"
-    )
+    print(f"max_output_tokens: {entry.definition.max_output_tokens}")
     print(f"timeout_seconds: {entry.definition.timeout_seconds}")
     print(f"supports_tools: {str(entry.spec.supports_tools).lower()}")
-    print(
-        "supports_structured_output: "
-        f"{str(entry.spec.supports_structured_output).lower()}"
-    )
+    print(f"supports_structured_output: {str(entry.spec.supports_structured_output).lower()}")
     print(f"definition_revision: {entry.definition_revision}")
 
 
@@ -2132,7 +2302,6 @@ def model_update(
         int | None,
         typer.Option("--context-window-tokens"),
     ] = None,
-
     max_output_tokens: Annotated[
         int | None,
         typer.Option("--max-output-tokens"),
@@ -2234,9 +2403,7 @@ def _model_admin_call[T](operation: Callable[[], T]) -> T:
             ".".join(str(part) for part in error.get("loc", ())) or "configuration"
             for error in exc.errors(include_url=False, include_input=False)
         )
-        raise click.ClickException(
-            "Invalid model configuration fields: " + ", ".join(fields)
-        ) from None
+        raise click.ClickException("Invalid model configuration fields: " + ", ".join(fields)) from None
     except (OSError, KeyError, RuntimeError, ValueError) as exc:
         raise click.ClickException(str(exc)) from None
 
@@ -2317,7 +2484,7 @@ def _latest_cli_turn(
     *,
     workspace_path: Path | None,
 ) -> _CLITurn | None:
-    with RuntimeState.open_sync(checkpoint_db, read_only=True) as store:
+    with RuntimeStore.open_sync(checkpoint_db, read_only=True) as store:
         turn = _latest_harness_turn(
             store,
             statuses={"paused", "interrupted", "running"},
@@ -2331,7 +2498,7 @@ def _latest_abortable_cli_turn(
     *,
     workspace_path: Path | None,
 ) -> _CLITurn | None:
-    with RuntimeState.open_sync(checkpoint_db, read_only=True) as store:
+    with RuntimeStore.open_sync(checkpoint_db, read_only=True) as store:
         turn = _latest_harness_turn(
             store,
             statuses={"paused", "interrupted", "running"},
@@ -2345,7 +2512,7 @@ def _latest_completed_cli_turn(
     *,
     workspace_path: Path | None,
 ) -> _CLITurn | None:
-    with RuntimeState.open_sync(checkpoint_db, read_only=True) as store:
+    with RuntimeStore.open_sync(checkpoint_db, read_only=True) as store:
         turn = _latest_harness_turn(
             store,
             statuses={"completed", "failed", "cancelled"},
@@ -2355,7 +2522,7 @@ def _latest_completed_cli_turn(
 
 
 def _cli_turn(checkpoint_db: Path, turn_id: str) -> _CLITurn:
-    with RuntimeState.open_sync(checkpoint_db, read_only=True) as store:
+    with RuntimeStore.open_sync(checkpoint_db, read_only=True) as store:
         try:
             turn = store.read_turn(turn_id)
         except KeyError as exc:
@@ -2364,7 +2531,7 @@ def _cli_turn(checkpoint_db: Path, turn_id: str) -> _CLITurn:
 
 
 def _abortable_cli_turn(checkpoint_db: Path, turn_id: str) -> _CLITurn:
-    with RuntimeState.open_sync(checkpoint_db, read_only=True) as store:
+    with RuntimeStore.open_sync(checkpoint_db, read_only=True) as store:
         try:
             turn = store.read_turn(turn_id)
         except KeyError as exc:
@@ -2373,38 +2540,29 @@ def _abortable_cli_turn(checkpoint_db: Path, turn_id: str) -> _CLITurn:
 
 
 def _latest_harness_turn(
-    store: RuntimeState,
+    store: RuntimeStore,
     *,
     statuses: set[str],
     workspace_path: Path | None,
 ) -> TurnSnapshot | None:
-    expected_workspace = (
-        None if workspace_path is None else workspace_path.expanduser().resolve()
-    )
+    expected_workspace = None if workspace_path is None else workspace_path.expanduser().resolve()
     for turn in reversed(store.list_turns()):
         if turn.status not in statuses:
             continue
         thread = store.read_thread(turn.thread_id)
-        if (
-            expected_workspace is not None
-            and Path(thread.workspace).resolve() != expected_workspace
-        ):
+        if expected_workspace is not None and Path(thread.workspace).resolve() != expected_workspace:
             continue
         return turn
     return None
 
 
-def _project_cli_turn(store: RuntimeState, turn: TurnSnapshot) -> _CLITurn:
+def _project_cli_turn(store: RuntimeStore, turn: TurnSnapshot) -> _CLITurn:
     thread = store.read_thread(turn.thread_id)
     if "model_alias" in turn.binding_manifest:
         raise RuntimeError("legacy model_alias binding is unsupported")
     model_id = turn.binding_manifest.get("model_id")
     knowledge_value = turn.binding_manifest.get("knowledge_config")
-    knowledge = (
-        RAGKnowledgeConfig.model_validate(knowledge_value)
-        if isinstance(knowledge_value, Mapping)
-        else None
-    )
+    knowledge = RAGKnowledgeConfig.model_validate(knowledge_value) if isinstance(knowledge_value, Mapping) else None
     return _CLITurn(
         turn_id=turn.turn_id,
         status=turn.status,
@@ -2417,7 +2575,7 @@ def _project_cli_turn(store: RuntimeState, turn: TurnSnapshot) -> _CLITurn:
 
 
 def _project_abortable_cli_turn(
-    store: RuntimeState,
+    store: RuntimeStore,
     turn: TurnSnapshot,
 ) -> _CLITurn:
     thread = store.read_thread(turn.thread_id)
@@ -2451,7 +2609,8 @@ def agent_chat(
     ] = False,
     continue_chat: Annotated[bool, typer.Option("--continue", help="打开当前工作区最近聊天，回放后继续")] = False,
     resume_thread_id: Annotated[
-        str | None, typer.Option("--resume", help="打开指定会话 ID；交互选择请使用 agent resume"),
+        str | None,
+        typer.Option("--resume", help="打开指定会话 ID；交互选择请使用 agent resume"),
     ] = None,
     checkpoint_db: Annotated[
         Path,
@@ -2489,40 +2648,50 @@ def agent_chat(
         typer.Option("--allow-execute-tools", help="预授权进程执行类调用"),
     ] = False,
     allow_web_tools: Annotated[
-        bool, typer.Option("--allow-web-tools/--no-web-tools", help="启用公网搜索和网页读取（默认开启）"),
+        bool,
+        typer.Option("--allow-web-tools/--no-web-tools", help="启用公网搜索和网页读取（默认开启）"),
     ] = True,
     web_limits_file: Annotated[
-        Path | None, typer.Option("--web-limits", envvar="PRAXIS_WEB_LIMITS",
-                                 help="有界网页预算JSON；恢复使用原Turn配置"),
+        Path | None,
+        typer.Option("--web-limits", envvar="PRAXIS_WEB_LIMITS", help="有界网页预算JSON；恢复使用原Turn配置"),
     ] = None,
     web_proxy_url: Annotated[
-        str | None, typer.Option("--web-proxy", help="可信 HTTP(S) 网页代理；direct 强制直连；默认读取启动环境"),
+        str | None,
+        typer.Option("--web-proxy", help="可信 HTTP(S) 网页代理；direct 强制直连；默认读取启动环境"),
     ] = None,
     web_search_key_file: Annotated[
-        Path | None, typer.Option("--web-search-key-file",
-                                  help="工作区外的受保护搜索服务密钥文件"),
+        Path | None,
+        typer.Option("--web-search-key-file", help="工作区外的受保护搜索服务密钥文件"),
     ] = None,
     web_search_provider: Annotated[
-        str | None, typer.Option("--web-search-provider",
-                                 help="deepseek | brave | tavily；默认未配置则搜索不可用；仅提供密钥时用 Brave"),
+        str | None,
+        typer.Option(
+            "--web-search-provider", help="deepseek | brave | tavily；默认未配置则搜索不可用；仅提供密钥时用 Brave"
+        ),
     ] = None,
     permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限策略 JSON/TOML 文件")] = None,
     approval_mode: Annotated[
-        ApprovalMode | None, typer.Option(
-            "--approval-mode", help="ask 请求批准 | auto 帮我批准（新聊天默认）| full 范围内全自动",
+        ApprovalMode | None,
+        typer.Option(
+            "--approval-mode",
+            help="ask 请求批准 | auto 帮我批准（新聊天默认）| full 范围内全自动",
         ),
     ] = None,
     reasoning_effort: Annotated[
-        str | None, typer.Option("--effort", help="模型声明支持的思考强度；default/off 需匹配模型能力"),
+        str | None,
+        typer.Option("--effort", help="模型声明支持的思考强度；default/off 需匹配模型能力"),
     ] = None,
     max_output_tokens: Annotated[
-        int | None, typer.Option("--max-output-tokens", min=1, help="单次输出额度（包含思考 token），与累计预算分开"),
+        int | None,
+        typer.Option("--max-output-tokens", min=1, help="单次输出额度（包含思考 token），与累计预算分开"),
     ] = None,
     worktree: Annotated[
-        bool, typer.Option("--worktree", help="在独立 Git worktree 中开始新会话，自动生成 worktree/ 分支"),
+        bool,
+        typer.Option("--worktree", help="在独立 Git worktree 中开始新会话，自动生成 worktree/ 分支"),
     ] = False,
     worktree_name: Annotated[
-        str | None, typer.Option("--worktree-name", help="命名 worktree 分支（worktree/<name>）；隐含 --worktree"),
+        str | None,
+        typer.Option("--worktree-name", help="命名 worktree 分支（worktree/<name>）；隐含 --worktree"),
     ] = None,
 ) -> None:
     """交互式 Agent 对话。暂停时支持工具审批。"""
@@ -2551,15 +2720,11 @@ def agent_chat(
     created_worktree: CreateReport | None = None
     if worktree or worktree_name is not None:
         if effective_previous_turn_id is not None or resume_thread_id is not None:
-            raise typer.BadParameter(
-                "--worktree 只用于新会话；恢复旧会话会自动回到其记录的工作区。"
-            )
+            raise typer.BadParameter("--worktree 只用于新会话；恢复旧会话会自动回到其记录的工作区。")
         created_worktree = _open_cli_worktree(worktree_name)
     if continued_turn is None:
         facade_model = model
-        facade_workspace: Path | str = (
-            created_worktree.worktree.root if created_worktree is not None else Path.cwd()
-        )
+        facade_workspace: Path | str = created_worktree.worktree.root if created_worktree is not None else Path.cwd()
         facade_knowledge = _load_knowledge_config(knowledge_config)
     else:
         binding = continued_turn.runtime
@@ -2676,35 +2841,42 @@ def agent_run(
         bool,
         typer.Option(
             "--require-workspace-change/--no-require-workspace-change",
-            help=(
-                "要求产生真实 workspace 变更；需要机器验收时另设 --acceptance-command"
-            ),
+            help=("要求产生真实 workspace 变更；需要机器验收时另设 --acceptance-command"),
         ),
     ] = False,
     acceptance_command: Annotated[
-        str | None, typer.Option("--acceptance-command", help="用户指定的验收命令；必须在最后修改后真实执行成功"),
+        str | None,
+        typer.Option("--acceptance-command", help="用户指定的验收命令；必须在最后修改后真实执行成功"),
     ] = None,
     allow_execute_tools: Annotated[
         bool,
         typer.Option("--allow-execute-tools", help="预授权本次进程执行类调用"),
     ] = False,
     allow_web_tools: Annotated[
-        bool, typer.Option("--allow-web-tools/--no-web-tools", help="启用公网搜索和网页读取（默认开启）"),
+        bool,
+        typer.Option("--allow-web-tools/--no-web-tools", help="启用公网搜索和网页读取（默认开启）"),
     ] = True,
     web_proxy_url: Annotated[
-        str | None, typer.Option("--web-proxy", help="可信 HTTP(S) 网页代理；direct 强制直连；默认读取启动环境"),
+        str | None,
+        typer.Option("--web-proxy", help="可信 HTTP(S) 网页代理；direct 强制直连；默认读取启动环境"),
     ] = None,
     web_search_key_file: Annotated[
-        Path | None, typer.Option("--web-search-key-file",
-                                  help="工作区外的受保护搜索服务密钥文件"),
+        Path | None,
+        typer.Option("--web-search-key-file", help="工作区外的受保护搜索服务密钥文件"),
     ] = None,
     web_search_provider: Annotated[
-        str | None, typer.Option("--web-search-provider",
-                                 help="deepseek | brave | tavily；默认未配置则搜索不可用；仅提供密钥时用 Brave"),
+        str | None,
+        typer.Option(
+            "--web-search-provider", help="deepseek | brave | tavily；默认未配置则搜索不可用；仅提供密钥时用 Brave"
+        ),
     ] = None,
     web_limits_file: Annotated[
-        Path | None, typer.Option("--web-limits", envvar="PRAXIS_WEB_LIMITS",
-                                 help="有界网页预算JSON；Turn请求与浏览器资源分别配置，恢复使用原Turn配置"),
+        Path | None,
+        typer.Option(
+            "--web-limits",
+            envvar="PRAXIS_WEB_LIMITS",
+            help="有界网页预算JSON；Turn请求与浏览器资源分别配置，恢复使用原Turn配置",
+        ),
     ] = None,
     disable_workspace_mcp: Annotated[
         bool,
@@ -2715,19 +2887,24 @@ def agent_run(
     ] = False,
     permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限策略 JSON/TOML 文件")] = None,
     approval_mode: Annotated[
-        ApprovalMode, typer.Option("--approval-mode", help="ask 请求批准 | auto 帮我批准 | full 权限范围内全自动"),
+        ApprovalMode,
+        typer.Option("--approval-mode", help="ask 请求批准 | auto 帮我批准 | full 权限范围内全自动"),
     ] = "auto",
     reasoning_effort: Annotated[
-        str | None, typer.Option("--effort", help="模型声明支持的思考强度；default/off 需匹配模型能力"),
+        str | None,
+        typer.Option("--effort", help="模型声明支持的思考强度；default/off 需匹配模型能力"),
     ] = None,
     max_output_tokens: Annotated[
-        int | None, typer.Option("--max-output-tokens", min=1, help="单次输出额度（包含思考 token），与累计预算分开"),
+        int | None,
+        typer.Option("--max-output-tokens", min=1, help="单次输出额度（包含思考 token），与累计预算分开"),
     ] = None,
     worktree: Annotated[
-        bool, typer.Option("--worktree", help="在独立 Git worktree 中执行本任务，自动生成 worktree/ 分支"),
+        bool,
+        typer.Option("--worktree", help="在独立 Git worktree 中执行本任务，自动生成 worktree/ 分支"),
     ] = False,
     worktree_name: Annotated[
-        str | None, typer.Option("--worktree-name", help="命名 worktree 分支（worktree/<name>）；隐含 --worktree"),
+        str | None,
+        typer.Option("--worktree-name", help="命名 worktree 分支（worktree/<name>）；隐含 --worktree"),
     ] = None,
 ) -> None:
     """执行一个新 Turn；可从已完成 Turn 继续上下文。"""
@@ -2754,22 +2931,23 @@ def agent_run(
     created_worktree: CreateReport | None = None
     if worktree or worktree_name is not None:
         if effective_previous_turn_id is not None:
-            raise typer.BadParameter(
-                "--worktree 只用于新任务；继续旧 Turn 请使用其原工作区。"
-            )
+            raise typer.BadParameter("--worktree 只用于新任务；继续旧 Turn 请使用其原工作区。")
         created_worktree = _open_cli_worktree(worktree_name)
     effective_database = (
-        created_worktree.worktree.root / ".praxis" / "checkpoints.sqlite"
-        if created_worktree is not None else checkpoint_db
-    ).expanduser().resolve()
+        (
+            created_worktree.worktree.root / ".praxis" / "checkpoints.sqlite"
+            if created_worktree is not None
+            else checkpoint_db
+        )
+        .expanduser()
+        .resolve()
+    )
     facade = _create_agent_facade(
         reasoning_effort=reasoning_effort,
         max_output_tokens=max_output_tokens,
         model=model,
         checkpoint_db=effective_database,
-        workspace_path=(
-            created_worktree.worktree.root if created_worktree is not None else Path.cwd()
-        ),
+        workspace_path=(created_worktree.worktree.root if created_worktree is not None else Path.cwd()),
         model_session_path=model_session_path,
         knowledge=_load_knowledge_config(knowledge_config),
         **_permission_options(permissions, approval_mode),
@@ -2830,30 +3008,40 @@ def agent_run(
 def agent_resume(
     thread_id: Annotated[str | None, typer.Argument(help="稳定会话 ID；省略则选择当前工作区旧聊天")] = None,
     checkpoint_db: Annotated[
-        Path, typer.Option("--rollout-db", "--checkpoint-db", help="已有 SQLite Rollout 数据库"),
+        Path,
+        typer.Option("--rollout-db", "--checkpoint-db", help="已有 SQLite Rollout 数据库"),
     ] = DEFAULT_CHECKPOINT_PATH,
     web_proxy_url: Annotated[str | None, typer.Option("--web-proxy", help="当前调用的可信网页代理")] = None,
     web_limits_file: Annotated[
-        Path | None, typer.Option("--web-limits", envvar="PRAXIS_WEB_LIMITS", help="新 Turn 的有界网页预算 JSON"),
+        Path | None,
+        typer.Option("--web-limits", envvar="PRAXIS_WEB_LIMITS", help="新 Turn 的有界网页预算 JSON"),
     ] = None,
     web_search_key_file: Annotated[
-        Path | None, typer.Option("--web-search-key-file",
-                                 help="工作区外的受保护搜索服务密钥文件"),
+        Path | None,
+        typer.Option("--web-search-key-file", help="工作区外的受保护搜索服务密钥文件"),
     ] = None,
     web_search_provider: Annotated[
-        str | None, typer.Option("--web-search-provider",
-                                 help="deepseek | brave | tavily；默认未配置则搜索不可用；仅提供密钥时用 Brave"),
+        str | None,
+        typer.Option(
+            "--web-search-provider", help="deepseek | brave | tavily；默认未配置则搜索不可用；仅提供密钥时用 Brave"
+        ),
     ] = None,
     permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限上限；旧授权不能扩大它")] = None,
     approval_mode: Annotated[
-        ApprovalMode | None, typer.Option("--approval-mode", help="覆盖聊天保存的审批模式：ask | auto | full"),
+        ApprovalMode | None,
+        typer.Option("--approval-mode", help="覆盖聊天保存的审批模式：ask | auto | full"),
     ] = None,
 ) -> None:
     """重新打开旧聊天：只读回放历史，下一条消息创建新 Turn。原任务恢复使用 recover。"""
-    agent_chat(resume_thread_id=thread_id or "", checkpoint_db=checkpoint_db,
-               web_proxy_url=web_proxy_url, web_limits_file=web_limits_file,
-               web_search_key_file=web_search_key_file, web_search_provider=web_search_provider,
-               **_permission_options(permissions, approval_mode))
+    agent_chat(
+        resume_thread_id=thread_id or "",
+        checkpoint_db=checkpoint_db,
+        web_proxy_url=web_proxy_url,
+        web_limits_file=web_limits_file,
+        web_search_key_file=web_search_key_file,
+        web_search_provider=web_search_provider,
+        **_permission_options(permissions, approval_mode),
+    )
 
 
 @agent_app.command(name="recover")
@@ -2886,28 +3074,30 @@ def agent_recover(
         typer.Option("--input", help="clarification/choice 恢复时的用户输入"),
     ] = None,
     request_id: Annotated[
-        str | None, typer.Option("--request-id", help="只响应指定的持久请求；请求改变时先重新查看"),
+        str | None,
+        typer.Option("--request-id", help="只响应指定的持久请求；请求改变时先重新查看"),
     ] = None,
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="详细输出")] = False,
     web_limits_file: Annotated[
-        Path | None, typer.Option("--web-limits", envvar="PRAXIS_WEB_LIMITS",
-                                 help="有界网页预算JSON；恢复使用原Turn配置"),
+        Path | None,
+        typer.Option("--web-limits", envvar="PRAXIS_WEB_LIMITS", help="有界网页预算JSON；恢复使用原Turn配置"),
     ] = None,
     web_proxy_url: Annotated[
-        str | None, typer.Option("--web-proxy", help="可信 HTTP(S) 网页代理；direct 强制直连；默认读取启动环境"),
+        str | None,
+        typer.Option("--web-proxy", help="可信 HTTP(S) 网页代理；direct 强制直连；默认读取启动环境"),
     ] = None,
     web_search_key_file: Annotated[
         Path | None,
-        typer.Option("--web-search-key-file",
-                     help="工作区外、仅所有者可读的搜索服务密钥文件"),
+        typer.Option("--web-search-key-file", help="工作区外、仅所有者可读的搜索服务密钥文件"),
     ] = None,
     web_search_provider: Annotated[
-        str | None, typer.Option("--web-search-provider",
-                                 help="deepseek | brave | tavily；恢复时须与原 Turn 的搜索服务一致"),
+        str | None,
+        typer.Option("--web-search-provider", help="deepseek | brave | tavily；恢复时须与原 Turn 的搜索服务一致"),
     ] = None,
     permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限上限；旧授权不能扩大它")] = None,
     approval_mode: Annotated[
-        ApprovalMode | None, typer.Option("--approval-mode", help="恢复时使用的当前审批模式：ask | auto | full"),
+        ApprovalMode | None,
+        typer.Option("--approval-mode", help="恢复时使用的当前审批模式：ask | auto | full"),
     ] = None,
 ) -> None:
     """先读取持久化 Turn 元数据，再恢复未完成的 Turn。"""
@@ -3027,8 +3217,10 @@ async def _watch_command(
         if not resolved_branch.startswith(BRANCH_PREFIX):
             print("没有可观察的 praxis/* 分支；请先 /commit，或用 --branch 指定。")
             return 2
-        print(f"观察分支 {resolved_branch} 的 CI（最长 {int(timeout_seconds)} 秒，"
-              f"每 {int(poll_interval_seconds)} 秒轮询；Ctrl+C 取消）…")
+        print(
+            f"观察分支 {resolved_branch} 的 CI（最长 {int(timeout_seconds)} 秒，"
+            f"每 {int(poll_interval_seconds)} 秒轮询；Ctrl+C 取消）…"
+        )
         report = await delivery.pull_request_checks(
             resolved_branch,
             include_failure_logs=True,
@@ -3077,7 +3269,8 @@ async def _watch_command(
         print(f"把失败详情交给会话 {resolved_thread} 的 agent 分析…")
         try:
             async with facade.session(
-                thread_id=resolved_thread, approval_mode=approval_mode,
+                thread_id=resolved_thread,
+                approval_mode=approval_mode,
             ) as session:
                 result = await session.submit(message)
         except ConversationBusyError as error:
@@ -3104,15 +3297,9 @@ def agent_watch(
     thread_id: Annotated[
         str | None, typer.Option("--thread", help="CI 失败时要续写的会话 ID；默认当前工作区最近会话")
     ] = None,
-    timeout_seconds: Annotated[
-        float, typer.Option("--timeout", min=10, max=7200, help="最长等待秒数")
-    ] = 1800.0,
-    poll_interval_seconds: Annotated[
-        float, typer.Option("--interval", min=5, max=600, help="轮询间隔秒数")
-    ] = 30.0,
-    fix: Annotated[
-        bool, typer.Option("--fix/--no-fix", help="CI 失败时是否把失败详情交给 agent 分析修复")
-    ] = True,
+    timeout_seconds: Annotated[float, typer.Option("--timeout", min=10, max=7200, help="最长等待秒数")] = 1800.0,
+    poll_interval_seconds: Annotated[float, typer.Option("--interval", min=5, max=600, help="轮询间隔秒数")] = 30.0,
+    fix: Annotated[bool, typer.Option("--fix/--no-fix", help="CI 失败时是否把失败详情交给 agent 分析修复")] = True,
     checkpoint_db: Annotated[
         Path, typer.Option("--rollout-db", "--checkpoint-db", help="完整 SQLite Rollout／事件数据库")
     ] = DEFAULT_CHECKPOINT_PATH,
@@ -3125,14 +3312,18 @@ def agent_watch(
 
     交付动作保持用户确认：watch 只完成观察与分析，/commit 与 /pull 仍由你在聊天中执行。
     """
-    raise typer.Exit(_run_cli_async(_watch_command(
-        workspace=Path.cwd(),
-        checkpoint_db=checkpoint_db,
-        permissions=permissions,
-        approval_mode=approval_mode,
-        branch=branch,
-        thread_id=thread_id,
-        timeout_seconds=timeout_seconds,
-        poll_interval_seconds=poll_interval_seconds,
-        fix=fix,
-    )))
+    raise typer.Exit(
+        _run_cli_async(
+            _watch_command(
+                workspace=Path.cwd(),
+                checkpoint_db=checkpoint_db,
+                permissions=permissions,
+                approval_mode=approval_mode,
+                branch=branch,
+                thread_id=thread_id,
+                timeout_seconds=timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+                fix=fix,
+            )
+        )
+    )

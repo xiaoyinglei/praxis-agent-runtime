@@ -20,6 +20,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from agent_runtime.harness import completion_ops, turn_ops
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -35,30 +37,35 @@ def measure(operation: Callable[[], Any], samples: int) -> dict[str, float]:
 def benchmark(runtime: Path, sizes: list[int], payload_bytes: int, samples: int) -> dict[str, Any]:
     sys.path.insert(0, str(runtime))
     import agent_runtime
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
 
     if not Path(agent_runtime.__file__).resolve().is_relative_to(runtime):
         raise RuntimeError("benchmark imported a different runtime source")
     hashes = {
         p.relative_to(runtime).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
-        for p in (runtime / "agent_runtime").rglob("*.py") if "__pycache__" not in p.parts
+        for p in (runtime / "agent_runtime").rglob("*.py")
+        if "__pycache__" not in p.parts
     }
     rows = []
     with tempfile.TemporaryDirectory(prefix="praxis-history-benchmark-") as directory:
         workspace = Path(directory)
         database = workspace / "rollout.sqlite3"
-        with RuntimeState.open_sync(database) as store:
-            thread = store.create_thread(workspace=workspace)
+        with RuntimeStore.open_sync(database) as store:
+            thread = turn_ops.create_thread(store, workspace=workspace)
             count = 0
             for size in sizes:
                 while count < size:
-                    turn = store.start_turn(
-                        thread_id=thread.thread_id, user_message="u" * payload_bytes, binding_manifest={},
+                    turn = turn_ops.start_turn(
+                        store,
+                        thread_id=thread.thread_id,
+                        user_message="u" * payload_bytes,
+                        binding_manifest={},
                     )
-                    store.complete_turn(turn_id=turn.turn_id, answer="a" * payload_bytes)
+                    turn_ops.complete_turn(store, turn_id=turn.turn_id, answer="a" * payload_bytes)
                     count += 1
+
                 def settings() -> None:
-                    store.update_session_settings(thread.thread_id, {"model_alias": "benchmark"})
+                    turn_ops.update_session_settings(store, thread.thread_id, {"model_alias": "benchmark"})
 
                 result: dict[str, Any] = {"turns": size, "nominal_history_text_bytes": size * payload_bytes * 2}
                 result["settings"] = measure(settings, samples)
@@ -77,16 +84,21 @@ def benchmark(runtime: Path, sizes: list[int], payload_bytes: int, samples: int)
                 store.persistence._connection.set_progress_handler(None, 0)
                 result["settings_vm_steps"] = work
                 result["settings_inserts"] = sum(s.lstrip().startswith("INSERT INTO") for s in statements)
-                active = store.start_turn(
-                    thread_id=thread.thread_id, user_message="measure append", binding_manifest={},
+                active = turn_ops.start_turn(
+                    store,
+                    thread_id=thread.thread_id,
+                    user_message="measure append",
+                    binding_manifest={},
                 )
                 result["item_append"] = measure(
-                    lambda turn=active: store.record_final_proposal(turn_id=turn.turn_id, answer="a" * payload_bytes),
+                    lambda turn=active: completion_ops.record_final_proposal(
+                        store, turn_id=turn.turn_id, answer="a" * payload_bytes
+                    ),
                     samples,
                 )
                 result["context_read"] = measure(lambda turn=active: store.list_context_items(turn.turn_id), samples)
                 result["context_item_count"] = len(store.list_context_items(active.turn_id))
-                store.complete_turn(turn_id=active.turn_id, answer="benchmark complete")
+                turn_ops.complete_turn(store, turn_id=active.turn_id, answer="benchmark complete")
                 count += 1
 
                 def verify() -> None:
@@ -97,7 +109,7 @@ def benchmark(runtime: Path, sizes: list[int], payload_bytes: int, samples: int)
                 result["full_verify"] = measure(verify, samples)
 
                 def reopen() -> None:
-                    with RuntimeState.open_sync(database) as reopened:
+                    with RuntimeStore.open_sync(database) as reopened:
                         report = reopened.verify()
                         if not report.valid:
                             raise RuntimeError(str(report.errors))
@@ -111,8 +123,11 @@ def benchmark(runtime: Path, sizes: list[int], payload_bytes: int, samples: int)
     return {
         "schema_version": "praxis-history-performance-v1",
         "runtime_source_sha256": hashlib.sha256(json.dumps(hashes, sort_keys=True).encode()).hexdigest(),
-        "platform": platform.platform(), "python": platform.python_version(),
-        "samples": samples, "payload_bytes_per_message": payload_bytes, "measurements": rows,
+        "platform": platform.platform(),
+        "python": platform.python_version(),
+        "samples": samples,
+        "payload_bytes_per_message": payload_bytes,
+        "measurements": rows,
     }
 
 

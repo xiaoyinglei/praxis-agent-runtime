@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from agent_runtime.core import runtime_diagnostics
-from agent_runtime.harness import RuntimeState, ToolOrchestrator
+from agent_runtime.harness import RuntimeStore, ToolOrchestrator, artifact_ops, tool_ops, turn_ops
 from agent_runtime.tools.permissions import ToolExecutionContext
 from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel
 from tests.agent.harness.test_public_result_projection import AcceptPublicAnswer
@@ -48,26 +48,29 @@ def test_exception_diagnostic_is_bounded_and_omits_source_and_locals(
 def test_rollout_read_only_does_not_create_or_modify_database(tmp_path: Path) -> None:
     absent = tmp_path / "absent" / "rollout.sqlite3"
     with pytest.raises((FileNotFoundError, sqlite3.OperationalError)):
-        RuntimeState.open_sync(absent, read_only=True)
+        RuntimeStore.open_sync(absent, read_only=True)
     assert not absent.parent.exists()
     database = tmp_path / "rollout.sqlite3"
-    with RuntimeState.open_sync(database) as store:
-        thread = store.create_thread(workspace=tmp_path)
-        turn = store.start_turn(thread_id=thread.thread_id, user_message="read", binding_manifest={})
+    with RuntimeStore.open_sync(database) as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(store, thread_id=thread.thread_id, user_message="read", binding_manifest={})
         thread = store.read_thread(thread.thread_id)
     before = database.read_bytes()
-    with RuntimeState.open_sync(database, read_only=True) as reader:
+    with RuntimeStore.open_sync(database, read_only=True) as reader:
         assert reader.read_thread(thread.thread_id) == thread
         with pytest.raises(sqlite3.OperationalError, match="readonly"):
-            reader.create_thread(workspace=tmp_path)
+            turn_ops.create_thread(reader, workspace=tmp_path)
         with pytest.raises(sqlite3.OperationalError, match="readonly"):
-            reader.commit_artifact(turn_id=turn.turn_id, content=b"private", media_type="text/plain", name="private")
+            artifact_ops.commit_artifact(
+                reader, turn_id=turn.turn_id, content=b"private", media_type="text/plain", name="private"
+            )
         assert not reader.artifact_root.exists()
     assert database.read_bytes() == before
 
 
 def test_diagnostic_survives_durable_tool_result_and_history_lookup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from agent_runtime import history
 
@@ -77,14 +80,19 @@ def test_diagnostic_survives_durable_tool_result_and_history_lookup(
         raise LookupError("history-secret-0123456789 unavailable")
 
     database = tmp_path / "rollout.sqlite3"
-    with RuntimeState.open_sync(database) as store:
-        thread = store.create_thread(workspace=tmp_path)
-        turn = store.start_turn(
-            thread_id=thread.thread_id, user_message="read", binding_manifest={"model_id": "test"},
+    with RuntimeStore.open_sync(database) as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(
+            store,
+            thread_id=thread.thread_id,
+            user_message="read",
+            binding_manifest={"model_id": "test"},
         )
         tool = replace(_read_tool(), run=fail)
         orchestrator = ToolOrchestrator(
-            store=store, tools={"read_file": tool}, execution_context=ToolExecutionContext(workspace_root=tmp_path),
+            store=store,
+            tools={"read_file": tool},
+            execution_context=ToolExecutionContext(workspace_root=tmp_path),
         )
         call = _call("read_file", arguments={"path": "private-argument-path"})
         result = asyncio.run(orchestrator.execute(turn_id=turn.turn_id, call=call))
@@ -107,23 +115,28 @@ def test_diagnostic_survives_durable_tool_result_and_history_lookup(
 
 
 def test_commit_failure_keeps_diagnostic_without_claiming_durable_result(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from agent_runtime.harness.tool_orchestrator import ToolResultCommitError
 
     monkeypatch.setenv("TEST_COMMIT_SECRET", "commit-secret-0123456789")
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=tmp_path)
-        turn = store.start_turn(thread_id=thread.thread_id, user_message="read", binding_manifest={})
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(store, thread_id=thread.thread_id, user_message="read", binding_manifest={})
         tool = _read_tool()
         orchestrator = ToolOrchestrator(
-            store=store, tools={"read_file": tool}, execution_context=ToolExecutionContext(workspace_root=tmp_path),
+            store=store,
+            tools={"read_file": tool},
+            execution_context=ToolExecutionContext(workspace_root=tmp_path),
         )
 
         def fail_commit(**_kwargs: object) -> bool:
             raise OSError("commit-secret-0123456789 storage unavailable")
 
-        monkeypatch.setattr(store, "commit_tool_operation_result", fail_commit)
+        monkeypatch.setattr(
+            tool_ops, "commit_tool_operation_result", lambda _store, *args, **kwargs: (fail_commit)(*args, **kwargs)
+        )
         call = _call("read_file", arguments={"path": "README.md"})
         with pytest.raises(ToolResultCommitError) as captured:
             asyncio.run(orchestrator.execute(turn_id=turn.turn_id, call=call))
@@ -154,10 +167,12 @@ async def test_public_session_failure_is_inspectable_without_model_replay(tmp_pa
                 return HarnessModelResponse.from_parts(
                     text="",
                     tool_calls=(ModelToolCall(id="public-failure", name="read_file", arguments={"path": "x"}),),
-                    provider_response_id="failure-call", usage={"input_tokens": 1, "output_tokens": 1},
+                    provider_response_id="failure-call",
+                    usage={"input_tokens": 1, "output_tokens": 1},
                 )
             return HarnessModelResponse.from_parts(
-                text="read failed", provider_response_id="failure-answer",
+                text="read failed",
+                provider_response_id="failure-answer",
                 usage={"input_tokens": 1, "output_tokens": 1},
             )
 
@@ -166,14 +181,17 @@ async def test_public_session_failure_is_inspectable_without_model_replay(tmp_pa
 
     database = tmp_path / "rollout.sqlite3"
     async with await Session.open(
-        database=database, workspace=tmp_path, model=DiagnosticModel(),
-        tools={"read_file": replace(_read_tool(), run=fail)}, completion_gate=AcceptPublicAnswer(),
+        database=database,
+        workspace=tmp_path,
+        model=DiagnosticModel(),
+        tools={"read_file": replace(_read_tool(), run=fail)},
+        completion_gate=AcceptPublicAnswer(),
     ) as session:
         result = await session.submit("read the file")
         assert result.status == "done", (result.stop_reason, result.diagnostics)
         assert result.tool_calls[0].error_code == "runner_failed"
         assert session.store.verify().valid
-    [row] = (await asyncio.to_thread(read_history, database, turn_id=result.turn_id, tool_call_id="public-failure"))
+    [row] = await asyncio.to_thread(read_history, database, turn_id=result.turn_id, tool_call_id="public-failure")
     assert row["diagnostic"]["exception_type"] == "ArithmeticError"
     assert row["diagnostic"]["turn_id"] == result.turn_id
     assert row["retryable"] is False
@@ -187,16 +205,16 @@ def test_public_cli_history_is_read_only_and_never_opens_model(tmp_path, monkeyp
     from agent_runtime import cli
     from tests.agent.test_agent_cli_resume import _persist_cli_turn
 
-    database = tmp_path / 'state.sqlite'
-    turn_id = _persist_cli_turn(database, tmp_path / 'workspace')
+    database = tmp_path / "state.sqlite"
+    turn_id = _persist_cli_turn(database, tmp_path / "workspace")
     before = database.read_bytes()
-    monkeypatch.setattr(cli, '_create_agent_facade', lambda **kwargs: pytest.fail('History must not open an Agent'))
-    result = CliRunner().invoke(cli.agent_app, ['history', '--checkpoint-db', str(database)])
+    monkeypatch.setattr(cli, "_create_agent_facade", lambda **kwargs: pytest.fail("History must not open an Agent"))
+    result = CliRunner().invoke(cli.agent_app, ["history", "--checkpoint-db", str(database)])
     assert result.exit_code == 0, result.output
-    assert json.loads(result.output)[0]['turn_id'] == turn_id
+    assert json.loads(result.output)[0]["turn_id"] == turn_id
     assert database.read_bytes() == before
-    missing = tmp_path / 'missing.sqlite'
-    absent = CliRunner().invoke(cli.agent_app, ['history', '--checkpoint-db', str(missing)])
+    missing = tmp_path / "missing.sqlite"
+    absent = CliRunner().invoke(cli.agent_app, ["history", "--checkpoint-db", str(missing)])
     assert absent.exit_code != 0 and not missing.exists()
 
 
@@ -204,31 +222,69 @@ def test_history_web_details_are_bounded_and_exclude_private_content(tmp_path: P
     from agent_runtime.history import read_history
 
     database = tmp_path / "history.sqlite"
-    with RuntimeState.open_sync(database) as store:
-        thread = store.create_thread(workspace=tmp_path)
-        turn = store.start_turn(thread_id=thread.thread_id, user_message="read", binding_manifest={})
-        item = store.record_tool_result(turn_id=turn.turn_id, operation_id=None, result={
-            "tool_call_id": "web-call", "tool_name": "web_fetch", "is_error": True,
-            "error_code": "web_browser_budget_exceeded", "error_message": "browser budget exhausted",
-            "retryable": False,
-            "structured_content": {
-                "url": "https://user:private-password@example.com/path?query=private-query#private-fragment",
-                "source_id": "source-1", "static_source_id": "source-0", "content": "private-body",
-                "render_mode": "browser", "failure_stage": "browser_render",
-                "request_budget": {"used": 3, "remaining": 4, "limit": 7, "unit": "network_tool_attempts",
-                                   "last_reservation_item_id": "usage-1", "unknown_attempts_counted": True},
-                "render_diagnostics": {
-                    "requests": 2, "wire_bytes": 400, "raw_body": "private-resource-body",
-                    "failed_resources": [{"url": "https://example.com/r?token=private-resource-token",
-                                          "reason": "timeout", "method": "GET", "resource_type": "Script"}],
+    with RuntimeStore.open_sync(database) as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(store, thread_id=thread.thread_id, user_message="read", binding_manifest={})
+        item = tool_ops.record_tool_result(
+            store,
+            turn_id=turn.turn_id,
+            operation_id=None,
+            result={
+                "tool_call_id": "web-call",
+                "tool_name": "web_fetch",
+                "is_error": True,
+                "error_code": "web_browser_budget_exceeded",
+                "error_message": "browser budget exhausted",
+                "retryable": False,
+                "structured_content": {
+                    "url": "https://user:private-password@example.com/path?query=private-query#private-fragment",
+                    "source_id": "source-1",
+                    "static_source_id": "source-0",
+                    "content": "private-body",
+                    "render_mode": "browser",
+                    "failure_stage": "browser_render",
+                    "request_budget": {
+                        "used": 3,
+                        "remaining": 4,
+                        "limit": 7,
+                        "unit": "network_tool_attempts",
+                        "last_reservation_item_id": "usage-1",
+                        "unknown_attempts_counted": True,
+                    },
+                    "render_diagnostics": {
+                        "requests": 2,
+                        "wire_bytes": 400,
+                        "raw_body": "private-resource-body",
+                        "failed_resources": [
+                            {
+                                "url": "https://example.com/r?token=private-resource-token",
+                                "reason": "timeout",
+                                "method": "GET",
+                                "resource_type": "Script",
+                            }
+                        ],
+                    },
+                    "comparison": {
+                        "status": "changed",
+                        "baseline": {"source_id": "source-0", "url": "https://example.com/path?private=query"},
+                    },
+                    "failure_origin": {"item_id": "failed-item", "tool_call_id": "failed-call", "body": "private-body"},
                 },
-                "comparison": {"status": "changed", "baseline": {"source_id": "source-0",
-                                                                  "url": "https://example.com/path?private=query"}},
-                "failure_origin": {"item_id": "failed-item", "tool_call_id": "failed-call", "body": "private-body"},
+                "metadata": {
+                    "diagnostic": {
+                        "traceback": [
+                            {
+                                "filename": "x.py",
+                                "lineno": 1,
+                                "function": "f",
+                                "locals": "private-locals",
+                                "source": "private-source",
+                            }
+                        ]
+                    }
+                },
             },
-            "metadata": {"diagnostic": {"traceback": [{"filename": "x.py", "lineno": 1, "function": "f",
-                                                        "locals": "private-locals", "source": "private-source"}]}},
-        })
+        )
     [row] = read_history(database, item_id=item.item_id)
     assert row["web"]["source_id"] == "source-1"
     assert row["web"]["url"] == "https://example.com/path"
@@ -244,12 +300,19 @@ def test_history_reads_committed_results_from_an_active_wal(tmp_path: Path) -> N
     from agent_runtime.history import list_history_turns, read_history
 
     database = tmp_path / "live.sqlite"
-    with RuntimeState.open_sync(database) as writer:
-        thread = writer.create_thread(workspace=tmp_path)
-        turn = writer.start_turn(thread_id=thread.thread_id, user_message="read", binding_manifest={})
-        item = writer.record_tool_result(turn_id=turn.turn_id, operation_id=None, result={
-            "tool_call_id": "call-live", "tool_name": "read_file", "is_error": False,
-        })
+    with RuntimeStore.open_sync(database) as writer:
+        thread = turn_ops.create_thread(writer, workspace=tmp_path)
+        turn = turn_ops.start_turn(writer, thread_id=thread.thread_id, user_message="read", binding_manifest={})
+        item = tool_ops.record_tool_result(
+            writer,
+            turn_id=turn.turn_id,
+            operation_id=None,
+            result={
+                "tool_call_id": "call-live",
+                "tool_name": "read_file",
+                "is_error": False,
+            },
+        )
         [row] = read_history(database, item_id=item.item_id)
         assert row["turn_id"] == turn.turn_id
         assert row["tool_call_id"] == "call-live"
@@ -264,17 +327,30 @@ def test_cli_tool_commit_error_reports_safe_diagnostic_without_success(monkeypat
     from agent_runtime.harness.tool_orchestrator import ToolResultCommitError
     from agent_runtime.tools.tool import ToolResult
 
-    monkeypatch.setenv('TEST_COMMIT_SECRET', 'fake-commit-secret-0123456789')
-    diagnostic = exception_diagnostic(OSError('fake-commit-secret-0123456789 disk unavailable'),
-                                      stage='commit', turn_id='turn_test', tool_call_id='call_test',
-                                      operation_id='op_test')
+    monkeypatch.setenv("TEST_COMMIT_SECRET", "fake-commit-secret-0123456789")
+    diagnostic = exception_diagnostic(
+        OSError("fake-commit-secret-0123456789 disk unavailable"),
+        stage="commit",
+        turn_id="turn_test",
+        tool_call_id="call_test",
+        operation_id="op_test",
+    )
+
     async def fail():
-        raise ToolResultCommitError(ToolResult('call_test', 'read_file', is_error=True,
-            error_code='tool_result_commit_failed', error_message='Tool result was not accepted.',
-            metadata={'diagnostic': diagnostic}))
+        raise ToolResultCommitError(
+            ToolResult(
+                "call_test",
+                "read_file",
+                is_error=True,
+                error_code="tool_result_commit_failed",
+                error_message="Tool result was not accepted.",
+                metadata={"diagnostic": diagnostic},
+            )
+        )
+
     with pytest.raises(click.ClickException) as caught:
         _run_cli_async(fail())
-    assert 'OSError' in str(caught.value)
-    assert 'turn_test' in str(caught.value) and 'call_test' in str(caught.value)
-    assert 'fake-commit-secret-0123456789' not in str(caught.value)
-    assert '未确认持久化' in str(caught.value)
+    assert "OSError" in str(caught.value)
+    assert "turn_test" in str(caught.value) and "call_test" in str(caught.value)
+    assert "fake-commit-secret-0123456789" not in str(caught.value)
+    assert "未确认持久化" in str(caught.value)

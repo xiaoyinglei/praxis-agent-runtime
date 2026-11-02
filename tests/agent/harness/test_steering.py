@@ -2,11 +2,21 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from functools import partial
 
 import pytest
 
 from agent_runtime.core.messages import outputs_from_parts
-from agent_runtime.harness import HarnessModelResponse, ModelToolCall, RolloutContextManager, Session
+from agent_runtime.harness import (
+    HarnessModelResponse,
+    ModelToolCall,
+    RolloutContextManager,
+    Session,
+    completion_ops,
+    model_ops,
+    tool_ops,
+    turn_ops,
+)
 from agent_runtime.tools.permissions import ToolExecutionContext
 from tests.agent.harness.test_public_agent_cutover import PublicHarnessModel
 from tests.agent.harness.test_session import ZeroDeltaToolThenAnswerModel, _read_file_tool
@@ -52,14 +62,21 @@ async def test_sampling_inputs_are_durable_ordered_and_replace_stale_final(tmp_p
         assert session.input_status(first.item_id) == "applied"
         assert session.input_status(second.item_id) == "applied"
         assert [m.content for m in model.requests[-1].messages if m.role == "user"] == [
-            "initial task", "also test recovery", "use the existing API",
+            "initial task",
+            "also test recovery",
+            "use the existing API",
         ]
-        assert not any(i.kind == "agent_message" and i.payload.get("text") == "old answer"
-                       for i in session.store.list_items(turn_id))
+        assert not any(
+            i.kind == "agent_message" and i.payload.get("text") == "old answer"
+            for i in session.store.list_items(turn_id)
+        )
         from agent_runtime.history import read_chat_messages
 
         replay = await asyncio.to_thread(
-            read_chat_messages, session.database, thread_id=session.thread_id, workspace=tmp_path,
+            read_chat_messages,
+            session.database,
+            thread_id=session.thread_id,
+            workspace=tmp_path,
         )
         assert ("answer", "old answer") not in replay
         assert any(kind == "notice" and "已生效" in text for kind, text in replay)
@@ -72,7 +89,7 @@ async def test_sampling_inputs_are_durable_ordered_and_replace_stale_final(tmp_p
 
 @pytest.mark.anyio
 async def test_received_input_survives_unknown_provider_and_reopen(tmp_path):
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
 
     class UnknownModel(SteeringModel):
         async def dispatch(self, prepared, *, event_sink=None):
@@ -95,10 +112,13 @@ async def test_received_input_survives_unknown_provider_and_reopen(tmp_path):
         from agent_runtime.history import read_chat_messages
 
         replay = await asyncio.to_thread(
-            read_chat_messages, database, thread_id=session.thread_id, workspace=tmp_path,
+            read_chat_messages,
+            database,
+            thread_id=session.thread_id,
+            workspace=tmp_path,
         )
         assert any(kind == "notice" and "待生效" in text for kind, text in replay)
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         assert store.read_item(receipt.item_id).payload["text"] == "new requirement"
         assert store.verify().valid
         assert "new requirement" in [m.content for m in RolloutContextManager(store).build(turn_id)]
@@ -116,10 +136,15 @@ class ToolSteeringModel(ZeroDeltaToolThenAnswerModel):
     async def dispatch(self, prepared, *, event_sink=None):
         response = await super().dispatch(prepared, event_sink=event_sink)
         if response.tool_calls:
-            response = replace(response, outputs=outputs_from_parts(tool_calls=(
-                response.tool_calls[0],
-                ModelToolCall(id="call-2", name="read_file", arguments={"path": "second.txt"}),
-            )))
+            response = replace(
+                response,
+                outputs=outputs_from_parts(
+                    tool_calls=(
+                        response.tool_calls[0],
+                        ModelToolCall(id="call-2", name="read_file", arguments={"path": "second.txt"}),
+                    )
+                ),
+            )
         return response
 
 
@@ -136,8 +161,9 @@ async def test_input_during_tool_preserves_result_but_prevents_next_old_call(tmp
 
     tool = replace(_read_file_tool(), run=read, concurrency_safe=False)
     model = ToolSteeringModel()
-    async with await Session.open(database=tmp_path / "run.db", workspace=tmp_path,
-                                 model=model, tools={"read_file": tool}) as session:
+    async with await Session.open(
+        database=tmp_path / "run.db", workspace=tmp_path, model=model, tools={"read_file": tool}
+    ) as session:
         original_dispatch = model.dispatch
 
         async def compacting_dispatch(prepared, *, event_sink=None):
@@ -147,7 +173,8 @@ async def test_input_during_tool_preserves_result_but_prevents_next_old_call(tmp
                 turn_id = session.store.read_thread(session.thread_id).active_turn_id
                 manager.compact_for_budget(turn_id=turn_id, retained_tail_messages=1)
                 assert [m.content for m in manager.build(turn_id) if m.role == "user"] == [
-                    "read files", "only read the first file",
+                    "read files",
+                    "only read the first file",
                 ]
             return response
 
@@ -165,7 +192,11 @@ async def test_input_during_tool_preserves_result_but_prevents_next_old_call(tmp
         assert session.input_status(receipt.item_id) == "applied"
         messages = model.requests[-1].messages
         assert [m.role for m in messages if m.role != "context"] == [
-            "user", "assistant", "tool", "tool", "user",
+            "user",
+            "assistant",
+            "tool",
+            "tool",
+            "user",
         ]
         assert "superseded" in next(m.content for m in messages if m.tool_call_id == "call-2")
         assert session.store.verify().valid
@@ -177,10 +208,15 @@ async def test_steering_cannot_approve_paused_old_action(tmp_path, action):
     invoked = []
     tool = replace(_read_file_tool(), run=lambda a: invoked.append(a) or {"text": "read"})
     model = ToolSteeringModel()
-    async with await Session.open(database=tmp_path / "run.db", workspace=tmp_path, model=model,
-                                 tools={"read_file": tool}, tool_execution_context=ToolExecutionContext(
-                                     require_confirmation_for=frozenset({"read_file"}),
-                                 )) as session:
+    async with await Session.open(
+        database=tmp_path / "run.db",
+        workspace=tmp_path,
+        model=model,
+        tools={"read_file": tool},
+        tool_execution_context=ToolExecutionContext(
+            require_confirmation_for=frozenset({"read_file"}),
+        ),
+    ) as session:
         result = await session.submit("read files")
         assert result.status == "paused"
         receipt = await session.steer("do not read files; explain instead", expected_turn_id=result.turn_id)
@@ -192,29 +228,35 @@ async def test_steering_cannot_approve_paused_old_action(tmp_path, action):
 
 
 @pytest.mark.anyio
-async def test_input_in_final_decision_callback_blocks_old_completion(tmp_path):
-    from agent_runtime.harness import RuntimeState
+async def test_input_in_final_decision_callback_blocks_old_completion(tmp_path, monkeypatch):
+    from agent_runtime.harness import RuntimeStore
 
     class FinalModel(SteeringModel):
         async def dispatch(self, prepared, *, event_sink=None):
-            return HarnessModelResponse.from_parts(text="first" if len(self.requests) == 1 else "updated",
-                                        provider_response_id=None, usage={})
+            return HarnessModelResponse.from_parts(
+                text="first" if len(self.requests) == 1 else "updated", provider_response_id=None, usage={}
+            )
 
     model = FinalModel()
     async with await Session.open(database=tmp_path / "run.db", workspace=tmp_path, model=model) as session:
-        original = session.store.record_completion_decision
+        original = partial(completion_ops.record_completion_decision, session.store)
         received = []
 
         def completion(**kwargs):
             item = original(**kwargs)
             if not received:
-                with RuntimeState.open_sync(session.database) as external:
-                    received.append(external.receive_turn_input(
-                        thread_id=session.thread_id, turn_id=kwargs["turn_id"], text="last moment requirement",
-                    ))
+                with RuntimeStore.open_sync(session.database) as external:
+                    received.append(
+                        turn_ops.receive_turn_input(
+                            external,
+                            thread_id=session.thread_id,
+                            turn_id=kwargs["turn_id"],
+                            text="last moment requirement",
+                        )
+                    )
             return item
 
-        session.store.record_completion_decision = completion
+        monkeypatch.setattr(completion_ops, "record_completion_decision", lambda _store, **kwargs: completion(**kwargs))
         result = await session.submit("initial task")
         assert result.answer == "updated"
         assert session.input_status(received[0].item_id) == "applied"
@@ -228,14 +270,15 @@ async def test_input_after_durable_tool_start_before_runner_prevents_invocation(
     invoked = []
     tool = replace(_read_file_tool(), run=lambda a: invoked.append(a) or {"text": "read"})
     model = ToolSteeringModel()
-    async with await Session.open(database=tmp_path / "run.db", workspace=tmp_path, model=model,
-                                 tools={"read_file": tool}) as session:
+    async with await Session.open(
+        database=tmp_path / "run.db", workspace=tmp_path, model=model, tools={"read_file": tool}
+    ) as session:
+
         class Sink:
             submitted = False
 
             async def emit(self, event):
-                if (not self.submitted and event.type is EventType.ITEM_STARTED
-                        and event.item_kind is TurnItemKind.TOOL):
+                if not self.submitted and event.type is EventType.ITEM_STARTED and event.item_kind is TurnItemKind.TOOL:
                     self.submitted = True
                     await session.steer("explain instead", expected_turn_id=event.turn_id)
 
@@ -256,28 +299,43 @@ async def test_input_after_durable_tool_start_before_runner_prevents_invocation(
 
 
 @pytest.mark.anyio
-async def test_input_after_request_preparation_does_not_send_old_request(tmp_path):
-    from agent_runtime.harness import RuntimeState
+async def test_input_after_request_preparation_does_not_send_old_request(tmp_path, monkeypatch):
+    from agent_runtime.harness import RuntimeStore
+
     model = SteeringModel()
     model.release.set()
     async with await Session.open(database=tmp_path / "run.db", workspace=tmp_path, model=model) as session:
-        original = session.store.prepare_model_operation
+        original = model_ops.prepare_model_operation
         received = []
 
-        def prepare(**kwargs):
-            operation = original(**kwargs)
+        def prepare(store, **kwargs):
+            operation = original(store, **kwargs)
             if not received:
-                with RuntimeState.open_sync(session.database) as external:
-                    received.append(external.receive_turn_input(
-                        thread_id=session.thread_id, turn_id=kwargs["turn_id"], text="before dispatch requirement",
-                    ))
+                with RuntimeStore.open_sync(session.database) as external:
+                    received.append(
+                        turn_ops.receive_turn_input(
+                            external,
+                            thread_id=session.thread_id,
+                            turn_id=kwargs["turn_id"],
+                            text="before dispatch requirement",
+                        )
+                    )
             return operation
 
-        session.store.prepare_model_operation = prepare
+        monkeypatch.setattr(model_ops, "prepare_model_operation", prepare)
         result = await session.submit("initial task")
         assert result.answer == "updated answer"
-        assert len([a for op in session.store.list_model_operations(result.turn_id)
-                    for a in session.store.list_model_attempts(op.operation_id) if a.status == "completed"]) == 1
+        assert (
+            len(
+                [
+                    a
+                    for op in session.store.list_model_operations(result.turn_id)
+                    for a in session.store.list_model_attempts(op.operation_id)
+                    if a.status == "completed"
+                ]
+            )
+            == 1
+        )
         assert session.input_status(received[0].item_id) == "applied"
         assert session.store.verify().valid
 
@@ -285,7 +343,7 @@ async def test_input_after_request_preparation_does_not_send_old_request(tmp_pat
 @pytest.mark.anyio
 @pytest.mark.parametrize("tool_response", [False, True])
 async def test_reopen_after_committed_response_does_not_revive_old_work(tmp_path, monkeypatch, tool_response):
-    from agent_runtime.harness import TurnExecutor
+    from agent_runtime.harness import TurnRunner
 
     invoked = []
     tool = replace(_read_file_tool(), run=lambda a: invoked.append(a) or {"text": "read"})
@@ -294,11 +352,12 @@ async def test_reopen_after_committed_response_does_not_revive_old_work(tmp_path
         model.release.set()
     options = dict(database=tmp_path / "run.db", workspace=tmp_path, model=model, tools={"read_file": tool})
     async with await Session.open(**options) as session:
+
         async def crash(*args, **kwargs):
             raise RuntimeError("crash after response commit")
 
         with monkeypatch.context() as patch:
-            patch.setattr(TurnExecutor, "_handle_model_response", crash)
+            patch.setattr(TurnRunner, "_handle_model_response", crash)
             with pytest.raises(RuntimeError, match="crash after response"):
                 await session.submit("initial task")
         turn_id = session.store.read_thread(session.thread_id).active_turn_id
@@ -319,14 +378,19 @@ async def test_reopen_after_approval_commit_drops_stale_authorization(tmp_path):
     invoked = []
     tool = replace(_read_file_tool(), run=lambda a: invoked.append(a) or {"text": "read"})
     model = ToolSteeringModel()
-    options = dict(database=tmp_path / "run.db", workspace=tmp_path, model=model,
-                   tools={"read_file": tool}, tool_execution_context=ToolExecutionContext(
-                       require_confirmation_for=frozenset({"read_file"}),
-                   ))
+    options = dict(
+        database=tmp_path / "run.db",
+        workspace=tmp_path,
+        model=model,
+        tools={"read_file": tool},
+        tool_execution_context=ToolExecutionContext(
+            require_confirmation_for=frozenset({"read_file"}),
+        ),
+    )
     async with await Session.open(**options) as session:
         result = await session.submit("read files")
         assert result.status == "paused"
-        session.store.resolve_tool_approval(turn_id=result.turn_id, decision="approve")
+        tool_ops.resolve_tool_approval(session.store, turn_id=result.turn_id, decision="approve")
         receipt = await session.steer("new task; explain instead", expected_turn_id=result.turn_id)
         thread_id = session.thread_id
     async with await Session.open(**options, thread_id=thread_id) as reopened:
@@ -340,8 +404,9 @@ async def test_reopen_after_approval_commit_drops_stale_authorization(tmp_path):
 @pytest.mark.anyio
 async def test_exhausted_budget_keeps_input_as_explicitly_unconsumed(tmp_path):
     model = SteeringModel()
-    async with await Session.open(database=tmp_path / "run.db", workspace=tmp_path, model=model,
-                                 max_steps=1) as session:
+    async with await Session.open(
+        database=tmp_path / "run.db", workspace=tmp_path, model=model, max_steps=1
+    ) as session:
         running = asyncio.create_task(session.submit("initial task"))
         await model.started.wait()
         turn_id = session.store.read_thread(session.thread_id).active_turn_id
@@ -399,8 +464,10 @@ async def test_streaming_input_prevents_old_tools_and_preserves_complete_context
             return response
 
     model = StreamingModel()
-    async with await Session.open(database=tmp_path / "run.db", workspace=tmp_path, model=model,
-                                 tools={"read_file": tool}) as session:
+    async with await Session.open(
+        database=tmp_path / "run.db", workspace=tmp_path, model=model, tools={"read_file": tool}
+    ) as session:
+
         class Sink:
             receipt = None
 
@@ -418,33 +485,37 @@ async def test_streaming_input_prevents_old_tools_and_preserves_complete_context
 
 
 @pytest.mark.anyio
-async def test_reopen_between_superseding_request_and_next_step(tmp_path):
-    from agent_runtime.harness import RuntimeState
+async def test_reopen_between_superseding_request_and_next_step(tmp_path, monkeypatch):
+    from agent_runtime.harness import RuntimeStore
 
     model = SteeringModel()
     model.release.set()
     options = dict(database=tmp_path / "run.db", workspace=tmp_path, model=model)
     async with await Session.open(**options) as session:
-        original = session.store.prepare_model_operation
-        supersede = session.store.supersede_prepared_model
+        original = model_ops.prepare_model_operation
+        supersede = model_ops.supersede_prepared_model
         received = []
 
-        def prepare(**kwargs):
-            operation = original(**kwargs)
+        def prepare(store, **kwargs):
+            operation = original(store, **kwargs)
             if not received:
-                with RuntimeState.open_sync(session.database) as other:
-                    received.append(other.receive_turn_input(thread_id=session.thread_id,
-                                    turn_id=kwargs["turn_id"], text="new requirement"))
+                with RuntimeStore.open_sync(session.database) as other:
+                    received.append(
+                        turn_ops.receive_turn_input(
+                            other, thread_id=session.thread_id, turn_id=kwargs["turn_id"], text="new requirement"
+                        )
+                    )
             return operation
 
-        def crash(operation_id):
-            supersede(operation_id)
+        def crash(store, operation_id):
+            supersede(store, operation_id)
             raise RuntimeError("crash after supersede")
 
-        session.store.prepare_model_operation = prepare
-        session.store.supersede_prepared_model = crash
-        with pytest.raises(RuntimeError, match="crash after supersede"):
-            await session.submit("initial task")
+        with monkeypatch.context() as patch:
+            patch.setattr(model_ops, "prepare_model_operation", prepare)
+            patch.setattr(model_ops, "supersede_prepared_model", crash)
+            with pytest.raises(RuntimeError, match="crash after supersede"):
+                await session.submit("initial task")
         thread_id = session.thread_id
         turn_id = session.store.read_thread(thread_id).active_turn_id
     async with await Session.open(**options, thread_id=thread_id) as reopened:
@@ -455,7 +526,7 @@ async def test_reopen_between_superseding_request_and_next_step(tmp_path):
 
 @pytest.mark.anyio
 async def test_external_input_during_context_capture_is_not_falsely_acknowledged(tmp_path):
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
 
     model = SteeringModel()
     model.release.set()
@@ -466,15 +537,19 @@ async def test_external_input_during_context_capture_is_not_falsely_acknowledged
         def build(turn_id):
             messages = original(turn_id)
             if not received:
-                with RuntimeState.open_sync(session.database) as other:
-                    received.append(other.receive_turn_input(thread_id=session.thread_id, turn_id=turn_id,
-                                                            text="requirement during capture"))
+                with RuntimeStore.open_sync(session.database) as other:
+                    received.append(
+                        turn_ops.receive_turn_input(
+                            other, thread_id=session.thread_id, turn_id=turn_id, text="requirement during capture"
+                        )
+                    )
             return messages
 
         session.context_manager.build = build
         await session.submit("initial task")
-        dispatched = [operation for operation in session.store.list_model_operations()
-                      if operation.status == "completed"]
+        dispatched = [
+            operation for operation in session.store.list_model_operations() if operation.status == "completed"
+        ]
         assert dispatched
         assert all(
             "requirement during capture" in [m["body"] for m in operation.request_ref["step_snapshot"]["messages"]]
@@ -483,28 +558,35 @@ async def test_external_input_during_context_capture_is_not_falsely_acknowledged
 
 
 @pytest.mark.anyio
-async def test_input_after_compaction_commit_reprepares_instead_of_reporting_corruption(tmp_path):
-    from agent_runtime.harness import RuntimeState
+async def test_input_after_compaction_commit_reprepares_instead_of_reporting_corruption(tmp_path, monkeypatch):
+    from agent_runtime.harness import RuntimeStore
     from tests.agent.harness.test_compaction_consistency import long_history
     from tests.agent.harness.test_context_capacity_policy import capacity_runner
 
-    async with (await RuntimeState.open(tmp_path / "run.db")) as store:
+    async with await RuntimeStore.open(tmp_path / "run.db") as store:
         runner, turn, gateway = capacity_runner(store, tmp_path, messages=5)
         long_history(store, turn)
-        manager = runner._context_manager
-        original = manager.commit_compaction
+        from agent_runtime.harness import compaction_jobs
+
+        original = compaction_jobs.install_candidate
         received = []
 
-        def commit(candidate):
-            item = original(candidate)
+        def commit(*args, **kwargs):
+            item = original(*args, **kwargs)
             if not received:
-                with RuntimeState.open_sync(tmp_path / "run.db") as external:
-                    received.append(external.receive_turn_input(thread_id=turn.thread_id, turn_id=turn.turn_id,
-                                                               text="requirement at compaction commit"))
+                with RuntimeStore.open_sync(tmp_path / "run.db") as external:
+                    received.append(
+                        turn_ops.receive_turn_input(
+                            external,
+                            thread_id=turn.thread_id,
+                            turn_id=turn.turn_id,
+                            text="requirement at compaction commit",
+                        )
+                    )
             return item
 
-        manager.commit_compaction = commit
-        result = await runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1)
+        monkeypatch.setattr(compaction_jobs, "install_candidate", commit)
+        result = await runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1)
         assert result.status == "completed"
         assert received
         requests = [r for r in gateway.requests if ":context-summary:" not in r.request_id]

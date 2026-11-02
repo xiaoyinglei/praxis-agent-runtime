@@ -3,10 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 from contextlib import AsyncExitStack
-from dataclasses import asdict
 
 import pytest
 
+from agent_runtime.core.messages import model_message_payload
 from agent_runtime.harness import CompletionDecision, HarnessModelResponse, PreparedModelCall, Session
 
 
@@ -25,7 +25,10 @@ class ChangingModel:
     def prepare(self, request):
         self.requests.append(request)
         digest = hashlib.sha256(
-            json.dumps([dict(request.binding_manifest), [asdict(m) for m in request.messages]], sort_keys=True).encode()
+            json.dumps(
+                [dict(request.binding_manifest), [dict(model_message_payload(m)) for m in request.messages]],
+                sort_keys=True,
+            ).encode()
         ).hexdigest()
         return PreparedModelCall(
             request_hash=digest,
@@ -273,7 +276,7 @@ async def test_policy_change_while_sampling_does_not_rewrite_that_requests_tools
 async def test_committed_tool_response_rejects_changed_runner_before_io(tmp_path, monkeypatch):
     from dataclasses import replace
 
-    from agent_runtime.harness import TurnExecutor
+    from agent_runtime.harness import TurnRunner
     from tests.agent.harness.test_approval_resume import AcceptAnswer, WriteThenAnswerModel, _write_tool
 
     calls = []
@@ -283,7 +286,7 @@ async def test_committed_tool_response_rejects_changed_runner_before_io(tmp_path
         raise RuntimeError("crash after model response commit")
 
     with monkeypatch.context() as patch:
-        patch.setattr(TurnExecutor, "_handle_model_response", crash)
+        patch.setattr(TurnRunner, "_handle_model_response", crash)
         async with await Session.open(
             database=tmp_path / "db",
             workspace=tmp_path,
@@ -324,7 +327,6 @@ async def test_child_inherits_originating_step_while_parent_next_step_uses_updat
                 self.selected = "second"
                 session.update_tool_policy(allow_write_tools=False)
             return await super().dispatch(prepared)
-
 
     model = Model()
     async with await Session.open(

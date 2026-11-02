@@ -4,19 +4,29 @@ import asyncio
 import sqlite3
 import threading
 import time
+from functools import partial
 
 import pytest
 
-from agent_runtime.harness import RuntimeState, TurnExecutor
+from agent_runtime.harness import (
+    RuntimeStore,
+    TurnRunner,
+    artifact_ops,
+    budget_ops,
+    facts,
+    memory_ops,
+    model_ops,
+    turn_ops,
+)
 from agent_runtime.harness.tool_orchestrator import ToolOrchestrator
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("kind", [TurnExecutor, ToolOrchestrator])
+@pytest.mark.parametrize("kind", [TurnRunner, ToolOrchestrator])
 async def test_transaction_body_yields_while_real_store_commits(tmp_path, monkeypatch, kind):
-    async with (await RuntimeState.open(tmp_path / "run.db")) as store:
-        thread = store.create_thread(workspace=tmp_path)
-        original = store._append_and_reduce
+    async with await RuntimeStore.open(tmp_path / "run.db") as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        original = partial(facts.append_fact, store)
         completed = threading.Event()
         ticks = []
 
@@ -24,14 +34,15 @@ async def test_transaction_body_yields_while_real_store_commits(tmp_path, monkey
             time.sleep(0.08)
             original(**kwargs)
 
-        monkeypatch.setattr(store, "_append_and_reduce", slow_reduce)
+        monkeypatch.setattr(facts, "append_fact", lambda _store, *args, **kwargs: (slow_reduce)(*args, **kwargs))
         executor = object.__new__(kind)
         executor._store, executor._event_dispatcher = store, None
 
         async def commit():
             try:
                 return await executor._commit(
-                    lambda: store.start_turn(
+                    lambda: turn_ops.start_turn(
+                        store,
                         thread_id=thread.thread_id,
                         user_message="large durable input" * 1000,
                         binding_manifest={},
@@ -55,9 +66,9 @@ async def test_transaction_body_yields_while_real_store_commits(tmp_path, monkey
 
 @pytest.mark.anyio
 async def test_artifact_install_yields_and_commit_is_visible(tmp_path, monkeypatch):
-    async with (await RuntimeState.open(tmp_path / "run.db")) as store:
-        thread = store.create_thread(workspace=tmp_path)
-        turn = store.start_turn(thread_id=thread.thread_id, user_message="save", binding_manifest={})
+    async with await RuntimeStore.open(tmp_path / "run.db") as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(store, thread_id=thread.thread_id, user_message="save", binding_manifest={})
         ticks = []
         done = threading.Event()
 
@@ -73,7 +84,8 @@ async def test_artifact_install_yields_and_commit_is_visible(tmp_path, monkeypat
         pulse = asyncio.create_task(heartbeat())
         try:
             mutation = await store.capture_mutation_async(
-                lambda: store.commit_artifact(
+                lambda: artifact_ops.commit_artifact(
+                    store,
                     turn_id=turn.turn_id,
                     content=b"artifact" * 10000,
                     media_type="text/plain",
@@ -96,7 +108,7 @@ async def test_public_agent_open_and_read_result_yield(tmp_path, monkeypatch):
 
     agent = Agent(checkpoint_db=tmp_path / "run.db", workspace_path=tmp_path)
     monkeypatch.setattr(agent, "_model_factory", lambda: PublicHarnessModel())
-    original = RuntimeState.validate_conversation
+    original = RuntimeStore.validate_conversation
     observed = []
 
     def slow_verify(store, **anchor):
@@ -106,7 +118,7 @@ async def test_public_agent_open_and_read_result_yield(tmp_path, monkeypatch):
         assert len(observed) > before, "public Agent initialization blocked its loop"
         return value
 
-    monkeypatch.setattr(RuntimeState, "validate_conversation", slow_verify)
+    monkeypatch.setattr(RuntimeStore, "validate_conversation", slow_verify)
     stopped = asyncio.Event()
 
     async def heartbeat():
@@ -118,7 +130,7 @@ async def test_public_agent_open_and_read_result_yield(tmp_path, monkeypatch):
     try:
         result = await agent.run("answer", require_workspace_change=False)
         assert result.status == "done"
-        original_read = RuntimeState.read_turn_answer
+        original_read = RuntimeStore.read_turn_answer
 
         def slow_read(store, turn_id):
             before = len(observed)
@@ -127,7 +139,7 @@ async def test_public_agent_open_and_read_result_yield(tmp_path, monkeypatch):
             assert len(observed) > before, "public read_result blocked its loop"
             return value
 
-        monkeypatch.setattr(RuntimeState, "read_turn_answer", slow_read)
+        monkeypatch.setattr(RuntimeStore, "read_turn_answer", slow_read)
         assert await agent.read_result(result.turn_id) == result
     finally:
         stopped.set()
@@ -140,13 +152,13 @@ async def test_public_agent_never_waits_synchronously_for_store(tmp_path, monkey
     from tests.agent.harness.test_public_agent_cutover import PublicHarnessModel
 
     loop_thread = threading.get_ident()
-    original = RuntimeState.run_sync
+    original = RuntimeStore.run_sync
 
     def guarded(store, operation):
         assert threading.get_ident() != loop_thread, "async runtime called the blocking Store API"
         return original(store, operation)
 
-    monkeypatch.setattr(RuntimeState, "run_sync", guarded)
+    monkeypatch.setattr(RuntimeStore, "run_sync", guarded)
     agent = Agent(checkpoint_db=tmp_path / "run.db", workspace_path=tmp_path, enable_workspace_mcp=False)
     monkeypatch.setattr(agent, "_model_factory", lambda: PublicHarnessModel())
     result = await agent.run("answer", require_workspace_change=False)
@@ -158,8 +170,8 @@ async def test_public_agent_never_waits_synchronously_for_store(tmp_path, monkey
 @pytest.mark.parametrize("fail", [False, True])
 async def test_cancel_and_close_wait_for_real_commit_or_rollback(tmp_path, fail):
     database = tmp_path / "run.db"
-    store = await RuntimeState.open(database)
-    thread = await store.run_async(store.create_thread, workspace=tmp_path)
+    store = await RuntimeStore.open(database)
+    thread = await store.run_async(partial(turn_ops.create_thread, store), workspace=tmp_path)
     entered, release, finished = threading.Event(), threading.Event(), threading.Event()
     calls = []
 
@@ -167,7 +179,7 @@ async def test_cancel_and_close_wait_for_real_commit_or_rollback(tmp_path, fail)
         calls.append(threading.get_ident())
         try:
             with store.persistence.transaction():
-                store.update_session_settings(thread.thread_id, {"observed": True})
+                turn_ops.update_session_settings(store, thread.thread_id, {"observed": True})
                 entered.set()
                 assert release.wait(3)
                 if fail:
@@ -193,7 +205,7 @@ async def test_cancel_and_close_wait_for_real_commit_or_rollback(tmp_path, fail)
         await closer
         assert finished.is_set()
         assert len(calls) == 1  # Neither cancellation nor a Store failure replays a transaction.
-        async with await RuntimeState.open(database, read_only=True) as reader:
+        async with await RuntimeStore.open(database, read_only=True) as reader:
             state = await reader.run_async(reader.read_thread, thread.thread_id)
             assert dict(state.settings) == ({} if fail else {"observed": True})
             assert (await reader.run_async(reader.verify)).valid
@@ -225,8 +237,8 @@ async def test_connection_open_queries_and_close_share_one_owner(tmp_path, monke
         return original(*args, **kwargs, factory=Connection)
 
     monkeypatch.setattr(sqlite3, "connect", connect)
-    async with await RuntimeState.open(tmp_path / "run.db") as store:
-        first = await store.run_async(store.create_thread, workspace=tmp_path)
+    async with await RuntimeStore.open(tmp_path / "run.db") as store:
+        first = await store.run_async(partial(turn_ops.create_thread, store), workspace=tmp_path)
         assert store.read_thread(first.thread_id) == first  # Explicit blocking API remains usable.
         assert await asyncio.to_thread(store.read_thread, first.thread_id) == first
     assert {identity for _, identity in observed} == {observed[0][1]}
@@ -237,14 +249,19 @@ async def test_connection_open_queries_and_close_share_one_owner(tmp_path, monke
 @pytest.mark.anyio
 async def test_multiple_tasks_connections_and_read_only_queries(tmp_path):
     database = tmp_path / "run.db"
-    async with await RuntimeState.open(database) as first, await RuntimeState.open(database) as second:
-        thread = await first.run_async(first.create_thread, workspace=tmp_path)
+    async with await RuntimeStore.open(database) as first, await RuntimeStore.open(database) as second:
+        thread = await first.run_async(partial(turn_ops.create_thread, first), workspace=tmp_path)
         turn = await first.run_async(
-            first.start_turn, thread_id=thread.thread_id, user_message="concurrent reservations", binding_manifest={}
+            partial(turn_ops.start_turn, first),
+            thread_id=thread.thread_id,
+            user_message="concurrent reservations",
+            binding_manifest={},
         )
         mutations = await asyncio.gather(
             *[
-                store.capture_mutation_async(lambda store=store: store.reserve_resource_unit(turn.turn_id, "reads", 32))
+                store.capture_mutation_async(
+                    lambda store=store: budget_ops.reserve_resource_unit(store, turn.turn_id, "reads", 32)
+                )
                 for store in [first, second] * 8
             ]
         )
@@ -253,10 +270,10 @@ async def test_multiple_tasks_connections_and_read_only_queries(tmp_path):
         assert ids[::2] == sorted(ids[::2])
         assert ids[1::2] == sorted(ids[1::2])
         assert (await first.run_async(first.read_resource_usage, turn.turn_id, "reads"))["used"] == 16
-        async with await RuntimeState.open(database, read_only=True) as reader:
+        async with await RuntimeStore.open(database, read_only=True) as reader:
             assert (await reader.run_async(reader.verify)).valid
             with pytest.raises(Exception, match="readonly"):
-                await reader.run_async(reader.create_thread, workspace=tmp_path)
+                await reader.run_async(partial(turn_ops.create_thread, reader), workspace=tmp_path)
 
 
 @pytest.mark.anyio
@@ -265,10 +282,10 @@ async def test_cancelled_guard_records_known_unexecuted_tool_result(tmp_path, mo
     from agent_runtime.tools.tool import ToolCall, ToolCallOrigin
     from tests.agent.harness.test_tool_orchestrator import _read_tool
 
-    async with await RuntimeState.open(tmp_path / "run.db") as store:
-        thread = await store.run_async(store.create_thread, workspace=tmp_path)
+    async with await RuntimeStore.open(tmp_path / "run.db") as store:
+        thread = await store.run_async(partial(turn_ops.create_thread, store), workspace=tmp_path)
         turn = await store.run_async(
-            store.start_turn, thread_id=thread.thread_id, user_message="read", binding_manifest={}
+            partial(turn_ops.start_turn, store), thread_id=thread.thread_id, user_message="read", binding_manifest={}
         )
         orchestrator = ToolOrchestrator(
             store=store,
@@ -311,12 +328,12 @@ async def test_compaction_never_waits_synchronously_for_store(tmp_path, monkeypa
     from agent_runtime.harness import RolloutContextManager
     from tests.agent.harness.test_compaction_consistency import Accept, long_history, model_for, start
 
-    async with await RuntimeState.open(tmp_path / "run.db") as store:
+    async with await RuntimeStore.open(tmp_path / "run.db") as store:
         thread, turn = await store.run_async(start, store, tmp_path)
         await store.run_async(long_history, store, turn)
         model, _ = model_for()
         runner = await store.run_async(
-            lambda: TurnExecutor(
+            lambda: TurnRunner(
                 thread_id=thread.thread_id,
                 store=store,
                 model=model,
@@ -334,7 +351,7 @@ async def test_compaction_never_waits_synchronously_for_store(tmp_path, monkeypa
             return original(operation)
 
         monkeypatch.setattr(store, "run_sync", guarded)
-        result = await runner.run_turn(context, start_step=1)
+        result = await runner.drive(context, start_step=1)
         assert result.status == "completed"
 
 
@@ -345,7 +362,7 @@ async def test_cancellation_during_model_claim_does_not_invent_provider_io(tmp_p
 
     calls = []
     entered, release = threading.Event(), threading.Event()
-    original = RuntimeState.dispatch_model_attempt
+    original = model_ops.dispatch_model_attempt
 
     class Model(PublicHarnessModel):
         async def dispatch(self, prepared, *, event_sink=None):
@@ -358,7 +375,7 @@ async def test_cancellation_during_model_claim_does_not_invent_provider_io(tmp_p
         assert release.wait(3)
         return value
 
-    monkeypatch.setattr(RuntimeState, "dispatch_model_attempt", blocked_claim)
+    monkeypatch.setattr(model_ops, "dispatch_model_attempt", blocked_claim)
     agent = Agent(checkpoint_db=tmp_path / "run.db", workspace_path=tmp_path, enable_workspace_mcp=False)
     monkeypatch.setattr(agent, "_model_factory", Model)
     task = asyncio.create_task(agent.run("cancel before provider", require_workspace_change=False))
@@ -370,7 +387,7 @@ async def test_cancellation_during_model_claim_does_not_invent_provider_io(tmp_p
         with pytest.raises(asyncio.CancelledError):
             await task
         assert calls == []
-        async with await RuntimeState.open(tmp_path / "run.db", read_only=True) as reader:
+        async with await RuntimeStore.open(tmp_path / "run.db", read_only=True) as reader:
             [operation] = await reader.run_async(reader.list_model_operations)
             [attempt] = await reader.run_async(reader.list_model_attempts, operation.operation_id)
             assert attempt.status == "failed"
@@ -409,13 +426,13 @@ async def test_tool_loop_public_entries_use_async_store_boundary(tmp_path, monke
             return await super().dispatch(prepared, event_sink=event_sink)
 
     loop_thread = threading.get_ident()
-    original = RuntimeState.run_sync
+    original = RuntimeStore.run_sync
 
     def guarded(store, operation):
         assert threading.get_ident() != loop_thread, "public tool loop synchronously waited for Store"
         return original(store, operation)
 
-    monkeypatch.setattr(RuntimeState, "run_sync", guarded)
+    monkeypatch.setattr(RuntimeStore, "run_sync", guarded)
     agent = Agent(checkpoint_db=tmp_path / "run.db", workspace_path=tmp_path, enable_workspace_mcp=False)
     monkeypatch.setattr(agent, "_model_factory", Model)
     if entry == "cli":
@@ -437,7 +454,7 @@ async def test_tool_loop_public_entries_use_async_store_boundary(tmp_path, monke
 async def test_cancelled_snapshot_does_not_leave_trusted_turn_identity(tmp_path, monkeypatch):
     from agent_runtime.harness.tool_orchestrator import current_tool_turn_id
 
-    async with await RuntimeState.open(tmp_path / "run.db") as store:
+    async with await RuntimeStore.open(tmp_path / "run.db") as store:
         orchestrator = object.__new__(ToolOrchestrator)
         orchestrator._store = store
         entered, release = threading.Event(), threading.Event()
@@ -510,8 +527,8 @@ async def test_session_close_cancellation_keeps_its_resource_owner(tmp_path):
 async def test_cancelled_memory_claim_releases_the_actual_lease(tmp_path, monkeypatch):
     from agent_runtime.harness.memory import update_memory
 
-    async with await RuntimeState.open(tmp_path / "run.db") as store:
-        original = store.claim_memory_job
+    async with await RuntimeStore.open(tmp_path / "run.db") as store:
+        original = partial(memory_ops.claim_memory_job, store)
         entered, release = threading.Event(), threading.Event()
 
         def blocked_claim(*args, **kwargs):
@@ -520,7 +537,9 @@ async def test_cancelled_memory_claim_releases_the_actual_lease(tmp_path, monkey
             assert release.wait(3)
             return claimed
 
-        monkeypatch.setattr(store, "claim_memory_job", blocked_claim)
+        monkeypatch.setattr(
+            memory_ops, "claim_memory_job", lambda _store, *args, **kwargs: (blocked_claim)(*args, **kwargs)
+        )
         task = asyncio.create_task(update_memory(store, workspace=tmp_path, model=None, binding={}))
         try:
             while not entered.is_set():
@@ -531,7 +550,7 @@ async def test_cancelled_memory_claim_releases_the_actual_lease(tmp_path, monkey
                 await task
             claim = await store.run_async(original, tmp_path, owner="next-owner", now=time.time(), lease_seconds=300)
             assert claim is not None
-            await store.run_async(store.release_memory_job, tmp_path, claim=claim)
+            await store.run_async(partial(memory_ops.release_memory_job, store), tmp_path, claim=claim)
         finally:
             release.set()
             await asyncio.gather(task, return_exceptions=True)
@@ -541,8 +560,8 @@ async def test_cancelled_memory_claim_releases_the_actual_lease(tmp_path, monkey
 async def test_cancelled_memory_turn_creation_is_tracked_and_terminal(tmp_path, monkeypatch):
     from agent_runtime.harness import memory as memory_module
 
-    async with await RuntimeState.open(tmp_path / "run.db") as store:
-        source = await store.run_async(store.create_thread, workspace=tmp_path)
+    async with await RuntimeStore.open(tmp_path / "run.db") as store:
+        source = await store.run_async(partial(turn_ops.create_thread, store), workspace=tmp_path)
         monkeypatch.setattr(
             memory_module,
             "_source",
@@ -554,7 +573,7 @@ async def test_cancelled_memory_turn_creation_is_tracked_and_terminal(tmp_path, 
                 False,
             ),
         )
-        original = store.start_turn
+        original = partial(turn_ops.start_turn, store)
         entered, release = threading.Event(), threading.Event()
 
         def blocked_start(*args, **kwargs):
@@ -563,7 +582,7 @@ async def test_cancelled_memory_turn_creation_is_tracked_and_terminal(tmp_path, 
             assert release.wait(3)
             return turn
 
-        monkeypatch.setattr(store, "start_turn", blocked_start)
+        monkeypatch.setattr(turn_ops, "start_turn", lambda _store, *args, **kwargs: (blocked_start)(*args, **kwargs))
         task = asyncio.create_task(memory_module.update_memory(store, workspace=tmp_path, model=None, binding={}))
         try:
             while not entered.is_set():

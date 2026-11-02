@@ -8,7 +8,7 @@ import json
 from collections.abc import Sequence
 from pathlib import Path
 
-from agent_runtime.harness import RuntimeState
+from agent_runtime.harness import RuntimeStore, turn_ops
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -22,8 +22,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Confirm the prior process/worker has stopped.",
     )
     args = parser.parse_args(argv)
-    with RuntimeState.open_sync(args.database) as store:
-        turn = store.interrupt_orphaned_turn(
+    with RuntimeStore.open_sync(args.database) as store:
+        turn = turn_ops.interrupt_orphaned_turn(
+            store,
             turn_id=args.turn_id,
             reason=args.reason,
             maintenance_confirmed=args.maintenance_confirmed,

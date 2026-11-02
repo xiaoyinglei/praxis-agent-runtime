@@ -1,4 +1,3 @@
-
 """Controlled public CLI evidence with synthetic provider and real local tools."""
 
 from __future__ import annotations
@@ -12,7 +11,7 @@ from typer.testing import CliRunner
 
 from agent_runtime.cli import agent_app
 from agent_runtime.core.messages import ModelToolCall, StopReason, ToolUseResult
-from agent_runtime.harness import GatewayHarnessModel, RuntimeState
+from agent_runtime.harness import GatewayHarnessModel, RuntimeStore, turn_ops
 from agent_runtime.harness.protocol import item_text
 from agent_runtime.modeling.contracts import ContextCapacityPolicy, LLMCallStage, LLMProviderResult, LLMStageBudget
 from agent_runtime.modeling.gateway import LLMGateway
@@ -51,9 +50,11 @@ class SyntheticProvider:
     def _turn(self, *, messages, **kwargs):
         del kwargs
         text = json.dumps(messages, ensure_ascii=False)
-        if ("Summarize the supplied execution history faithfully." in text
-                or "Create a concise context checkpoint for another LLM that will resume this task." in text
-                or "Return only a checkpoint; do not continue the task or call tools." in text):
+        if (
+            "Summarize the supplied execution history faithfully." in text
+            or "Create a concise context checkpoint for another LLM that will resume this task." in text
+            or "Return only a checkpoint; do not continue the task or call tools." in text
+        ):
             self.summary_sources.append(text)
             facts = [fact for fact in ["GOLD_WEB_FACT=17", "GOLD_CODE_FACT=17", "GOLD_DIALOG_FACT=17"] if fact in text]
             return ToolUseResult(
@@ -204,15 +205,15 @@ def test_public_cli_controlled_context_replay(tmp_path, monkeypatch, task, mode)
     if task == "dialog":
         from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
 
-        with RuntimeState.open_sync(database) as store:
-            thread = store.create_thread(workspace=tmp_path)
-            previous = store.start_turn(
-                thread_id=thread.thread_id, user_message="Synthetic dialogue", binding_manifest={}
+        with RuntimeStore.open_sync(database) as store:
+            thread = turn_ops.create_thread(store, workspace=tmp_path)
+            previous = turn_ops.start_turn(
+                store, thread_id=thread.thread_id, user_message="Synthetic dialogue", binding_manifest={}
             )
             for _index in range(8):
                 seed(store, turn_id=previous.turn_id, kind="agent_message", payload={"text": "x" * 2000})
             seed(store, turn_id=previous.turn_id, kind="agent_message", payload={"text": "GOLD_DIALOG_FACT=17"})
-            store.complete_turn(turn_id=previous.turn_id, answer="Continue later.")
+            turn_ops.complete_turn(store, turn_id=previous.turn_id, answer="Continue later.")
             args.extend(["--previous-turn-id", previous.turn_id])
     result = CliRunner().invoke(agent_app, args)
     assert result.exit_code == 0, result.output + repr(result.exception)
@@ -224,7 +225,7 @@ def test_public_cli_controlled_context_replay(tmp_path, monkeypatch, task, mode)
         assert not provider.summary_sources
     if task == "code":
         assert (tmp_path / "sample.py").read_text().startswith("VALUE = 17\n# old evidence ")
-    with RuntimeState.open_sync(database) as store:
+    with RuntimeStore.open_sync(database) as store:
         turn = store.list_turns()[-1]
         items = store.list_items(turn.turn_id)
         compactions = [item for item in items if item.kind == "context_compaction"]

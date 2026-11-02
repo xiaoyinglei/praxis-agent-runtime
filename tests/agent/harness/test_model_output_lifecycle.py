@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime.harness import RuntimeState
+from agent_runtime.harness import RuntimeStore, model_ops, turn_ops
 from agent_runtime.harness.model_outputs import (
     close_model_outputs,
     complete_model_output,
@@ -36,10 +36,11 @@ class _EventModel:
         return await self.dispatch_events(event_sink)
 
 
-def _attempt(state: RuntimeState, workspace: Path):
-    thread = state.create_thread(workspace=workspace)
-    turn = state.start_turn(thread_id=thread.thread_id, user_message="inspect and fix", binding_manifest={})
-    operation = state.prepare_model_operation(
+def _attempt(state: RuntimeStore, workspace: Path):
+    thread = turn_ops.create_thread(state, workspace=workspace)
+    turn = turn_ops.start_turn(state, thread_id=thread.thread_id, user_message="inspect and fix", binding_manifest={})
+    operation = model_ops.prepare_model_operation(
+        state,
         turn_id=turn.turn_id,
         request_hash="request",
         context_hash="context",
@@ -47,13 +48,13 @@ def _attempt(state: RuntimeState, workspace: Path):
         wire_hash="wire",
         request_ref={"input_revision": 1, "request_id": "request"},
     )
-    attempt = state.dispatch_model_attempt(operation.operation_id, worker_id="worker", lease_seconds=30)
+    attempt = model_ops.dispatch_model_attempt(state, operation.operation_id, worker_id="worker", lease_seconds=30)
     return operation, attempt
 
 
 def test_completed_output_survives_later_transport_failure_and_reopen(tmp_path: Path) -> None:
     path = tmp_path / "rollout.sqlite3"
-    with RuntimeState.open_sync(path) as state:
+    with RuntimeStore.open_sync(path) as state:
         operation, attempt = _attempt(state, tmp_path)
         identity = dict(
             operation_id=operation.operation_id, attempt_id=attempt.attempt_id, generation=attempt.generation
@@ -69,16 +70,16 @@ def test_completed_output_survives_later_transport_failure_and_reopen(tmp_path: 
             ("b", "outcome_unknown"),
         ]
         assert completed[0].payload["public_item_id"] != completed[1].payload["public_item_id"]
-    with RuntimeState.open_sync(path) as state:
+    with RuntimeStore.open_sync(path) as state:
         outputs = read_model_outputs(state, attempt_id=attempt.attempt_id)
         assert [(o.output_id, o.content) for o in outputs] == [("a", "checked"), ("b", "")]
 
 
 def test_old_attempt_cannot_start_or_complete_an_output(tmp_path: Path) -> None:
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as state:
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as state:
         operation, attempt = _attempt(state, tmp_path)
-        state.mark_model_attempt_unknown(
-            operation_id=operation.operation_id, attempt_id=attempt.attempt_id, generation=attempt.generation
+        model_ops.mark_model_attempt_unknown(
+            state, operation_id=operation.operation_id, attempt_id=attempt.attempt_id, generation=attempt.generation
         )
         identity = dict(
             operation_id=operation.operation_id, attempt_id=attempt.attempt_id, generation=attempt.generation
@@ -90,7 +91,7 @@ def test_old_attempt_cannot_start_or_complete_an_output(tmp_path: Path) -> None:
 def test_delta_identity_check_does_not_enumerate_durable_history(tmp_path: Path, monkeypatch) -> None:
     from agent_runtime.harness.model_outputs import require_open_model_output
 
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as state:
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as state:
         operation, attempt = _attempt(state, tmp_path)
         identity = dict(
             operation_id=operation.operation_id, attempt_id=attempt.attempt_id, generation=attempt.generation
@@ -109,7 +110,7 @@ def test_delta_identity_check_does_not_enumerate_durable_history(tmp_path: Path,
 
 
 def test_output_lifecycle_reads_are_scoped_to_the_turn(tmp_path: Path, monkeypatch) -> None:
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as state:
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as state:
         operation, attempt = _attempt(state, tmp_path)
         original_rows = state.persistence.rows
 
@@ -128,7 +129,7 @@ def test_output_lifecycle_reads_are_scoped_to_the_turn(tmp_path: Path, monkeypat
 
 
 def test_completed_output_cannot_change_and_private_provider_data_is_durable(tmp_path: Path) -> None:
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as state:
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as state:
         operation, attempt = _attempt(state, tmp_path)
         identity = dict(
             operation_id=operation.operation_id, attempt_id=attempt.attempt_id, generation=attempt.generation
@@ -142,7 +143,7 @@ def test_completed_output_cannot_change_and_private_provider_data_is_durable(tmp
 
 
 def test_process_recovery_closes_only_open_outputs(tmp_path: Path) -> None:
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as state:
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as state:
         operation, attempt = _attempt(state, tmp_path)
         identity = dict(
             operation_id=operation.operation_id, attempt_id=attempt.attempt_id, generation=attempt.generation
@@ -150,7 +151,7 @@ def test_process_recovery_closes_only_open_outputs(tmp_path: Path) -> None:
         start_model_output(state, **identity, output=ModelOutput("a", "text"))
         complete_model_output(state, **identity, output=ModelOutput("a", "text", content="finished"))
         start_model_output(state, **identity, output=ModelOutput("b", "text"))
-        state.expire_model_attempt_dispatch(operation_id=operation.operation_id, now=time.time() + 60)
+        model_ops.expire_model_attempt_dispatch(state, operation_id=operation.operation_id, now=time.time() + 60)
         completed = [
             r
             for r in state.list_records(operation.thread_id)
@@ -221,8 +222,11 @@ async def test_runtime_keeps_two_text_outputs_and_replays_the_same_identities(tm
     async with await Session.open(database=path, workspace=tmp_path, model=model, completion_gate=Accept()) as session:
         first = await session.submit("inspect", event_sink=sink)
         assert first.answer == "checked. fixed."
-        completed_attempt = next(event for event in sink.events
-                                 if event.type.value == "model_attempt_updated" and event.data["status"] == "completed")
+        completed_attempt = next(
+            event
+            for event in sink.events
+            if event.type.value == "model_attempt_updated" and event.data["status"] == "completed"
+        )
         assert completed_attempt.data["stop_reason"] == "stop"
         thread_id = session.thread_id
         await session.submit("continue")
@@ -238,7 +242,7 @@ async def test_runtime_keeps_two_text_outputs_and_replays_the_same_identities(tm
     ]
     assert [event.data["content"] for event in live] == ["checked. ", "fixed."]
     assert len({event.item_id for event in live}) == 2
-    async with await RuntimeState.open(path) as state:
+    async with await RuntimeStore.open(path) as state:
         entries = await state.run_async(RolloutEventReader(state).read, thread_id)
         replay = [
             entry.event
@@ -313,7 +317,7 @@ async def test_response_identity_survives_failure_before_first_output(tmp_path: 
         result = await session.submit("inspect")
         assert result.status == "paused"
         thread_id = session.thread_id
-    async with await RuntimeState.open(path) as state:
+    async with await RuntimeStore.open(path) as state:
         operations = await state.run_async(state.list_model_operations)
         [attempt] = await state.run_async(state.list_model_attempts, operations[0].operation_id)
         assert attempt.status == "unknown"

@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import pytest
 
-from agent_runtime.harness import RuntimeState, ToolOrchestrator
+from agent_runtime.harness import RuntimeStore, ToolOrchestrator, tool_ops, turn_ops
 from agent_runtime.harness.context_recall import create_context_recall_tool
 from agent_runtime.tools.permissions import ToolExecutionContext
 from agent_runtime.tools.tool import ToolCall, ToolCallOrigin
@@ -17,14 +17,21 @@ def test_tool_recall_returns_content_without_recursive_payload_encoding(tmp_path
     from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
     from tests.agent.harness.test_compaction_consistency import start
 
-    with RuntimeState.open_sync(tmp_path / "content.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "content.db") as store:
         _, turn = start(store, tmp_path)
         content = 'RULE: preserve tenant identity.\n{"sample":123456789012345}'
-        item = seed(store, turn_id=turn.turn_id, kind="tool_result", payload={
-            "tool_call_id": "read", "tool_name": "read_file", "is_error": False,
-            "structured_content": {"content": content, "path": "spec.md"},
-            "model_content": json.dumps({"structured_content": {"content": content}}),
-        })
+        item = seed(
+            store,
+            turn_id=turn.turn_id,
+            kind="tool_result",
+            payload={
+                "tool_call_id": "read",
+                "tool_name": "read_file",
+                "is_error": False,
+                "structured_content": {"content": content, "path": "spec.md"},
+                "model_content": json.dumps({"structured_content": {"content": content}}),
+            },
+        )
         result = _read(store, tmp_path, turn.turn_id, item_id=item.item_id)
         page = json.loads(result.content[0].data["text"])
         assert page["text"] == content
@@ -56,9 +63,11 @@ def _read(store, workspace, turn_id, **arguments):
 
 
 def test_recall_pages_original_payload_through_orchestrator(tmp_path: Path):
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=tmp_path)
-        turn = store.start_turn(thread_id=thread.thread_id, user_message="原始🙂\n" * 2000, binding_manifest={})
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(
+            store, thread_id=thread.thread_id, user_message="原始🙂\n" * 2000, binding_manifest={}
+        )
         item = store.list_items(turn.turn_id)[0]
         offset, chunks = 0, []
         while True:
@@ -78,17 +87,21 @@ def test_recall_pages_original_payload_through_orchestrator(tmp_path: Path):
 
 
 def test_recall_visibility_respects_fork_and_other_threads(tmp_path: Path):
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        parent = store.create_thread(workspace=tmp_path)
-        first = store.start_turn(thread_id=parent.thread_id, user_message="visible", binding_manifest={})
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        parent = turn_ops.create_thread(store, workspace=tmp_path)
+        first = turn_ops.start_turn(store, thread_id=parent.thread_id, user_message="visible", binding_manifest={})
         visible = store.list_items(first.turn_id)[0]
-        store.complete_turn(turn_id=first.turn_id, answer="done")
-        child = store.fork_thread(from_turn_id=first.turn_id)
-        later = store.start_turn(thread_id=parent.thread_id, user_message="parent future secret", binding_manifest={})
+        turn_ops.complete_turn(store, turn_id=first.turn_id, answer="done")
+        child = turn_ops.fork_thread(store, from_turn_id=first.turn_id)
+        later = turn_ops.start_turn(
+            store, thread_id=parent.thread_id, user_message="parent future secret", binding_manifest={}
+        )
         hidden = store.list_items(later.turn_id)[0]
-        current = store.start_turn(thread_id=child.thread_id, user_message="recall", binding_manifest={})
-        other = store.create_thread(workspace=tmp_path)
-        other_turn = store.start_turn(thread_id=other.thread_id, user_message="other secret", binding_manifest={})
+        current = turn_ops.start_turn(store, thread_id=child.thread_id, user_message="recall", binding_manifest={})
+        other = turn_ops.create_thread(store, workspace=tmp_path)
+        other_turn = turn_ops.start_turn(
+            store, thread_id=other.thread_id, user_message="other secret", binding_manifest={}
+        )
         other_item = store.list_items(other_turn.turn_id)[0]
         assert not _read(store, tmp_path, current.turn_id, item_id=visible.item_id).is_error
         for item_id in (hidden.item_id, other_item.item_id, "missing", "/etc/passwd"):
@@ -98,19 +111,21 @@ def test_recall_visibility_respects_fork_and_other_threads(tmp_path: Path):
 
 
 def test_recall_requires_runtime_turn_identity(tmp_path: Path):
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
         tool = create_context_recall_tool(store)
         with pytest.raises(RuntimeError, match="Harness Turn"):
             asyncio.run(tool.run(tool.validate_input({"item_id": "anything"})))
 
 
 def test_recall_exposes_chronology_across_turns(tmp_path: Path):
-    with RuntimeState.open_sync(tmp_path / "r.db") as store:
-        thread = store.create_thread(workspace=tmp_path)
-        first = store.start_turn(thread_id=thread.thread_id, user_message="TTL=17", binding_manifest={})
+    with RuntimeStore.open_sync(tmp_path / "r.db") as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        first = turn_ops.start_turn(store, thread_id=thread.thread_id, user_message="TTL=17", binding_manifest={})
         older = store.list_items(first.turn_id)[0]
-        store.complete_turn(turn_id=first.turn_id, answer="decision recorded")
-        second = store.start_turn(thread_id=thread.thread_id, user_message="TTL=23 supersedes 17", binding_manifest={})
+        turn_ops.complete_turn(store, turn_id=first.turn_id, answer="decision recorded")
+        second = turn_ops.start_turn(
+            store, thread_id=thread.thread_id, user_message="TTL=23 supersedes 17", binding_manifest={}
+        )
         newer = store.list_items(second.turn_id)[0]
         pages = [
             json.loads(_read(store, tmp_path, second.turn_id, item_id=item.item_id).content[0].data["text"])
@@ -123,16 +138,18 @@ def test_recall_exposes_chronology_across_turns(tmp_path: Path):
     "arguments", [{"offset": -1}, {"max_chars": 0}, {"max_chars": 4001}, {"offset": True}, {"path": "file"}]
 )
 def test_recall_rejects_invalid_pagination(tmp_path: Path, arguments):
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
         tool = create_context_recall_tool(store)
         with pytest.raises(ValueError):
             tool.validate_input({"item_id": "item", **arguments})
 
 
 def test_recall_end_offset_and_byte_budget(tmp_path: Path):
-    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
-        thread = store.create_thread(workspace=tmp_path)
-        turn = store.start_turn(thread_id=thread.thread_id, user_message='\x00🙂"\\' * 4000, binding_manifest={})
+    with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(
+            store, thread_id=thread.thread_id, user_message='\x00🙂"\\' * 4000, binding_manifest={}
+        )
         item = store.list_items(turn.turn_id)[0]
         result = _read(store, tmp_path, turn.turn_id, item_id=item.item_id, max_chars=4000)
         assert not result.truncated
@@ -150,7 +167,7 @@ def test_archive_catalog_can_recover_original_without_summary_retaining_ids(tmp_
     from agent_runtime.harness import RolloutContextManager
     from tests.agent.harness.test_compaction_consistency import long_history, start
 
-    with RuntimeState.open_sync(tmp_path / "r.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "r.db") as store:
         _, turn = start(store, tmp_path)
         long_history(store, turn)
         manager = RolloutContextManager(store)
@@ -170,7 +187,7 @@ def test_history_query_searches_archived_content_without_knowing_item_id(tmp_pat
     from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
     from tests.agent.harness.test_compaction_consistency import start
 
-    with RuntimeState.open_sync(tmp_path / "r.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "r.db") as store:
         _, turn = start(store, tmp_path)
         seed(
             store,
@@ -203,14 +220,18 @@ def test_history_query_searches_archived_content_without_knowing_item_id(tmp_pat
 def test_history_search_respects_fork_visibility(tmp_path: Path):
     from agent_runtime.harness import RolloutContextManager
 
-    with RuntimeState.open_sync(tmp_path / "r.db") as store:
-        first_thread = store.create_thread(workspace=tmp_path)
-        first = store.start_turn(thread_id=first_thread.thread_id, user_message="parent public", binding_manifest={})
-        store.complete_turn(turn_id=first.turn_id, answer="visible result " * 1000)
-        fork = store.fork_thread(from_turn_id=first.turn_id)
-        later = store.start_turn(thread_id=first_thread.thread_id, user_message="secret-sentinel", binding_manifest={})
-        store.complete_turn(turn_id=later.turn_id, answer="secret-sentinel")
-        child = store.start_turn(thread_id=fork.thread_id, user_message="continue", binding_manifest={})
+    with RuntimeStore.open_sync(tmp_path / "r.db") as store:
+        first_thread = turn_ops.create_thread(store, workspace=tmp_path)
+        first = turn_ops.start_turn(
+            store, thread_id=first_thread.thread_id, user_message="parent public", binding_manifest={}
+        )
+        turn_ops.complete_turn(store, turn_id=first.turn_id, answer="visible result " * 1000)
+        fork = turn_ops.fork_thread(store, from_turn_id=first.turn_id)
+        later = turn_ops.start_turn(
+            store, thread_id=first_thread.thread_id, user_message="secret-sentinel", binding_manifest={}
+        )
+        turn_ops.complete_turn(store, turn_id=later.turn_id, answer="secret-sentinel")
+        child = turn_ops.start_turn(store, thread_id=fork.thread_id, user_message="continue", binding_manifest={})
         manager = RolloutContextManager(store)
         source_hash, _ = manager.semantic_source(child.turn_id)
         manager.commit_compaction(
@@ -227,9 +248,10 @@ def test_history_search_respects_fork_visibility(tmp_path: Path):
 
 
 def test_query_finds_detail_between_skipped_pages_and_proves_absence(tmp_path: Path):
-    with RuntimeState.open_sync(tmp_path / "r.db") as store:
-        thread = store.create_thread(workspace=tmp_path)
-        turn = store.start_turn(
+    with RuntimeStore.open_sync(tmp_path / "r.db") as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="noise " * 1000 + "Helios code HX-7294-KAPPA" + " noise" * 1000,
             binding_manifest={},
@@ -250,7 +272,7 @@ def test_archive_search_cursor_crosses_bounded_scan_without_false_absence(tmp_pa
     from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
     from tests.agent.harness.test_compaction_consistency import start
 
-    with RuntimeState.open_sync(tmp_path / "pages.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "pages.db") as store:
         _, turn = start(store, tmp_path)
         for index in range(70):
             seed(
@@ -282,11 +304,12 @@ def test_runtime_verification_is_in_summary_input_and_searchable_archive(tmp_pat
     from agent_runtime.harness import RolloutContextManager
     from tests.agent.harness.test_compaction_consistency import long_history, start
 
-    with RuntimeState.open_sync(tmp_path / "verification.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "verification.db") as store:
         _, turn = start(store, tmp_path)
         _read(store, tmp_path, turn.turn_id, item_id=store.list_items(turn.turn_id)[0].item_id)
         operation = store.list_tool_operations(turn.turn_id)[0]
-        verification = store.record_verification(
+        verification = tool_ops.record_verification(
+            store,
             turn_id=turn.turn_id,
             operation_id=operation.operation_id,
             kind="inspection",

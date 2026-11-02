@@ -4,7 +4,14 @@ from dataclasses import replace
 import pytest
 
 from agent_runtime import Agent
-from agent_runtime.harness import GatewayHarnessModel, HarnessModelResponse, ModelToolCall, Session
+from agent_runtime.harness import (
+    GatewayHarnessModel,
+    HarnessModelResponse,
+    ModelToolCall,
+    Session,
+    memory_ops,
+    turn_ops,
+)
 from agent_runtime.harness.memory import MemoryConfig
 from agent_runtime.modeling.openai_wire import serialize_openai_request
 from tests.agent.harness.test_model_adapter import CapturingGateway, _resolved_model
@@ -93,7 +100,7 @@ async def test_context_changes_append_to_serialized_history(tmp_path, mode):
             (tmp_path / "pkg/AGENTS.md").write_text("nested rules v2")
         if mode == "memory_version":
             state = live.store.read_memory_state(tmp_path)
-            live.store.commit_memory_state(tmp_path, expected_version=state["version"], state=state)
+            memory_ops.commit_memory_state(live.store, tmp_path, expected_version=state["version"], state=state)
         await live.submit("second task")
         second = model.requests[-1]
         before, after = wire(last), wire(second)
@@ -130,11 +137,11 @@ async def test_context_changes_append_to_serialized_history(tmp_path, mode):
 @pytest.mark.anyio
 @pytest.mark.parametrize("change", ["delete", "disable", "disable_legacy_gap", "delete_legacy_enabled_gap"])
 async def test_memory_revocation_starts_a_new_context_window_and_survives_reopen(tmp_path, change):
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
     from agent_runtime.harness.memory_management import remember_memory
 
     database = tmp_path / "run.db"
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         remember_memory(store, tmp_path, key="secret", title="Sensitive heading", text="PRIVATE_MEMORY_BODY")
 
     class MemoryReader(Probe):
@@ -169,10 +176,13 @@ async def test_memory_revocation_starts_a_new_context_window_and_survives_reopen
                 if change == "delete_legacy_enabled_gap"
                 else {}
             )
-            gap = session.store.start_turn(
-                thread_id=thread_id, user_message="legacy intermediate task", binding_manifest=legacy_binding
+            gap = turn_ops.start_turn(
+                session.store,
+                thread_id=thread_id,
+                user_message="legacy intermediate task",
+                binding_manifest=legacy_binding,
             )
-            session.store.complete_turn(turn_id=gap.turn_id, answer="intermediate answer")
+            turn_ops.complete_turn(session.store, turn_id=gap.turn_id, answer="intermediate answer")
         config = (
             enabled
             if change in {"delete", "delete_legacy_enabled_gap"}
@@ -226,7 +236,9 @@ async def test_context_updates_survive_saved_request_replay_and_compaction(tmp_p
             assert wire(restored.model_request()) == wire(original)
         binding = {**original.binding_manifest, "context_capacity_policy": ContextCapacityPolicy().model_dump()}
         binding.pop("execution_ownership", None)
-        turn = session.store.start_turn(thread_id=session.thread_id, user_message="continue", binding_manifest=binding)
+        turn = turn_ops.start_turn(
+            session.store, thread_id=session.thread_id, user_message="continue", binding_manifest=binding
+        )
         manager = RolloutContextManager(session.store)
         source_hash, source = manager.semantic_source(turn.turn_id)
         assert "ROOT_BASELINE" in source
@@ -308,11 +320,11 @@ async def test_tool_discovery_survives_reopen_but_obeys_fork_cutoff(tmp_path):
 
 @pytest.mark.anyio
 async def test_memory_body_change_appends_navigation_even_when_title_is_unchanged(tmp_path):
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
     from agent_runtime.harness.memory_management import edit_memory, remember_memory
 
     database = tmp_path / "run.db"
-    async with (await RuntimeState.open(database)) as store:
+    async with await RuntimeStore.open(database) as store:
         remember_memory(store, tmp_path, key="runner", title="Runner", text="old body")
     model = Probe("answer")
     async with await Session.open(

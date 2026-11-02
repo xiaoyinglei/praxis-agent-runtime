@@ -12,6 +12,7 @@ import pytest
 from typer.testing import CliRunner
 
 from agent_runtime.git_delivery import GitDelivery
+from agent_runtime.harness import turn_ops
 from agent_runtime.worktrees import (
     PROVENANCE_RELATIVE_PATH,
     WorktreeError,
@@ -46,7 +47,10 @@ def worktrees_root(tmp_path: Path) -> Path:
 
 def _git(repo: Path, *arguments: str, check: bool = True) -> str:
     completed = subprocess.run(
-        ["git", "-C", str(repo), *arguments], capture_output=True, text=True, check=check,
+        ["git", "-C", str(repo), *arguments],
+        capture_output=True,
+        text=True,
+        check=check,
     )
     return completed.stdout
 
@@ -60,7 +64,8 @@ def _manager(repo: Path, root: Path) -> WorktreeManager:
 
 
 def test_create_builds_isolated_checkout_on_named_branch(
-    repo: Path, worktrees_root: Path,
+    repo: Path,
+    worktrees_root: Path,
 ) -> None:
     report = _manager(repo, worktrees_root).create("demo feature")
     worktree = report.worktree
@@ -119,7 +124,8 @@ def test_dirty_source_is_excluded_and_reported(repo: Path, worktrees_root: Path)
 
 
 def test_worktreeinclude_copies_matched_ignored_files_only(
-    repo: Path, worktrees_root: Path,
+    repo: Path,
+    worktrees_root: Path,
 ) -> None:
     (repo / ".worktreeinclude").write_text(".env\nconfig/\n")
     report = _manager(repo, worktrees_root).create("with-env")
@@ -131,7 +137,8 @@ def test_worktreeinclude_copies_matched_ignored_files_only(
 
 
 def test_git_delivery_from_worktree_inherits_real_base(
-    repo: Path, worktrees_root: Path,
+    repo: Path,
+    worktrees_root: Path,
 ) -> None:
     import asyncio
 
@@ -139,7 +146,10 @@ def test_git_delivery_from_worktree_inherits_real_base(
     worktree = manager.create("delivery").worktree
     # The worktree branch records the source branch as its delivery base.
     recorded = _git(
-        repo, "config", "--get", f"branch.{worktree.branch}.praxis-base",
+        repo,
+        "config",
+        "--get",
+        f"branch.{worktree.branch}.praxis-base",
     ).strip()
     assert recorded in {"main", "master"}
 
@@ -151,7 +161,10 @@ def test_git_delivery_from_worktree_inherits_real_base(
     # The delivery branch inherits the worktree's base, so /pull targets the
     # real upstream instead of the local worktree branch.
     delivery_base = _git(
-        repo, "config", "--get", f"branch.{result.branch}.praxis-base",
+        repo,
+        "config",
+        "--get",
+        f"branch.{result.branch}.praxis-base",
     ).strip()
     assert delivery_base in {"main", "master"}
     # Delivering does not advance the worktree branch: the checkout stays clean
@@ -185,7 +198,8 @@ def test_remove_clean_worktree_deletes_branch(repo: Path, worktrees_root: Path) 
 
 
 def test_remove_refuses_uncommitted_changes_without_force(
-    repo: Path, worktrees_root: Path,
+    repo: Path,
+    worktrees_root: Path,
 ) -> None:
     manager = _manager(repo, worktrees_root)
     worktree = manager.create("dirty").worktree
@@ -199,7 +213,8 @@ def test_remove_refuses_uncommitted_changes_without_force(
 
 
 def test_remove_refuses_unmerged_commits_without_force(
-    repo: Path, worktrees_root: Path,
+    repo: Path,
+    worktrees_root: Path,
 ) -> None:
     manager = _manager(repo, worktrees_root)
     worktree = manager.create("ahead").worktree
@@ -256,15 +271,17 @@ def test_cli_worktree_list_and_remove(repo: Path, worktrees_root: Path, monkeypa
 
 
 def test_remove_preserves_owned_turn_even_when_forced(repo: Path, worktrees_root: Path) -> None:
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
     from agent_runtime.harness.ownership import execution_owner
 
     manager = _manager(repo, worktrees_root)
     worktree = manager.create("running").worktree
     database = worktree.root / ".praxis" / "checkpoints.sqlite"
-    with RuntimeState.open_sync(database) as store:
-        thread = store.create_thread(workspace=worktree.root)
-        store.start_turn(thread_id=thread.thread_id, user_message="running", binding_manifest={"model_id": "test"})
+    with RuntimeStore.open_sync(database) as store:
+        thread = turn_ops.create_thread(store, workspace=worktree.root)
+        turn_ops.start_turn(
+            store, thread_id=thread.thread_id, user_message="running", binding_manifest={"model_id": "test"}
+        )
         with execution_owner(database, thread.thread_id):
             for force in (False, True):
                 with pytest.raises(WorktreeError):
@@ -292,8 +309,10 @@ async def test_open_session_protects_clean_checkout_until_close(repo: Path, work
     manager = _manager(repo, worktrees_root)
     worktree = manager.create("open-session").worktree
     async with await Session.open(
-        database=worktree.root / ".praxis" / "checkpoints.sqlite", workspace=worktree.root,
-        model=WriteThenAnswerModel(), completion_gate=AcceptAnswer(),
+        database=worktree.root / ".praxis" / "checkpoints.sqlite",
+        workspace=worktree.root,
+        model=WriteThenAnswerModel(),
+        completion_gate=AcceptAnswer(),
     ):
         with pytest.raises(WorktreeError):
             (await asyncio.to_thread(manager.remove, worktree.name))
@@ -303,7 +322,9 @@ async def test_open_session_protects_clean_checkout_until_close(repo: Path, work
 
 @pytest.mark.anyio
 async def test_subdirectory_session_with_external_database_protects_checkout(
-    repo: Path, worktrees_root: Path, tmp_path: Path,
+    repo: Path,
+    worktrees_root: Path,
+    tmp_path: Path,
 ) -> None:
     from agent_runtime.harness import Session
     from tests.agent.harness.test_approval_resume import AcceptAnswer, WriteThenAnswerModel
@@ -313,8 +334,10 @@ async def test_subdirectory_session_with_external_database_protects_checkout(
     subdirectory = worktree.root / "nested"
     subdirectory.mkdir()
     async with await Session.open(
-        database=tmp_path / "external.sqlite", workspace=subdirectory,
-        model=WriteThenAnswerModel(), completion_gate=AcceptAnswer(),
+        database=tmp_path / "external.sqlite",
+        workspace=subdirectory,
+        model=WriteThenAnswerModel(),
+        completion_gate=AcceptAnswer(),
     ):
         with pytest.raises(WorktreeError):
             (await asyncio.to_thread(manager.remove, worktree.name, force=True))
@@ -330,8 +353,10 @@ async def test_session_does_not_block_removing_an_idle_sibling_inside_repository
     busy = manager.create("busy").worktree
     idle = manager.create("idle").worktree
     async with await Session.open(
-        database=busy.root / ".praxis/checkpoints.sqlite", workspace=busy.root,
-        model=WriteThenAnswerModel(), completion_gate=AcceptAnswer(),
+        database=busy.root / ".praxis/checkpoints.sqlite",
+        workspace=busy.root,
+        model=WriteThenAnswerModel(),
+        completion_gate=AcceptAnswer(),
     ):
         assert (await asyncio.to_thread(manager.remove, idle.name)).branch_deleted
         assert busy.root.is_dir()
@@ -372,7 +397,9 @@ def test_prune_and_explicit_paths_stay_within_repository(repo: Path, worktrees_r
 
 
 def test_broken_foreign_repository_does_not_block_current_repository(
-    repo: Path, worktrees_root: Path, tmp_path: Path,
+    repo: Path,
+    worktrees_root: Path,
+    tmp_path: Path,
 ) -> None:
     import shutil
 
@@ -393,7 +420,8 @@ def test_broken_foreign_repository_does_not_block_current_repository(
 @pytest.mark.anyio
 @pytest.mark.skipif(sys.platform not in {"darwin", "linux"}, reason="requires native OS sandbox")
 async def test_worktree_git_reads_work_in_sandbox_without_source_or_metadata_writes(
-    repo: Path, worktrees_root: Path,
+    repo: Path,
+    worktrees_root: Path,
 ) -> None:
     from agent_runtime.tools.builtins.shell import create_run_command_tool
     from agent_runtime.workspace import open_workspace
@@ -408,9 +436,14 @@ async def test_worktree_git_reads_work_in_sandbox_without_source_or_metadata_wri
     assert output.exit_code != 0
     metadata = repo / ".git" / "config"
     before = metadata.read_bytes()
-    output = await tool.run(tool.validate_input({
-        "command": f"printf corrupted >> '{metadata}'", "workspace_write": True,
-    }))
+    output = await tool.run(
+        tool.validate_input(
+            {
+                "command": f"printf corrupted >> '{metadata}'",
+                "workspace_write": True,
+            }
+        )
+    )
     assert output.exit_code != 0
     assert metadata.read_bytes() == before
 
@@ -419,7 +452,10 @@ async def test_worktree_git_reads_work_in_sandbox_without_source_or_metadata_wri
 @pytest.mark.parametrize("entrypoint", ["sdk", "cli"])
 @pytest.mark.skipif(sys.platform not in {"darwin", "linux"}, reason="requires native OS sandbox")
 async def test_public_worktree_run_verifies_real_git_status(
-    repo: Path, worktrees_root: Path, monkeypatch, entrypoint: str,
+    repo: Path,
+    worktrees_root: Path,
+    monkeypatch,
+    entrypoint: str,
 ) -> None:
     from agent_runtime import Agent, cli
     from tests.agent.harness.test_macos_command_sessions import SessionCommandModel
@@ -427,8 +463,11 @@ async def test_public_worktree_run_verifies_real_git_status(
     command = "git status --porcelain"
     if entrypoint == "sdk":
         worktree = _manager(repo, worktrees_root).create("public-sdk").worktree
-        agent = Agent(workspace_path=worktree.root, checkpoint_db=worktree.root / ".praxis/checkpoints.sqlite",
-                      enable_workspace_mcp=False)
+        agent = Agent(
+            workspace_path=worktree.root,
+            checkpoint_db=worktree.root / ".praxis/checkpoints.sqlite",
+            enable_workspace_mcp=False,
+        )
         monkeypatch.setattr(agent, "_model_factory", lambda: SessionCommandModel(command))
         result = await agent.run("Inspect Git", allow_execute_tools=True, acceptance_command=command, max_steps=4)
         assert result.status == "done", result
@@ -447,10 +486,23 @@ async def test_public_worktree_run_verifies_real_git_status(
         # CliRunner owns its own event loop, as it does in a normal CLI process.
         import asyncio
 
-        result = await asyncio.to_thread(runner.invoke, cli.agent_app, [
-            "run", "Inspect Git", "--worktree-name", "public-cli", "--allow-execute-tools",
-            "--acceptance-command", command, "--max-steps", "4", "--non-interactive", "--disable-workspace-mcp",
-        ])
+        result = await asyncio.to_thread(
+            runner.invoke,
+            cli.agent_app,
+            [
+                "run",
+                "Inspect Git",
+                "--worktree-name",
+                "public-cli",
+                "--allow-execute-tools",
+                "--acceptance-command",
+                command,
+                "--max-steps",
+                "4",
+                "--non-interactive",
+                "--disable-workspace-mcp",
+            ],
+        )
         assert result.exit_code == 0, result.output
 
 
@@ -459,11 +511,13 @@ def test_linked_git_metadata_is_only_mounted_read_only_on_linux(repo: Path, work
 
     worktree = _manager(repo, worktrees_root).create("linux-metadata").worktree
     arguments = shell._linux_sandbox_argv(
-        workspace_root=worktree.root, temporary_root=tmp_path / "scratch", additional_read_roots=(),
+        workspace_root=worktree.root,
+        temporary_root=tmp_path / "scratch",
+        additional_read_roots=(),
     )
     common = str(repo / ".git")
     offset = arguments.index(common)
-    assert arguments[offset - 1:offset + 2] == ["--ro-bind", common, common]
+    assert arguments[offset - 1 : offset + 2] == ["--ro-bind", common, common]
     assert str(repo) not in arguments
     # A broken or forged backlink must never turn a .git pointer into a read grant.
     administrative = Path(_git(worktree.root, "rev-parse", "--absolute-git-dir").strip())
@@ -472,16 +526,16 @@ def test_linked_git_metadata_is_only_mounted_read_only_on_linux(repo: Path, work
 
 
 def test_remove_protects_sdk_store_at_arbitrary_location(repo, tmp_path, monkeypatch):
-    from agent_runtime.harness import RuntimeState
+    from agent_runtime.harness import RuntimeStore
 
     monkeypatch.setenv("PRAXIS_CONFIG_DIR", str(tmp_path / "host-config"))
     manager = WorktreeManager(repo, root=tmp_path / "trees")
     entry = manager.create("registered-store").worktree
     database = entry.root / ".praxis" / "custom-state" / "conversation.db"
-    with RuntimeState.open_sync(database) as store:
-        thread = store.create_thread(workspace=entry.root)
-        turn = store.start_turn(thread_id=thread.thread_id, user_message="unfinished", binding_manifest={})
-        store.pause_turn(turn_id=turn.turn_id, reason="waiting for user")
+    with RuntimeStore.open_sync(database) as store:
+        thread = turn_ops.create_thread(store, workspace=entry.root)
+        turn = turn_ops.start_turn(store, thread_id=thread.thread_id, user_message="unfinished", binding_manifest={})
+        turn_ops.pause_turn(store, turn_id=turn.turn_id, reason="waiting for user")
     with pytest.raises(WorktreeError, match="未结束"):
         manager.remove(entry.name)
     assert database.is_file()

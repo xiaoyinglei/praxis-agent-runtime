@@ -19,8 +19,8 @@ from agent_runtime.cli import (
     _print_chat_help,
     agent_app,
 )
-from agent_runtime.harness import RuntimeState
-from agent_runtime.harness.recovery import RecoveryPlan
+from agent_runtime.harness import RuntimeStore, turn_ops
+from agent_runtime.harness.recovery import ContinuationKind, RecoveryDecision
 from agent_runtime.result import AgentPause, AgentToolSummary
 from agent_runtime.streaming.events import (
     EventType,
@@ -109,9 +109,13 @@ def _render_recovery_commands(turn_id: str, checkpoint_db: Path) -> str:
             request,
             turn_id=turn_id,
             checkpoint_db=checkpoint_db,
-            recovery=RecoveryPlan(
-                turn_id=turn_id, status="paused", route="approval", actions=request.options,
-                reason_code="tool_approval_required", evidence_ids=(turn_id, request.request_id),
+            recovery=RecoveryDecision(
+                turn_id=turn_id,
+                status="paused",
+                kind=ContinuationKind.APPROVAL,
+                actions=request.options,
+                reason_code="tool_approval_required",
+                evidence_ids=(turn_id, request.request_id),
                 request_id=request.request_id,
             ).as_dict(),
         )
@@ -125,20 +129,21 @@ def run_smoke() -> CLISmokeResult:
         workspace = root / "workspace"
         workspace.mkdir()
         checkpoint_db = root / "agent.sqlite"
-        with RuntimeState.open_sync(checkpoint_db) as store:
-            thread = store.create_thread(workspace=workspace)
-            turn = store.start_turn(
+        with RuntimeStore.open_sync(checkpoint_db) as store:
+            thread = turn_ops.create_thread(store, workspace=workspace)
+            turn = turn_ops.start_turn(
+                store,
                 thread_id=thread.thread_id,
                 user_message="verify CLI projection",
                 binding_manifest={"model_id": "smoke-model"},
             )
-            turn = store.complete_turn(
+            turn = turn_ops.complete_turn(
+                store,
                 turn_id=turn.turn_id,
                 answer="CLI smoke fixture",
             )
             checks["model_binding"] = (
-                turn.binding_manifest.get("model_id") == "smoke-model"
-                and "model_alias" not in turn.binding_manifest
+                turn.binding_manifest.get("model_id") == "smoke-model" and "model_alias" not in turn.binding_manifest
             )
 
         rendered = asyncio.run(_render_canonical_events())

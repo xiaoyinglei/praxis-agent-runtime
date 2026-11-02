@@ -1,4 +1,5 @@
 """Source-preserving tabular inspection, with no implicit header inference."""
+
 from __future__ import annotations
 
 import hashlib
@@ -40,9 +41,13 @@ async def test_title_units_multilevel_headers_and_blank_rows_are_raw_cells(tmp_p
     grid = out["tables"][0]
     assert "headers" not in grid
     assert grid["rows"] == (
-        ("Quarterly report", "", ""), ("Unit: USD", "", ""),
-        ("", "Previous", "Current"), ("Product", "Revenue", "Revenue"),
-        ("A", "10", "20"), ("", "", ""), ("Notes", "provisional", ""),
+        ("Quarterly report", "", ""),
+        ("Unit: USD", "", ""),
+        ("", "Previous", "Current"),
+        ("Product", "Revenue", "Revenue"),
+        ("A", "10", "20"),
+        ("", "", ""),
+        ("Notes", "provisional", ""),
     )
     assert grid["row_numbers"] == tuple(range(1, 8))
     assert grid["column_numbers"] == (1, 2, 3)
@@ -54,7 +59,8 @@ async def test_title_units_multilevel_headers_and_blank_rows_are_raw_cells(tmp_p
 @pytest.mark.parametrize("extension,separator", [("csv", ","), ("tsv", "\t")])
 async def test_headerless_delimited_records_keep_first_record_and_blank_records(tmp_path, extension, separator):
     (tmp_path / f"raw.{extension}").write_text(
-        f'001{separator}NA\n\n002{separator}"two\nlines"\n', encoding="utf-8-sig",
+        f'001{separator}NA\n\n002{separator}"two\nlines"\n',
+        encoding="utf-8-sig",
     )
     out = await inspect(tmp_path, f"raw.{extension}")
     grid = out["tables"][0]
@@ -83,8 +89,9 @@ async def test_row_and_column_pages_retain_source_coordinates(tmp_path, extensio
     assert grid["next_row"] == 4
     assert grid["next_column"] == 4
     assert grid["truncated"] and out["truncated"]
-    tail = (await inspect(tmp_path, f"grid.{extension}", start_row=4, start_column=4,
-                          max_rows=2, max_columns=2))["tables"][0]
+    tail = (await inspect(tmp_path, f"grid.{extension}", start_row=4, start_column=4, max_rows=2, max_columns=2))[
+        "tables"
+    ][0]
     assert tail["rows"] == (("r4c4", "r4c5"), ("r5c4", "r5c5"))
     assert tail["next_row"] is None and tail["next_column"] is None
     assert tail["row_count"] == 5 and tail["column_count"] == 5
@@ -184,7 +191,7 @@ def test_public_entrypoints_preserve_raw_grid_in_model_request(tmp_path, monkeyp
 
     from agent_runtime import Agent
     from agent_runtime import cli as cli_module
-    from agent_runtime.harness import HarnessModelResponse, ModelToolCall, RuntimeState
+    from agent_runtime.harness import HarnessModelResponse, ModelToolCall, RuntimeStore
     from tests.agent.harness.test_subagent_budget import SmallAnswerModel
 
     class InspectModel(SmallAnswerModel):
@@ -193,20 +200,32 @@ def test_public_entrypoints_preserve_raw_grid_in_model_request(tmp_path, monkeyp
 
         def prepare(self, request):
             prepared = super().prepare(request)
-            return replace(prepared, dispatch_payload=request, request_ref={
-                **prepared.request_ref,
-                "toolset_revision": prepared.tool_hash,
-                "exposed_tool_names": [tool.definition.name for tool in request.tools],
-            })
+            return replace(
+                prepared,
+                dispatch_payload=request,
+                request_ref={
+                    **prepared.request_ref,
+                    "toolset_revision": prepared.tool_hash,
+                    "exposed_tool_names": [tool.definition.name for tool in request.tools],
+                },
+            )
 
         async def dispatch(self, prepared, *, event_sink=None):
             messages = prepared.dispatch_payload.messages
             results = [m for m in messages if m.role == "tool"]
             if not results:
-                return HarnessModelResponse.from_parts(text="", provider_response_id="inspect", usage={
-                    "input_tokens": 2, "output_tokens": 3, "total_tokens": 5,
-                }, tool_calls=(ModelToolCall(id="inspect-call", name="inspect_data_file",
-                    arguments={"path": "source.xlsx"}),))
+                return HarnessModelResponse.from_parts(
+                    text="",
+                    provider_response_id="inspect",
+                    usage={
+                        "input_tokens": 2,
+                        "output_tokens": 3,
+                        "total_tokens": 5,
+                    },
+                    tool_calls=(
+                        ModelToolCall(id="inspect-call", name="inspect_data_file", arguments={"path": "source.xlsx"}),
+                    ),
+                )
             content = json.loads(results[-1].content)
             self.grid = content["structured_content"]["tables"][0]
             assert self.grid["rows"] == [["Report", ""], ["Unit: USD", ""], ["Item", "Value"], ["A", "7"]]
@@ -234,8 +253,9 @@ def test_public_entrypoints_preserve_raw_grid_in_model_request(tmp_path, monkeyp
     database = tmp_path / "rollout.sqlite"
     model = InspectModel()
     if entrypoint == "sdk":
-        agent = Agent(workspace_path=workspace_path, checkpoint_db=database, model_session_path=None,
-                      enable_workspace_mcp=False)
+        agent = Agent(
+            workspace_path=workspace_path, checkpoint_db=database, model_session_path=None, enable_workspace_mcp=False
+        )
         agent._model_factory = lambda: model
         result = asyncio.run(agent.run("Inspect source.xlsx", max_steps=3, max_tokens_total=1000))
         assert result.status == "done"
@@ -248,13 +268,25 @@ def test_public_entrypoints_preserve_raw_grid_in_model_request(tmp_path, monkeyp
             return agent
 
         monkeypatch.setattr(cli_module, "_create_agent_facade", facade)
-        result = CliRunner().invoke(cli_module.agent_app, [
-            "run", "Inspect source.xlsx", "--rollout-db", str(database), "--non-interactive",
-            "--no-web-tools", "--disable-workspace-mcp", "--max-steps", "3", "--max-tokens-total", "1000",
-        ])
+        result = CliRunner().invoke(
+            cli_module.agent_app,
+            [
+                "run",
+                "Inspect source.xlsx",
+                "--rollout-db",
+                str(database),
+                "--non-interactive",
+                "--no-web-tools",
+                "--disable-workspace-mcp",
+                "--max-steps",
+                "3",
+                "--max-tokens-total",
+                "1000",
+            ],
+        )
         assert result.exit_code == 0, result.output
     assert model.grid is not None
-    with RuntimeState.open_sync(database) as store:
+    with RuntimeStore.open_sync(database) as store:
         assert store.verify().valid
 
 
@@ -323,8 +355,7 @@ async def test_cell_budget_preserves_remaining_row_and_sheet_pages(tmp_path):
     assert sum(len(t["rows"]) * len(t["column_numbers"]) for t in out["tables"]) <= 2000
     assert out["tables"][0]["next_row"] == 21
     assert out["next_sheet_offset"] == 1 and out["truncated"]
-    tail = await inspect(tmp_path, "wide.xlsx", sheet_name=wb.active.title, start_row=21,
-                         max_rows=100, max_columns=100)
+    tail = await inspect(tmp_path, "wide.xlsx", sheet_name=wb.active.title, start_row=21, max_rows=100, max_columns=100)
     assert tail["tables"][0]["row_numbers"] == (21, 22, 23, 24, 25)
     assert tail["tables"][0]["next_row"] is None
 
@@ -336,8 +367,12 @@ async def test_old_inspection_execution_revision_cannot_be_restored(tmp_path):
 
     workspace = open_workspace(tmp_path)
     tool = _tools(workspace)["inspect_data_file"]
-    async with await Session.open(database=tmp_path / "history.sqlite", workspace=tmp_path,
-                                  model=SmallAnswerModel(), tools={"inspect_data_file": tool}) as runtime:
+    async with await Session.open(
+        database=tmp_path / "history.sqlite",
+        workspace=tmp_path,
+        model=SmallAnswerModel(),
+        tools={"inspect_data_file": tool},
+    ) as runtime:
         orchestrator = runtime.tool_orchestrator
         with pytest.raises(RuntimeError, match="original operation tool is unavailable: inspect_data_file"):
             orchestrator.restore_tools({"inspect_data_file": "builtin-inspect-data-file-v1"})

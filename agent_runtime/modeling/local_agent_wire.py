@@ -102,6 +102,7 @@ def render_local_agent_request(
     messages = []
     for message in request.messages:
         payload = dict(model_message_payload(message))
+        payload.pop("runtime_metadata", None)
         if message.role == "assistant":
             payload["body"] = tuple(
                 {key: value for key, value in output.items() if key != "provider_data"}
@@ -155,14 +156,13 @@ def render_local_agent_request(
     if request.settings.max_output_tokens is None:
         settings.pop("max_output_tokens", None)
     generation_options: dict[str, JsonValue] = {
-    "model": request.settings.model,
-    "temperature": float(request.settings.temperature),
-    "parallel_tool_calls": request.settings.parallel_tool_calls,}
+        "model": request.settings.model,
+        "temperature": float(request.settings.temperature),
+        "parallel_tool_calls": request.settings.parallel_tool_calls,
+    }
 
     if request.settings.max_output_tokens is not None:
-        generation_options["max_tokens"] = (
-            request.settings.max_output_tokens
-        )
+        generation_options["max_tokens"] = request.settings.max_output_tokens
     if request.settings.top_p is not None:
         generation_options["top_p"] = float(request.settings.top_p)
     if request.settings.seed is not None:

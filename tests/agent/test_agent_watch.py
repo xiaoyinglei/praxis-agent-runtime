@@ -10,14 +10,15 @@ from pytest import MonkeyPatch
 
 from agent_runtime.cli import _watch_command
 from agent_runtime.git_delivery import CheckRun, GitDelivery, PullRequestChecks
-from agent_runtime.harness import RuntimeState
+from agent_runtime.harness import RuntimeStore, turn_ops
 from agent_runtime.result import AgentResult, AgentUsage
 
 pytestmark = pytest.mark.anyio
 
 
-def _checks_report(overall: str, checks: tuple[CheckRun, ...],
-                   logs: tuple[tuple[str, str], ...] = ()) -> PullRequestChecks:
+def _checks_report(
+    overall: str, checks: tuple[CheckRun, ...], logs: tuple[tuple[str, str], ...] = ()
+) -> PullRequestChecks:
     return PullRequestChecks(
         branch="praxis/x",
         pull_request_url="https://github.com/o/r/pull/5",
@@ -58,10 +59,22 @@ class _FakeWatchFacade:
 
 def _result() -> AgentResult:
     return AgentResult(
-        answer="已修复超时处理。", status="done", files=(), tool_calls=(), evidence=(),
-        citations=(), usage=AgentUsage(), diagnostics=(), turn_id="turn_ci",
-        stop_reason=None, pause=None, workspace_path=None, groundedness=False,
-        insufficient_evidence=False, plan=None, plan_events=(),
+        answer="已修复超时处理。",
+        status="done",
+        files=(),
+        tool_calls=(),
+        evidence=(),
+        citations=(),
+        usage=AgentUsage(),
+        diagnostics=(),
+        turn_id="turn_ci",
+        stop_reason=None,
+        pause=None,
+        workspace_path=None,
+        groundedness=False,
+        insufficient_evidence=False,
+        plan=None,
+        plan_events=(),
     )
 
 
@@ -74,14 +87,15 @@ def workspace(tmp_path: Path) -> Path:
 
 
 def _seed_thread(workspace: Path, database: Path) -> str:
-    with RuntimeState.open_sync(database) as store:
-        thread = store.create_thread(workspace=workspace)
-        turn_id = store.start_turn(
+    with RuntimeStore.open_sync(database) as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn_id = turn_ops.start_turn(
+            store,
             thread_id=thread.thread_id,
             user_message="修复超时",
             binding_manifest={"model_id": "test-model"},
         ).turn_id
-        store.complete_turn(turn_id=turn_id, answer="done")
+        turn_ops.complete_turn(store, turn_id=turn_id, answer="done")
         return thread.thread_id
 
 
@@ -102,10 +116,14 @@ def _patch_delivery(
 
 
 async def test_watch_pass_reports_success_without_agent(
-    workspace: Path, tmp_path: Path, monkeypatch: MonkeyPatch,
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
 ) -> None:
     _patch_delivery(
-        monkeypatch, current="praxis/x", latest=None,
+        monkeypatch,
+        current="praxis/x",
+        latest=None,
         report=_checks_report("pass", (CheckRun("build", "pass", "CI", "u"),)),
     )
     submitted: list[tuple[str | None, str]] = []
@@ -114,19 +132,29 @@ async def test_watch_pass_reports_success_without_agent(
         lambda **kwargs: (_ for _ in ()).throw(AssertionError("pass must not open a model")),
     )
     code = await _watch_command(
-        workspace=workspace, checkpoint_db=tmp_path / "rollout.sqlite3", permissions=None,
-        approval_mode="auto", branch=None, thread_id=None,
-        timeout_seconds=60, poll_interval_seconds=5, fix=True,
+        workspace=workspace,
+        checkpoint_db=tmp_path / "rollout.sqlite3",
+        permissions=None,
+        approval_mode="auto",
+        branch=None,
+        thread_id=None,
+        timeout_seconds=60,
+        poll_interval_seconds=5,
+        fix=True,
     )
     assert code == 0
     assert submitted == []
 
 
 async def test_watch_failure_hands_report_to_latest_thread(
-    workspace: Path, tmp_path: Path, monkeypatch: MonkeyPatch,
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
 ) -> None:
     _patch_delivery(
-        monkeypatch, current="main", latest="praxis/x",
+        monkeypatch,
+        current="main",
+        latest="praxis/x",
         report=_checks_report(
             "fail",
             (CheckRun("build", "fail", "CI", "u"),),
@@ -134,16 +162,22 @@ async def test_watch_failure_hands_report_to_latest_thread(
         ),
     )
     database = tmp_path / "rollout.sqlite3"
-    thread_id = (await asyncio.to_thread(_seed_thread, workspace, database))
+    thread_id = await asyncio.to_thread(_seed_thread, workspace, database)
     submitted: list[tuple[str | None, str]] = []
     monkeypatch.setattr(
         "agent_runtime.cli._create_agent_facade",
         lambda **kwargs: _FakeWatchFacade(submitted, _result()),
     )
     code = await _watch_command(
-        workspace=workspace, checkpoint_db=database, permissions=None,
-        approval_mode="auto", branch=None, thread_id=None,
-        timeout_seconds=60, poll_interval_seconds=5, fix=True,
+        workspace=workspace,
+        checkpoint_db=database,
+        permissions=None,
+        approval_mode="auto",
+        branch=None,
+        thread_id=None,
+        timeout_seconds=60,
+        poll_interval_seconds=5,
+        fix=True,
     )
     assert code == 1
     assert len(submitted) == 1
@@ -155,42 +189,66 @@ async def test_watch_failure_hands_report_to_latest_thread(
 
 
 async def test_watch_no_fix_only_reports(
-    workspace: Path, tmp_path: Path, monkeypatch: MonkeyPatch,
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
 ) -> None:
     _patch_delivery(
-        monkeypatch, current="praxis/x", latest=None,
+        monkeypatch,
+        current="praxis/x",
+        latest=None,
         report=_checks_report("fail", (CheckRun("test", "fail", "CI", "u"),)),
     )
     submitted: list[tuple[str | None, str]] = []
     code = await _watch_command(
-        workspace=workspace, checkpoint_db=tmp_path / "rollout.sqlite3", permissions=None,
-        approval_mode="auto", branch=None, thread_id=None,
-        timeout_seconds=60, poll_interval_seconds=5, fix=False,
+        workspace=workspace,
+        checkpoint_db=tmp_path / "rollout.sqlite3",
+        permissions=None,
+        approval_mode="auto",
+        branch=None,
+        thread_id=None,
+        timeout_seconds=60,
+        poll_interval_seconds=5,
+        fix=False,
     )
     assert code == 1
     assert submitted == []
 
 
 async def test_watch_without_praxis_branch_is_refused(
-    workspace: Path, tmp_path: Path, monkeypatch: MonkeyPatch,
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
 ) -> None:
     _patch_delivery(
-        monkeypatch, current="main", latest=None,
+        monkeypatch,
+        current="main",
+        latest=None,
         report=_checks_report("pass", ()),
     )
     code = await _watch_command(
-        workspace=workspace, checkpoint_db=tmp_path / "rollout.sqlite3", permissions=None,
-        approval_mode="auto", branch=None, thread_id=None,
-        timeout_seconds=60, poll_interval_seconds=5, fix=True,
+        workspace=workspace,
+        checkpoint_db=tmp_path / "rollout.sqlite3",
+        permissions=None,
+        approval_mode="auto",
+        branch=None,
+        thread_id=None,
+        timeout_seconds=60,
+        poll_interval_seconds=5,
+        fix=True,
     )
     assert code == 2
 
 
 async def test_watch_pending_timeout_keeps_waiting_state(
-    workspace: Path, tmp_path: Path, monkeypatch: MonkeyPatch,
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
 ) -> None:
     _patch_delivery(
-        monkeypatch, current="praxis/x", latest=None,
+        monkeypatch,
+        current="praxis/x",
+        latest=None,
         report=_checks_report("pending", (CheckRun("build", "pending", "CI", "u"),)),
     )
     monkeypatch.setattr(
@@ -198,25 +256,41 @@ async def test_watch_pending_timeout_keeps_waiting_state(
         lambda **kwargs: (_ for _ in ()).throw(AssertionError("pending must not open a model")),
     )
     code = await _watch_command(
-        workspace=workspace, checkpoint_db=tmp_path / "rollout.sqlite3", permissions=None,
-        approval_mode="auto", branch=None, thread_id=None,
-        timeout_seconds=60, poll_interval_seconds=5, fix=True,
+        workspace=workspace,
+        checkpoint_db=tmp_path / "rollout.sqlite3",
+        permissions=None,
+        approval_mode="auto",
+        branch=None,
+        thread_id=None,
+        timeout_seconds=60,
+        poll_interval_seconds=5,
+        fix=True,
     )
     assert code == 2
 
 
 async def test_watch_failure_without_thread_reports_guidance(
-    workspace: Path, tmp_path: Path, monkeypatch: MonkeyPatch,
+    workspace: Path,
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
 ) -> None:
     _patch_delivery(
-        monkeypatch, current="praxis/x", latest=None,
+        monkeypatch,
+        current="praxis/x",
+        latest=None,
         report=_checks_report("fail", (CheckRun("build", "fail", "CI", "u"),)),
     )
     submitted: list[tuple[str | None, str]] = []
     code = await _watch_command(
-        workspace=workspace, checkpoint_db=tmp_path / "missing.sqlite3", permissions=None,
-        approval_mode="auto", branch=None, thread_id=None,
-        timeout_seconds=60, poll_interval_seconds=5, fix=True,
+        workspace=workspace,
+        checkpoint_db=tmp_path / "missing.sqlite3",
+        permissions=None,
+        approval_mode="auto",
+        branch=None,
+        thread_id=None,
+        timeout_seconds=60,
+        poll_interval_seconds=5,
+        fix=True,
     )
     assert code == 2
     assert submitted == []

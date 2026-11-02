@@ -16,7 +16,7 @@ from agent_runtime.budget.pricing import (
     estimated_model_cost_micros,
 )
 from agent_runtime.core.llm_registry import ResolvedModel
-from agent_runtime.core.messages import StopReason
+from agent_runtime.core.messages import StopReason, model_message_payload
 from agent_runtime.core.model_request import (
     ContextBlock,
     ModelRequest,
@@ -25,7 +25,10 @@ from agent_runtime.core.model_request import (
     build_model_request,
     build_stable_context,
     canonical_model_request_json,
+    freeze_json_mapping,
 )
+from agent_runtime.harness.control import ContextSnapshot
+from agent_runtime.harness.prepared_requests import decode_frozen_request, encode_frozen_request, restore_prepared_call
 from agent_runtime.harness.protocol import (
     ContextBudgetExceededError,
     ContextCompactionRequiredError,
@@ -33,25 +36,30 @@ from agent_runtime.harness.protocol import (
     HarnessModelResponse,
     ModelContextOverflowError,
     ModelDispatchCancelledError,
-    ModelDispatchOutcomeUnknownError,
     ModelDispatchPreflightError,
     ModelMessage,
     PreparedModelCall,
 )
-from agent_runtime.modeling.contracts import ContextCapacityPolicy, LLMCallStage, context_capacity_policy
+from agent_runtime.modeling.contracts import (
+    ContextCapacityPolicy,
+    LLMCallStage,
+    context_capacity_policy,
+    context_working_limit,
+)
 from agent_runtime.modeling.events import (
     ModelEvent,
     ModelEventSink,
     ModelStreamState,
     emit_model_event,
 )
+from agent_runtime.modeling.failures import ModelCallFailed, classify_model_failure
 from agent_runtime.modeling.gateway import (
     LLMContextOverflowError,
     _emit_complete_model_response,
     model_request_input_text,
 )
-from agent_runtime.modeling.local_agent_wire import render_local_agent_request
-from agent_runtime.modeling.openai_wire import serialize_openai_request, stable_prompt_cache_key
+from agent_runtime.modeling.local_agent_wire import LocalAgentWireRequest, render_local_agent_request
+from agent_runtime.modeling.openai_wire import OpenAIWireRequest, serialize_openai_request, stable_prompt_cache_key
 from agent_runtime.modeling.quota import ProviderQuotaPreflightError
 from agent_runtime.models import ModelControlPlane
 from agent_runtime.tools.tool import JsonValue
@@ -62,6 +70,7 @@ class _GatewayDispatch:
     request: ModelRequest
     wire_hash: str
     resolved: ResolvedModel
+    wire: OpenAIWireRequest | LocalAgentWireRequest
     stage: LLMCallStage = LLMCallStage.AGENT_STEP
 
 
@@ -88,13 +97,15 @@ class GatewayHarnessModel:
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
         if request.purpose not in {"agent_step", "context_summary", "memory_extract", "memory_consolidate"}:
             raise ValueError("unsupported model request purpose")
-        summary_fork = (request.purpose == "context_summary"
-                        and request.binding_manifest.get("summary_cache_fork") is True)
+        summary_fork = (
+            request.purpose == "context_summary" and request.binding_manifest.get("summary_cache_fork") is True
+        )
         # Keep the parent's tool choice as well as its schemas: providers can
         # render a different prefix for "none". Summary responses are data only;
-        # TurnExecutor rejects any returned tool calls before orchestration.
-        append_state = (request.binding_manifest.get("execution_context_policy", {})
-                        .get("cache_continuity") == "append-v1")
+        # TurnRunner rejects any returned tool calls before orchestration.
+        append_state = (
+            request.binding_manifest.get("execution_context_policy", {}).get("cache_continuity") == "append-v1"
+        )
         if summary_fork and not self._resolved.capabilities.supports_native_tools:
             raise ContextBudgetExceededError("Summary prefix forks require a native tool protocol.")
         if request.purpose != "agent_step" and request.tools and not summary_fork:
@@ -126,13 +137,16 @@ class GatewayHarnessModel:
         )
         clock = request.binding_manifest.get("runtime_clock")
         if request.purpose == "agent_step" and isinstance(clock, Mapping) and not append_state:
-            clock_blocks = (ContextBlock(
-                name="runtime_clock",
-                content="Current runtime clock facts:\n" + json.dumps(dict(clock), sort_keys=True) +
-                "\nUse these facts when interpreting relative dates and whether dates are past or future. "
-                "Saved messages describe their original time; do not treat their dates as current. "
-                "When the intended date or year is ambiguous, clarify it rather than silently moving it.",
-            ),)
+            clock_blocks = (
+                ContextBlock(
+                    name="runtime_clock",
+                    content="Current runtime clock facts:\n"
+                    + json.dumps(dict(clock), sort_keys=True)
+                    + "\nUse these facts when interpreting relative dates and whether dates are past or future. "
+                    "Saved messages describe their original time; do not treat their dates as current. "
+                    "When the intended date or year is ambiguous, clarify it rather than silently moving it.",
+                ),
+            )
         context = build_stable_context(
             instructions=(
                 (
@@ -156,10 +170,14 @@ class GatewayHarnessModel:
                 for index, message in enumerate(leading, start=1)
             ),
             initial_user_task=first.content,
-            transcript=(*messages[first_user_index + 1 :], *(
-                tuple(ModelMessage(role="context", body=cast(str, block.content)) for block in clock_blocks)
-                if dynamic_context else ()
-            )),
+            transcript=(
+                *messages[first_user_index + 1 :],
+                *(
+                    tuple(ModelMessage(role="context", body=cast(str, block.content)) for block in clock_blocks)
+                    if dynamic_context
+                    else ()
+                ),
+            ),
         )
         settings = _model_settings(self._resolved)
         effective_settings = None
@@ -174,21 +192,28 @@ class GatewayHarnessModel:
             and isinstance(policy.get("max_parallel_calls"), int)
         ):
             settings = replace(settings, parallel_tool_calls=policy["max_parallel_calls"] > 1)
-        stage = (LLMCallStage.LLM_SUMMARIZE if request.purpose.startswith("memory_") else
-                 LLMCallStage.CONTEXT_COMPACTION if request.purpose == "context_summary" else LLMCallStage.AGENT_STEP)
+        stage = (
+            LLMCallStage.LLM_SUMMARIZE
+            if request.purpose.startswith("memory_")
+            else LLMCallStage.CONTEXT_COMPACTION
+            if request.purpose == "context_summary"
+            else LLMCallStage.AGENT_STEP
+        )
         if request.purpose != "agent_step" and not summary_fork:
             options = dict(settings.provider_options)
             reasoning = self._resolved.capabilities.reasoning
             legacy = getattr(self._resolved.gateway, "agent_output_policy", None) is None
-            if ((reasoning is not None and reasoning.thinking_toggle == "thinking")
-                    or (legacy and reasoning is None and "thinking" in options)):
+            if (reasoning is not None and reasoning.thinking_toggle == "thinking") or (
+                legacy and reasoning is None and "thinking" in options
+            ):
                 options["thinking"] = {"type": "disabled"}
             template = options.get("chat_template_kwargs")
-            if ((reasoning is not None and reasoning.thinking_toggle == "chat_template_kwargs")
-                    or (legacy and reasoning is None and isinstance(template, Mapping)
-                        and "enable_thinking" in template)):
+            if (reasoning is not None and reasoning.thinking_toggle == "chat_template_kwargs") or (
+                legacy and reasoning is None and isinstance(template, Mapping) and "enable_thinking" in template
+            ):
                 options["chat_template_kwargs"] = {
-                    **(dict(template) if isinstance(template, Mapping) else {}), "enable_thinking": False,
+                    **(dict(template) if isinstance(template, Mapping) else {}),
+                    "enable_thinking": False,
                 }
             settings = replace(settings, provider_options=options)
         effective_budget = getattr(self._resolved.gateway, "effective_stage_budget", None)
@@ -226,13 +251,16 @@ class GatewayHarnessModel:
             capacity_policy=context_capacity_policy(request.binding_manifest)
             or getattr(self._resolved.gateway, "context_policy", None),
             append_state=append_state,
-            include_input_status=(request.binding_manifest.get("execution_context_policy", {})
-                                  .get("revision") != "working-context-v2"),
+            auto_compact_token_limit=context_working_limit(request.binding_manifest),
+            include_input_status=(
+                request.binding_manifest.get("execution_context_policy", {}).get("revision") != "working-context-v2"
+            ),
             supported_cache_parameters=self._resolved.capabilities.supported_cache_parameters if append_state else (),
         )
         request_hash = hashlib.sha256(canonical_model_request_json(canonical_request).encode()).hexdigest()
         context_hash = hashlib.sha256(context.context_revision.encode()).hexdigest()
         tool_hash = hashlib.sha256(canonical_request.toolset_revision.encode()).hexdigest()
+        wire: OpenAIWireRequest | LocalAgentWireRequest
         if self._resolved.provider in {"mlx", "ollama"} and not self._resolved.capabilities.supports_native_tools:
             local_wire = render_local_agent_request(
                 canonical_request,
@@ -240,10 +268,15 @@ class GatewayHarnessModel:
             )
             wire_hash = local_wire.provider_wire_hash
             serializer_revision = local_wire.serializer_revision
+            wire = local_wire
         else:
             openai_wire = serialize_openai_request(canonical_request)
+            # The first dispatch and restored dispatch share the same canonical
+            # key ordering, so the SDK emits identical JSON bodies on replay.
+            openai_wire = replace(openai_wire, payload=freeze_json_mapping(json.loads(openai_wire.serialized_json)))
             wire_hash = openai_wire.provider_wire_hash
             serializer_revision = openai_wire.serializer_revision
+            wire = openai_wire
         resource_request, pricing_known = _model_resource_request(
             request=canonical_request,
             settings=settings,
@@ -251,7 +284,7 @@ class GatewayHarnessModel:
             stage=stage,
             require_pricing=(request.binding_manifest.get("model_cost_budget_total_micros") is not None),
         )
-        return PreparedModelCall(
+        prepared = PreparedModelCall(
             request_hash=request_hash,
             context_hash=context_hash,
             tool_hash=tool_hash,
@@ -260,9 +293,20 @@ class GatewayHarnessModel:
                 "model_id": self._model_id,
                 **({"effective_settings": effective_settings} if effective_settings is not None else {}),
                 "purpose": request.purpose,
-                **({"runtime_input_update": context.transcript[-1].content}
-                   if append_state and context.transcript
-                   and context.transcript[-1].content.startswith("Runtime input limits:\n") else {}),
+                **(
+                    {"runtime_input_update": context.transcript[-1].content}
+                    if append_state
+                    and context.transcript
+                    and context.transcript[-1].runtime_metadata.get("kind") == "input_limits"
+                    else {}
+                ),
+                **(
+                    {"runtime_input_message": model_message_payload(context.transcript[-1])}
+                    if append_state
+                    and context.transcript
+                    and context.transcript[-1].runtime_metadata.get("kind") == "input_limits"
+                    else {}
+                ),
                 "request_id": canonical_request.request_id,
                 "prompt_revision": canonical_request.prompt_revision,
                 "toolset_revision": canonical_request.toolset_revision,
@@ -276,10 +320,13 @@ class GatewayHarnessModel:
                 "pricing_known": pricing_known,
                 "continuation_summary_role": summary_role,
                 "reserved_cost_micros": resource_request.cost_micros,
-                "serialized_input_bytes": len(model_request_input_text(
-                    canonical_request, provider=self._resolved.provider,
-                    supports_native_tools=self._resolved.capabilities.supports_native_tools,
-                ).encode("utf-8")),
+                "serialized_input_bytes": len(
+                    model_request_input_text(
+                        canonical_request,
+                        provider=self._resolved.provider,
+                        supports_native_tools=self._resolved.capabilities.supports_native_tools,
+                    ).encode("utf-8")
+                ),
                 **({"context_projection": context_projection} if context_projection is not None else {}),
             },
             resource_request=resource_request,
@@ -287,7 +334,37 @@ class GatewayHarnessModel:
                 request=canonical_request,
                 wire_hash=wire_hash,
                 resolved=self._resolved,
+                wire=wire,
                 stage=stage,
+            ),
+        )
+        return replace(
+            prepared,
+            frozen_payload=encode_frozen_request(
+                request=canonical_request,
+                context=context,
+                wire=wire,
+                prepared=prepared,
+                provider=self._resolved.provider,
+                stage=stage.value,
+            ),
+        )
+
+    def replay(self, payload: Mapping[str, Any], *, request: HarnessModelRequest) -> PreparedModelCall:
+        canonical, wire = decode_frozen_request(payload)
+        expected_id = request.request_id or f"{request.turn_id}:step:{request.step}"
+        if canonical.request_id != expected_id:
+            raise ValueError("frozen request belongs to another operation")
+        if payload["provider"] != self._resolved.provider or canonical.settings.model != self._resolved.model_id:
+            raise ValueError("frozen request belongs to another model endpoint")
+        return restore_prepared_call(
+            payload,
+            dispatch_payload=_GatewayDispatch(
+                request=canonical,
+                wire_hash=wire.provider_wire_hash,
+                wire=wire,
+                resolved=self._resolved,
+                stage=LLMCallStage(payload["stage"]),
             ),
         )
 
@@ -314,6 +391,7 @@ class GatewayHarnessModel:
             response = await gateway.agenerate_model_request(
                 stage=payload.stage,
                 request=payload.request,
+                frozen_wire=payload.wire,
                 provider=resolved.provider,
                 supports_native_tools=resolved.capabilities.supports_native_tools,
                 stream=event_sink is not None,
@@ -333,67 +411,65 @@ class GatewayHarnessModel:
             if current is not None and current.cancelling():
                 raise
             raise ModelDispatchCancelledError("provider acknowledged model cancellation") from exc
-        except BaseException as exc:
-            body = getattr(exc, "body", None)
-            code = getattr(exc, "code", None)
-            if isinstance(body, Mapping):
-                error = body.get("error", body)
-                if isinstance(error, Mapping):
-                    code = error.get("code", code)
-            if getattr(exc, "status_code", None) == 400 and code in {
+        except Exception as exc:
+            if getattr(exc, "status_code", None) == 400 and getattr(exc, "code", None) in {
                 "context_length_exceeded",
                 "context_window_exceeded",
             }:
-                raise ModelContextOverflowError(str(exc)) from exc
-            if _is_uncertain_transport_failure(exc):
-                raise ModelDispatchOutcomeUnknownError(str(exc).strip() or type(exc).__name__) from exc
-            raise
-        if response.provider_wire_hash != payload.wire_hash:
-            raise RuntimeError("provider wire changed between prepare and dispatch")
-        if event_sink is not None:
-            if not stream_state.started:
-                await _emit_complete_model_response(forward_event, response)
-            if not stream_state.completed:
-                raise ModelDispatchOutcomeUnknownError("model stream ended without a terminal response")
-            if stream_state.outputs != response.outputs:
-                raise RuntimeError("model stream output snapshots disagree with the terminal response")
-            if stream_state.provider_response_id != response.provider_response_id:
-                raise RuntimeError("model stream response identity disagrees with the terminal response")
-        turn = response.turn
-        incomplete = response.stop_reason in {StopReason.MAX_TOKENS, StopReason.INCOMPLETE}
-        if not incomplete:
-            if response.stop_reason is StopReason.TOOL_USE and not turn.tool_calls:
-                raise RuntimeError("tool-use stop reason did not include tool calls")
-            if response.stop_reason is StopReason.END_TURN and any(
-                output.kind == "tool_call" for output in response.outputs
-            ):
-                raise RuntimeError("end-turn response unexpectedly included tool calls")
-            if not turn.text.strip() and not turn.tool_calls:
-                raise RuntimeError("model returned neither text nor tool calls")
-        result = HarnessModelResponse(
-            provider_response_id=response.provider_response_id,
-            usage=_priced_usage_payload(response.usage.model_dump(mode="json"), resolved),
-            outputs=response.outputs,
-            stop_reason=response.raw_stop_reason or response.stop_reason.value,
-            status="incomplete" if incomplete else "completed",
-            incomplete_reason=(
-                "max_output_tokens"
-                if response.stop_reason is StopReason.MAX_TOKENS
-                else response.raw_stop_reason or "unknown"
+                raise ModelContextOverflowError(
+                    "Provider context window exceeded.",
+                    failure=classify_model_failure(exc, output_started=bool(stream_state.outputs)),
+                ) from None
+            raise ModelCallFailed(classify_model_failure(exc, output_started=bool(stream_state.outputs))) from None
+        try:
+            if response.provider_wire_hash != payload.wire_hash:
+                raise RuntimeError("provider wire changed between prepare and dispatch")
+            if event_sink is not None:
+                if not stream_state.started:
+                    await _emit_complete_model_response(forward_event, response)
+                if not stream_state.completed:
+                    raise ConnectionError("model stream ended without a terminal response")
+                if stream_state.outputs != response.outputs:
+                    raise RuntimeError("model stream output snapshots disagree with the terminal response")
+                if stream_state.provider_response_id != response.provider_response_id:
+                    raise RuntimeError("model stream response identity disagrees with the terminal response")
+            turn = response.turn
+            incomplete = response.stop_reason in {StopReason.MAX_TOKENS, StopReason.INCOMPLETE}
+            if not incomplete:
+                if response.stop_reason is StopReason.TOOL_USE and not turn.tool_calls:
+                    raise RuntimeError("tool-use stop reason did not include tool calls")
+                if response.stop_reason is StopReason.END_TURN and any(
+                    output.kind == "tool_call" for output in response.outputs
+                ):
+                    raise RuntimeError("end-turn response unexpectedly included tool calls")
+                if not turn.text.strip() and not turn.tool_calls:
+                    raise RuntimeError("model returned neither text nor tool calls")
+            result = HarnessModelResponse(
+                provider_response_id=response.provider_response_id,
+                usage=_priced_usage_payload(response.usage.model_dump(mode="json"), resolved),
+                outputs=response.outputs,
+                stop_reason=response.raw_stop_reason or response.stop_reason.value,
+                status="incomplete" if incomplete else "completed",
+                incomplete_reason=(
+                    "max_output_tokens"
+                    if response.stop_reason is StopReason.MAX_TOKENS
+                    else response.raw_stop_reason or "unknown"
+                )
+                if incomplete
+                else None,
             )
-            if incomplete
-            else None,
-        )
-        if event_sink is not None:
-            stream_state.validate_response(
-                outputs=result.outputs,
-                provider_response_id=result.provider_response_id,
-                usage=result.usage,
-                status=result.status,
-                incomplete_reason=result.incomplete_reason,
-                stop_reason=result.stop_reason,
-            )
-        return result
+            if event_sink is not None:
+                stream_state.validate_response(
+                    outputs=result.outputs,
+                    provider_response_id=result.provider_response_id,
+                    usage=result.usage,
+                    status=result.status,
+                    incomplete_reason=result.incomplete_reason,
+                    stop_reason=result.stop_reason,
+                )
+            return result
+        except Exception as exc:
+            raise ModelCallFailed(classify_model_failure(exc, output_started=bool(stream_state.outputs))) from None
 
 
 class ControlPlaneHarnessModel:
@@ -456,6 +532,19 @@ class ControlPlaneHarnessModel:
             instructions=self._instructions,
         ).prepare(request)
 
+    def replay(self, payload: Mapping[str, Any], *, request: HarnessModelRequest) -> PreparedModelCall:
+        binding = _authenticated_model_binding(request.binding_manifest)
+        resolved = self._resolve_frozen(binding, thread_id=request.thread_id, turn_id=request.turn_id)
+        envelope = binding["binding"]
+        if not isinstance(envelope, Mapping):
+            raise RuntimeError("validated model binding envelope changed type")
+        model_id = envelope["model_id"]
+        if not isinstance(model_id, str):
+            raise RuntimeError("validated model ID changed type")
+        return GatewayHarnessModel(model_id=model_id, resolved=resolved, instructions=self._instructions).replay(
+            payload, request=request
+        )
+
     def _resolve_frozen(
         self,
         binding: Mapping[str, JsonValue],
@@ -517,24 +606,6 @@ def _authenticated_model_binding(
     )
 
 
-def _is_uncertain_transport_failure(error: BaseException) -> bool:
-    if isinstance(error, (ConnectionError, TimeoutError)):
-        return True
-    error_type = type(error)
-    return (error_type.__module__, error_type.__name__) in {
-        ("openai", "APIConnectionError"),
-        ("openai", "APITimeoutError"),
-        ("httpx", "ConnectError"),
-        ("httpx", "ConnectTimeout"),
-        ("httpx", "ReadError"),
-        ("httpx", "ReadTimeout"),
-        ("httpcore", "ConnectError"),
-        ("httpcore", "ConnectTimeout"),
-        ("httpcore", "ReadError"),
-        ("httpcore", "ReadTimeout"),
-    }
-
-
 def _model_messages(
     messages: tuple[ModelMessage, ...],
     *,
@@ -560,7 +631,9 @@ def _model_messages(
 
 
 def _request_settings(
-    request: HarnessModelRequest, resolved: ResolvedModel, settings: ModelSettings,
+    request: HarnessModelRequest,
+    resolved: ResolvedModel,
+    settings: ModelSettings,
 ) -> tuple[ModelSettings, dict[str, Any]]:
     from agent_runtime.core.generation_settings import ModelRequestPreferences, ReasoningCapabilities
 
@@ -584,8 +657,10 @@ def _request_settings(
         options["thinking"] = {"type": "disabled" if effort == "off" else "enabled"}
     elif effort is not None and reasoning.thinking_toggle == "chat_template_kwargs":
         template = options.get("chat_template_kwargs", {})
-        options["chat_template_kwargs"] = {**(dict(template) if isinstance(template, Mapping) else {}),
-                                           "enable_thinking": effort != "off"}
+        options["chat_template_kwargs"] = {
+            **(dict(template) if isinstance(template, Mapping) else {}),
+            "enable_thinking": effort != "off",
+        }
     fallback = resolved.gateway.stage_budget(LLMCallStage.AGENT_STEP).max_output_tokens
     requested = preferences.max_output_tokens or defaults.max_output_tokens or fallback
     output = requested
@@ -593,8 +668,11 @@ def _request_settings(
     if resolved.capabilities.max_output_tokens is not None and output > resolved.capabilities.max_output_tokens:
         output = resolved.capabilities.max_output_tokens
         constraints.append("model_max_output_tokens")
-    window_limit = resolved.capabilities.context_window_tokens - resolved.gateway.stage_budget(
-        LLMCallStage.AGENT_STEP).safety_margin_tokens - 1
+    window_limit = (
+        resolved.capabilities.context_window_tokens
+        - resolved.gateway.stage_budget(LLMCallStage.AGENT_STEP).safety_margin_tokens
+        - 1
+    )
     if output > window_limit:
         output = window_limit
         constraints.append("model_context_window")
@@ -604,8 +682,13 @@ def _request_settings(
         "reasoning_source": "user" if preferences.reasoning_effort else "model_default",
         "requested_output_tokens": requested,
         "max_output_tokens": output,
-        "output_source": ("user" if preferences.max_output_tokens else
-                          "model_default" if defaults.max_output_tokens else "conservative_fallback"),
+        "output_source": (
+            "user"
+            if preferences.max_output_tokens
+            else "model_default"
+            if defaults.max_output_tokens
+            else "conservative_fallback"
+        ),
         "output_constraints": constraints,
     }
 
@@ -732,6 +815,7 @@ def _budgeted_request(
     input_token_limit: int | None = None,
     capacity_policy: ContextCapacityPolicy | None = None,
     append_state: bool = False,
+    auto_compact_token_limit: int | None = None,
     include_input_status: bool = True,
     supported_cache_parameters: tuple[str, ...] = (),
 ) -> tuple[StableModelContext, ModelRequest, Mapping[str, Any] | None]:
@@ -744,7 +828,8 @@ def _budgeted_request(
         )
         if "prompt_cache_key" in supported_cache_parameters:
             canonical = build_model_request(
-                request_id=request_id, context=candidate,
+                request_id=request_id,
+                context=candidate,
                 selected_tools=selected_tools,  # type: ignore[arg-type]
                 settings=replace(settings, cache_parameters={"prompt_cache_key": stable_prompt_cache_key(canonical)}),
             )
@@ -780,6 +865,10 @@ def _budgeted_request(
     if capacity_policy is not None:
         window = resolved.capabilities.context_window_tokens
         auto_limit = min(effective_input_limit, window * 9 // 10)
+        if auto_compact_token_limit is not None:
+            if type(auto_compact_token_limit) is not int or auto_compact_token_limit < 1:
+                raise ValueError("auto_compact_token_limit must be a positive integer")
+            auto_limit = min(auto_limit, auto_compact_token_limit)
         configured = gateway.stage_budget(stage) if callable(getattr(gateway, "stage_budget", None)) else None
         policy_fields = {
             "model_context_tokens": window,
@@ -794,23 +883,47 @@ def _budgeted_request(
             "policy_revision": capacity_policy.revision,
             "trigger_reason": None,
         }
-        if stage == LLMCallStage.AGENT_STEP and input_token_limit is None:
-            max_input_tokens = auto_limit
         if stage == LLMCallStage.AGENT_STEP and include_input_status:
-            input_status = "Runtime input limits:\n" + json.dumps({key: policy_fields[key] for key in (
-                "model_context_tokens", "explicit_input_cap", "effective_input_limit",
-                "auto_compact_limit", "post_compact_target",
-            )}, sort_keys=True)
-            previous_status = next((m.content for m in reversed(context.transcript)
-                                    if m.content.startswith("Runtime input limits:\n")), None)
-            append_input_status = not append_state or input_status != previous_status
+            input_status = "Runtime input limits:\n" + json.dumps(
+                {
+                    key: policy_fields[key]
+                    for key in (
+                        "model_context_tokens",
+                        "explicit_input_cap",
+                        "effective_input_limit",
+                        "auto_compact_limit",
+                        "post_compact_target",
+                    )
+                },
+                sort_keys=True,
+            )
+            visible_limits = ContextSnapshot.from_messages(context.transcript).input_limits
+            status_fields = {
+                key: policy_fields[key]
+                for key in (
+                    "model_context_tokens",
+                    "explicit_input_cap",
+                    "effective_input_limit",
+                    "auto_compact_limit",
+                    "post_compact_target",
+                )
+            }
+            append_input_status = not append_state or visible_limits != status_fields
         else:
             append_input_status = False
         if append_input_status:
             context = build_stable_context(
-                instructions=context.instructions, frozen_run_context=context.frozen_run_context,
+                instructions=context.instructions,
+                frozen_run_context=context.frozen_run_context,
                 initial_user_task=context.initial_user_task,
-                transcript=(*context.transcript, ModelMessage(role="context", body=input_status)),
+                transcript=(
+                    *context.transcript,
+                    ModelMessage(
+                        role="context",
+                        body=input_status,
+                        runtime_metadata={"kind": "input_limits", "limits": status_fields},
+                    ),
+                ),
             )
     if input_token_limit is not None:
         max_input_tokens = min(max_input_tokens, input_token_limit)
@@ -830,6 +943,7 @@ def _budgeted_request(
                     else "external_counter"
                 ),
                 **policy_fields,
+                "soft_limit_exceeded": input_tokens > policy_fields.get("auto_compact_limit", max_input_tokens),
             },
         )
 

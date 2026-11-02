@@ -45,10 +45,12 @@ from agent_runtime.modeling.events import (
     validate_model_outputs,
 )
 from agent_runtime.modeling.local_agent_wire import (
+    LocalAgentWireRequest,
     parse_local_agent_response,
     render_local_agent_request,
 )
 from agent_runtime.modeling.openai_wire import (
+    OpenAIWireRequest,
     parse_openai_response,
     parse_openai_usage,
     serialize_openai_request,
@@ -319,6 +321,7 @@ class LLMGateway:
         ledger: AsyncBudgetLedger | None = None,
         lease_id: str | None = None,
         inherit_budget_ledger: bool = True,
+        frozen_wire: OpenAIWireRequest | LocalAgentWireRequest | None = None,
     ) -> AgentModelResponse:
         """Serialize and execute one already-selected canonical agent request."""
 
@@ -332,7 +335,9 @@ class LLMGateway:
             raise TypeError("stream must be a bool")
 
         if provider in {"mlx", "ollama"} and not supports_native_tools:
-            local_wire = render_local_agent_request(request, provider=provider)
+            if frozen_wire is not None and not isinstance(frozen_wire, LocalAgentWireRequest):
+                raise TypeError("frozen wire does not match local provider protocol")
+            local_wire = frozen_wire or render_local_agent_request(request, provider=provider)
             budget, stage_kwargs, input_tokens, reservation = self._prepare_call(
                 stage=stage,
                 prompt=local_wire.prompt,
@@ -383,7 +388,9 @@ class LLMGateway:
                 await _emit_complete_model_response(event_sink, response)
             return response
 
-        wire = serialize_openai_request(request)
+        if frozen_wire is not None and not isinstance(frozen_wire, OpenAIWireRequest):
+            raise TypeError("frozen wire does not match OpenAI provider protocol")
+        wire = frozen_wire or serialize_openai_request(request)
         payload = _plain_wire_mapping(wire.payload)
         messages = _plain_wire_sequence(payload.get("messages", []), field_name="messages")
         tools = _plain_wire_sequence(payload.get("tools", []), field_name="tools")
@@ -393,7 +400,11 @@ class LLMGateway:
             if key not in {"model", "messages", "tools", "max_completion_tokens"}
         }
         if request.settings.provider_options:
-            provider_kwargs["extra_body"] = {key: provider_kwargs.pop(key) for key in request.settings.provider_options}
+            # Initial settings and artifact-restored settings may have different
+            # insertion order. Keep the SDK's merged extension bytes stable too.
+            provider_kwargs["extra_body"] = {
+                key: provider_kwargs.pop(key) for key in sorted(request.settings.provider_options)
+            }
         max_completion_tokens = payload.get("max_completion_tokens")
         if isinstance(max_completion_tokens, int):
             # Route the canonical request limit through the gateway so context
@@ -592,7 +603,6 @@ class LLMGateway:
             stage=stage,
         )
 
-
     async def astream_with_tools(
         self,
         *,
@@ -650,9 +660,7 @@ class LLMGateway:
                     required_tokens=reservation,
                 )
 
-        bridge: thread_queue.Queue[StreamChunk] = thread_queue.Queue(
-            maxsize=_PROVIDER_BRIDGE_MAXSIZE
-        )
+        bridge: thread_queue.Queue[StreamChunk] = thread_queue.Queue(maxsize=_PROVIDER_BRIDGE_MAXSIZE)
         stop_producer = threading.Event()
         producer_done = threading.Event()
         producer_error: list[BaseException] = []
@@ -819,10 +827,12 @@ class LLMGateway:
             # retain the agent cap and the configured summary output allowance.
             agent = self._stage_budget(LLMCallStage.AGENT_STEP)
             summary = self._stage_budget(LLMCallStage.LLM_SUMMARIZE)
-            return summary.model_copy(update={
-                "max_input_tokens": agent.max_input_tokens if self.context_policy is None else None,
-                "safety_margin_tokens": max(agent.safety_margin_tokens, summary.safety_margin_tokens),
-            })
+            return summary.model_copy(
+                update={
+                    "max_input_tokens": agent.max_input_tokens if self.context_policy is None else None,
+                    "safety_margin_tokens": max(agent.safety_margin_tokens, summary.safety_margin_tokens),
+                }
+            )
         try:
             return self._stage_budgets[stage]
         except KeyError as exc:
@@ -951,9 +961,7 @@ class LLMGateway:
 
         if callable(stream_with_tools):
             # 真流式路径
-            for chunk in stream_with_tools(
-                messages=messages, tools=tools, **kwargs
-            ):
+            for chunk in stream_with_tools(messages=messages, tools=tools, **kwargs):
                 if stop_event.is_set():
                     return
                 if isinstance(chunk, StreamChunk):
@@ -968,40 +976,52 @@ class LLMGateway:
             raw = result.value
             turn = parse_openai_response(raw)
             outputs = _outputs_from_chat_response(raw, turn)
-            if not put(StreamChunk(
-                type="response_start", provider_response_id=_provider_field(raw, "id"),
-            )):
+            if not put(
+                StreamChunk(
+                    type="response_start",
+                    provider_response_id=_provider_field(raw, "id"),
+                )
+            ):
                 return
             delta_types = {
-                "text": "text_delta", "reasoning": "thinking_delta", "refusal": "refusal_delta",
+                "text": "text_delta",
+                "reasoning": "thinking_delta",
+                "refusal": "refusal_delta",
             }
             for output in outputs:
-                if not put(StreamChunk(
-                    type="tool_use_start" if output.kind == "tool_call" else "content_block_start",
-                    output_id=output.output_id,
-                    output_kind=output.kind,
-                    tool_id=output.tool_call_id or "",
-                    tool_name=output.tool_name or "",
-                    provider_data=output.provider_data,
-                )):
+                if not put(
+                    StreamChunk(
+                        type="tool_use_start" if output.kind == "tool_call" else "content_block_start",
+                        output_id=output.output_id,
+                        output_kind=output.kind,
+                        tool_id=output.tool_call_id or "",
+                        tool_name=output.tool_name or "",
+                        provider_data=output.provider_data,
+                    )
+                ):
                     return
-                if output.content and not put(StreamChunk(
-                    type="tool_input_delta" if output.kind == "tool_call" else delta_types[output.kind],
-                    output_id=output.output_id,
-                    content=output.content,
-                )):
+                if output.content and not put(
+                    StreamChunk(
+                        type="tool_input_delta" if output.kind == "tool_call" else delta_types[output.kind],
+                        output_id=output.output_id,
+                        content=output.content,
+                    )
+                ):
                     return
                 if not put(StreamChunk(type="content_block_stop", output_id=output.output_id)):
                     return
-            put(StreamChunk(
-                type="message_stop",
-                stop_reason=turn.raw_stop_reason,
-                usage=result.usage,
-            ))
+            put(
+                StreamChunk(
+                    type="message_stop",
+                    stop_reason=turn.raw_stop_reason,
+                    usage=result.usage,
+                )
+            )
 
 
 def _openai_output_parts(response: object) -> tuple[str, ...]:
     """Visible generated channels, including tool fragments from incomplete steps."""
+
     def field(value: object, name: str, default: object = None) -> Any:
         return value.get(name, default) if isinstance(value, Mapping) else getattr(value, name, default)
 
@@ -1009,8 +1029,7 @@ def _openai_output_parts(response: object) -> tuple[str, ...]:
     if not choices:
         return ()
     message = field(choices[0], "message")
-    parts = [field(message, "content", ""),
-             field(message, "reasoning_content") or field(message, "reasoning", "")]
+    parts = [field(message, "content", ""), field(message, "reasoning_content") or field(message, "reasoning", "")]
     for call in field(message, "tool_calls", ()) or ():
         function = field(call, "function")
         parts.extend((field(function, "name", ""), field(function, "arguments", "")))
@@ -1036,9 +1055,12 @@ def _render_messages_as_prompt(messages: list[dict[str, Any]]) -> str:
 
 def _normalized_stop(stop_reason: str) -> StopReason:
     return (
-        StopReason.MAX_TOKENS if stop_reason in {"max_tokens", "length"}
-        else StopReason.TOOL_USE if stop_reason in {"tool_use", "tool_calls"}
-        else StopReason.END_TURN if stop_reason in {"end_turn", "stop"}
+        StopReason.MAX_TOKENS
+        if stop_reason in {"max_tokens", "length"}
+        else StopReason.TOOL_USE
+        if stop_reason in {"tool_use", "tool_calls"}
+        else StopReason.END_TURN
+        if stop_reason in {"end_turn", "stop"}
         else StopReason.INCOMPLETE
     )
 
@@ -1054,8 +1076,14 @@ def _outputs_from_chat_response(raw: object, turn: ToolUseResult) -> tuple[Model
     outputs = []
     if turn.reasoning_content:
         opaque = _provider_field(message, "reasoning_details")
-        outputs.append(ModelOutput("reasoning", "reasoning", turn.reasoning_content,
-                                   provider_data={"reasoning_details": opaque} if opaque is not None else {}))
+        outputs.append(
+            ModelOutput(
+                "reasoning",
+                "reasoning",
+                turn.reasoning_content,
+                provider_data={"reasoning_details": opaque} if opaque is not None else {},
+            )
+        )
     if turn.text:
         outputs.append(ModelOutput("text", "text", turn.text))
     refusal = _provider_field(message, "refusal")

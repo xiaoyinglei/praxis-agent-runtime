@@ -67,16 +67,16 @@ def test_agent_runtime_internal_contracts_use_explicit_modules() -> None:
     import agent_runtime as public_api
     import agent_runtime.core as core
     from agent_runtime.harness import (
-        RuntimeState,
+        RuntimeStore,
         Session,
         StepContext,
         TurnContext,
-        TurnExecutor,
+        TurnRunner,
     )
     from agent_runtime.tools import Tool, ToolRegistry, ToolResult
 
-    assert RuntimeState is not None
-    assert TurnExecutor is not None
+    assert RuntimeStore is not None
+    assert TurnRunner is not None
     assert Session is not None
     assert TurnContext is not None
     assert StepContext is not None

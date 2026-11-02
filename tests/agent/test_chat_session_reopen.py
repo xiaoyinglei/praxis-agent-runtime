@@ -8,7 +8,7 @@ import pytest
 
 from agent_runtime import cli
 from agent_runtime.core.messages import ModelToolCall as _ModelToolCall
-from agent_runtime.harness import RuntimeState
+from agent_runtime.harness import RuntimeStore, context_ops, model_ops, tool_ops, turn_ops
 from agent_runtime.harness.protocol import HarnessModelResponse, item_text
 from agent_runtime.history import list_chat_sessions, read_chat_messages
 from tests.agent.test_agent_cli_resume import _result
@@ -16,16 +16,17 @@ from tests.agent.test_agent_cli_resume import _result
 
 def conversation(database, workspace, *, question="first question", answer="saved answer"):
     workspace.mkdir(exist_ok=True)
-    with RuntimeState.open_sync(database) as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(thread_id=thread.thread_id, user_message=question,
-                                binding_manifest={"model_id": "saved-model"})
-        store.complete_turn(turn_id=turn.turn_id, answer=answer)
+    with RuntimeStore.open_sync(database) as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store, thread_id=thread.thread_id, user_message=question, binding_manifest={"model_id": "saved-model"}
+        )
+        turn_ops.complete_turn(store, turn_id=turn.turn_id, answer=answer)
     return thread.thread_id, turn.turn_id
 
 
 def records(database):
-    with RuntimeState.open_sync(database, read_only=True) as store:
+    with RuntimeStore.open_sync(database, read_only=True) as store:
         return store.list_global_records()
 
 
@@ -34,13 +35,17 @@ def test_chat_list_groups_turns_and_isolates_workspace_without_mutation(tmp_path
     workspace = tmp_path / "workspace"
     thread_id, _ = conversation(database, workspace)
     conversation(database, tmp_path / "other", question="private other workspace")
-    with RuntimeState.open_sync(database) as store:
-        second = store.start_turn(thread_id=thread_id, user_message="second question", binding_manifest={})
-        store.complete_turn(turn_id=second.turn_id, answer="second answer")
-        child = store.create_thread(workspace=workspace)
-        child_turn = store.start_turn(thread_id=child.thread_id, user_message="child agent task",
-                                      binding_manifest={"budget_parent_turn_id": second.turn_id})
-        store.complete_turn(turn_id=child_turn.turn_id, answer="child answer")
+    with RuntimeStore.open_sync(database) as store:
+        second = turn_ops.start_turn(store, thread_id=thread_id, user_message="second question", binding_manifest={})
+        turn_ops.complete_turn(store, turn_id=second.turn_id, answer="second answer")
+        child = turn_ops.create_thread(store, workspace=workspace)
+        child_turn = turn_ops.start_turn(
+            store,
+            thread_id=child.thread_id,
+            user_message="child agent task",
+            binding_manifest={"budget_parent_turn_id": second.turn_id},
+        )
+        turn_ops.complete_turn(store, turn_id=child_turn.turn_id, answer="child answer")
     before = records(database)
     summaries = list_chat_sessions(database, workspace=workspace)
     assert len(summaries) == 1
@@ -49,8 +54,10 @@ def test_chat_list_groups_turns_and_isolates_workspace_without_mutation(tmp_path
     assert summaries[0].head_turn_id == second.turn_id
     assert summaries[0].status == "completed" and summaries[0].updated_at_ms > 0
     assert read_chat_messages(database, thread_id=thread_id, workspace=workspace) == (
-        ("user", "first question"), ("answer", "saved answer"),
-        ("user", "second question"), ("answer", "second answer"),
+        ("user", "first question"),
+        ("answer", "saved answer"),
+        ("user", "second question"),
+        ("answer", "second answer"),
     )
     assert records(database) == before
     with pytest.raises(ValueError, match="其他工作区"):
@@ -60,15 +67,21 @@ def test_chat_list_groups_turns_and_isolates_workspace_without_mutation(tmp_path
 def test_fork_replay_uses_ancestor_cutoff_and_original_messages(tmp_path):
     database = tmp_path / "state.sqlite"
     thread_id, fork_point = conversation(database, tmp_path / "workspace")
-    with RuntimeState.open_sync(database) as store:
-        later = store.start_turn(thread_id=thread_id, user_message="excluded later question", binding_manifest={})
-        store.complete_turn(turn_id=later.turn_id, answer="excluded later answer")
-        fork = store.fork_thread(from_turn_id=fork_point)
-        turn = store.start_turn(thread_id=fork.thread_id, user_message="branch question", binding_manifest={})
-        store.complete_turn(turn_id=turn.turn_id, answer="branch answer")
+    with RuntimeStore.open_sync(database) as store:
+        later = turn_ops.start_turn(
+            store, thread_id=thread_id, user_message="excluded later question", binding_manifest={}
+        )
+        turn_ops.complete_turn(store, turn_id=later.turn_id, answer="excluded later answer")
+        fork = turn_ops.fork_thread(store, from_turn_id=fork_point)
+        turn = turn_ops.start_turn(store, thread_id=fork.thread_id, user_message="branch question", binding_manifest={})
+        turn_ops.complete_turn(store, turn_id=turn.turn_id, answer="branch answer")
     messages = read_chat_messages(database, thread_id=fork.thread_id, workspace=tmp_path / "workspace")
-    assert messages == (("user", "first question"), ("answer", "saved answer"),
-                        ("user", "branch question"), ("answer", "branch answer"))
+    assert messages == (
+        ("user", "first question"),
+        ("answer", "saved answer"),
+        ("user", "branch question"),
+        ("answer", "branch answer"),
+    )
 
 
 def test_no_saved_chats_does_not_create_database(tmp_path):
@@ -81,35 +94,61 @@ def test_replay_keeps_original_messages_after_context_compaction_and_reuses_answ
     database = tmp_path / "state.sqlite"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeState.open_sync(database) as store:
-        thread = store.create_thread(workspace=workspace)
-        turn = store.start_turn(thread_id=thread.thread_id, user_message="original question", binding_manifest={})
-        operation = store.prepare_model_operation(
-            turn_id=turn.turn_id, request_hash="r", context_hash="c", tool_hash="t", wire_hash="w",
+    with RuntimeStore.open_sync(database) as store:
+        thread = turn_ops.create_thread(store, workspace=workspace)
+        turn = turn_ops.start_turn(
+            store, thread_id=thread.thread_id, user_message="original question", binding_manifest={}
+        )
+        operation = model_ops.prepare_model_operation(
+            store,
+            turn_id=turn.turn_id,
+            request_hash="r",
+            context_hash="c",
+            tool_hash="t",
+            wire_hash="w",
             request_ref={"input_revision": 1, "request_id": "fixture"},
         )
-        attempt = store.dispatch_model_attempt(operation.operation_id, now=1)
-        assert store.complete_model_attempt(operation_id=operation.operation_id,
+        attempt = model_ops.dispatch_model_attempt(store, operation.operation_id, now=1)
+        assert model_ops.complete_model_attempt(
+            store,
+            operation_id=operation.operation_id,
             attempt_id=attempt.attempt_id,
             generation=attempt.generation,
             now=2,
-            response=HarnessModelResponse.from_parts(text="final answer", provider_response_id=None, usage={}))
-        response_item_id = store.list_model_operations(turn.turn_id)[-1].response_item_id
-        store.complete_turn(turn_id=turn.turn_id, answer="final answer", source_item_id=response_item_id)
-        assert store.read_turn_answer(turn.turn_id).item_id == response_item_id
-        following = store.start_turn(thread_id=thread.thread_id, user_message="follow up", binding_manifest={})
-        store.record_context_compaction(
-            turn_id=following.turn_id, covered_item_ids=tuple(item.item_id for item in store.list_items(turn.turn_id)),
-            summary="compressed summary", preserved_facts={name: [] for name in (
-                "architecture_and_safety_constraints", "file_changes", "verification_results",
-                "unresolved_work", "uncertain_side_effects",
-            )}, context_version=1,
+            response=HarnessModelResponse.from_parts(text="final answer", provider_response_id=None, usage={}),
         )
-        store.complete_turn(turn_id=following.turn_id, answer="second answer")
+        response_item_id = store.list_model_operations(turn.turn_id)[-1].response_item_id
+        turn_ops.complete_turn(store, turn_id=turn.turn_id, answer="final answer", source_item_id=response_item_id)
+        assert store.read_turn_answer(turn.turn_id).item_id == response_item_id
+        following = turn_ops.start_turn(
+            store, thread_id=thread.thread_id, user_message="follow up", binding_manifest={}
+        )
+        context_ops.record_context_compaction(
+            store,
+            turn_id=following.turn_id,
+            covered_item_ids=tuple(item.item_id for item in store.list_items(turn.turn_id)),
+            summary="compressed summary",
+            preserved_facts={
+                name: []
+                for name in (
+                    "architecture_and_safety_constraints",
+                    "file_changes",
+                    "verification_results",
+                    "unresolved_work",
+                    "uncertain_side_effects",
+                )
+            },
+            context_version=1,
+        )
+        turn_ops.complete_turn(store, turn_id=following.turn_id, answer="second answer")
     before = records(database)
     messages = read_chat_messages(database, thread_id=thread.thread_id, workspace=workspace)
-    assert messages == (("user", "original question"), ("answer", "final answer"),
-                        ("user", "follow up"), ("answer", "second answer"))
+    assert messages == (
+        ("user", "original question"),
+        ("answer", "final answer"),
+        ("user", "follow up"),
+        ("answer", "second answer"),
+    )
     assert records(database) == before
 
 
@@ -117,8 +156,8 @@ def test_replay_keeps_original_messages_after_context_compaction_and_reuses_answ
 async def test_reopen_and_copy_saved_answer_never_open_session(tmp_path, monkeypatch, capsys):
     database = tmp_path / "state.sqlite"
     workspace = tmp_path / "workspace"
-    thread_id, _ = (await asyncio.to_thread(conversation, database, workspace))
-    before = (await asyncio.to_thread(records, database))
+    thread_id, _ = await asyncio.to_thread(conversation, database, workspace)
+    before = await asyncio.to_thread(records, database)
 
     class Facade:
         checkpoint_db = database
@@ -143,7 +182,7 @@ async def test_reopen_and_copy_saved_answer_never_open_session(tmp_path, monkeyp
 async def test_reopened_chat_submits_new_turn_in_original_thread(tmp_path, monkeypatch):
     database = tmp_path / "state.sqlite"
     workspace = tmp_path / "workspace"
-    thread_id, previous_turn_id = (await asyncio.to_thread(conversation, database, workspace))
+    thread_id, previous_turn_id = await asyncio.to_thread(conversation, database, workspace)
     opened = []
 
     class Facade:
@@ -160,21 +199,23 @@ async def test_reopened_chat_submits_new_turn_in_original_thread(tmp_path, monke
             yield self
 
         async def submit(self, task, **options):
-            async with (await RuntimeState.open(database)) as store:
-                turn = store.start_turn(thread_id=thread_id, user_message=task, binding_manifest={})
+            async with await RuntimeStore.open(database) as store:
+                turn = turn_ops.start_turn(store, thread_id=thread_id, user_message=task, binding_manifest={})
                 assert turn.predecessor_turn_id == previous_turn_id
                 assert turn.turn_id != previous_turn_id
                 assert [item_text(item) for item in store.list_context_items(turn.turn_id)] == [
-                    "first question", "saved answer", "follow up",
+                    "first question",
+                    "saved answer",
+                    "follow up",
                 ]
-                store.complete_turn(turn_id=turn.turn_id, answer="new answer")
+                turn_ops.complete_turn(store, turn_id=turn.turn_id, answer="new answer")
             return _result(turn_id=turn.turn_id, answer="new answer")
 
     commands = iter(["follow up", "/exit"])
     monkeypatch.setattr("builtins.input", lambda _prompt="": next(commands))
     await cli._chat_facade_loop(Facade(), max_tokens_total=None, resume_thread_id=thread_id)
     assert len(opened) == 1
-    async with (await RuntimeState.open(database, read_only=True)) as store:
+    async with await RuntimeStore.open(database, read_only=True) as store:
         assert len(store.list_threads()) == 1
         assert len(store.list_turns(thread_id)) == 2
         assert store.read_turn(previous_turn_id).status == "completed"
@@ -183,14 +224,17 @@ async def test_reopened_chat_submits_new_turn_in_original_thread(tmp_path, monke
 @pytest.mark.anyio
 @pytest.mark.parametrize("tool_unknown", [False, True])
 async def test_running_conversation_attempts_owned_recovery_when_user_sends(
-    tmp_path, monkeypatch, capsys, tool_unknown,
+    tmp_path,
+    monkeypatch,
+    capsys,
+    tool_unknown,
 ):
     database = tmp_path / "state.sqlite"
     workspace = tmp_path / "workspace"
-    thread_id, _ = (await asyncio.to_thread(conversation, database, workspace))
-    async with (await RuntimeState.open(database)) as store:
-        running = store.start_turn(thread_id=thread_id, user_message="unfinished", binding_manifest={})
-    before = (await asyncio.to_thread(records, database))
+    thread_id, _ = await asyncio.to_thread(conversation, database, workspace)
+    async with await RuntimeStore.open(database) as store:
+        running = turn_ops.start_turn(store, thread_id=thread_id, user_message="unfinished", binding_manifest={})
+    before = await asyncio.to_thread(records, database)
     resumed = []
 
     class Facade:
@@ -213,8 +257,14 @@ async def test_running_conversation_attempts_owned_recovery_when_user_sends(
             resumed.append(task)
             if tool_unknown:
                 from agent_runtime.result import AgentPause
-                return _result(turn_id=running.turn_id, status="paused", pause=AgentPause(
-                    request_id="unknown", kind="tool_reconciliation", question="结果待核对", options=()))
+
+                return _result(
+                    turn_id=running.turn_id,
+                    status="paused",
+                    pause=AgentPause(
+                        request_id="unknown", kind="tool_reconciliation", question="结果待核对", options=()
+                    ),
+                )
             return _result(turn_id="turn_new", answer="continued")
 
         async def resume(self, *_args, **_options):
@@ -237,11 +287,11 @@ async def test_saved_clarification_continues_in_chat_after_user_reply(tmp_path, 
 
     database = tmp_path / "state.sqlite"
     workspace = tmp_path / "workspace"
-    thread_id, _ = (await asyncio.to_thread(conversation, database, workspace))
-    async with (await RuntimeState.open(database)) as store:
-        turn = store.start_turn(thread_id=thread_id, user_message="original task", binding_manifest={})
-        interaction = store.request_clarification(turn_id=turn.turn_id, question="Which destination?")
-    before = (await asyncio.to_thread(records, database))
+    thread_id, _ = await asyncio.to_thread(conversation, database, workspace)
+    async with await RuntimeStore.open(database) as store:
+        turn = turn_ops.start_turn(store, thread_id=thread_id, user_message="original task", binding_manifest={})
+        interaction = turn_ops.request_clarification(store, turn_id=turn.turn_id, question="Which destination?")
+    before = await asyncio.to_thread(records, database)
     recovery = []
 
     class Facade:
@@ -261,10 +311,11 @@ async def test_saved_clarification_continues_in_chat_after_user_reply(tmp_path, 
             # Inspection before the explicit reply has changed no durable facts.
             assert (await asyncio.to_thread(records, database)) == before
             recovery.append((turn_id, action, options["user_input"]))
-            async with (await RuntimeState.open(database)) as store:
-                store.resolve_clarification(turn_id=turn_id, request_id=interaction.request_id,
-                                            response=options["user_input"])
-                store.complete_turn(turn_id=turn_id, answer="continued original task")
+            async with await RuntimeStore.open(database) as store:
+                turn_ops.resolve_clarification(
+                    store, turn_id=turn_id, request_id=interaction.request_id, response=options["user_input"]
+                )
+                turn_ops.complete_turn(store, turn_id=turn_id, answer="continued original task")
             return _result(turn_id=turn_id, answer="continued original task")
 
     commands = iter(["Shanghai", "/exit"])
@@ -309,12 +360,13 @@ def test_continue_selects_recent_thread_in_current_workspace(tmp_path, monkeypat
 @pytest.mark.parametrize("action", ["continue", "retry", "abort"])
 async def test_reopened_reconciliation_reaches_owned_recovery(tmp_path, monkeypatch, action):
     from agent_runtime.result import AgentPause
+
     database = tmp_path / "state.sqlite"
     workspace = tmp_path / "workspace"
-    thread_id, _ = (await asyncio.to_thread(conversation, database, workspace))
-    async with (await RuntimeState.open(database)) as store:
-        turn = store.start_turn(thread_id=thread_id, user_message="interrupted command", binding_manifest={})
-        store.pause_turn(turn_id=turn.turn_id, reason="command observation needs recovery")
+    thread_id, _ = await asyncio.to_thread(conversation, database, workspace)
+    async with await RuntimeStore.open(database) as store:
+        turn = turn_ops.start_turn(store, thread_id=thread_id, user_message="interrupted command", binding_manifest={})
+        turn_ops.pause_turn(store, turn_id=turn.turn_id, reason="command observation needs recovery")
     calls = []
 
     class Facade:
@@ -325,8 +377,13 @@ async def test_reopened_reconciliation_reaches_owned_recovery(tmp_path, monkeypa
             raise AssertionError("A saved pending Turn must use the owned resume path")
 
         async def read_result(self, turn_id):
-            return _result(turn_id=turn_id, status="paused", pause=AgentPause(
-                request_id="pending-wait", kind="tool_reconciliation", question="needs recovery", options=()))
+            return _result(
+                turn_id=turn_id,
+                status="paused",
+                pause=AgentPause(
+                    request_id="pending-wait", kind="tool_reconciliation", question="needs recovery", options=()
+                ),
+            )
 
         async def resume(self, turn_id, action, **options):
             calls.append((turn_id, action, options.get("user_input")))
@@ -339,16 +396,24 @@ async def test_reopened_reconciliation_reaches_owned_recovery(tmp_path, monkeypa
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(("query", "reconciled", "driver"), [
-    ("Stop the old work and explain the existing files", False, "agent"),
-    ("Stop the old work and explain the existing files", True, "agent"),
-    ("abort", False, "agent"),
-    ("abort", True, "agent"),
-    ("abort", False, "session"),
-    ("abort", True, "session"),
-])
+@pytest.mark.parametrize(
+    ("query", "reconciled", "driver"),
+    [
+        ("Stop the old work and explain the existing files", False, "agent"),
+        ("Stop the old work and explain the existing files", True, "agent"),
+        ("abort", False, "agent"),
+        ("abort", True, "agent"),
+        ("abort", False, "session"),
+        ("abort", True, "session"),
+    ],
+)
 async def test_reopened_reconciliation_preserves_new_request_in_owned_followup(
-    tmp_path, monkeypatch, capsys, query, reconciled, driver,
+    tmp_path,
+    monkeypatch,
+    capsys,
+    query,
+    reconciled,
+    driver,
 ):
     from agent_runtime import Agent
     from agent_runtime.harness import Session, ToolOrchestrator
@@ -357,16 +422,26 @@ async def test_reopened_reconciliation_preserves_new_request_in_owned_followup(
 
     database = tmp_path / "state.sqlite"
     workspace = tmp_path / "workspace"
-    thread_id, _ = (await asyncio.to_thread(conversation, database, workspace))
-    async with (await RuntimeState.open(database)) as store:
-        old = store.start_turn(thread_id=thread_id, user_message="interrupted operation",
-                               binding_manifest={"execution_ownership": OWNERSHIP_REVISION})
-        operation = store.prepare_model_operation(
-            turn_id=old.turn_id, request_hash="r", context_hash="c", tool_hash="t", wire_hash="w",
+    thread_id, _ = await asyncio.to_thread(conversation, database, workspace)
+    async with await RuntimeStore.open(database) as store:
+        old = turn_ops.start_turn(
+            store,
+            thread_id=thread_id,
+            user_message="interrupted operation",
+            binding_manifest={"execution_ownership": OWNERSHIP_REVISION},
+        )
+        operation = model_ops.prepare_model_operation(
+            store,
+            turn_id=old.turn_id,
+            request_hash="r",
+            context_hash="c",
+            tool_hash="t",
+            wire_hash="w",
             request_ref={"input_revision": 1, "request_id": "old-request", "purpose": "agent_step"},
         )
-        attempt = store.dispatch_model_attempt(operation.operation_id, worker_id="dead")
-        assert store.complete_model_attempt(
+        attempt = model_ops.dispatch_model_attempt(store, operation.operation_id, worker_id="dead")
+        assert model_ops.complete_model_attempt(
+            store,
             operation_id=operation.operation_id,
             attempt_id=attempt.attempt_id,
             generation=attempt.generation,
@@ -382,18 +457,38 @@ async def test_reopened_reconciliation_preserves_new_request_in_owned_followup(
                 ),
             ),
         )
-        values = dict(turn_id=old.turn_id, operation_id="uncertain-write", tool_call_id="write-call",
-                      tool_name="write_file", arguments_digest="args", execution_revision="write-v1",
-                      idempotent=False, attempt_count=0, error_code=None, requires_reconciliation=False)
-        store.record_tool_execution_state(status="prepared", **values)
-        store.record_tool_execution_state(status="ready", **values)
-        claim = store.claim_tool_operation(operation_id="uncertain-write", worker_id="dead", lease_seconds=30)
-        assert store.commit_tool_operation_result(
-            turn_id=old.turn_id, operation_id=claim.operation_id, claim_generation=claim.claim_generation,
-            fencing_token=claim.fencing_token, status="unknown", attempt_count=1,
-            error_code="execution_owner_lost", requires_reconciliation=True,
-            result={"tool_call_id": "write-call", "tool_name": "write_file", "is_error": True,
-                    "content": [], "attachments": []},
+        values = dict(
+            turn_id=old.turn_id,
+            operation_id="uncertain-write",
+            tool_call_id="write-call",
+            tool_name="write_file",
+            arguments_digest="args",
+            execution_revision="write-v1",
+            idempotent=False,
+            attempt_count=0,
+            error_code=None,
+            requires_reconciliation=False,
+        )
+        tool_ops.record_tool_execution_state(store, status="prepared", **values)
+        tool_ops.record_tool_execution_state(store, status="ready", **values)
+        claim = tool_ops.claim_tool_operation(store, operation_id="uncertain-write", worker_id="dead", lease_seconds=30)
+        assert tool_ops.commit_tool_operation_result(
+            store,
+            turn_id=old.turn_id,
+            operation_id=claim.operation_id,
+            claim_generation=claim.claim_generation,
+            fencing_token=claim.fencing_token,
+            status="unknown",
+            attempt_count=1,
+            error_code="execution_owner_lost",
+            requires_reconciliation=True,
+            result={
+                "tool_call_id": "write-call",
+                "tool_name": "write_file",
+                "is_error": True,
+                "content": [],
+                "attachments": [],
+            },
         )
 
     model = ReopenModel()
@@ -401,15 +496,26 @@ async def test_reopened_reconciliation_preserves_new_request_in_owned_followup(
 
     async def observe(orchestrator, _commands, turn_id):
         # An independent receipt is available only in the recoverable case.
-        pending = [item for item in orchestrator._store.list_interactions(turn_id)
-                   if item.kind == "tool_reconciliation" and item.status == "pending"]
+        pending = [
+            item
+            for item in orchestrator._store.list_interactions(turn_id)
+            if item.kind == "tool_reconciliation" and item.status == "pending"
+        ]
         observed.append(turn_id)
         if not reconciled or not pending:
             return False
-        orchestrator._store.resolve_tool_reconciliation(
-            turn_id=turn_id, status="succeeded", reconciler_revision="independent-receipt-v1",
-            result={"tool_call_id": "write-call", "tool_name": "write_file", "is_error": False,
-                    "content": [], "attachments": []},
+        tool_ops.resolve_tool_reconciliation(
+            orchestrator._store,
+            turn_id=turn_id,
+            status="succeeded",
+            reconciler_revision="independent-receipt-v1",
+            result={
+                "tool_call_id": "write-call",
+                "tool_name": "write_file",
+                "is_error": False,
+                "content": [],
+                "attachments": [],
+            },
         )
         return True
 
@@ -426,15 +532,24 @@ async def test_reopened_reconciliation_preserves_new_request_in_owned_followup(
             assert query == "abort" and action == "abort", "New requests must reach Session.submit"
             if reconciled:
                 # A receipt can close the effect between the read and owned abort.
-                async with (await RuntimeState.open(database)) as store:
-                    store.resolve_tool_reconciliation(
-                        turn_id=turn_id, status="succeeded", reconciler_revision="independent-receipt-v1",
-                        result={"tool_call_id": "write-call", "tool_name": "write_file", "is_error": False,
-                                "content": [], "attachments": []},
+                async with await RuntimeStore.open(database) as store:
+                    tool_ops.resolve_tool_reconciliation(
+                        store,
+                        turn_id=turn_id,
+                        status="succeeded",
+                        reconciler_revision="independent-receipt-v1",
+                        result={
+                            "tool_call_id": "write-call",
+                            "tool_name": "write_file",
+                            "is_error": False,
+                            "content": [],
+                            "attachments": [],
+                        },
                     )
             if driver == "session":
-                async with await Session.open(database=database, workspace=workspace, thread_id=thread_id,
-                                              model=model, _background_memory=False) as session:
+                async with await Session.open(
+                    database=database, workspace=workspace, thread_id=thread_id, model=model, _background_memory=False
+                ) as session:
                     return await session.resume(turn_id, action, **options)
             return await Agent(checkpoint_db=database, workspace_path=workspace).resume(turn_id, action, **options)
 
@@ -442,18 +557,18 @@ async def test_reopened_reconciliation_preserves_new_request_in_owned_followup(
         async def session(self, **options):
             assert query != "abort", "Cancellation must not open a model Session"
             assert options["thread_id"] == thread_id
-            async with await Session.open(database=database, workspace=workspace, thread_id=thread_id,
-                                          model=model, _background_memory=False) as session:
+            async with await Session.open(
+                database=database, workspace=workspace, thread_id=thread_id, model=model, _background_memory=False
+            ) as session:
                 session._command_sessions = object()
-                yield SimpleNamespace(current_model=lambda: SimpleNamespace(id="offline-model"),
-                                      submit=session.submit)
+                yield SimpleNamespace(current_model=lambda: SimpleNamespace(id="offline-model"), submit=session.submit)
 
     commands = iter([query, "/exit"])
     monkeypatch.setattr("builtins.input", lambda _prompt="": next(commands))
     await cli._chat_facade_loop(Facade(), max_tokens_total=None, resume_thread_id=thread_id)
     output = capsys.readouterr().out
     assert bool(observed) is (query != "abort")
-    async with (await RuntimeState.open(database, read_only=True)) as store:
+    async with await RuntimeStore.open(database, read_only=True) as store:
         assert store.verify().valid
         assert store.read_tool_operation("uncertain-write").attempt_count == 1
         turns = store.list_turns(thread_id)
@@ -463,12 +578,15 @@ async def test_reopened_reconciliation_preserves_new_request_in_owned_followup(
                 assert len(turns) == 2 and not model.requests
             else:
                 assert len(turns) == 3 and turns[-1].status == "completed"
-                assert any(message.role == "user" and message.content == query
-                           for message in model.requests[-1].messages)
+                assert any(
+                    message.role == "user" and message.content == query for message in model.requests[-1].messages
+                )
         else:
             assert ("取消未完成" if query == "abort" else "输入未发送") in output
             assert store.read_turn(old.turn_id).status == "paused"
             assert store.read_tool_operation("uncertain-write").status == "unknown"
-            assert any(item.kind == "tool_reconciliation" and item.status == "pending"
-                       for item in store.list_interactions(old.turn_id))
+            assert any(
+                item.kind == "tool_reconciliation" and item.status == "pending"
+                for item in store.list_interactions(old.turn_id)
+            )
             assert len(turns) == 2 and not model.requests
