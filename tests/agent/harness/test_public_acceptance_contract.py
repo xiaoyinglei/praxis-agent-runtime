@@ -15,7 +15,7 @@ def test_default_sdk_turn_ends_without_claiming_task_acceptance(tmp_path, monkey
     monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
     result = asyncio.run(agent.run("Explain this concept", max_steps=2))
     assert result.status == "done"
-    assert result.validation_status == "not_evaluated"
+    assert not hasattr(result, "validation_status")
     with RuntimeStore.open_sync(tmp_path / "run.db") as store:
         policy = store.read_turn(result.turn_id).binding_manifest["completion_policy"]
         assert policy == {"revision": "completion-v2", "require_workspace_change": False, "acceptance_command": None}
@@ -59,8 +59,7 @@ def test_public_explicit_command_uses_actual_execution_without_name_whitelist(
             agent.run("Inspect evidence", acceptance_command=command, allow_execute_tools=True, max_steps=3)
         )
         assert (result.status == "done") is passed
-        assert result.validation_status == ("passed" if passed else "failed")
-        assert result.validation_scope == "acceptance_command"
+        assert not hasattr(result, "validation_status")
     else:
         monkeypatch.chdir(tmp_path)
         original = cli._create_agent_facade
@@ -147,7 +146,7 @@ def test_approval_recovery_keeps_the_original_acceptance_contract_and_budget(tmp
     monkeypatch.setattr(fresh, "_model_factory", lambda: model)
     result = asyncio.run(fresh.resume(paused.turn_id, "allow_once"))
     assert result.status == "done"
-    assert result.validation_status == "passed" and result.validation_scope == "acceptance_command"
+    assert not hasattr(result, "validation_status")
     with RuntimeStore.open_sync(database) as store:
         policy = store.read_turn(result.turn_id).binding_manifest["completion_policy"]
         assert policy["acceptance_command"] == command

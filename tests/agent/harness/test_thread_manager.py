@@ -80,7 +80,7 @@ async def test_session_creates_distinct_turns_with_fresh_bindings_and_shared_his
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr("agent_runtime.harness.turn.capture_runtime_clock", lambda: {"date": "2026-10-20"})
+    monkeypatch.setattr("agent_runtime.harness.request_context.capture_runtime_clock", lambda: {"date": "2026-10-20"})
     model = EchoHistoryModel()
     async with await Session.open(database=tmp_path / "rollout.sqlite3", workspace=tmp_path, model=model) as session:
         first = await session.submit("first")
@@ -93,11 +93,12 @@ async def test_session_creates_distinct_turns_with_fresh_bindings_and_shared_his
             .content.startswith("Runtime state update (changed fields; latest value wins):")
         )
         state = json.loads(model.requests[0].messages[-1].content.splitlines()[1])
-        assert state["resource_reminder"] is None
+        assert "resource_reminder" not in state
+        assert "Resource limits (runtime ledger)" not in state
         assert "Runtime budget status" not in state
         assert (
             session.store.list_model_operations(first.turn_id)[0].request_ref["budget_status"]["agent_steps_remaining"]
-            > 0
+            == "unset"
         )
         assert model.requests[1].messages == (
             *model.requests[0].messages,
@@ -107,6 +108,7 @@ async def test_session_creates_distinct_turns_with_fresh_bindings_and_shared_his
             ),
             ModelMessage(role="user", body="second"),
         )
+
         assert session.store.read_turn(second.turn_id).predecessor_turn_id == first.turn_id
         assert session.store.read_turn(first.turn_id).binding_manifest["model_id"] == "model-v1"
         assert session.store.read_turn(second.turn_id).binding_manifest["model_id"] == "model-v2"
@@ -133,7 +135,7 @@ async def test_clarification_continues_with_current_model_when_initial_model_is_
 
 @pytest.mark.anyio
 async def test_opening_from_non_head_turn_forks_with_exact_history(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr("agent_runtime.harness.turn.capture_runtime_clock", lambda: {"date": "2026-10-27"})
+    monkeypatch.setattr("agent_runtime.harness.request_context.capture_runtime_clock", lambda: {"date": "2026-10-27"})
     model = EchoHistoryModel()
     options = dict(database=tmp_path / "rollout.sqlite3", workspace=tmp_path, model=model)
     async with await Session.open(**options) as source:
@@ -156,6 +158,7 @@ async def test_opening_from_non_head_turn_forks_with_exact_history(tmp_path: Pat
                 ),
                 ModelMessage(role="user", body="branch"),
             )
+
             assert source.store.read_thread(source.thread_id).head_turn_id == second.turn_id
 
 

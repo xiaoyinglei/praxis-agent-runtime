@@ -421,18 +421,24 @@ def admit_retry(store: RuntimeStore, *, turn_id: str, operation_id: str, amount:
         purpose = str(operation.request_ref.get("purpose", "agent_step"))
         admitted = retry_admission_count(store, turn_id=turn_id, job_id=job_id)
         max_calls = job.plan.get("max_summary_calls", job.plan["planned_summary_calls"])
-        max_retries = job.plan.get("max_summary_retries", max(0, max_calls - job.plan["planned_summary_calls"]))
+        max_retries = job.plan.get("max_summary_retries")
+        if "max_summary_retries" not in job.plan:
+            # Historical plans retain their recorded retry allowance.
+            max_retries = max(0, max_calls - job.plan["planned_summary_calls"]) if max_calls is not None else None
         used_calls = sum(
             attempt.status != "prepared"
             for operation in store.list_model_operations(turn_id)
             if operation.request_ref.get("purpose") == "context_summary"
             for attempt in store.list_model_attempts(operation.operation_id)
         )
-        if admitted >= max_retries or (purpose == "context_summary" and used_calls >= max_calls):
+        exceeded_limit = max_retries if max_retries is not None and admitted >= max_retries else None
+        if purpose == "context_summary" and max_calls is not None and used_calls >= max_calls:
+            exceeded_limit = max_calls
+        if exceeded_limit is not None:
             from agent_runtime.budget import BudgetLimitExceededError
 
             raise BudgetLimitExceededError(
-                resource="model_calls", limit=max_calls, current_exposure=used_calls, requested=1
+                resource="model_calls", limit=exceeded_limit, current_exposure=used_calls, requested=1
             )
         bucket = "summary" if purpose == "context_summary" else "continuation"
         _reserve_hold(store, turn_id, job_id, bucket, amount)

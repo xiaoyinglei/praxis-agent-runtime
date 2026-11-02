@@ -28,7 +28,6 @@ from agent_runtime.harness import artifact_ops, tool_ops
 from agent_runtime.harness.events import commit_and_publish
 from agent_runtime.harness.operation_values import ResourceClaimConflictError
 from agent_runtime.harness.runtime_store import RuntimeStore
-from agent_runtime.harness.verification import classify_tool_verification
 from agent_runtime.streaming.events import (
     ItemDeltaKind,
     TurnItemKind,
@@ -945,31 +944,6 @@ class ToolOrchestrator:
         tool = self._tools.get(call.tool_name)
         if tool is not None and tool.after_commit is not None and not execution.result.is_error:
             await tool.after_commit(call.arguments, execution.result.structured_content, record.operation_id)
-        operation = await self._store.run_async(self._store.read_tool_operation, record.operation_id)
-        # Historical gates retain their frozen verifier semantics. New Turns
-        # use explicit acceptance commands and do not mint inferred certificates.
-        policy = await self._store.run_async(
-            lambda: self._store.read_turn(turn_id).binding_manifest.get("completion_policy", {})
-        )
-        if isinstance(policy, Mapping) and policy.get("revision") == "completion-v2":
-            return
-        evidence = classify_tool_verification(
-            tool_name=call.tool_name,
-            arguments=call.arguments,
-            structured_content=execution.result.structured_content,
-            resources=operation.resources,
-        )
-        if evidence is not None:
-            await self._commit(
-                lambda: tool_ops.record_verification(
-                    self._store,
-                    turn_id=turn_id,
-                    operation_id=record.operation_id,
-                    kind=evidence.kind,
-                    verifier=evidence.verifier,
-                    verified_resources=evidence.verified_resources,
-                )
-            )
 
     async def resume_approval(
         self,

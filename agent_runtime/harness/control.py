@@ -136,8 +136,6 @@ def append_runtime_state(
             "\nUse the latest clock for relative dates; clarify ambiguous dates. "
             "Keep the advisory plan current; it is not execution proof."
         )
-        if "resource_reminder" not in state:
-            text += " Under budget pressure or <=2 requests, converge and report unfinished work."
         if acceptance:
             text += (
                 " Run acceptance_contract.acceptance_command exactly via run_command in the workspace "

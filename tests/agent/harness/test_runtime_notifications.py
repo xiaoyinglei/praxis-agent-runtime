@@ -307,7 +307,7 @@ def test_completion_decision_preserves_action_separate_from_validation(reader) -
     )[0].event
     assert event.type.value == "completion_decided"
     assert event.data["action"] == "accept"
-    assert event.data["validation_status"] == "failed"
+    assert "validation_status" not in event.data
     assert event.data["proposal_item_id"] == "proposal-1"
 
 

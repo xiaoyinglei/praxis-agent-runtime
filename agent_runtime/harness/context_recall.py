@@ -232,6 +232,8 @@ def create_context_recall_tool(store: RuntimeStore) -> Tool:
             name=READ_CONTEXT_NAME,
             description=(
                 "Recall original content from a compacted context reference by canonical item_id. "
+                "Reads conversation records, not the live workspace. Use it for missing or conflicting "
+                "details needed by the active task; use file tools for current file contents. "
                 "This restores archived evidence without a network request. Web next_line describes the original "
                 "fetched page's continuation; visible_end_line describes only its current context excerpt. "
                 "Use item_id=history to page through the archived Item ID catalog. "

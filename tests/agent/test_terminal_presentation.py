@@ -166,11 +166,9 @@ def test_result_receipt_never_turns_done_into_verified_or_claims_file_exists():
     assert "未运行验收" not in view.plain_text()
     assert "本轮累计 Token" in view.plain_text()
     assert "已验证" not in view.plain_text() and "已生成" not in view.plain_text()
-    display.present_result(
-        result(files=("/not-existing/report.docx",), validation_status="passed", validation_scope="acceptance_command")
-    )
+    display.present_result(result(files=("/not-existing/report.docx",)))
     text = view.plain_text()
-    assert "已验证" in text and "用户指定的验收命令" in text
+    assert "已验证" not in text and "用户指定的验收命令" not in text
     assert text.count("report.docx") == 1
 
 
@@ -326,9 +324,9 @@ async def test_cli_abort_failure_preserves_unknown_operation_result():
 def test_recorded_workspace_change_does_not_claim_task_validation():
     view = Conversation()
     display = ConversationEventDisplay(view)
-    display.present_result(result(validation_status="passed", validation_scope="workspace_change_recorded"))
+    display.present_result(result())
     assert "已验证" not in view.plain_text()
-    assert "已记录工作区修改" in view.plain_text()
+    assert "验证状态" not in view.plain_text()
     assert "未运行任务验收" not in view.plain_text()
 
 

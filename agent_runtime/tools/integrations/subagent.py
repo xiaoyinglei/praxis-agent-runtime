@@ -40,22 +40,25 @@ class SubagentInput(BaseModel):
     max_turns: int | None = Field(
         default=None,
         ge=1,
-        le=50,
         strict=True,
-        description="Optional child model/tool step ceiling.",
+        description="Optional child step ceiling; inherits the parent Turn limit when omitted and may only narrow it.",
     )
     llm_budget_total: int | None = Field(
         default=None,
         ge=1,
-        description=("Requested child model-token ceiling. The runtime grants it only "
-            "from the parent Turn's currently available budget; it cannot mint new budget."),
+        description=(
+            "Requested child model-token ceiling. The runtime grants it only "
+            "from the parent Turn's currently available budget; it cannot mint new budget."
+        ),
     )
     llm_cost_budget_micros: int | None = Field(
         default=None,
         ge=1,
         strict=True,
-        description=("Requested child monetary ceiling in integer micro-dollars. "
-            "Required when the parent Turn has a monetary budget."),
+        description=(
+            "Requested child monetary ceiling in integer micro-dollars. "
+            "Required when the parent Turn has a monetary budget."
+        ),
     )
 
 

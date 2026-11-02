@@ -605,13 +605,10 @@ class RolloutEventReader:
                     "proposal_item_id",
                     "action",
                     "reason",
-                    "validation_status",
-                    "validation_scope",
                     "reason_code",
                 )
                 if key in body
             }
-            data.setdefault("validation_status", "not_evaluated")
         elif record.record_type == "item_completed" and payload.get("kind") == "verification":
             event_type = EventType.VERIFICATION_COMPLETED
             body = payload.get("payload", {})

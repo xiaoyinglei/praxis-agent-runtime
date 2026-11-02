@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
-from functools import partial
 
 import pytest
 
@@ -12,11 +11,11 @@ from agent_runtime.harness import (
     ModelToolCall,
     RolloutContextManager,
     Session,
-    completion_ops,
     model_ops,
     tool_ops,
     turn_ops,
 )
+from agent_runtime.harness.responses import ResponseHandler
 from agent_runtime.tools.permissions import ToolExecutionContext
 from tests.agent.harness.test_public_agent_cutover import PublicHarnessModel
 from tests.agent.harness.test_session import ZeroDeltaToolThenAnswerModel, _read_file_tool
@@ -228,7 +227,7 @@ async def test_steering_cannot_approve_paused_old_action(tmp_path, action):
 
 
 @pytest.mark.anyio
-async def test_input_in_final_decision_callback_blocks_old_completion(tmp_path, monkeypatch):
+async def test_input_before_atomic_finalization_blocks_old_completion(tmp_path, monkeypatch):
     from agent_runtime.harness import RuntimeStore
 
     class FinalModel(SteeringModel):
@@ -239,13 +238,14 @@ async def test_input_in_final_decision_callback_blocks_old_completion(tmp_path, 
 
     model = FinalModel()
     async with await Session.open(database=tmp_path / "run.db", workspace=tmp_path, model=model) as session:
-        original = partial(completion_ops.record_completion_decision, session.store)
+        from agent_runtime.harness.stop import TurnStop
+
+        original = TurnStop.finish
         received = []
 
-        def completion(**kwargs):
-            item = original(**kwargs)
+        async def finish(stop, **kwargs):
             if not received:
-                with RuntimeStore.open_sync(session.database) as external:
+                async with await RuntimeStore.open(session.database) as external:
                     received.append(
                         turn_ops.receive_turn_input(
                             external,
@@ -254,9 +254,9 @@ async def test_input_in_final_decision_callback_blocks_old_completion(tmp_path, 
                             text="last moment requirement",
                         )
                     )
-            return item
+            return await original(stop, **kwargs)
 
-        monkeypatch.setattr(completion_ops, "record_completion_decision", lambda _store, **kwargs: completion(**kwargs))
+        monkeypatch.setattr(TurnStop, "finish", finish)
         result = await session.submit("initial task")
         assert result.answer == "updated"
         assert session.input_status(received[0].item_id) == "applied"
@@ -343,7 +343,6 @@ async def test_input_after_request_preparation_does_not_send_old_request(tmp_pat
 @pytest.mark.anyio
 @pytest.mark.parametrize("tool_response", [False, True])
 async def test_reopen_after_committed_response_does_not_revive_old_work(tmp_path, monkeypatch, tool_response):
-    from agent_runtime.harness import TurnRunner
 
     invoked = []
     tool = replace(_read_file_tool(), run=lambda a: invoked.append(a) or {"text": "read"})
@@ -357,7 +356,7 @@ async def test_reopen_after_committed_response_does_not_revive_old_work(tmp_path
             raise RuntimeError("crash after response commit")
 
         with monkeypatch.context() as patch:
-            patch.setattr(TurnRunner, "_handle_model_response", crash)
+            patch.setattr(ResponseHandler, "_handle_model_response", crash)
             with pytest.raises(RuntimeError, match="crash after response"):
                 await session.submit("initial task")
         turn_id = session.store.read_thread(session.thread_id).active_turn_id

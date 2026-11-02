@@ -51,8 +51,8 @@ Runtime 把状态转换提交为事实，再从已提交批次派发公共通知
 - `tool_operation_updated`：工具接纳、拒绝、授权变化及恢复核对等控制状态。
 - `interaction_requested/resolved/invalidated`：可操作请求、请求身份和解决结果；用户回复正文不作为广播载荷。
 - `context_compaction_started/completed`：已提交的上下文变换及版本范围。
-- `completion_decided`：Runtime 的结束决定和独立 validation 状态。
-- `verification_completed`：已记录的验证事实与来源。
+- `completion_decided`：Runtime 的生命周期结束决定（action、reason 和可选 reason_code）；不投影通用验证评分。
+- `verification_completed`：仅重放历史记录的验证事实与来源；新执行保留原始工具结果，不再推断验证证书。
 
 生成中的工具调用以 `TOOL_CALL` Item 和 `tool_arguments` 增量呈现，`execution_started=false`。
 执行过程使用独立的 TOOL / COMMAND Item。只有完整响应被 Runtime 接纳并经过授权后才能进入执行。

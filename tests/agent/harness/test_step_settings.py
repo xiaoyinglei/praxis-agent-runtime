@@ -8,6 +8,7 @@ import pytest
 
 from agent_runtime.core.messages import model_message_payload
 from agent_runtime.harness import CompletionDecision, HarnessModelResponse, PreparedModelCall, Session
+from agent_runtime.harness.responses import ResponseHandler
 
 
 class ChangingModel:
@@ -276,7 +277,6 @@ async def test_policy_change_while_sampling_does_not_rewrite_that_requests_tools
 async def test_committed_tool_response_rejects_changed_runner_before_io(tmp_path, monkeypatch):
     from dataclasses import replace
 
-    from agent_runtime.harness import TurnRunner
     from tests.agent.harness.test_approval_resume import AcceptAnswer, WriteThenAnswerModel, _write_tool
 
     calls = []
@@ -286,7 +286,7 @@ async def test_committed_tool_response_rejects_changed_runner_before_io(tmp_path
         raise RuntimeError("crash after model response commit")
 
     with monkeypatch.context() as patch:
-        patch.setattr(TurnRunner, "_handle_model_response", crash)
+        patch.setattr(ResponseHandler, "_handle_model_response", crash)
         async with await Session.open(
             database=tmp_path / "db",
             workspace=tmp_path,

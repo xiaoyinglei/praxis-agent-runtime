@@ -68,7 +68,7 @@ uv run python scripts/verify_agent_rollout.py --database /path/to/rollout.sqlite
 
 ## 执行内核
 
-`Session` 管理输入、资源和公开结果；新 Turn 和恢复都进入 `TurnRunner.drive`。恢复决策从同一读快照中的模型操作、响应处理收据、工具和交互事实推导，携带确切 operation/response 身份，不以最后一条消息猜测执行位置。`execution_facts` 保存响应处理收据和完整工具批次接纳事实。`ModelRunner` 独立管理准备、claim、provider I/O、流式输出和用量结算；`ContextEngine` 管理上下文测量与压缩作业。
+`Session` 管理输入、资源和公开结果；新 Turn 和恢复都进入 `TurnRunner.drive`。恢复决策从同一读快照中的模型操作、响应处理收据、工具和交互事实推导，携带确切 operation/response 身份，不以最后一条消息猜测执行位置。`execution_facts` 保存响应处理收据和完整工具批次接纳事实。`RequestContext` 捕获新请求的增量事实并精确恢复已冻结请求；`ModelRunner` 独立管理准备、claim、provider I/O、流式输出和用量结算；`ResponseHandler` 消费已提交响应；`ContextEngine` 管理上下文测量与压缩作业。`StopChecks` 只检查明确停止条件，`TurnStop` 将检查与结束在同一事务提交。预算与停止边界见 [预算、执行与停止](runtime-termination.md)。
 
 主机控制信息使用 `StepControl` 和 `ModelMessage.runtime_metadata`，文本是单向渲染结果。用户即使粘贴相同标题或 JSON 也不能产生主机控制状态。完整 Step 快照和冻结 canonical/wire 请求存入引用完整性可审计的 artifact；replay 校验 request/context/tool/wire 四个 hash，发送冻结 wire，不重新序列化 provider 请求。凭据从当前可信连接取得，不写入 artifact。旧记录仅在其保存的快照、版本和 hash 能精确恢复时继续执行，历史读取与安全取消独立保留。
 

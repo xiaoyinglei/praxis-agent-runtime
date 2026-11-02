@@ -601,20 +601,7 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
             self._receipt.kind = "error"
         else:
             self._activity_status = "本轮已结束"
-            scopes = {
-                "acceptance_command": "用户指定的验收命令",
-                "workspace_change": "工作区修改及修改后的检查",
-                "workspace_change_recorded": "仅记录工作区修改",
-            }
-            scope = scopes.get(result.validation_scope or "", result.validation_scope or "未声明范围")
-            if result.validation_scope == "workspace_change_recorded":
-                text = "已记录工作区修改"
-            elif result.validation_status == "passed":
-                text = "✓ 已验证 · " + safe_terminal_text(scope)
-            elif result.validation_status == "failed":
-                text = "! 验收未通过 · " + safe_terminal_text(scope)
-            else:
-                text = ""
+            text = ""
         if result.files:
             text += (
                 ("\n" if text else "") + "文件引用：\n" + "\n".join(safe_terminal_text(path) for path in result.files)

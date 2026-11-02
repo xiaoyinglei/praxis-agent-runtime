@@ -375,8 +375,12 @@ class RolloutContextManager:
         """
         return self._candidate(turn_id, retained_tail_messages, require_reduction=False, summary_override="")
 
-    def summary_byte_allowance(self, floor: ContextCompactionCandidate) -> int:
-        messages = floor.messages
+    def summary_byte_allowance(
+        self, floor: ContextCompactionCandidate, *, messages: tuple[ModelMessage, ...] | None = None
+    ) -> int:
+        # Include live request facts when the caller has captured them. They
+        # occupy the same byte envelope as the history and summary.
+        messages = floor.messages if messages is None else messages
         context_size = next(_message_size_bytes(m) for m in messages if m.role == "context")
         limits = self.limits(floor.turn_id)
         return min(

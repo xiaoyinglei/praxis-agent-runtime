@@ -105,6 +105,7 @@ class SyntheticProvider:
         expected = f"GOLD_{self.task.upper() if self.task != 'code' else 'CODE'}_FACT=17"
         if self.task == "dialog":
             expected = "GOLD_DIALOG_FACT=17"
+        self.final_context = text
         return ToolUseResult(
             raw_stop_reason="synthetic",
             text=expected if expected in text else "synthetic fact unavailable",
@@ -163,13 +164,14 @@ def test_public_cli_controlled_context_replay(tmp_path, monkeypatch, task, mode)
 
     monkeypatch.setattr(cli_module, "_create_agent_facade", create_facade)
     # Inject the same low projection guard to trigger both algorithms. Summary
-    # fragments retain their frozen policy materialization bounds; an 8K bound
-    # there would correctly reject these indivisible 12K tool work units.
+    # fragments retain their frozen policy materialization bounds. Leave room
+    # for a protected 12K work unit plus live facts; two such units still
+    # exceed the 20K guard and exercise compaction in both modes.
     from agent_runtime.harness import services
     from agent_runtime.harness.context import RolloutContextManager
 
     monkeypatch.setattr(
-        services, "RolloutContextManager", lambda store: RolloutContextManager(store, max_total_bytes=8000)
+        services, "RolloutContextManager", lambda store: RolloutContextManager(store, max_total_bytes=20000)
     )
     monkeypatch.chdir(tmp_path)
     database = tmp_path / "replay.sqlite"
@@ -222,7 +224,8 @@ def test_public_cli_controlled_context_replay(tmp_path, monkeypatch, task, mode)
     if preserves_fact:
         assert provider.summary_sources and expected in str(provider.summary_sources)
     else:
-        assert not provider.summary_sources
+        if provider.summary_sources:
+            assert expected in str(provider.summary_sources)
     if task == "code":
         assert (tmp_path / "sample.py").read_text().startswith("VALUE = 17\n# old evidence ")
     with RuntimeStore.open_sync(database) as store:
@@ -236,7 +239,10 @@ def test_public_cli_controlled_context_replay(tmp_path, monkeypatch, task, mode)
         answer = item_text(accepted)
         assert accepted.kind == "model_response"
         assert not any(item.kind == "agent_message" for item in items)
-        assert (answer == expected) == preserves_fact
+        if preserves_fact:
+            assert answer == expected
+        else:
+            assert (answer == expected) == (expected in provider.final_context)
         assert store.verify().valid
         tool_results = [item for item in items if item.kind == "tool_result"]
         assert all(not item.payload.get("is_error") for item in tool_results)

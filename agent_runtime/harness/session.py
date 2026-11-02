@@ -21,6 +21,8 @@ from agent_runtime.core.generation_settings import ModelRequestPreferences
 from agent_runtime.harness import artifact_ops, budget_ops, memory_ops, turn_ops
 from agent_runtime.harness.context import validate_tool_history
 from agent_runtime.harness.events import commit_and_publish
+from agent_runtime.harness.execution import TurnRunner
+from agent_runtime.harness.execution_context import step_limit_from_binding
 from agent_runtime.harness.ownership import (
     OWNERSHIP_REVISION,
     ConversationBusyError,
@@ -48,7 +50,6 @@ from agent_runtime.harness.services import (
     restore_tool_policy,
 )
 from agent_runtime.harness.tool_orchestrator import ToolOrchestrator, current_tool_binding
-from agent_runtime.harness.turn import TurnRunner
 from agent_runtime.permission_policy import NetworkPolicy, PermissionPolicy, ResolvedPermissions
 from agent_runtime.result import AgentResult
 from agent_runtime.streaming.sink import TurnEventDispatcher
@@ -93,7 +94,7 @@ class Session:
     tool_orchestrator: ToolOrchestrator | None
     tools: Mapping[str, Tool]
     worker_id: str
-    max_steps: int
+    max_steps: int | None
     binding_provider: SessionBindingProvider
     event_dispatcher: TurnEventDispatcher
     memory_config: MemoryConfig
@@ -225,7 +226,7 @@ class Session:
                     service_options.update(
                         require_workspace_change=completion.get("require_workspace_change") is True,
                         acceptance_command=completion.get("acceptance_command"),
-                        max_steps=binding.get("model_step_budget") or 16,
+                        max_steps=step_limit_from_binding(binding),
                         max_tokens_total=binding.get("model_token_budget_total"),
                         max_cost_micros=binding.get("model_cost_budget_total_micros"),
                     )
@@ -1277,8 +1278,8 @@ class Session:
             }
         tools = {tool.definition.name: tool for tool in (*resident, *web_tools, *mcp_tools)}
 
-        from agent_runtime.builtin.generic import coding_instructions
         from agent_runtime.harness.model_adapter import ControlPlaneHarnessModel
+        from agent_runtime.prompts import SYSTEM_INSTRUCTIONS
 
         override = agent._model_factory
         model = (
@@ -1286,7 +1287,7 @@ class Session:
             if callable(override)
             else ControlPlaneHarnessModel(
                 control_plane=self.model_control_plane,
-                instructions=coding_instructions(workspace.root),
+                instructions=SYSTEM_INSTRUCTIONS,
             )
         )
         return model, dict(
@@ -1418,8 +1419,11 @@ class Session:
             }
             # Borrow providers through the source binding, independent of the parent's next selection.
             await self._prepare_step_binding(source_binding)
-            if max_steps is not None:
-                binding["model_step_budget"] = max_steps
+            binding["model_step_budget"] = (
+                step_limit_from_binding(source_binding)
+                if max_steps is None
+                else step_limit_from_binding({"model_step_budget": max_steps})
+            )
             binding["completion_policy"] = {"require_workspace_change": False}
             if parent_turn_id is None:
                 (

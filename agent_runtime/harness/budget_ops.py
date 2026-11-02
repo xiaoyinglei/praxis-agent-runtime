@@ -16,6 +16,7 @@ from agent_runtime.budget import (
     resource_usage_from_model_usage,
 )
 from agent_runtime.harness import facts, turn_ops
+from agent_runtime.harness.execution_context import step_limit_from_binding
 from agent_runtime.harness.operation_values import _json_object, _validate_resource_usage_input
 from agent_runtime.harness.records import (
     TurnSnapshot,
@@ -127,6 +128,13 @@ def start_budgeted_child_turn(
         if isinstance(inherited_root, str) and inherited_root:
             root_turn_id = inherited_root
         child_binding = dict(frozen_binding)
+        parent_steps = step_limit_from_binding(parent_binding)
+        child_steps = step_limit_from_binding(child_binding)
+        if parent_steps is not None:
+            if child_steps is not None and child_steps > parent_steps:
+                raise ValueError("child max_steps cannot exceed the frozen parent Turn limit")
+            child_steps = parent_steps if child_steps is None else child_steps
+        child_binding["model_step_budget"] = child_steps
         child_binding["budget_root_turn_id"] = root_turn_id
         child_binding["budget_parent_turn_id"] = parent_turn_id
         child_binding["budget_allocation_id"] = allocation_id

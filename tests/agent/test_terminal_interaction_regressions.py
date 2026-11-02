@@ -22,7 +22,10 @@ async def test_fullscreen_scrolls_the_viewport_immediately_while_composing(navig
     with create_pipe_input() as pipe:
         terminal = io.StringIO()
         ui = TerminalChatApp(
-            model="test", workspace="/tmp", ui_mode="fullscreen", input=pipe,
+            model="test",
+            workspace="/tmp",
+            ui_mode="fullscreen",
+            input=pipe,
             output=Vt100_Output(terminal, lambda: Size(rows=24, columns=90), enable_cpr=False),
         )
         ui.view.message("\n".join(f"history row {index:03d}" for index in range(100)), "notice")
@@ -76,9 +79,15 @@ def test_normal_result_shows_usage_and_cache_without_an_unrequested_acceptance_n
     view = Conversation()
     display = ConversationEventDisplay(view)
     display.begin_turn()
-    value = result(status=status, usage=AgentUsage(
-        input_tokens=1000, output_tokens=200, total_tokens=1200, cache_read_input_tokens=800,
-    ))
+    value = result(
+        status=status,
+        usage=AgentUsage(
+            input_tokens=1000,
+            output_tokens=200,
+            total_tokens=1200,
+            cache_read_input_tokens=800,
+        ),
+    )
     display.present_result(value)
     display.present_result(value)
     text = view.plain_text()
@@ -94,7 +103,7 @@ def test_missing_cache_usage_is_reported_as_unknown_instead_of_zero_or_hidden():
     assert "缓存命中 0" in reported and "0.0%" in reported
 
 
-def test_resumed_long_answer_keeps_final_usage_and_validation_at_the_bottom():
+def test_resumed_long_answer_keeps_final_usage_without_a_validation_score():
     view = Conversation()
     display = ConversationEventDisplay(view)
     display.begin_turn()
@@ -102,12 +111,13 @@ def test_resumed_long_answer_keeps_final_usage_and_validation_at_the_bottom():
     pause_receipt = view.blocks[-1]
     display.begin_turn(reset=False)
     view.message("\n".join(f"resumed answer {line}" for line in range(100)))
-    display.present_result(result(
-        usage=AgentUsage(input_tokens=2000, output_tokens=100, total_tokens=2100),
-        validation_status="passed", validation_scope="acceptance_command",
-    ))
+    display.present_result(
+        result(
+            usage=AgentUsage(input_tokens=2000, output_tokens=100, total_tokens=2100),
+        )
+    )
     assert view.blocks[-1].kind == "receipt"
-    assert "输入 2,000" in view.blocks[-1].text and "已验证" in view.blocks[-1].text
+    assert "输入 2,000" in view.blocks[-1].text and "已验证" not in view.blocks[-1].text
     assert "输入 1,000" in pause_receipt.text and "输入 2,000" not in pause_receipt.text
     assert "暂停时" in pause_receipt.text
 
@@ -122,16 +132,26 @@ async def test_real_chat_loop_outputs_turn_usage_without_verbose_or_acceptance_n
 
     class CachedAnswer(SteeringModel):
         async def dispatch(self, prepared, *, event_sink=None):
-            return HarnessModelResponse.from_parts(text="a normal chat answer", provider_response_id=None, usage={
-                "input_tokens": 1000, "output_tokens": 200, "total_tokens": 1200, "cache_read_input_tokens": 800,
-            })
+            return HarnessModelResponse.from_parts(
+                text="a normal chat answer",
+                provider_response_id=None,
+                usage={
+                    "input_tokens": 1000,
+                    "output_tokens": 200,
+                    "total_tokens": 1200,
+                    "cache_read_input_tokens": 800,
+                },
+            )
 
     model = CachedAnswer()
     agent = Agent(checkpoint_db=tmp_path / "run.db", workspace_path=tmp_path, enable_workspace_mcp=False)
     monkeypatch.setattr(agent, "_model_factory", lambda: model)
     with create_pipe_input() as pipe:
         ui = TerminalChatApp(
-            model="test", workspace=str(tmp_path), ui_mode=mode, input=pipe,
+            model="test",
+            workspace=str(tmp_path),
+            ui_mode=mode,
+            input=pipe,
             output=Vt100_Output(io.StringIO(), lambda: Size(rows=24, columns=90), enable_cpr=False),
         )
         task = asyncio.create_task(ui.run(lambda: _chat_facade_loop(agent, max_tokens_total=None, _ui=ui)))
@@ -210,8 +230,14 @@ async def test_native_search_password_input_can_save_or_cancel_without_leaking(t
         ui.editor.text = "保留这份草稿"
 
         async def configure_then_chat():
-            model = ModelSpec(id="test", provider="local", context_window=4096,
-                              supports_tools=True, supports_structured_output=True, location="local")
+            model = ModelSpec(
+                id="test",
+                provider="local",
+                context_window=4096,
+                supports_tools=True,
+                supports_structured_output=True,
+                location="local",
+            )
             try:
                 await ui.setup_search(model)
                 outcomes.append("saved")

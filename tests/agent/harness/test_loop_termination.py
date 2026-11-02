@@ -17,11 +17,11 @@ from agent_runtime.harness import (
     ModelToolCall,
     RuntimeStore,
     Session,
-    TurnRunner,
     completion_ops,
     tool_ops,
     turn_ops,
 )
+from agent_runtime.harness.responses import ResponseHandler
 from tests.agent.harness.test_tool_orchestrator import ToolThenAnswerModel
 
 
@@ -82,14 +82,16 @@ async def test_recovery_allowance_is_independent_of_feedback_wording(tmp_path, m
 async def test_repeated_failure_has_the_same_outcome_after_public_recovery(tmp_path, monkeypatch, boundary):
     model = LoopModel(invalid_until=4)
     agent = agent_for(tmp_path, model)
-    original_check = TurnRunner._repeated_tool_failure
+    from agent_runtime.harness import responses
+
+    original_check = responses.repeated_tool_failure
     original_feedback = completion_ops.record_completion_feedback
 
-    def check(executor, turn_id):
-        results = [i for i in executor._store.list_items(turn_id) if i.kind == "tool_result"]
+    def check(store, turn_id):
+        results = [i for i in store.list_items(turn_id) if i.kind == "tool_result"]
         if boundary == "result" and len(results) == 4:
             raise Crash()
-        return original_check(executor, turn_id)
+        return original_check(store, turn_id)
 
     def feedback(store, **kwargs):
         item = original_feedback(store, **kwargs)
@@ -97,12 +99,12 @@ async def test_repeated_failure_has_the_same_outcome_after_public_recovery(tmp_p
             raise Crash()
         return item
 
-    monkeypatch.setattr(TurnRunner, "_repeated_tool_failure", check)
+    monkeypatch.setattr(responses, "repeated_tool_failure", check)
     monkeypatch.setattr(completion_ops, "record_completion_feedback", feedback)
     if boundary:
         with pytest.raises(Crash):
             await agent.run("Inspect source", max_steps=12, max_tokens_total=10_000)
-        monkeypatch.setattr(TurnRunner, "_repeated_tool_failure", original_check)
+        monkeypatch.setattr(responses, "repeated_tool_failure", original_check)
         monkeypatch.setattr(completion_ops, "record_completion_feedback", original_feedback)
         async with await RuntimeStore.open(tmp_path / "run.db") as store:
             turn_id = store.list_turns()[-1].turn_id
@@ -243,8 +245,7 @@ async def test_stop_continuations_are_bounded_and_recovery_does_not_spend_them_t
         )
     assert result.status == "failed"
     assert result.stop_reason == "completion_continuation_limit"
-    assert result.validation_status == "failed"
-    assert result.validation_scope == "workspace_change_recorded"
+    assert not hasattr(result, "validation_status")
     assert result.usage.model_calls == 9
     assert result.usage.total_tokens == 63
     async with await RuntimeStore.open(tmp_path / "run.db") as store:
@@ -297,7 +298,7 @@ async def test_successful_repeated_reads_remain_available(tmp_path):
     model = LoopModel(read_until=25)
     result = await agent_for(tmp_path, model).run("Investigate", max_steps=30)
     assert result.status == "done"
-    assert result.validation_status == "not_evaluated"
+    assert not hasattr(result, "validation_status")
     assert result.usage.model_calls == 26
     assert len(result.tool_calls) == 25
     assert all(not call.is_error for call in result.tool_calls)
@@ -330,18 +331,18 @@ async def test_recovery_consumes_a_real_committed_write_without_reexecution(tmp_
             return response
 
     model = WriteModel()
-    original = TurnRunner._after_tool_batch
+    original = ResponseHandler._after_tool_batch
 
     async def crash_after_write(*args, **kwargs):
         raise Crash()
 
-    monkeypatch.setattr(TurnRunner, "_after_tool_batch", crash_after_write)
+    monkeypatch.setattr(ResponseHandler, "_after_tool_batch", crash_after_write)
     with pytest.raises(Crash):
         await agent_for(tmp_path, model).run(
             "Update value.txt", allow_write_tools=True, require_workspace_change=True, max_steps=4
         )
     assert (tmp_path / "value.txt").read_text() == "after"
-    monkeypatch.setattr(TurnRunner, "_after_tool_batch", original)
+    monkeypatch.setattr(ResponseHandler, "_after_tool_batch", original)
     async with await RuntimeStore.open(tmp_path / "run.db") as store:
         turn_id = store.list_turns()[-1].turn_id
     result = await agent_for(tmp_path, model).resume(turn_id, "continue")
@@ -357,22 +358,26 @@ async def test_recovery_consumes_a_real_committed_write_without_reexecution(tmp_
 @pytest.mark.anyio
 async def test_new_user_input_resets_continuations_and_supersedes_an_old_decision(tmp_path, monkeypatch):
     model = LoopModel()
-    original = completion_ops.record_completion_decision
+    from agent_runtime.harness.stop import TurnStop
+
+    original = TurnStop.finish
     received = []
 
-    def record(store, **kwargs):
-        item = original(store, **kwargs)
-        if len(store.list_model_operations(kwargs["turn_id"])) == 8 and not received:
-            turn = store.read_turn(kwargs["turn_id"])
-            with RuntimeStore.open_sync(tmp_path / "run.db") as external:
+    async def finish(stop, **kwargs):
+        result = await original(stop, **kwargs)
+        # The stop decision and feedback are atomic now. A concurrent writer
+        # delivers immediately after that transaction, before response handling.
+        if len(stop._store.list_model_operations(kwargs["turn_id"])) == 8 and not received:
+            turn = stop._store.read_turn(kwargs["turn_id"])
+            async with await RuntimeStore.open(tmp_path / "run.db") as external:
                 received.append(
                     turn_ops.receive_turn_input(
                         external, thread_id=turn.thread_id, turn_id=turn.turn_id, text="Additional requirement"
                     )
                 )
-        return item
+        return result
 
-    monkeypatch.setattr(completion_ops, "record_completion_decision", record)
+    monkeypatch.setattr(TurnStop, "finish", finish)
     result = await agent_for(tmp_path, model).run("Make a change", require_workspace_change=True, max_steps=25)
     assert result.stop_reason == "completion_continuation_limit"
     assert result.usage.model_calls == 17

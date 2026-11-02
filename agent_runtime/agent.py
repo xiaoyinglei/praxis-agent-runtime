@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 from agent_runtime.approval import MODE_ORDER, ApprovalMode
 from agent_runtime.harness import memory_ops, turn_ops
 from agent_runtime.harness.memory import MemoryConfig
-from agent_runtime.harness.protocol import DEFAULT_MAX_STEPS, item_text
+from agent_runtime.harness.protocol import item_text
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.models import (
     ModelControlPlane,
@@ -245,7 +245,7 @@ class Agent:
             allow_execute_tools=allow_execute_tools,
             allow_web_tools=allow_web_tools,
             approval_mode=approval_mode if approval_mode is not None else self.approval_mode,
-            max_steps=DEFAULT_MAX_STEPS if step_budget is None else step_budget,
+            max_steps=step_budget,
             max_tokens_total=max_tokens_total,
             max_cost_micros=max_cost_micros,
             event_sink=event_sink,

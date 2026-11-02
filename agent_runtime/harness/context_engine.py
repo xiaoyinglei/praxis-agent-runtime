@@ -49,7 +49,6 @@ class ContextEngine:
         restore_step_context: Callable[..., StepContext],
         dispatch_prepared: Callable[..., Awaitable[Any]],
         commit: Callable[..., Awaitable[Any]],
-        max_steps: int,
         budget_status: Callable[..., Mapping[str, Any]] | None = None,
     ) -> None:
         self._store = store
@@ -59,7 +58,6 @@ class ContextEngine:
         self.restore_step_context = restore_step_context
         self._dispatch_prepared = dispatch_prepared
         self._commit = commit
-        self._max_steps = max_steps
         self._budget_status = budget_status or (lambda turn: {})
         self.policy = ContextPolicy()
 
@@ -297,7 +295,6 @@ class ContextEngine:
         cached_only: bool = False,
     ) -> str:
         """One generation per complete source fragment, with durable call accounting."""
-        max_calls = turn.binding_manifest.get("model_step_budget", self._max_steps)
 
         async def summarize(text: str, *, merged_input: bool = False, node: Mapping[str, Any] | None = None) -> str:
             active_plan = plan
@@ -408,18 +405,6 @@ class ContextEngine:
                 return await summarize(merged, merged_input=True)
             if cached_only:
                 raise ContextBudgetExceededError("No complete cached summary exists for this source.")
-            attempts = await self._store.run_async(
-                lambda: sum(
-                    max(1, len(self._store.list_model_attempts(op.operation_id)))
-                    for op in operations
-                    if op.request_ref.get("purpose") == "context_summary"
-                )
-            )
-            if existing is None and attempts >= max_calls:
-                raise ContextBudgetExceededError(
-                    "Turn summary work exhausted its frozen model-step allowance.",
-                    reason_code="model_step_budget_exhausted",
-                )
             operation = existing or await self._commit(
                 partial(
                     partial(model_ops.prepare_model_operation, self._store),
@@ -504,7 +489,7 @@ class ContextEngine:
             "continuation_input_limit": continuation_limit,
             "continuation_output_limit": base.resource_request.output_tokens,
             "continuation_token_reserve": continuation_limit + base.resource_request.output_tokens,
-            "max_summary_calls": turn.binding_manifest.get("model_step_budget", self._max_steps),
+            "max_summary_calls": None,
         }
         # Empty child slots measure the fixed merge wrapper in the real native
         # or local serializer; B includes escaping in both enclosing formats.
@@ -545,17 +530,6 @@ class ContextEngine:
             return {"source_hash": digest, "input_limit": leaf.resource_request.input_tokens}
 
         plan["summary_tree"] = await measure(source)
-        used = await self._store.run_async(
-            lambda: sum(
-                max(1, len(self._store.list_model_attempts(op.operation_id)))
-                for op in self._store.list_model_operations(turn.turn_id)
-                if op.request_ref.get("purpose") == "context_summary"
-            )
-        )
-        if used + len(nodes) > plan["max_summary_calls"]:
-            raise ContextBudgetExceededError(
-                "Planned summary work exceeds the Turn model-step allowance.", reason_code="model_step_budget_exhausted"
-            )
         required = (
             sum(tokens + plan["summary_output_limit"] for tokens, _ in nodes) + plan["continuation_token_reserve"]
         )
@@ -623,7 +597,7 @@ class ContextEngine:
             "continuation_input_limit": continuation_input_limit,
             "continuation_output_limit": output,
             "continuation_token_reserve": continuation_input_limit + output,
-            "max_summary_calls": turn.binding_manifest.get("model_step_budget", self._max_steps),
+            "max_summary_calls": None,
         }
 
         async def measure_leaves(text: str, active_plan: Mapping[str, Any]) -> list[PreparedModelCall]:
@@ -639,17 +613,6 @@ class ContextEngine:
 
         leaves = await measure_leaves(source, plan)
         count = 2 * len(leaves) - 1
-        used = await self._store.run_async(
-            lambda: sum(
-                max(1, len(self._store.list_model_attempts(op.operation_id)))
-                for op in self._store.list_model_operations(turn.turn_id)
-                if op.request_ref.get("purpose") == "context_summary"
-            )
-        )
-        if used + count > plan["max_summary_calls"]:
-            raise ContextBudgetExceededError(
-                "Planned summary work exceeds the Turn model-step allowance.", reason_code="model_step_budget_exhausted"
-            )
         summary_input_limit = probe.request_ref["context_projection"]["max_input_tokens"]
         fixed = (
             sum(leaf.resource_request.input_tokens for leaf in leaves)
@@ -889,11 +852,11 @@ class ContextEngine:
                 floor = await self._store.run_async(
                     manager.semantic_floor, turn.turn_id, retained_tail_messages=retained
                 )
-                _, base = await accept(floor)
+                floor_context, base = await accept(floor)
             except ContextBudgetExceededError:
                 retained = 0
                 floor = await self._store.run_async(manager.semantic_floor, turn.turn_id)
-                _, base = await accept(floor)
+                floor_context, base = await accept(floor)
             source_hash, source = await self._store.run_async(
                 manager.semantic_source, turn.turn_id, retained_tail_messages=retained
             )
@@ -947,7 +910,11 @@ class ContextEngine:
                         source=source,
                         retained=retained,
                         base=base,
-                        byte_allowance=(await self._store.run_async(manager.summary_byte_allowance, floor)),
+                        byte_allowance=(
+                            await self._store.run_async(
+                                manager.summary_byte_allowance, floor, messages=floor_context.messages
+                            )
+                        ),
                         target_input_tokens=target_input_tokens,
                     )
                 except (ContextBudgetExceededError, PricingUnavailableError):
@@ -955,7 +922,7 @@ class ContextEngine:
                         raise
                     retained = 0
                     floor = await self._store.run_async(manager.semantic_floor, turn.turn_id)
-                    _, base = await accept(floor)
+                    floor_context, base = await accept(floor)
                     plan = await self._plan_capacity_compaction(
                         turn,
                         step=step,
@@ -963,7 +930,11 @@ class ContextEngine:
                         source=source,
                         retained=0,
                         base=base,
-                        byte_allowance=(await self._store.run_async(manager.summary_byte_allowance, floor)),
+                        byte_allowance=(
+                            await self._store.run_async(
+                                manager.summary_byte_allowance, floor, messages=floor_context.messages
+                            )
+                        ),
                         target_input_tokens=target_input_tokens,
                     )
             else:
@@ -974,7 +945,11 @@ class ContextEngine:
                     source=source,
                     retained=retained,
                     base=base,
-                    byte_limit=(await self._store.run_async(manager.summary_byte_allowance, floor)),
+                    byte_limit=(
+                        await self._store.run_async(
+                            manager.summary_byte_allowance, floor, messages=floor_context.messages
+                        )
+                    ),
                 )
             if saved is None:
                 covered = json.loads(floor.payload_json)
@@ -983,7 +958,7 @@ class ContextEngine:
                     covered_item_ids=covered["covered_item_ids"],
                     preserved_item_ids=covered.get("preserved_item_ids", []),
                     binding_manifest=dict(turn.binding_manifest),
-                    max_summary_retries=max(0, plan["max_summary_calls"] - plan["planned_summary_calls"]),
+                    max_summary_retries=None,
                     continuation_measurement={
                         "resource_request": base.resource_request.to_dict(),
                         "context_projection": dict(base.request_ref.get("context_projection", {})),

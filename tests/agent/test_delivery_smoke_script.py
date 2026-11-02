@@ -69,7 +69,7 @@ async def test_fake_delivery_matrix_runs_public_sdk_and_approval_resume() -> Non
     assert "Ran 3 tests" in checkout.check_outputs[1]
     assert "\nOK\n" in checkout.check_outputs[1]
     assert "+    return round(subtotal * (1 - discount_percent / 100), 2)" in checkout.workspace_diff
-    assert checkout.validation_status == "passed"
+    assert not hasattr(checkout, "validation_status")
 
 
 def test_demo_trace_rejects_absolute_paths() -> None:
@@ -80,33 +80,43 @@ def test_demo_trace_rejects_absolute_paths() -> None:
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize('scenario', ['no_change', 'verify_before_change', 'unreached_assertion'])
+@pytest.mark.parametrize("scenario", ["no_change", "verify_before_change", "unreached_assertion"])
 async def test_delivery_smoke_explicit_acceptance_rejects_missing_or_unexecuted_checks(scenario):
     module = _load_smoke_module()
     case = module.build_cases()[2]
-    read = module.ModelToolCall(id='read', name='read_file', arguments={'path': 'pricing.py'})
-    verify = module.ModelToolCall(id='verify', name='run_command', arguments={'command': module.CHECKOUT_COMMAND})
-    patch = module.ModelToolCall(id='patch', name='apply_patch', arguments={
-        'file_path': 'pricing.py', 'old_string': module.CHECKOUT_BEFORE, 'new_string': module.CHECKOUT_AFTER})
-    unexecuted = module.ModelToolCall(id='unchecked', name='execute_python', arguments={
-        'code': 'def never_called():\n    assert False\nprint("no check ran")'})
-    calls = {'no_change': (read,), 'verify_before_change': (verify, patch),
-             'unreached_assertion': (patch, unexecuted)}[scenario]
+    read = module.ModelToolCall(id="read", name="read_file", arguments={"path": "pricing.py"})
+    verify = module.ModelToolCall(id="verify", name="run_command", arguments={"command": module.CHECKOUT_COMMAND})
+    patch = module.ModelToolCall(
+        id="patch",
+        name="apply_patch",
+        arguments={
+            "file_path": "pricing.py",
+            "old_string": module.CHECKOUT_BEFORE,
+            "new_string": module.CHECKOUT_AFTER,
+        },
+    )
+    unexecuted = module.ModelToolCall(
+        id="unchecked",
+        name="execute_python",
+        arguments={"code": 'def never_called():\n    assert False\nprint("no check ran")'},
+    )
+    calls = {"no_change": (read,), "verify_before_change": (verify, patch), "unreached_assertion": (patch, unexecuted)}[
+        scenario
+    ]
 
     class Model(module._SmokeModel):
         async def dispatch(self, prepared, *, event_sink=None):
-            step = int(prepared.request_ref['step'])
+            step = int(prepared.request_ref["step"])
             if step <= len(calls):
-                return module._response(text='', step=step, tool_calls=(calls[step - 1],))
-            return module._response(text='praxis demo complete', step=step)
+                return module._response(text="", step=step, tool_calls=(calls[step - 1],))
+            return module._response(text="praxis demo complete", step=step)
 
     result = await module._run_case(case, model=Model(case))
     assert not result.passed
-    assert result.status != 'done'
-    assert result.validation_status == 'failed'
-    assert result.validation_scope == ('workspace_change_recorded' if scenario == 'no_change' else 'acceptance_command')
-    if scenario == 'no_change':
-        assert result.workspace_diff == ''
+    assert result.status != "done"
+    assert not hasattr(result, "validation_status")
+    if scenario == "no_change":
+        assert result.workspace_diff == ""
     else:
         assert "-    return round(subtotal * (1 - discount_percent), 2)" in result.workspace_diff
         assert "+    return round(subtotal * (1 - discount_percent / 100), 2)" in result.workspace_diff

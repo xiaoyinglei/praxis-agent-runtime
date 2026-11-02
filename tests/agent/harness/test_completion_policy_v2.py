@@ -7,7 +7,7 @@ from uuid import uuid4
 import pytest
 
 from agent_runtime.harness import RuntimeStore, budget_ops, tool_ops, turn_ops
-from agent_runtime.harness.completion import DeliveryCompletionGate
+from agent_runtime.harness.stop import StopChecks
 from tests.agent.harness.test_completion_gate import _commit_tool_result, _proposal
 
 COMMAND = "python tools/custom_acceptance.py --strict"
@@ -56,7 +56,7 @@ def _command(
 
 
 def _evaluate(store, turn_id):
-    return DeliveryCompletionGate(store).evaluate(_proposal(store, turn_id))
+    return StopChecks(store).evaluate(_proposal(store, turn_id))
 
 
 def test_natural_v2_completion_has_no_inferred_validation(tmp_path):
@@ -64,8 +64,7 @@ def test_natural_v2_completion_has_no_inferred_validation(tmp_path):
         turn = _start(store, tmp_path)
         decision = _evaluate(store, turn.turn_id)
         assert decision.action == "accept"
-        assert decision.validation_status == "not_evaluated"
-        assert decision.validation_scope is None
+        assert not hasattr(decision, "validation_status")
 
 
 def test_v2_requested_change_checks_only_actual_mutation(tmp_path):
@@ -75,18 +74,16 @@ def test_v2_requested_change_checks_only_actual_mutation(tmp_path):
         _change(store, turn.turn_id, tmp_path)
         decision = _evaluate(store, turn.turn_id)
         assert decision.action == "accept"
-        assert decision.validation_status == "passed"
-        assert decision.validation_scope == "workspace_change_recorded"
+        assert not hasattr(decision, "validation_status")
 
 
-def test_legacy_policy_still_requires_post_change_verification(tmp_path):
+def test_historical_policy_uses_only_explicit_stop_conditions(tmp_path):
     with RuntimeStore.open_sync(tmp_path / "rollout.sqlite3") as store:
         turn = _start(store, tmp_path, require_change=True, command=COMMAND, revision=None)
         _change(store, turn.turn_id, tmp_path)
         _command(store, turn.turn_id)
         decision = _evaluate(store, turn.turn_id)
-        assert decision.action == "continue"
-        assert decision.validation_scope == "workspace_change"
+        assert decision.action == "accept"
 
 
 def test_explicit_custom_command_passes_without_a_runner_name_whitelist(tmp_path):
@@ -95,8 +92,7 @@ def test_explicit_custom_command_passes_without_a_runner_name_whitelist(tmp_path
         _command(store, turn.turn_id, command=f"\n{COMMAND}\n")
         decision = _evaluate(store, turn.turn_id)
         assert decision.action == "accept"
-        assert decision.validation_status == "passed"
-        assert decision.validation_scope == "acceptance_command"
+        assert not hasattr(decision, "validation_status")
 
 
 @pytest.mark.parametrize("actual", ["pytest -q", COMMAND + " --extra", "python  tools/custom_acceptance.py --strict"])
@@ -106,7 +102,6 @@ def test_other_successful_commands_do_not_replace_the_frozen_acceptance_command(
         _command(store, turn.turn_id, command=actual)
         decision = _evaluate(store, turn.turn_id)
         assert decision.action == "continue"
-        assert decision.validation_scope == "acceptance_command"
         feedback = json.loads(decision.reason)
         assert feedback["reason_code"] == "acceptance_command_missing"
         assert feedback["command"] == COMMAND
@@ -173,7 +168,6 @@ def test_trusted_acceptance_command_may_itself_produce_workspace_outputs(tmp_pat
         )
         decision = _evaluate(store, turn.turn_id)
         assert decision.action == "accept"
-        assert decision.validation_scope == "acceptance_command"
 
 
 def test_unlinked_result_cannot_attest_the_user_command(tmp_path):
@@ -282,7 +276,6 @@ def test_delegated_change_satisfies_explicit_change_requirement_before_parent_ac
         _command(store, parent.turn_id, call_id="parent-check")
         decision = _evaluate(store, parent.turn_id)
         assert decision.action == "accept"
-        assert decision.validation_scope == "acceptance_command"
 
 
 def test_delegated_change_alone_satisfies_only_the_recorded_mutation_scope(tmp_path):
@@ -292,7 +285,6 @@ def test_delegated_change_alone_satisfies_only_the_recorded_mutation_scope(tmp_p
         _change(store, child.turn_id, tmp_path, call_id="delegated-change")
         decision = _evaluate(store, parent.turn_id)
         assert decision.action == "accept"
-        assert decision.validation_scope == "workspace_change_recorded"
 
 
 @pytest.mark.parametrize("same_workspace", [False, True])

@@ -179,7 +179,11 @@ def test_affordable_file_work_continues_with_measured_usage_and_frozen_replay(tm
         context = runner.restore_turn_context(turn.turn_id)
     with RuntimeStore.open_sync(database) as reopened:
         runner._store = reopened
+        runner._requests._store = reopened
+        runner._responses._store = reopened
+        runner._stop._store = reopened
         runner._context_manager = RolloutContextManager(reopened)
+        runner._requests._context_manager = runner._context_manager
         for op in operations:
             replay = asyncio.run(runner._model_runner.prepare(runner.restore_step_context(context, op)))
             assert (replay.request_hash, replay.context_hash, replay.tool_hash, replay.wire_hash) == (
@@ -268,7 +272,11 @@ def test_output_cap_accounts_for_changed_input_limits_without_provider_io(tmp_pa
         context = runner.restore_turn_context(turn.turn_id)
     with RuntimeStore.open_sync(tmp_path / "run.db") as reopened:
         runner._store = reopened
+        runner._requests._store = reopened
+        runner._responses._store = reopened
+        runner._stop._store = reopened
         runner._context_manager = RolloutContextManager(reopened)
+        runner._requests._context_manager = runner._context_manager
         replay = asyncio.run(runner._model_runner.prepare(runner.restore_step_context(context, operation)))
         assert (replay.request_hash, replay.context_hash, replay.tool_hash, replay.wire_hash) == (
             operation.request_hash,
@@ -300,7 +308,11 @@ def test_old_prepared_final_only_snapshot_keeps_exact_request_after_reopen(tmp_p
         )
     with RuntimeStore.open_sync(database) as store:
         runner._store = store
+        runner._requests._store = store
+        runner._responses._store = store
+        runner._stop._store = store
         runner._context_manager = RolloutContextManager(store)
+        runner._requests._context_manager = runner._context_manager
         restored = runner.restore_step_context(context, op)
         replay = asyncio.run(runner._model_runner.prepare(restored))
         assert restored.tools == ()

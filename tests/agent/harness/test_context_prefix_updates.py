@@ -213,7 +213,7 @@ async def test_context_updates_survive_saved_request_replay_and_compaction(tmp_p
     from agent_runtime.runtime_clock import capture_runtime_clock
 
     clock = capture_runtime_clock()
-    monkeypatch.setattr("agent_runtime.harness.turn.capture_runtime_clock", lambda: dict(clock))
+    monkeypatch.setattr("agent_runtime.harness.request_context.capture_runtime_clock", lambda: dict(clock))
 
     (tmp_path / "AGENTS.md").write_text("ROOT_BASELINE")
     model = Probe("answer")
@@ -231,7 +231,7 @@ async def test_context_updates_survive_saved_request_replay_and_compaction(tmp_p
             def forbid_clock():
                 raise AssertionError("replay must use its saved clock")
 
-            guard.setattr("agent_runtime.harness.turn.capture_runtime_clock", forbid_clock)
+            guard.setattr("agent_runtime.harness.request_context.capture_runtime_clock", forbid_clock)
             restored = executor.restore_step_context(executor.restore_turn_context(result.turn_id), operation)
             assert wire(restored.model_request()) == wire(original)
         binding = {**original.binding_manifest, "context_capacity_policy": ContextCapacityPolicy().model_dump()}
@@ -255,7 +255,7 @@ async def test_context_updates_survive_saved_request_replay_and_compaction(tmp_p
 
 
 @pytest.mark.anyio
-async def test_legacy_turn_keeps_its_context_layout(tmp_path):
+async def test_new_request_from_historical_turn_uses_current_append_projection(tmp_path):
     from agent_runtime.harness import ModelMessage
 
     (tmp_path / "AGENTS.md").write_text("legacy rule")
@@ -277,12 +277,11 @@ async def test_legacy_turn_keeps_its_context_layout(tmp_path):
         }
         legacy = replace(turn, binding_manifest={**turn.binding_manifest, "execution_context_policy": policy})
         step = executor.capture_step_context(legacy, step=2, messages=(ModelMessage(role="user", body="task"),))
-        assert step.messages[0].content.startswith("Cross-chat memory (")
-        assert json.loads(step.messages[0].content.split("\n", 1)[1])["version"] == 0
-        assert step.messages[1].content.startswith("Project instructions (")
-        assert "legacy rule" in step.messages[1].content
-        assert "replaces earlier" not in step.messages[1].content
-        assert "context_updates" not in step.binding_manifest
+        assert step.messages[0].content == "task"
+        updates = step.binding_manifest["context_update_messages"]
+        assert "legacy rule" in str(updates)
+        assert all(message["role"] == "context" for message in updates)
+        assert step.binding_manifest["execution_context_policy"]["cache_continuity"] == "append-v1"
 
 
 @pytest.mark.anyio

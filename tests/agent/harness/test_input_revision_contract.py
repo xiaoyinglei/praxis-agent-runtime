@@ -104,7 +104,7 @@ async def test_unsupported_prepared_request_still_allows_safe_abort(tmp_path, mo
 def test_low_level_recovery_rejects_old_requests_before_mutation_or_preparation(tmp_path, monkeypatch, route):
     import asyncio
 
-    from agent_runtime.harness import DeliveryCompletionGate, RolloutContextManager, TurnRunner
+    from agent_runtime.harness import RolloutContextManager, StopChecks, TurnRunner
     from tests.agent.harness.test_rollout_integrity_boundary import OpenOnlyModel
 
     with RuntimeStore.open_sync(tmp_path / "run.db") as state:
@@ -140,7 +140,7 @@ def test_low_level_recovery_rejects_old_requests_before_mutation_or_preparation(
             store=state,
             model=OpenOnlyModel(),
             context_manager=RolloutContextManager(state),
-            completion_gate=DeliveryCompletionGate(state),
+            completion_gate=StopChecks(state),
         )
         before = state.list_records(thread.thread_id)
         with pytest.raises(ValueError, match="input_revision.*start a new Turn"):

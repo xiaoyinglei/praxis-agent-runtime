@@ -18,6 +18,7 @@ from agent_runtime.harness import (
     turn_ops,
 )
 from agent_runtime.harness.model_runner import ModelRunner
+from agent_runtime.harness.responses import ResponseHandler
 from agent_runtime.streaming.events import EventType, ItemStatus, TurnItemKind
 from tests.agent.harness.test_public_agent_cutover import PublicHarnessModel
 
@@ -175,7 +176,7 @@ def test_legacy_turn_cannot_acquire_retry_policy_on_public_recovery(tmp_path, mo
         pass
 
     original_start = turn_ops.start_turn
-    original_handle = TurnRunner._handle_model_response
+    original_handle = ResponseHandler._handle_model_response
 
     def legacy_start(self, **kwargs):
         kwargs["binding_manifest"] = dict(kwargs["binding_manifest"])
@@ -186,14 +187,14 @@ def test_legacy_turn_cannot_acquire_retry_policy_on_public_recovery(tmp_path, mo
         raise Crash()
 
     monkeypatch.setattr(turn_ops, "start_turn", legacy_start)
-    monkeypatch.setattr(TurnRunner, "_handle_model_response", crash_handle)
+    monkeypatch.setattr(ResponseHandler, "_handle_model_response", crash_handle)
     database = tmp_path / "run.db"
     agent = Agent(workspace_path=tmp_path, checkpoint_db=database, enable_workspace_mcp=False)
     monkeypatch.setattr(agent, "_model_factory", TruncatedThenAnswer)
     with pytest.raises(Crash):
         asyncio.run(agent.run("Explain", max_steps=5))
     monkeypatch.setattr(turn_ops, "start_turn", original_start)
-    monkeypatch.setattr(TurnRunner, "_handle_model_response", original_handle)
+    monkeypatch.setattr(ResponseHandler, "_handle_model_response", original_handle)
     with RuntimeStore.open_sync(database) as store:
         turn = store.list_turns()[-1]
         assert "model_response_recovery" not in turn.binding_manifest
@@ -214,7 +215,7 @@ def test_restart_between_commits_preserves_retry_limit_and_usage(tmp_path, monke
     model = TruncatedThenAnswer()
     agent = Agent(workspace_path=tmp_path, checkpoint_db=database, enable_workspace_mcp=False)
     monkeypatch.setattr(agent, "_model_factory", lambda: model)
-    original_handle = TurnRunner._handle_model_response
+    original_handle = ResponseHandler._handle_model_response
     original_dispatch = ModelRunner.dispatch
 
     async def crash_handle(self, **kwargs):
@@ -227,11 +228,11 @@ def test_restart_between_commits_preserves_retry_limit_and_usage(tmp_path, monke
             raise Crash()
         return await original_dispatch(self, **kwargs)
 
-    monkeypatch.setattr(TurnRunner, "_handle_model_response", crash_handle)
+    monkeypatch.setattr(ResponseHandler, "_handle_model_response", crash_handle)
     monkeypatch.setattr(ModelRunner, "dispatch", crash_dispatch)
     with pytest.raises(Crash):
         asyncio.run(agent.run("Explain", max_steps=5, max_tokens_total=1000))
-    monkeypatch.setattr(TurnRunner, "_handle_model_response", original_handle)
+    monkeypatch.setattr(ResponseHandler, "_handle_model_response", original_handle)
     monkeypatch.setattr(ModelRunner, "dispatch", original_dispatch)
     with RuntimeStore.open_sync(database) as store:
         turn_id = store.list_turns()[-1].turn_id

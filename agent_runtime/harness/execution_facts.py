@@ -111,3 +111,140 @@ def handled_response_ids(records: Sequence[Any]) -> frozenset[str]:
     return frozenset(
         record.payload["response_item_id"] for record in records if record.record_type == "response_handling_decided"
     )
+
+
+def canonical_tool_results(store: RuntimeStore, turn_id: str) -> tuple[tuple[str, Mapping[str, Any]], ...]:
+    """Read the accepted outcome; keep superseded unknowns only in the audit ledger."""
+    operations = {op.tool_call_id: op for op in store.list_tool_operations(turn_id)}
+    results: list[tuple[str, Mapping[str, Any]]] = []
+    for item in store.list_items(turn_id):
+        if item.status != "completed":
+            continue
+        payload = item.payload
+        if item.kind == "tool_reconciliation" and item.producer == "reconciler":
+            reconciled = item.payload.get("result")
+            if not isinstance(reconciled, Mapping):
+                continue
+            payload = reconciled
+            call_id = payload.get("tool_call_id")
+            if not isinstance(call_id, str):
+                continue
+            operation = operations.get(call_id)
+            if operation is None or operation.result_item_id != item.item_id:
+                continue
+        elif item.kind == "tool_result":
+            call_id = payload.get("tool_call_id")
+            if not isinstance(call_id, str):
+                continue
+            operation = operations.get(call_id)
+            if (
+                operation is not None
+                and operation.result_item_id is not None
+                and operation.result_item_id != item.item_id
+            ):
+                continue
+        else:
+            continue
+        results.append((item.item_id, payload))
+    return tuple(results)
+
+
+def repeated_tool_failure(store: RuntimeStore, turn_id: str) -> bool:
+    """Use committed results so a process restart cannot reset the failure streak."""
+    items = store.list_items(turn_id)
+    calls = {
+        item.payload.get("tool_call_id"): item.payload
+        for item in items
+        if item.kind == "tool_call" and item.status == "completed"
+    }
+    canonical = canonical_tool_results(store, turn_id)
+    results = [result for _, result in canonical]
+    if len(results) < 3:
+        return False
+    operations = {op.result_item_id: op for op in store.list_tool_operations(turn_id)}
+    result_items = {result.get("tool_call_id"): item_id for item_id, result in canonical}
+    target = None
+    repeats = 0
+    for result in reversed(results):
+        call = calls.get(result.get("tool_call_id"))
+        if call is None:
+            break
+        metadata = result.get("metadata")
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        if metadata.get("workspace_tree_changed") is True:
+            break
+        if result.get("is_error") is not True:
+            operation = operations.get(result_items.get(result.get("tool_call_id")))
+            # Inspections and proven no-op writes do not reset a failure streak.
+            # Unknown/external effects remain a conservative progress boundary.
+            if operation is None:
+                break
+            effects = set(operation.effects)
+            readonly = effects <= {"read_workspace"}
+            noop = metadata.get("workspace_tree_changed") is False and effects <= {
+                "read_workspace",
+                "write_workspace",
+                "execute_process",
+                "destructive",
+            }
+            if not (readonly or noop):
+                break
+            if target and (call.get("tool_name"), call.get("arguments")) == (target[0], target[3]):
+                break  # The same call succeeded: actual recovery.
+            if target and isinstance(target[3], tuple) and call.get("tool_name") == target[0]:
+                resources = tuple(
+                    sorted(
+                        resource["identity"]
+                        for resource in operation.resources
+                        if resource.get("kind") == "filesystem" and resource.get("access") == "read"
+                    )
+                )
+                if set(target[3]) <= set(resources):
+                    break
+            continue
+        # Argument validation permits a corrected call, not identical retries.
+        deterministic = result.get("retryable") is False or result.get("error_code") == "invalid_arguments"
+        if not deterministic:
+            break
+        signature = (
+            result.get("tool_name"),
+            result.get("error_code"),
+            None,
+            call.get("arguments"),
+        )
+        operation = operations.get(result_items.get(result.get("tool_call_id")))
+        constraint = metadata.get("permission_constraint")
+        if result.get("error_code") == "filesystem_denied" and isinstance(constraint, Mapping):
+            # The same policy/resource/action remains the same obstacle
+            # when a model changes tool names or rewrites its arguments.
+            denied_resources = tuple(sorted({(r["path"], r["access"]) for r in constraint.get("resources", ())}))
+            if denied_resources:
+                signature = (
+                    "filesystem_permission",
+                    "filesystem_denied",
+                    None,
+                    (constraint.get("permissions_revision"), denied_resources),
+                )
+        if (
+            result.get("error_code") == "file_not_found"
+            and operation is not None
+            and set(operation.effects) <= {"read_workspace"}
+        ):
+            resources = tuple(
+                sorted(
+                    resource["identity"]
+                    for resource in operation.resources
+                    if resource.get("kind") == "filesystem" and resource.get("access") == "read"
+                )
+            )
+            if resources:
+                # The committed outcome already attests a missing resource.
+                # Replaying it must not perform unrecorded filesystem probes.
+                signature = (result.get("tool_name"), "file_not_found", None, resources)
+        if target is None:
+            target = signature
+        if signature == target:
+            repeats += 1
+            if repeats == 3:
+                return True
+    return False

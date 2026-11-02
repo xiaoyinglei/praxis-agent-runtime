@@ -8,7 +8,8 @@ import json
 import pytest
 
 from agent_runtime.core.messages import ModelToolCall, StopReason, ToolUseResult
-from agent_runtime.harness import RolloutContextManager, RuntimeStore, TurnRunner
+from agent_runtime.harness import RolloutContextManager, RuntimeStore
+from agent_runtime.harness.responses import ResponseHandler
 from agent_runtime.modeling.contracts import normalize_llm_usage
 from agent_runtime.modeling.gateway import AgentModelResponse, model_request_input_text
 from agent_runtime.modeling.openai_wire import serialize_openai_request
@@ -83,7 +84,7 @@ def test_bad_call_feedback_then_corrected_file_action_survives_restart(tmp_path,
 
     gateway = CorrectedArgumentsGateway(path="result.txt", body="verified\n")
     gateway.workspace = tmp_path
-    original_handle = TurnRunner._handle_model_response
+    original_handle = ResponseHandler._handle_model_response
 
     async def stop_after_commit(self, **kwargs):
         raise Crash()
@@ -93,20 +94,27 @@ def test_bad_call_feedback_then_corrected_file_action_survives_restart(tmp_path,
         runner, turn, initial_gateway = file_runner(store, tmp_path)
         monkeypatch.setattr(initial_gateway, "agenerate_model_request", gateway.agenerate_model_request)
         if restart:
-            monkeypatch.setattr(TurnRunner, "_handle_model_response", stop_after_commit)
+            monkeypatch.setattr(ResponseHandler, "_handle_model_response", stop_after_commit)
             with pytest.raises(Crash):
                 asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
             assert not (tmp_path / "result.txt").exists()
             assert not store.list_tool_operations(turn.turn_id)
-            monkeypatch.setattr(TurnRunner, "_handle_model_response", original_handle)
+            monkeypatch.setattr(ResponseHandler, "_handle_model_response", original_handle)
         else:
             result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
             assert result.status == "completed"
     with RuntimeStore.open_sync(database) as reopened:
         runner._store = reopened
+        runner._requests._store = reopened
+        runner._responses._store = reopened
+        runner._stop._store = reopened
         runner._context_manager = RolloutContextManager(reopened)
+        runner._requests._context_manager = runner._context_manager
         runner._tool_orchestrator._store = reopened
         runner._model_runner._store = reopened
+        runner._requests._store = reopened
+        runner._responses._store = reopened
+        runner._stop._store = reopened
         runner._model_runner._context_manager = runner._context_manager
         runner._context_engine._store = reopened
         runner._context_engine._context_manager = runner._context_manager

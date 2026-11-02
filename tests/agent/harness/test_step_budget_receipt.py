@@ -37,7 +37,7 @@ async def test_default_budget_allows_tasks_past_sixteen_steps(tmp_path):
     result = await agent.run("inspect and answer")
     assert result.status == "done"
     assert len(model.requests) == 18
-    assert model.requests[0].binding_manifest["model_step_budget"] == 128
+    assert model.requests[0].binding_manifest["model_step_budget"] is None
 
 
 @pytest.mark.anyio

@@ -1,4 +1,5 @@
 """CLI connection setup; configuration and credentials belong to the human host."""
+
 from __future__ import annotations
 
 import asyncio
@@ -10,6 +11,7 @@ import typer
 
 from agent_runtime import mcp_admin
 from agent_runtime.core.runtime_diagnostics import RuntimeDiagnostic
+from agent_runtime.tools.tool import ToolApprovalProfile
 
 mcp_app = typer.Typer(no_args_is_help=True)
 
@@ -22,40 +24,67 @@ async def check_mcp_connection(name: str, workspace: Path, *, config_path: Path 
     config = (mcp_admin.user_mcp_config() if config_path is None else config_path).expanduser().resolve()
     policy = resolve_permission_sources(workspace)
     trust = decide_mcp_config_trust(
-        config, workspace_root=workspace, trust_workspace=config_path is not None,
+        config,
+        workspace_root=workspace,
+        trust_workspace=config_path is not None,
         trusted_external_configs=() if config_path is None else (config,),
     )
     diagnostics: list[RuntimeDiagnostic] = []
     async with open_trusted_product_mcp_tools(
-        config, trust=trust, permissions=policy, diagnostics=diagnostics, server_names=frozenset({name}),
+        config,
+        trust=trust,
+        permissions=policy,
+        diagnostics=diagnostics,
+        server_names=frozenset({name}),
         cache_catalog=True,
     ) as tools:
-        return {"name": name, "connected": bool(tools), "tools": [tool.definition.name for tool in tools],
-                "diagnostics": [item.model_dump(mode="json") for item in diagnostics]}
+        return {
+            "name": name,
+            "connected": bool(tools),
+            "tools": [tool.definition.name for tool in tools],
+            "action_tools": [
+                tool.definition.name for tool in tools if tool.approval_profile is ToolApprovalProfile.MCP_ACTION
+            ],
+            "diagnostics": [item.model_dump(mode="json") for item in diagnostics],
+        }
 
 
 @mcp_app.command("add")
 def add(
-    name: Annotated[str, typer.Argument(help="服务名称；github 使用官方只读预设")],
+    name: Annotated[str, typer.Argument(help="服务名称；github 使用官方端点，工具来自服务发现")],
     url: Annotated[str | None, typer.Option("--url", help="远程 HTTPS MCP 地址")] = None,
     bearer_token_env_var: Annotated[str | None, typer.Option("--bearer-token-env-var")] = None,
-    tools: Annotated[list[str] | None, typer.Option("--tool", help="可重复指定工具白名单")] = None,
+    tools: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--tool",
+            help="可重复指定工具白名单；省略时发现全部符合模式的工具",
+        ),
+    ] = None,
     read_only: Annotated[bool, typer.Option("--read-only/--allow-actions")] = True,
     oauth: Annotated[bool, typer.Option("--oauth", help="使用标准浏览器 OAuth 登录")] = False,
     oauth_client_id: Annotated[str | None, typer.Option("--oauth-client-id")] = None,
     oauth_callback_port: Annotated[int, typer.Option("--oauth-callback-port", min=0, max=65535)] = 0,
     oauth_scopes: Annotated[list[str] | None, typer.Option("--oauth-scope")] = None,
     oauth_domains: Annotated[
-        list[str] | None, typer.Option("--oauth-domain", help="授权 OAuth 使用的额外精确域名"),
+        list[str] | None,
+        typer.Option("--oauth-domain", help="授权 OAuth 使用的额外精确域名"),
     ] = None,
 ) -> None:
     """注册远程服务及其域名授权；github 默认使用现有 gh 登录。"""
     try:
-        config = mcp_admin.register_remote_mcp(name, url=url, bearer_token_env_var=bearer_token_env_var,
-                                               tools=tuple(tools or ()), read_only=read_only, oauth=oauth,
-                                               oauth_client_id=oauth_client_id, oauth_scopes=tuple(oauth_scopes or ()),
-                                               oauth_allowed_domains=tuple(oauth_domains or ()),
-                                               oauth_callback_port=oauth_callback_port)
+        config = mcp_admin.register_remote_mcp(
+            name,
+            url=url,
+            bearer_token_env_var=bearer_token_env_var,
+            tools=tuple(tools or ()),
+            read_only=read_only,
+            oauth=oauth,
+            oauth_client_id=oauth_client_id,
+            oauth_scopes=tuple(oauth_scopes or ()),
+            oauth_allowed_domains=tuple(oauth_domains or ()),
+            oauth_callback_port=oauth_callback_port,
+        )
     except (OSError, ValueError) as error:
         raise typer.BadParameter(str(error)) from None
     print(json.dumps({"registered": name, "config": str(config), "read_only": read_only}, ensure_ascii=False))
@@ -65,10 +94,53 @@ def add(
 @mcp_app.command("list")
 def list_connections() -> None:
     """显示个人连接；不读取凭据、不连接远程服务。"""
-    keys = ("name", "transport", "url", "enabled", "read_only", "bearer_token_env_var", "keychain",
-            "oauth", "oauth_client_id", "oauth_scopes", "oauth_allowed_domains", "oauth_callback_port")
-    print(json.dumps([{key: entry[key] for key in keys if key in entry}
-                      for entry in mcp_admin.mcp_connections()], ensure_ascii=False, indent=2))
+    keys = (
+        "name",
+        "transport",
+        "url",
+        "enabled",
+        "read_only",
+        "tools_allowlist",
+        "allow_all_tools",
+        "bearer_token_env_var",
+        "keychain",
+        "oauth",
+        "oauth_client_id",
+        "oauth_scopes",
+        "oauth_allowed_domains",
+        "oauth_callback_port",
+    )
+    print(
+        json.dumps(
+            [{key: entry[key] for key in keys if key in entry} for entry in mcp_admin.mcp_connections()],
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+@mcp_app.command("configure")
+def configure(
+    name: Annotated[str, typer.Argument(help="已注册的 HTTP MCP 服务")],
+    read_only: Annotated[bool | None, typer.Option("--read-only/--allow-actions")] = None,
+    tools: Annotated[list[str] | None, typer.Option("--tool", help="替换工具白名单，可重复指定")] = None,
+    all_tools: Annotated[bool, typer.Option("--all-tools", help="清除工具白名单，发现服务提供的全部工具")] = False,
+    workspace: Annotated[Path, typer.Option("--workspace")] = Path("."),
+) -> None:
+    """修改工具范围并保留登录；已有只读模式和白名单均需显式更改。"""
+    if all_tools and tools:
+        raise typer.BadParameter("--all-tools 与 --tool 不能同时使用")
+    try:
+        config = mcp_admin.configure_mcp_connection(
+            name,
+            read_only=read_only,
+            tools=() if all_tools else None if tools is None else tuple(tools),
+            workspace=workspace,
+        )
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from None
+    print(json.dumps({"configured": name, "config": str(config)}, ensure_ascii=False))
+    print(f"刷新工具目录：agent mcp check {name}；会话批准不会增加服务或账号权限。")
 
 
 @mcp_app.command("login")
@@ -84,6 +156,7 @@ def login(
             if from_gh:
                 raise ValueError("OAuth connections cannot use --from-gh")
             from agent_runtime.mcp_oauth import login_mcp_oauth
+
             asyncio.run(login_mcp_oauth(name, callback_port=callback_port))
             print(f"已完成 {name} OAuth 登录；后续会话自动刷新凭据。")
             return

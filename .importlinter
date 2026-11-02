@@ -36,7 +36,7 @@ source_modules =
 forbidden_modules =
     agent_runtime.harness.services
     agent_runtime.harness.session
-    agent_runtime.harness.turn
+    agent_runtime.harness.execution
 
 [importlinter:contract:harness_components_do_not_depend_on_session]
 name = Harness components do not depend on Session internals
@@ -51,6 +51,10 @@ source_modules =
     agent_runtime.harness.runtime_store
     agent_runtime.harness.runtime_tx
     agent_runtime.harness.execution_context
+    agent_runtime.harness.request_context
+    agent_runtime.harness.responses
+    agent_runtime.harness.stop
+    agent_runtime.harness.budget_context
     agent_runtime.harness.execution_facts
     agent_runtime.harness.control
     agent_runtime.harness.context_rendering
@@ -76,7 +80,7 @@ source_modules =
 forbidden_modules =
     agent_runtime.harness.services
     agent_runtime.harness.session
-    agent_runtime.harness.turn
+    agent_runtime.harness.execution
 
 [importlinter:contract:core_does_not_depend_on_harness_orchestration]
 name = Core does not depend on Harness orchestration
@@ -86,7 +90,7 @@ source_modules =
 forbidden_modules =
     agent_runtime.harness.services
     agent_runtime.harness.session
-    agent_runtime.harness.turn
+    agent_runtime.harness.execution
 
 [importlinter:contract:rollout_persistence_has_no_business_policy]
 name = Rollout persistence does not own runtime business policy
@@ -99,7 +103,7 @@ forbidden_modules =
     agent_runtime.harness.runtime_store
     agent_runtime.harness.protocol
     agent_runtime.harness.session
-    agent_runtime.harness.turn
+    agent_runtime.harness.execution
     agent_runtime.harness.tool_orchestrator
     agent_runtime.budget
     agent_runtime.approval

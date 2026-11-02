@@ -669,7 +669,8 @@ def test_session_persists_model_transaction_before_provider_io(tmp_path: Path) -
 
         assert result.answer == "model answer"
         assert completion_gate.evaluated is True
-        assert model.prepared_requests[0].messages == (ModelMessage(role="user", body="answer plainly"),)
+        assert model.prepared_requests[0].messages[0] == ModelMessage(role="user", body="answer plainly")
+        assert model.prepared_requests[0].messages[-1].runtime_metadata["kind"] == "runtime_state"
         assert result.thread_id == thread.thread_id
         assert store.read_turn(result.turn_id).status == "completed"
         [operation] = store.list_model_operations(result.turn_id)
@@ -1571,7 +1572,7 @@ def test_choice_uses_the_durable_interaction_lifecycle_without_granting_permissi
         assert result.status == "completed"
         assert store.read_interaction(choice.request_id).response == {"selection": "staging"}
         assert store.list_approvals(turn.turn_id) == ()
-        assert model.prepared_requests[0].messages[-1] == ModelMessage(
+        assert [m for m in model.prepared_requests[0].messages if m.role == "user"][-1] == ModelMessage(
             role="user",
             body="staging",
         )

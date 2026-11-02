@@ -285,8 +285,6 @@ class StreamEvent:
             required_string("proposal_item_id")
             if required_string("action") not in {"accept", "continue", "pause", "fail"}:
                 raise ValueError("unsupported completion action")
-            if required_string("validation_status") not in {"not_evaluated", "passed", "failed"}:
-                raise ValueError("unsupported validation status")
         elif self.type is EventType.VERIFICATION_COMPLETED:
             required_string("operation_id")
             required_string("source_result_item_id")

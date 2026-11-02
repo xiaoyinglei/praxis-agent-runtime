@@ -1,4 +1,4 @@
-"""Capacity accounting stays outside the model conversation for new Turns."""
+"""Provider context capacity and host resource facts have separate projections."""
 
 from dataclasses import replace
 
@@ -50,24 +50,28 @@ def test_output_reservation_changes_metadata_without_changing_input(tmp_path):
         assert not gateway.requests
 
 
-def test_runtime_only_warns_when_actionable_state_changes(tmp_path):
+def test_runtime_reports_exact_changed_limits_without_completion_instructions(tmp_path):
+    from agent_runtime.harness.control import ContextSnapshot
+
     with RuntimeStore.open_sync(tmp_path / "run.db") as store:
         runner, turn, _ = file_runner(store, tmp_path)
         context = runner.restore_turn_context(turn.turn_id)
-        context = replace(context, binding_manifest={**context.binding_manifest, "execution_context_policy": POLICY})
         messages = (ModelMessage(role="user", body="Complete and verify the task"),)
         clock = {"date": "2026-10-20"}
-        messages, initial = runner._append_runtime_state(context, messages, step=1, pressure=False, clock=clock)
-        assert "Runtime budget status" not in initial.content
-        assert "requests_remaining_including_this" not in initial.content
-        messages, update = runner._append_runtime_state(context, messages, step=2, pressure=False, clock=clock)
-        assert update is None
-        messages, warning = runner._append_runtime_state(context, messages, step=3, pressure=True, clock=clock)
-        assert "required actions and verification" in warning.content
-        assert "Prefer a final answer" not in warning.content
-        messages, update = runner._append_runtime_state(context, messages, step=4, pressure=True, clock=clock)
-        assert update is None
-        messages, warning = runner._append_runtime_state(context, messages, step=7, pressure=True, clock=clock)
-        assert "2 model request(s)" in warning.content
-        _, warning = runner._append_runtime_state(context, messages, step=8, pressure=True, clock=clock)
-        assert "1 model request(s)" in warning.content
+        messages, initial = runner._requests._append_runtime_state(context, messages, step=1, clock=clock)
+        assert initial is not None
+        messages, same = runner._requests._append_runtime_state(context, messages, step=1, clock=clock)
+        assert same is None
+        messages, update = runner._requests._append_runtime_state(context, messages, step=7, clock=clock)
+        facts = ContextSnapshot.from_messages(messages).runtime_state["Resource limits (runtime ledger)"]
+        assert facts["agent_requests_remaining_including_this"] == 2
+        assert update is not None
+        assert "required actions and verification" not in update.content
+        assert "Prefer a final answer" not in update.content
+        _, update = runner._requests._append_runtime_state(context, messages, step=8, clock=clock)
+        assert (
+            update.runtime_metadata["state"]["Resource limits (runtime ledger)"][
+                "agent_requests_remaining_including_this"
+            ]
+            == 1
+        )

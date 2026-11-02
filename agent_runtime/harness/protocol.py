@@ -31,8 +31,6 @@ from agent_runtime.modeling.events import (
 from agent_runtime.modeling.failures import ModelFailure
 from agent_runtime.tools.tool import Tool, _thaw_json, json_schema_output
 
-DEFAULT_MAX_STEPS = 128
-
 
 @dataclass(frozen=True, slots=True)
 class HarnessModelRequest:
@@ -213,16 +211,10 @@ class CompletionProposal:
 
 @dataclass(frozen=True, slots=True)
 class CompletionDecision:
-    """Runtime action and independent validation of the stated scope.
-
-    Accepting an answer ends the Turn; it does not imply validation passed.
-    Legacy custom gates that only return action/reason remain not_evaluated.
-    """
+    """A lifecycle decision from optional stop conditions, never a task score."""
 
     action: Literal["accept", "continue", "pause", "fail"]
     reason: str
-    validation_status: Literal["not_evaluated", "passed", "failed"] = "not_evaluated"
-    validation_scope: str | None = None
     reason_code: str | None = None
 
 
