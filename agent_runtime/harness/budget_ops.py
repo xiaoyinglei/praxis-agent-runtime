@@ -68,6 +68,7 @@ def start_budgeted_child_turn(
             raise KeyError(f"unknown parent Turn: {parent_turn_id}")
         if parent["status"] != "running":
             raise RuntimeError("child budget can only be allocated from a running parent Turn")
+        turn_ops._assert_no_pending_cancellation(store, parent_turn_id)
 
         parent_state = store.read_budget_state(parent_turn_id)
         remaining = normal_token_remaining(parent_state)

@@ -12,6 +12,7 @@ from agent_runtime.harness.runtime_store import RuntimeStore
 
 class ContinuationKind(StrEnum):
     APPROVAL_RESOLVED = "approval_resolved"
+    CHILD_WAIT = "child_wait"
     TERMINAL = "terminal"
     UNSUPPORTED_REQUEST = "unsupported_request"
     RECONCILE = "reconcile"
@@ -49,6 +50,23 @@ class RecoveryDecision:
     response_item_id: str | None = None
     expected_generation: int | None = None
     expected_sequence: int = 0
+
+    @property
+    def automatically_resumable(self) -> bool:
+        """Continuation authority that needs no new user decision.
+
+        Owner recovery only fences lost dispatches. The decision must be read
+        again afterwards, before an unknown result can become a retry.
+        """
+        return not self.requires_input and self.kind in {
+            ContinuationKind.TERMINAL, ContinuationKind.APPROVAL_RESOLVED,
+            ContinuationKind.RECOVER_OWNER, ContinuationKind.CANCEL,
+            ContinuationKind.CHILD_WAIT, ContinuationKind.WAIT_RETRY,
+            ContinuationKind.APPROVED_READY, ContinuationKind.COMMITTED_RESPONSE,
+            ContinuationKind.PREPARED_MODEL, ContinuationKind.CONTEXT_OVERFLOW,
+            ContinuationKind.RESUME_COMPACTION, ContinuationKind.INPUT_SUPERSEDED,
+            ContinuationKind.FIRST_DISPATCH, ContinuationKind.NEXT_STEP,
+        }
 
     def accepts(self, action: str) -> bool:
         if action == "approve":
@@ -255,10 +273,26 @@ def _recovery_decision(store: RuntimeStore, turn_id: str) -> RecoveryDecision:
             *(op.operation_id for op in dispatched),
             *(op.operation_id for op in uncertain),
         )
-    if turn.status == "running" and store.turn_cancellation_pending(turn_id):
-        return plan("cancel", (), "cancellation_pending")
-    if pending and store.turn_cancellation_pending(turn_id):
+    revoked = store.turn_admission_revoked_by(turn_id)
+    if turn.status == "running" and revoked is not None:
+        return plan("cancel", (), "cancellation_pending", revoked)
+    if revoked is not None and revoked != turn_id:
+        # A child cannot resume authority revoked by its persisted ancestor.
+        # Reconciliation above remains available for unknown tool effects.
+        if any(op.status == "unknown" for op in models):
+            return plan("unavailable", (), "ancestor_cancelled_outcome_unknown", revoked)
+        return plan("cancel", (), "ancestor_cancelled", revoked)
+    if pending and revoked is not None:
         return plan("unavailable", (), "cancellation_pending", *(item.request_id for item in pending))
+    pause = next((r for r in reversed(records) if r.record_type == "turn_paused"), None)
+    if (
+        turn.status == "paused" and revoked is None and pause is not None
+        and pause.payload.get("reason_code") == "attached_children"
+    ):
+        children = store.tx.rows("child_budget_allocations", where={"parent_turn_id": turn_id, "status": "active"})
+        if children and store.user_input_revision(turn_id) == pause.payload.get("input_revision"):
+            return plan("unavailable", (), "attached_children_pending", *(str(c["child_turn_id"]) for c in children))
+        return plan("child_wait", ("continue",), "attached_children_ready")
     if len(pending) == 1:
         request = pending[0]
         question = str(request.request.get("question") or request.request.get("reason") or request.kind)

@@ -40,7 +40,7 @@ from agent_runtime.harness.protocol import (
     ReplayingHarnessModel,
     TurnResult,
 )
-from agent_runtime.harness.records import ModelOperationSnapshot
+from agent_runtime.harness.records import ModelAttemptSnapshot, ModelOperationSnapshot
 from agent_runtime.harness.runtime_store import RuntimeStore
 from agent_runtime.modeling.contracts import context_capacity_policy
 from agent_runtime.modeling.events import (
@@ -74,6 +74,7 @@ class ModelRunner:
         event_dispatcher: TurnEventDispatcher | None = None,
         context_manager: ContextManager | None = None,
         prepare_binding: Callable[[Mapping[str, Any]], Awaitable[None]] | None = None,
+        dispatch_guard: Callable[[RuntimeStore], None] | None = None,
     ) -> None:
         self._store = store
         self._model = model
@@ -82,6 +83,7 @@ class ModelRunner:
         self._event_dispatcher = event_dispatcher
         self._context_manager = context_manager
         self._prepare_binding = prepare_binding
+        self._dispatch_guard = dispatch_guard
 
     def attach_event_dispatcher(self, dispatcher: TurnEventDispatcher) -> None:
         self._event_dispatcher = dispatcher
@@ -277,9 +279,11 @@ class ModelRunner:
         prepared: PreparedModelCall,
         allow_protected_budget: bool = False,
     ) -> HarnessModelResponse | TurnResult:
-        try:
-            attempt = await self._commit(
-                lambda: model_ops.dispatch_model_attempt(
+        def claim() -> ModelAttemptSnapshot:
+            with self._store.tx.transaction():
+                if self._dispatch_guard is not None:
+                    self._dispatch_guard(self._store)
+                return model_ops.dispatch_model_attempt(
                     self._store,
                     operation.operation_id,
                     worker_id=self._worker_id,
@@ -287,7 +291,9 @@ class ModelRunner:
                     resource_request=prepared.resource_request,
                     allow_protected_budget=allow_protected_budget,
                 )
-            )
+
+        try:
+            attempt = await self._commit(claim)
         except asyncio.CancelledError:
             # The Store observed the claim's real outcome, but provider dispatch
             # has not been called. Release that known unspent reservation.
@@ -323,6 +329,12 @@ class ModelRunner:
                 await self._commit(lambda: model_ops.supersede_prepared_model(self._store, operation.operation_id))
             raise
         except TurnCancellationPendingError:
+            # The rejected claim transaction rolled back. Persist revocation
+            # separately so recovery observes cancellation instead of retrying
+            # the same denied admission forever.
+            await self._commit(lambda: turn_ops.request_turn_cancellation(
+                self._store, turn_id=turn_id, reason="Execution admission revoked before model dispatch"
+            ))
             raise
         except BudgetLimitExceededError as exc:
             return await self._fail_turn(

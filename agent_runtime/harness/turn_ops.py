@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from agent_runtime.harness import artifact_ops, facts
-from agent_runtime.harness.operation_values import TurnCancellationPendingError, TurnInputChangedError, _json_object
+from agent_runtime.harness.operation_values import (
+    TurnCancellationPendingError,
+    TurnChildrenPendingError,
+    TurnInputChangedError,
+    _json_object,
+)
 from agent_runtime.harness.protocol import (
     item_text,
     restore_model_response,
@@ -191,6 +198,29 @@ def start_turn(
 
 
 @owner_operation
+def read_input_receipt(
+    store: RuntimeStore,
+    *,
+    thread_id: str,
+    turn_id: str,
+    input_id: str,
+    text: str,
+    input_file_paths: tuple[str, ...],
+) -> ItemSnapshot | None:
+    """Match a frozen input intent before touching referenced files again."""
+    if store.tx.first("items", where={"item_id": input_id}) is None:
+        return None
+    saved = store.read_item(input_id)
+    request = {"text": text, "files": list(input_file_paths)}
+    if (
+        saved.thread_id != thread_id or saved.turn_id != turn_id or saved.kind != "user_message"
+        or saved.producer != "user" or saved.payload.get("input_request") != request
+    ):
+        raise ValueError("input receipt conflicts with an earlier command")
+    return saved
+
+
+@owner_operation
 def receive_turn_input(
     store: RuntimeStore,
     *,
@@ -198,12 +228,31 @@ def receive_turn_input(
     turn_id: str,
     text: str,
     input_files: tuple[Mapping[str, Any], ...] = (),
+    input_id: str | None = None,
+    input_file_paths: tuple[str, ...] | None = None,
 ) -> ItemSnapshot:
-    """Durably accept steering for exactly the expected active Turn."""
+    """Accept guidance once; a host receipt may be replayed after the Turn ends."""
     if not isinstance(text, str) or not text.strip():
         raise ValueError("input must be non-empty")
-    item_id = f"item_{uuid4().hex}"
+    if input_id is not None and (not isinstance(input_id, str) or not input_id.strip()):
+        raise ValueError("input receipt must be non-empty")
+    item_id = input_id or f"item_{uuid4().hex}"
+    request = None if input_file_paths is None else {"text": text, "files": list(input_file_paths)}
+    digest = hashlib.sha256(json.dumps(
+        {"text": text, "files": [dict(value) for value in input_files]},
+        sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode()).hexdigest()
     with store.tx.transaction():
+        prior = store.tx.first("items", where={"item_id": item_id}) if input_id is not None else None
+        if prior is not None:
+            saved = store.read_item(item_id)
+            if (
+                saved.thread_id != thread_id or saved.turn_id != turn_id or saved.kind != "user_message"
+                or saved.producer != "user" or saved.payload.get("input_receipt_digest") != digest
+                or request is not None and saved.payload.get("input_request") != request
+            ):
+                raise ValueError("input receipt conflicts with an earlier command")
+            return saved
         thread = store.read_thread(thread_id)
         turn = store.read_turn(turn_id) if thread.active_turn_id == turn_id else None
         if turn is None or turn.status not in {"running", "paused", "interrupted"}:
@@ -224,7 +273,11 @@ def receive_turn_input(
             turn_id=turn_id,
             record_type="item_completed",
             producer="user",
-            payload={"item_id": item_id, "payload": {"text": text, "input_revision": revision}},
+            payload={"item_id": item_id, "payload": {
+                "text": text, "input_revision": revision,
+                **({"input_receipt_digest": digest} if input_id is not None else {}),
+                **({"input_request": request} if input_id is not None and request is not None else {}),
+            }},
         )
         for value in input_files:
             file_id = f"item_{uuid4().hex}"
@@ -269,6 +322,19 @@ def complete_turn(
             raise KeyError(f"unknown turn: {turn_id}")
         if turn["status"] != "running":
             raise RuntimeError(f"turn is not running: {turn_id}")
+        pending_children = tuple(
+            str(child["child_turn_id"])
+            for child in store.tx.rows(
+                "child_budget_allocations", where={"parent_turn_id": turn_id, "status": "active"}, order_by="rowid"
+            )
+        )
+        if pending_children:
+            # The allocator checks the same parent's running state under the
+            # same SQLite write lock. Completion and late allocation therefore
+            # serialize: either the allocation blocks completion, or a terminal
+            # parent rejects allocation. A preceding asynchronous drain alone
+            # cannot establish this invariant.
+            raise TurnChildrenPendingError(pending_children)
         thread_id = turn["thread_id"]
         active = store.tx.first("threads", where={"thread_id": thread_id})
         if active is None or active["active_turn_id"] != turn_id:
@@ -451,6 +517,8 @@ def pause_turn(
     turn_id: str,
     reason: str,
     producer: str = "runtime",
+    reason_code: str | None = None,
+    input_revision: int | None = None,
 ) -> TurnSnapshot:
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError("Turn pause reason must be non-empty")
@@ -471,7 +539,11 @@ def pause_turn(
             turn_id=turn_id,
             record_type="turn_paused",
             producer=producer,
-            payload={"turn_id": turn_id, "reason": reason},
+            payload={
+                "turn_id": turn_id, "reason": reason,
+                **({"reason_code": reason_code} if reason_code is not None else {}),
+                **({"input_revision": input_revision} if input_revision is not None else {}),
+            },
         )
     return store.read_turn(turn_id)
 
@@ -641,11 +713,40 @@ def request_turn_cancellation(
 
 
 def _assert_no_pending_cancellation(store: RuntimeStore, turn_id: str) -> None:
-    # Every path that resumes a paused Turn on behalf of user input must
-    # respect a durable cancellation request; an explicit
-    # resume_cancelled_turn is the only way past it.
-    if store.turn_cancellation_pending(turn_id):
-        raise TurnCancellationPendingError("Turn cancellation was requested; new work was not accepted")
+    """Check canonical lineage inside the caller's admission transaction.
+
+    Binding fields and live child drivers are not ownership evidence. A paused
+    ancestor still permits admitted children to run; cancellation or a terminal
+    ancestor closes admission without discarding already dispatched outcomes.
+    """
+    revoked = store.turn_admission_revoked_by(turn_id)
+    if revoked is not None:
+        raise TurnCancellationPendingError(
+            f"Turn cancellation was requested or authority ended at {revoked}; new work was not accepted"
+        )
+
+
+@owner_operation
+def resume_child_wait(store: RuntimeStore, *, turn_id: str) -> TurnSnapshot:
+    """Continue a child-wait pause only after settlement or new user guidance."""
+    with store.tx.transaction():
+        turn = store.read_turn(turn_id)
+        _assert_no_pending_cancellation(store, turn_id)
+        pause = next(
+            (r for r in reversed(store.list_turn_records(turn_id)) if r.record_type == "turn_paused"), None
+        )
+        if turn.status != "paused" or pause is None or pause.payload.get("reason_code") != "attached_children":
+            raise RuntimeError("Turn is not waiting for attached children")
+        active = store.tx.rows("child_budget_allocations", where={"parent_turn_id": turn_id, "status": "active"})
+        if active and store.user_input_revision(turn_id) == pause.payload.get("input_revision"):
+            raise RuntimeError("Attached children still require attention")
+        if store.read_thread(turn.thread_id).active_turn_id != turn_id:
+            raise RuntimeError("child-wait Turn does not own the active slot")
+        facts.append_fact(
+            store, thread_id=turn.thread_id, turn_id=turn_id, record_type="turn_resumed", producer="runtime",
+            payload={"turn_id": turn_id, "reason": "attached children settled or new guidance received"},
+        )
+    return store.read_turn(turn_id)
 
 
 @owner_operation

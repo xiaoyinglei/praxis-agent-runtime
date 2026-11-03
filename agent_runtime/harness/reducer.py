@@ -44,6 +44,7 @@ class ProjectionState:
     interactions: dict[str, dict[str, Any]] = field(default_factory=dict)
     approvals: dict[str, dict[str, Any]] = field(default_factory=dict)
     artifacts: dict[str, dict[str, Any]] = field(default_factory=dict)
+    host_commands: dict[str, dict[str, Any]] = field(default_factory=dict)
     # Transient replay bookkeeping, not a persisted projection or hash input.
     item_sequences: dict[str, int] = field(default_factory=dict)
 
@@ -89,6 +90,30 @@ def apply_record(
             }
         case "session_settings_updated":
             state.threads[thread_id]["settings"] = payload["settings"]
+            state.threads[thread_id]["applied_thread_sequence"] = sequence
+        case "host_command_received":
+            state.host_commands[payload["command_id"]] = {
+                "command_id": payload["command_id"], "thread_id": thread_id, "turn_id": payload["turn_id"],
+                "kind": payload["kind"], "request_hash": payload["request_hash"], "request": payload["request"],
+                "status": "pending", "generation": 0, "owner": None, "lease_expires_at": None,
+                "available_at": 0.0, "result": {}, "applied_thread_sequence": sequence,
+                "reducer_version": reducer_version,
+            }
+            state.threads[thread_id]["applied_thread_sequence"] = sequence
+        case "host_command_claimed" | "host_command_renewed":
+            command = state.host_commands[payload["command_id"]]
+            command.update({
+                "status": "claimed", "owner": payload["owner"], "generation": payload["generation"],
+                "lease_expires_at": payload["lease_expires_at"], "applied_thread_sequence": sequence,
+            })
+            state.threads[thread_id]["applied_thread_sequence"] = sequence
+        case "host_command_settled" | "host_command_released":
+            command = state.host_commands[payload["command_id"]]
+            command.update({
+                "status": payload["status"], "owner": None, "lease_expires_at": None,
+                "available_at": payload.get("available_at", 0.0), "result": payload["result"],
+                "applied_thread_sequence": sequence,
+            })
             state.threads[thread_id]["applied_thread_sequence"] = sequence
         case "turn_started":
             turn_id = payload["turn_id"]
@@ -661,7 +686,9 @@ def _identity_v1(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     return payload
 
 
-_PAYLOAD_UPCASTERS = {1: _identity_v1, 2: _identity_v1, 3: _identity_v1, 4: _identity_v1, 5: _identity_v1}
+_PAYLOAD_UPCASTERS = {
+    1: _identity_v1, 2: _identity_v1, 3: _identity_v1, 4: _identity_v1, 5: _identity_v1, 6: _identity_v1,
+}
 
 
 def _advance(

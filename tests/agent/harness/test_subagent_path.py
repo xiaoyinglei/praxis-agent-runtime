@@ -87,7 +87,7 @@ class ParentChildModel:
                     ),
                 ),
             )
-        if not any("child_turn_id" in message.content for message in tool_messages):
+        if not any(message.tool_call_id == "delegate-task" for message in tool_messages):
             return HarnessModelResponse.from_parts(
                 text="",
                 provider_response_id="delegate-response",

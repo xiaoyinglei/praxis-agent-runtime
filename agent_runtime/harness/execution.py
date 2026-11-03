@@ -38,7 +38,7 @@ from agent_runtime.harness.protocol import (
     TurnResult,
     item_text,
 )
-from agent_runtime.harness.records import ModelOperationSnapshot
+from agent_runtime.harness.records import ModelOperationSnapshot, TurnSnapshot
 from agent_runtime.harness.recovery import ContinuationKind, active_capacity_root, recovery_plan
 from agent_runtime.harness.request_context import RequestContext
 from agent_runtime.harness.responses import ResponseHandler
@@ -71,6 +71,8 @@ class TurnRunner:
         event_dispatcher: TurnEventDispatcher | None = None,
         binding_provider: BindingProvider | None = None,
         prepare_binding: Callable[[Mapping[str, Any]], Awaitable[None]] | None = None,
+        before_completion: Callable[[str], Awaitable[None]] | None = None,
+        dispatch_guard: Callable[[RuntimeStore], None] | None = None,
     ) -> None:
         store.read_thread(thread_id)
         self.thread_id = thread_id
@@ -82,6 +84,7 @@ class TurnRunner:
         self._worker_id = worker_id or f"worker_{uuid4().hex}"
         self._event_dispatcher = event_dispatcher
         self._capacity_recovery_root: str | None = None
+        self._dispatch_guard = dispatch_guard
         self._model_runner = ModelRunner(
             store=store,
             model=model,
@@ -90,6 +93,7 @@ class TurnRunner:
             event_dispatcher=event_dispatcher,
             context_manager=context_manager,
             prepare_binding=prepare_binding,
+            dispatch_guard=dispatch_guard,
         )
         self._requests = RequestContext(
             thread_id=thread_id,
@@ -99,7 +103,9 @@ class TurnRunner:
             tool_orchestrator=tool_orchestrator,
             binding_provider=binding_provider,
         )
-        self._stop = TurnStop(store=store, gate=completion_gate, commit=self._commit)
+        self._stop = TurnStop(
+            store=store, gate=completion_gate, commit=self._commit, before_completion=before_completion
+        )
         self._responses = ResponseHandler(
             store=store,
             tool_orchestrator=tool_orchestrator,
@@ -160,16 +166,16 @@ class TurnRunner:
         binding_manifest = dict(binding_manifest)
         binding_manifest.setdefault("model_step_budget", self._max_steps)
         step_limit_from_binding(binding_manifest)
-        turn = await self._commit(
-            lambda: turn_ops.start_turn(
-                self._store,
-                thread_id=self.thread_id,
-                turn_id=turn_id,
-                user_message=user_message,
-                binding_manifest=binding_manifest,
-                input_files=input_files,
-            )
-        )
+        def admit() -> TurnSnapshot:
+            with self._store.tx.transaction():
+                if self._dispatch_guard is not None:
+                    self._dispatch_guard(self._store)
+                return turn_ops.start_turn(
+                    self._store, thread_id=self.thread_id, turn_id=turn_id,
+                    user_message=user_message, binding_manifest=binding_manifest, input_files=input_files,
+                )
+
+        turn = await self._commit(admit)
         return await self.drive(
             (await self._store.run_async(self.restore_turn_context, turn.turn_id)),
             start_step=1,
@@ -474,6 +480,8 @@ class TurnRunner:
         action: str | None = None,
         user_input: str | None = None,
         expected_request_id: str | None = None,
+        automatic: bool = False,
+        authorization_revision: int | None = None,
         on_session_grant: Callable[[CommandGrant], None] | None = None,
         command_sessions: Any = None,
         cancel_live_commands: Callable[[], Awaitable[None]] | None = None,
@@ -493,6 +501,12 @@ class TurnRunner:
             raise RuntimeError("Turn belongs to a different Session")
         permit_retry = False
         if action is not None:
+            # A queued reply authorizes the observed Turn revision. Replaying
+            # its delivery may finish already committed work, but cannot reuse
+            # that reply to approve a later interaction or retry another attempt.
+            if authorization_revision is not None:
+                current = await self._store.run_async(self._store.read_turn, turn_id)
+                automatic = automatic or current.applied_thread_sequence != authorization_revision
             offered = await self._store.run_async(recovery_plan, self._store, turn_id)
             acknowledged = False
             if expected_request_id is not None and offered.request_id != expected_request_id:
@@ -520,6 +534,11 @@ class TurnRunner:
                 while await self._tool_orchestrator.reconcile_command_observation(command_sessions, turn_id):
                     await self._commit(lambda: recover_owner_loss(self._store, turn_id))
             offered = await self._store.run_async(recovery_plan, self._store, turn_id)
+            if automatic and not offered.automatically_resumable:
+                return TurnResult(
+                    thread_id=thread_id, turn_id=turn_id, answer=None,
+                    status=offered.status, interaction_id=offered.request_id,
+                )
             if acknowledged:
                 # The old response is already committed. Continue from current
                 # facts without applying it to a newer outstanding interaction.
@@ -549,7 +568,9 @@ class TurnRunner:
                     f"resume action {action!r} is unavailable: {offered.reason_code}; "
                     f"available actions: {', '.join(offered.actions) or 'none'}"
                 )
-            if offered.kind == ContinuationKind.RESUME_CANCELLED:
+            if offered.kind == ContinuationKind.CHILD_WAIT:
+                await self._commit(lambda: turn_ops.resume_child_wait(self._store, turn_id=turn_id))
+            elif offered.kind == ContinuationKind.RESUME_CANCELLED:
                 await self._commit(lambda: turn_ops.resume_cancelled_turn(self._store, turn_id=turn_id))
             elif offered.kind in {
                 ContinuationKind.APPROVAL,
@@ -585,6 +606,11 @@ class TurnRunner:
         while True:
             decision = await self._store.run_async(recovery_plan, self._store, turn_id)
             if decision.kind == ContinuationKind.CANCEL:
+                await self._commit(
+                    lambda: turn_ops.request_turn_cancellation(
+                        self._store, turn_id=turn_id, reason="Execution authority revoked"
+                    )
+                )
                 for operation in await self._store.run_async(self._store.list_model_operations, turn_id):
                     schedule = await self._store.run_async(
                         model_retry_ops.read_schedule, self._store, operation.operation_id
@@ -599,6 +625,14 @@ class TurnRunner:
                             )
                         )
                 await self._commit(lambda: recover_owner_loss(self._store, turn_id, abort=True))
+                current = await self._store.run_async(self._store.read_turn, turn_id)
+                if current.status == "running":
+                    # A reserved child may have no execution-ownership binding
+                    # yet. Recovery already excluded live/unknown tool effects
+                    # and active model leases before offering CANCEL.
+                    await self._commit(
+                        lambda: turn_ops.pause_turn(self._store, turn_id=turn_id, reason="Unstarted work cancelled")
+                    )
                 cancelled = await self._commit(lambda: turn_ops.cancel_turn(self._store, turn_id=turn_id))
                 return TurnResult(thread_id=thread_id, turn_id=turn_id, answer=None, status=cancelled.status)
             if decision.kind in {ContinuationKind.TERMINAL, ContinuationKind.APPROVAL_RESOLVED}:

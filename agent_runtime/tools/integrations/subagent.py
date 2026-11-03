@@ -109,11 +109,10 @@ class SubagentExecutionEvidence(BaseModel):
     verified_resources: list[str] = Field(default_factory=list, max_length=50)
 
 
-class StandardSubagentOutput(BaseModel):
+class _SubagentResultFields(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     conclusion: str = Field(default="", max_length=50_000)
-    status: Literal["done", "failed", "paused"] = "failed"
     child_turn_id: str = Field(default="", max_length=500)
     stop_reason: str | None = Field(default=None, max_length=1000)
     pause: SubagentPause | None = None
@@ -121,6 +120,10 @@ class StandardSubagentOutput(BaseModel):
         default_factory=list,
         max_length=50,
     )
+
+
+class StandardSubagentOutput(_SubagentResultFields):
+    status: Literal["done", "failed", "paused"] = "failed"
 
 
 class SubagentOutput(StandardSubagentOutput):
@@ -220,3 +223,161 @@ __all__ = [
     "SubagentRunner",
     "create_subagent_tool",
 ]
+
+
+class ChildHandleInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    child_turn_id: str = Field(
+        min_length=1, max_length=500, description="Durable child Turn returned by spawn_agent, owned by this parent."
+    )
+
+
+class SendAgentMessageInput(ChildHandleInput):
+    message: str = Field(min_length=1, max_length=20_000)
+    message_id: str = Field(
+        min_length=1,
+        max_length=500,
+        description=(
+            "Stable caller-selected message id. Reuse only for an identical retry; the kernel delivers it once."
+        ),
+    )
+
+
+class WaitAgentInput(ChildHandleInput):
+    timeout_seconds: float = Field(
+        default=10,
+        ge=0,
+        le=30,
+        description="Bounded status/event wait; timeout returns running without cancelling the child.",
+    )
+
+
+class SpawnAgentOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    child_turn_id: str
+    thread_id: str
+    status: Literal["running"]
+
+
+class AgentStatusOutput(_SubagentResultFields):
+    status: Literal["running", "done", "failed", "paused"] = "running"
+
+
+class AgentMessageOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    child_turn_id: str
+    message_id: str
+    input_id: str
+    status: Literal["accepted"]
+
+
+def create_async_subagent_tools(
+    *,
+    spawn: SubagentRunner,
+    send: SubagentRunner,
+    wait: SubagentRunner,
+    cancel: SubagentRunner,
+) -> tuple[Tool, ...]:
+    """Project lifecycle operations without introducing a second execution loop."""
+    specs: tuple[
+        tuple[str, type[BaseModel], type[BaseModel], SubagentRunner, str, frozenset[ToolEffect], bool], ...
+    ] = (
+        (
+            "spawn_agent",
+            SubagentInput,
+            SpawnAgentOutput,
+            spawn,
+            (
+                "Start an attached child agent in a fresh context and return its durable child_turn_id "
+                "immediately after budget reservation. Children share the workspace and inherit the parent's "
+                "frozen permissions/model and finite depth/count/budget ceilings. Supply only relevant "
+                "context_summary; arbitrary conversation forks are not supported. Use wait_agent for "
+                "completion/evidence. Parent completion drains attached children."
+            ),
+            frozenset({ToolEffect.NETWORK}),
+            False,
+        ),
+        (
+            "send_agent_message",
+            SendAgentMessageInput,
+            AgentMessageOutput,
+            send,
+            (
+                "Deliver guidance only to an owned child's active Turn through the canonical input boundary. "
+                "Provide a stable message_id for retry-safe, once-only delivery. This does not resume a paused "
+                "approval or grant permissions."
+            ),
+            frozenset(),
+            True,
+        ),
+        (
+            "wait_agent",
+            WaitAgentInput,
+            AgentStatusOutput,
+            wait,
+            (
+                "Wait up to timeout_seconds for an owned attached child's live driver, then return running, "
+                "paused, done or failed with its canonical conclusion and actual execution evidence. Timeout "
+                "leaves the child running. Lost drivers require explicit recovery; wait does not start another "
+                "model loop."
+            ),
+            frozenset(),
+            True,
+        ),
+        (
+            "cancel_agent",
+            ChildHandleInput,
+            AgentStatusOutput,
+            cancel,
+            (
+                "Record cancellation of an owned child before cancelling live execution and managed command "
+                "processes. Unknown outcomes keep their reserved budget and remain visible for reconciliation. "
+                "Other children are unaffected."
+            ),
+            frozenset(),
+            True,
+        ),
+    )
+    tools = []
+    for name, input_model, output_model, runner, description, effects, idempotent in specs:
+        input_schema, validate = pydantic_input(input_model)
+        output_schema, _ = pydantic_input(output_model)
+
+        def normalize(
+            raw: object,
+            output_model: type[BaseModel] = output_model,
+            output_schema: Mapping[str, JsonValue] = output_schema,
+        ) -> NormalizedToolOutput:
+            value = output_model.model_validate(raw)
+            data = value.model_dump(mode="json")
+            return NormalizedToolOutput(
+                structured_content=json_schema_output(output_schema, data),
+                is_error=getattr(value, "status", None) == "failed",
+                metadata={"child_turn_id": data["child_turn_id"]},
+            )
+
+        def resolve(
+            _arguments: Mapping[str, JsonValue],
+            effects: frozenset[ToolEffect] = effects,
+        ) -> ResolvedToolUse:
+            return ResolvedToolUse(effects=effects, targets=())
+
+        tools.append(
+            Tool(
+                definition=ToolDefinition(name=name, description=description, input_schema=input_schema),
+                validate_input=validate,
+                run=runner,
+                normalize_output=normalize,
+                output_schema=output_schema,
+                static_effects=effects,
+                resolve_use=resolve,
+                execution_revision="integration-subagent-async-v1",
+                idempotent=idempotent,
+                concurrency_safe=True,
+                cancellation_mode=CancellationMode.COOPERATIVE,
+                interrupt_behavior=InterruptBehavior.CANCEL,
+                timeout_seconds=40,
+                max_model_output_bytes=500_000,
+            )
+        )
+    return tuple(tools)

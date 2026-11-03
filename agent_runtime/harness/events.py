@@ -69,6 +69,11 @@ _SUPPRESSED_ITEM_KINDS = frozenset(
 )
 _SUPPRESSED_RECORD_TYPES = frozenset(
     {
+        "host_command_received",
+        "host_command_claimed",
+        "host_command_renewed",
+        "host_command_settled",
+        "host_command_released",
         "execution_protocol_adopted",
         "response_handling_decided",
         "tool_batch_admitted",
@@ -249,7 +254,7 @@ class RolloutEventReader:
     def _project_records(self, records: tuple[RolloutRecord, ...]) -> tuple[tuple[RolloutRecord, StreamEvent], ...]:
         projected: list[tuple[RolloutRecord, StreamEvent]] = []
         for record in records:
-            if record.payload_schema_version not in {1, 2, 3, 4, 5}:
+            if record.payload_schema_version not in {1, 2, 3, 4, 5, 6}:
                 raise RuntimeError(f"unsupported event record schema: {record.payload_schema_version}")
             self._validate_public_item_ids(record)
             current = self._legacy_event_record(record) if record.payload_schema_version < 3 else record

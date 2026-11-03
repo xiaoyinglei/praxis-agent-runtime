@@ -35,6 +35,7 @@ from agent_runtime.harness.reducer import ProjectionState, apply_record
 _REDUCER_VERSION = 1
 _PROJECTIONS = {
     "threads": ("thread_id", "rowid"),
+    "host_commands": ("command_id", "rowid"),
     "turns": ("turn_id", "rowid"),
     "items": ("item_id", "sequence"),
     "model_operations": ("operation_id", "rowid"),
@@ -915,7 +916,7 @@ class RolloutStore:
                 turn_id,
                 sequence,
                 record_type,
-                5,
+                6,
                 producer,
                 payload_json,
                 payload_hash,
@@ -993,6 +994,7 @@ class RolloutStore:
                 ("interactions", "request_id", (record.payload.get("request_id"),), _interaction_row_payload),
                 ("approvals", "request_id", (record.payload.get("request_id"),), _approval_row_payload),
                 ("artifacts", "artifact_id", (record.payload.get("artifact_id"),), _artifact_row_payload),
+                ("host_commands", "command_id", (record.payload.get("command_id"),), _host_command_row_payload),
             ):
                 entities = getattr(state, table)
                 for identity in identities:
@@ -1056,6 +1058,8 @@ class RolloutStore:
             state.approvals[row["request_id"]] = _approval_row_payload(row)
         for row in self._connection.execute("SELECT * FROM artifacts WHERE thread_id = ?", (thread_id,)):
             state.artifacts[row["artifact_id"]] = _artifact_row_payload(row)
+        for row in self._connection.execute("SELECT * FROM host_commands WHERE thread_id = ?", (thread_id,)):
+            state.host_commands[row["command_id"]] = _host_command_row_payload(row)
         return state
 
     def _persist_projection_state(
@@ -1084,6 +1088,7 @@ class RolloutStore:
                 state.interactions,
                 state.approvals,
                 state.artifacts,
+                state.host_commands,
             ):
                 for identity in tuple(entities):
                     if entities[identity]["applied_thread_sequence"] != changed_sequence:
@@ -1119,6 +1124,20 @@ class RolloutStore:
                     thread["applied_thread_sequence"],
                     thread["reducer_version"],
                 ),
+            )
+        for command in state.host_commands.values():
+            columns = (
+                "command_id", "thread_id", "turn_id", "kind", "request_hash", "request_json", "status",
+                "generation", "owner", "lease_expires_at", "available_at", "result_json",
+                "applied_thread_sequence", "reducer_version",
+            )
+            values = {**command, "request_json": _canonical_json(command["request"]),
+                      "result_json": _canonical_json(command["result"])}
+            connection.execute(
+                f"INSERT INTO host_commands ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)}) "
+                f"ON CONFLICT(command_id) DO UPDATE SET "
+                + ", ".join(f"{c} = excluded.{c}" for c in columns if c != "command_id"),
+                tuple(values[c] for c in columns),
             )
         for turn in state.turns.values():
             connection.execute(
@@ -1474,14 +1493,14 @@ class RolloutStore:
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             self._connection.execute("""INSERT INTO store_metadata(key, value)
-                VALUES ('minimum_writer_schema', '5') ON CONFLICT(key) DO UPDATE SET
-                value = CAST(MAX(CAST(value AS INTEGER), 5) AS TEXT)""")
+                VALUES ('minimum_writer_schema', '6') ON CONFLICT(key) DO UPDATE SET
+                value = CAST(MAX(CAST(value AS INTEGER), 6) AS TEXT)""")
             required = int(
                 self._connection.execute(
                     "SELECT value FROM store_metadata WHERE key='minimum_writer_schema'"
                 ).fetchone()[0]
             )
-            if required > 5:
+            if required > 6:
                 raise RuntimeError(f"runtime writer schema {required} requires a newer version")
             self._connection.execute("""CREATE TRIGGER IF NOT EXISTS rollout_writer_protocol_guard
                 BEFORE INSERT ON rollout_records
@@ -1551,6 +1570,23 @@ class RolloutStore:
                    OR record_type = 'tool_operation_prepared'
                    OR record_type = 'tool_operation_outcome_committed'
                    OR record_type = 'tool_operation_migrated';
+            CREATE TABLE IF NOT EXISTS host_commands (
+                command_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL REFERENCES threads(thread_id) DEFERRABLE INITIALLY DEFERRED,
+                turn_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                owner TEXT,
+                lease_expires_at REAL,
+                available_at REAL NOT NULL,
+                result_json TEXT NOT NULL,
+                applied_thread_sequence INTEGER NOT NULL,
+                reducer_version INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS host_commands_queue ON host_commands(status, available_at);
             CREATE TABLE IF NOT EXISTS store_metadata (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -1820,6 +1856,9 @@ def _projection_hash(state: ProjectionState, thread_id: str) -> str:
     artifacts = {key: value for key, value in state.artifacts.items() if value["thread_id"] == thread_id}
     if artifacts:
         payload["artifacts"] = artifacts
+    host_commands = {key: value for key, value in state.host_commands.items() if value["thread_id"] == thread_id}
+    if host_commands:
+        payload["host_commands"] = host_commands
     return hashlib.sha256(_canonical_json(payload).encode()).hexdigest()
 
 
@@ -1875,6 +1914,16 @@ def _committed_at_ms(row: sqlite3.Row) -> int:
     if created_at.tzinfo is None:
         created_at = created_at.replace(tzinfo=UTC)
     return int(created_at.timestamp() * 1000)
+
+
+def _host_command_row_payload(row: sqlite3.Row) -> dict[str, Any]:
+    payload = {key: row[key] for key in (
+        "command_id", "thread_id", "turn_id", "kind", "request_hash", "status", "generation",
+        "owner", "lease_expires_at", "available_at", "applied_thread_sequence", "reducer_version",
+    )}
+    payload["request"] = json.loads(row["request_json"])
+    payload["result"] = json.loads(row["result_json"])
+    return payload
 
 
 def _thread_row_payload(row: sqlite3.Row) -> dict[str, Any]:

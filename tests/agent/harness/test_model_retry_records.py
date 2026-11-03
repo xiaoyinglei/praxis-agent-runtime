@@ -98,14 +98,15 @@ def test_retry_schedule_rejects_wrong_source_or_invalid_deadline(tmp_path, mutat
         assert store.verify().valid
 
 
-def test_writer_gate_rejects_schema_four_on_already_open_connection(tmp_path):
+@pytest.mark.parametrize("old_schema", [4, 5])
+def test_writer_gate_rejects_old_schema_on_already_open_connection(tmp_path, old_schema):
     path = tmp_path / "gate.db"
     # This connection represents the previous writer's already open SQLite handle.
     old = sqlite3.connect(path)
     with RuntimeStore.open_sync(path) as store:
         thread = turn_ops.create_thread(store, workspace=tmp_path)
         record = store.list_records(thread.thread_id)[0]
-        assert record.payload_schema_version == 5
+        assert record.payload_schema_version == 6
         with pytest.raises(sqlite3.IntegrityError, match="writer protocol requires upgrade"):
             old.execute(
                 """INSERT INTO rollout_records(record_uuid,thread_id,turn_id,thread_sequence,record_type,
@@ -117,7 +118,7 @@ def test_writer_gate_rejects_schema_four_on_already_open_connection(tmp_path):
                     None,
                     2,
                     "thread_created",
-                    4,
+                    old_schema,
                     "runtime",
                     "{}",
                     "hash",

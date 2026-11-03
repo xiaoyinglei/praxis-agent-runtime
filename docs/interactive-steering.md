@@ -11,7 +11,7 @@
 - https://developers.openai.com/blog/mastering-codex-remote-for-engineering
 - https://code.claude.com/docs/en/interactive-mode#queue-messages-while-claude-works
 
-Praxis 复用 Session / TurnExecutor / ToolOrchestrator / Rollout，采用相同的单执行循环、安全边界消费和 Turn 身份校验。本地先落盘再确认接收。普通补充影响当前 Turn；停止是显式取消，替换任务通过停止后提交新 Turn 表达，不猜关键词。独立的后续任务队列不属于本轮接口。
+Praxis 复用 Session / TurnExecutor / ToolOrchestrator / Rollout，采用相同的单执行循环、安全边界消费和 Turn 身份校验。本地先落盘再确认接收。普通补充影响当前 Turn；停止是显式取消，替换任务通过停止后提交新 Turn 表达，不猜关键词。独立后台执行、重新接入与命令回执见 [后台执行](background-execution.md)。
 
 ## 契约
 
@@ -80,3 +80,15 @@ asyncio.run(main())
 ## 仍需独立处理的命令会话设计债
 
 当前 `command_sessions.py` 保留 32 个内存结果并限制同一 Session 的活跃命令；本轮未改变这些并发/资源契约。私有 job 日志、孤立准备记录和固化代码 bundle 的自动 GC 尚未实现。安全清理必须同时考虑 owner/run 锁、恢复引用和账本保留，不能用直接删除目录替代。全工作区候选复制、权限变化时的保守取消也维持现有契约；本轮不将对话修复宣称为这些问题已解决。
+
+## 可重试的输入回执
+
+需要在连接中断后重投同一条补充时，Agent.steer 和 Session.steer 可传稳定的 input_id。相同 Turn、原始正文及附件路径请求的重投返回原 Item，不新增输入版本或重新读文件；首次接收时冻结附件元数据，文件随后删除也不妨碍取回原回执。需要提交新文件内容时使用新 input_id；该回执可在原 Turn 结束或进程重开后查询。相同 ID 携带不同正文、附件或目标会拒绝。省略 input_id 时每次调用仍是独立输入。
+
+    receipt = await agent.steer(
+        "还要检查异常分支",
+        expected_turn_id=turn_id,
+        input_id="client-command-42",
+    )
+
+回执仅证明内核曾接收这条输入，不代表模型已经消费或任务已完成。input_status 仍按实际模型派发记录推导。重投仍须通过工作区安全域检查；input_id 不授予读取其他工作区或审批的权限。

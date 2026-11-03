@@ -478,6 +478,22 @@ class RuntimeStore:
         return bool(records and records[0]["record_type"] == "turn_cancellation_requested")
 
     @read_operation
+    def turn_admission_revoked_by(self, turn_id: str) -> str | None:
+        """Read durable cancellation/terminal lineage without relying on live drivers."""
+        seen: set[str] = set()
+        current = turn_id
+        while current not in seen:
+            seen.add(current)
+            turn = self.read_turn(current)
+            if self.turn_cancellation_pending(current) or turn.status in {"completed", "failed", "cancelled"}:
+                return current
+            allocation = self.persistence.first("child_budget_allocations", where={"child_turn_id": current})
+            if allocation is None:
+                return None
+            current = str(allocation["parent_turn_id"])
+        raise RuntimeError("child allocation ancestry contains a cycle")
+
+    @read_operation
     def list_model_operations(self, turn_id: str | None = None) -> tuple[ModelOperationSnapshot, ...]:
         if turn_id is None:
             rows = self.persistence.rows("model_operations", order_by="rowid")

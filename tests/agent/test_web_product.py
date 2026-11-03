@@ -268,6 +268,7 @@ def test_legacy_step_never_inherits_live_web_authorization(monkeypatch):
     from tests.agent.test_web_tools import call
 
     orchestrator = object.__new__(ToolOrchestrator)
+    orchestrator._dispatch_guard = None
     orchestrator._execution_context = ToolExecutionContext(allow_web_tools=True)
     monkeypatch.setattr(
         orchestrator,
