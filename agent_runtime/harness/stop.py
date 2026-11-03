@@ -6,14 +6,16 @@ Raw tool evidence remains authoritative; no task-correctness score is produced.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from typing import Any, cast
 
 from agent_runtime.harness import completion_ops, turn_ops
-from agent_runtime.harness.operation_values import TurnInputChangedError
+from agent_runtime.harness.operation_values import TurnChildrenPendingError, TurnInputChangedError
 from agent_runtime.harness.protocol import (
     CompletionDecision,
     CompletionGate,
@@ -317,10 +319,12 @@ class TurnStop:
         store: RuntimeStore,
         gate: CompletionGate,
         commit: Callable[[Callable[[], Any]], Awaitable[Any]],
+        before_completion: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self._store = store
         self._gate = gate
         self._commit = commit
+        self._before_completion = before_completion
 
     async def finish(
         self,
@@ -344,7 +348,44 @@ class TurnStop:
                     source_item_id=source_item_id,
                 )
 
-        return cast(TurnResult | None, await self._commit(finish_atomically))
+        def pause_if_current(reason: str) -> TurnResult | None:
+            with self._store.tx.transaction():
+                if self._store.user_input_revision(turn_id) != input_revision:
+                    return None
+                turn_ops.pause_turn(
+                    self._store, turn_id=turn_id, reason=reason,
+                    reason_code="attached_children", input_revision=input_revision,
+                )
+                return TurnResult(thread_id=thread_id, turn_id=turn_id, answer=None, status="paused")
+
+        while True:
+            if self._before_completion is not None:
+                if await self._store.run_async(self._store.user_input_revision, turn_id) != input_revision:
+                    return None
+                waiting = asyncio.ensure_future(self._before_completion(turn_id))
+                try:
+                    while not waiting.done():
+                        await asyncio.wait({waiting}, timeout=0.05)
+                        if await self._store.run_async(self._store.user_input_revision, turn_id) != input_revision:
+                            return None
+                    waiting.result()
+                except TurnChildrenPendingError as exc:
+                    return cast(TurnResult | None, await self._commit(partial(pause_if_current, str(exc))))
+                finally:
+                    if not waiting.done():
+                        # Cancelling this wait leaves the actual child drivers
+                        # alive. The parent must consume steering before deciding
+                        # whether any child should be stopped.
+                        waiting.cancel()
+                    await asyncio.gather(waiting, return_exceptions=True)
+            try:
+                return cast(TurnResult | None, await self._commit(finish_atomically))
+            except TurnChildrenPendingError as exc:
+                if self._before_completion is None:
+                    return cast(TurnResult | None, await self._commit(partial(pause_if_current, str(exc))))
+                # A child was admitted after the drain but before the terminal
+                # transaction. Drain it and retry this same answer; do not ask
+                # the model to poll or regenerate an already received answer.
 
     def _finish(
         self,

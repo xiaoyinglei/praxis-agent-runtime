@@ -24,9 +24,9 @@ from agent_runtime.checkpoints import (
 )
 from agent_runtime.core.messages import tool_result_message
 from agent_runtime.core.runtime_diagnostics import exception_diagnostic
-from agent_runtime.harness import artifact_ops, tool_ops
+from agent_runtime.harness import artifact_ops, tool_ops, turn_ops
 from agent_runtime.harness.events import commit_and_publish
-from agent_runtime.harness.operation_values import ResourceClaimConflictError
+from agent_runtime.harness.operation_values import ResourceClaimConflictError, TurnCancellationPendingError
 from agent_runtime.harness.runtime_store import RuntimeStore
 from agent_runtime.streaming.events import (
     ItemDeltaKind,
@@ -207,6 +207,7 @@ class ToolOrchestrator:
         lease_seconds: float = 300.0,
         event_dispatcher: TurnEventDispatcher | None = None,
         checkpoints: CheckpointService | None = None,
+        dispatch_guard: Callable[[RuntimeStore], None] | None = None,
     ) -> None:
         self._store = store
         self._tools = tools
@@ -216,6 +217,7 @@ class ToolOrchestrator:
         self._lease_seconds = lease_seconds
         self._event_dispatcher = event_dispatcher
         self._checkpoints = checkpoints
+        self._dispatch_guard = dispatch_guard
         self._claims: dict[str, tuple[int, str]] = {}
         self._resolved_scopes: dict[
             str,
@@ -378,6 +380,8 @@ class ToolOrchestrator:
         return None
 
     def _context_for_call(self, turn_id: str, call: ToolCall) -> ToolExecutionContext:
+        if self._dispatch_guard is not None:
+            self._dispatch_guard(self._store)
         snapshot = self._step_snapshot(turn_id, call)
         if snapshot is None:
             # Direct ACI calls do not originate from a model operation.
@@ -1400,12 +1404,15 @@ class ToolOrchestrator:
             )
 
             def claim_operation() -> Any:
-                claim = tool_ops.claim_tool_operation(
-                    self._store,
-                    operation_id=record.operation_id,
-                    worker_id=self._worker_id,
-                    lease_seconds=lease_seconds,
-                )
+                with self._store.tx.transaction():
+                    if self._dispatch_guard is not None:
+                        self._dispatch_guard(self._store)
+                    claim = tool_ops.claim_tool_operation(
+                        self._store,
+                        operation_id=record.operation_id,
+                        worker_id=self._worker_id,
+                        lease_seconds=lease_seconds,
+                    )
                 if claim.fencing_token is None:
                     raise RuntimeError("claimed tool operation has no fencing token")
                 if claim.attempt_count != record.attempt_count:
@@ -1417,6 +1424,11 @@ class ToolOrchestrator:
 
             try:
                 await self._commit(claim_operation)
+            except TurnCancellationPendingError:
+                await self._commit(lambda: turn_ops.request_turn_cancellation(
+                    self._store, turn_id=turn_id, reason="Execution admission revoked before tool dispatch"
+                ))
+                raise
             except ResourceClaimConflictError as conflict:
                 await self._commit(
                     lambda: tool_ops.reject_ready_tool_operation(

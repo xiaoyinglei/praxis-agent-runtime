@@ -16,13 +16,13 @@ from typing import TYPE_CHECKING, Any, Self
 from uuid import uuid4
 
 from agent_runtime.approval import ApprovalMode, CommandGrant
-from agent_runtime.budget import ResourceUsage
 from agent_runtime.core.generation_settings import ModelRequestPreferences
 from agent_runtime.harness import artifact_ops, budget_ops, memory_ops, turn_ops
 from agent_runtime.harness.context import validate_tool_history
 from agent_runtime.harness.events import commit_and_publish
 from agent_runtime.harness.execution import TurnRunner
 from agent_runtime.harness.execution_context import step_limit_from_binding
+from agent_runtime.harness.operation_values import TurnCancellationPendingError
 from agent_runtime.harness.ownership import (
     OWNERSHIP_REVISION,
     ConversationBusyError,
@@ -102,13 +102,22 @@ class Session:
     _memory_control_version: int
 
     def __init__(self) -> None:
+        self._dispatch_guard: Callable[[RuntimeStore], None] | None = None
         self._stack = AsyncExitStack()
         self._active_turn_lock = asyncio.Lock()
         self._active_task: asyncio.Task[Any] | None = None
         self._child_calls: dict[asyncio.Task[Any], asyncio.Event] = {}
+        self._awaited_children: dict[asyncio.Task[Any], str] = {}
+        self._subagent_tasks: dict[str, asyncio.Task[TurnResult]] = {}
+        self._subagent_sessions: dict[str, Session] = {}
+        from agent_runtime.harness.subagents import DEFAULT_LIMITS, SubagentManager
+
+        self._subagent_limits = dict(DEFAULT_LIMITS)
+        self.subagents = SubagentManager(self)
         self._closed = False
         self._closing = False
         self._close_task: asyncio.Task[None] | None = None
+        self._preserve_children_on_exit = False
         self._persisted_request_revision = 0
         self._agent: Agent | None = None
         self.model_control_plane = None
@@ -149,9 +158,14 @@ class Session:
         event_sink: AgentEventSink | None = None,
         memory: MemoryConfig | None = None,
         _background_memory: bool = True,
+        _preserve_children_on_exit: bool = False,
         **service_options: Any,
     ) -> Self:
         self = cls()
+        self._preserve_children_on_exit = _preserve_children_on_exit
+        self._dispatch_guard = service_options.pop("dispatch_guard", None)
+        if self._dispatch_guard is not None and not callable(self._dispatch_guard):
+            raise TypeError("dispatch_guard must be callable")
         explicit_tool_context = "tool_execution_context" in service_options
         approval_mode = service_options.pop("approval_mode", None)
         agent = copy.copy(agent) if agent is not None else None
@@ -367,8 +381,15 @@ class Session:
         self._ensure_open()
         return self
 
-    async def __aexit__(self, *_args: object) -> None:
-        await self.close()
+    async def __aexit__(self, exc_type: object, *_args: object) -> None:
+        preserve = self._preserve_children_on_exit and exc_type is None
+        if preserve:
+            try:
+                await self.subagents.join()
+            except BaseException:
+                await self.close()
+                raise
+        await self.close(preserve_children=preserve)
 
     def _ensure_open(self) -> None:
         if self._closed or self._closing:
@@ -386,24 +407,34 @@ class Session:
         if cancelled:
             raise asyncio.CancelledError
 
-    async def close(self) -> None:
+    async def close(self, *, preserve_children: bool = False) -> None:
         if self._closed:
             return
         if self._active_task is asyncio.current_task() or asyncio.current_task() in self._child_calls:
             raise RuntimeError("cannot close Session from its active Turn")
         self._closing = True
         if self._close_task is None:
-            self._close_task = asyncio.create_task(self._close_resources())
+            self._close_task = asyncio.create_task(self._close_resources(preserve_children=preserve_children))
         await self._settle_cleanup(self._close_task)
 
-    async def _close_resources(self) -> None:
+    async def _close_resources(self, *, preserve_children: bool = False) -> None:
         if self._memory_task is not None:
             self._memory_task.cancel()
             await asyncio.gather(self._memory_task, return_exceptions=True)
+        # An active parent may hold this lock while draining async children.
+        # Stop those handles before waiting on the parent, while retaining the
+        # existing wait-for-result contract for direct awaited child calls.
+        await self.subagents.close(
+            exclude=frozenset(self._awaited_children.values()), preserve=preserve_children,
+        )
         async with self._active_turn_lock:
             if not self._closed:
                 if self._child_calls:
+                    # An awaited compatibility call still owns its result and
+                    # budget settlement. Detached async handles are cancelled
+                    # below once these active calls reach their boundary.
                     await asyncio.gather(*(done.wait() for done in tuple(self._child_calls.values())))
+                await self.subagents.close(preserve=preserve_children)
                 try:
                     await self._stack.aclose()
                 finally:
@@ -440,7 +471,19 @@ class Session:
                 try:
                     yield
                 except asyncio.CancelledError:
-                    await self._settle_cleanup(asyncio.create_task(self._record_cancellation()))
+
+                    async def cancel_attached() -> None:
+                        active = (await self.store.run_async(self.store.read_thread, self.thread_id)).active_turn_id
+                        # Revoke admission before enumerating the attached
+                        # children. A concurrent spawn then either appears in
+                        # this snapshot or fails its canonical ancestry check.
+                        await self._record_cancellation()
+                        if active is not None:
+                            await self.subagents.cancel_all(active)
+                        if self._cancel_live_commands is not None:
+                            await self._cancel_live_commands()
+
+                    await self._settle_cleanup(asyncio.create_task(cancel_attached()))
                     raise
                 finally:
                     try:
@@ -461,6 +504,20 @@ class Session:
                     finally:
                         self._active_task = None
 
+    def _guard_dispatch(self, store: RuntimeStore) -> None:
+        """Translate host revocation into canonical cancellation before further I/O."""
+        if self._dispatch_guard is None:
+            return
+        try:
+            self._dispatch_guard(store)
+        except TurnCancellationPendingError:
+            active = store.read_thread(self.thread_id).active_turn_id
+            if active is not None:
+                turn_ops.request_turn_cancellation(
+                    store, turn_id=active, reason="Host execution authority revoked"
+                )
+            raise
+
     def _executor(self) -> TurnRunner:
         executor = TurnRunner(
             thread_id=self.thread_id,
@@ -474,6 +531,8 @@ class Session:
             max_steps=self.max_steps,
             binding_provider=self.binding_provider,
             prepare_binding=self._prepare_step_binding,
+            before_completion=self._drain_children,
+            dispatch_guard=self._guard_dispatch,
         )
         executor.attach_event_dispatcher(self.event_dispatcher)
         return executor
@@ -484,9 +543,24 @@ class Session:
         *,
         files: Sequence[str] | None = None,
         event_sink: AgentEventSink | None = None,
+        turn_id: str | None = None,
     ) -> AgentResult:
         if not isinstance(task, str) or not task.strip():
             raise ValueError("user_message must be non-empty")
+        if turn_id is not None:
+            if not isinstance(turn_id, str) or not turn_id.strip():
+                raise ValueError("turn_id must be non-empty")
+            requested_turn_id = turn_id
+
+            def existing_turn() -> bool:
+                try:
+                    self.store.read_turn(requested_turn_id)
+                except KeyError:
+                    return False
+                return True
+
+            if await self.store.run_async(existing_turn):
+                raise ValueError("Turn identity already exists; inspect or resume the saved execution")
         async with self._active_turn(event_sink):
             active = (await self.store.run_async(self.store.read_thread, self.thread_id)).active_turn_id
             if active is not None:
@@ -526,7 +600,7 @@ class Session:
             input_files: tuple[dict[str, object], ...] = ()
             if files:
                 input_files = await self.store.run_async(self.attach_files, files)
-            turn_id = f"turn_{uuid4().hex}"
+            turn_id = turn_id or f"turn_{uuid4().hex}"
             binding = await self.store.run_async(
                 lambda: dict(self.binding_provider.snapshot(thread_id=self.thread_id, turn_id=turn_id))
             )
@@ -625,7 +699,14 @@ class Session:
         self._apply_tool_context()
         return values
 
-    async def steer(self, text: str, *, expected_turn_id: str, files: Sequence[str] | None = None) -> ItemSnapshot:
+    async def steer(
+        self,
+        text: str,
+        *,
+        expected_turn_id: str,
+        files: Sequence[str] | None = None,
+        input_id: str | None = None,
+    ) -> ItemSnapshot:
         """Receive guidance for the named active Turn without starting another loop.
 
         The returned Item is committed before acknowledgement. Running tools
@@ -641,8 +722,14 @@ class Session:
                 # Settings, input revision and file Items commit together. A rejected
                 # input must not leave an unacknowledged permission grant behind.
                 with self.store.persistence.transaction():
-                    if self.store.read_thread(self.thread_id).active_turn_id != expected_turn_id:
-                        raise RuntimeError("expected Turn is no longer active; input was not accepted")
+                    paths = tuple(files or ())
+                    if input_id is not None:
+                        saved = turn_ops.read_input_receipt(
+                            self.store, thread_id=self.thread_id, turn_id=expected_turn_id,
+                            input_id=input_id, text=text, input_file_paths=paths,
+                        )
+                        if saved is not None:
+                            return saved
                     values = self.attach_files(files) if files else ()
                     return turn_ops.receive_turn_input(
                         self.store,
@@ -650,6 +737,8 @@ class Session:
                         turn_id=expected_turn_id,
                         text=text,
                         input_files=values,
+                        input_id=input_id,
+                        input_file_paths=paths,
                     )
             except BaseException:
                 self.tool_execution_context = previous
@@ -1030,28 +1119,7 @@ class Session:
         command_sessions = DurableCommandSessions(workspace)
         self._command_sessions = command_sessions
 
-        async def close_command_sessions(*, close: bool = True) -> None:
-            from agent_runtime.tools.builtins.shell import _normalize_command_output
-
-            outcomes = await (command_sessions.close_results() if close else command_sessions.cancel_results())
-            for continuation, output in outcomes:
-                if self.tool_orchestrator is not None:
-                    normalized = _normalize_command_output(output)
-                    await self.tool_orchestrator.close_continuation(
-                        continuation,
-                        {
-                            "structured_content": output.model_dump(mode="json"),
-                            "is_error": normalized.is_error,
-                            "error_code": normalized.error_code,
-                            "error_message": normalized.error_message,
-                        },
-                    )
-
-        async def cancel_live_commands() -> None:
-            await close_command_sessions(close=False)
-
-        self._cancel_live_commands = cancel_live_commands
-        self._stack.push_async_callback(close_command_sessions)
+        self._own_command_sessions(command_sessions)
         resident = create_resident_coding_tools(
             workspace,
             plan_updater=acknowledge_plan_update,
@@ -1335,6 +1403,8 @@ class Session:
         files: Sequence[str] | None = None,
         event_sink: AgentEventSink | None = None,
         expected_request_id: str | None = None,
+        automatic: bool = False,
+        authorization_revision: int | None = None,
     ) -> AgentResult:
         async with self._active_turn(event_sink):
             turn = await self.store.run_async(self.store.read_turn, turn_id)
@@ -1356,11 +1426,43 @@ class Session:
                 action=action,
                 user_input=user_input,
                 expected_request_id=expected_request_id,
+                automatic=automatic,
+                authorization_revision=authorization_revision,
                 on_session_grant=self._add_approval_grant,
                 command_sessions=self._command_sessions,
                 cancel_live_commands=self._cancel_live_commands,
             )
             return await self.store.run_async(AgentResult._from_harness, internal, store=self.store)
+
+    def _own_command_sessions(self, command_sessions: Any) -> None:
+        """Bind cleanup/continuations to the Session that executes these commands."""
+        self._command_sessions = command_sessions
+
+        async def close_command_sessions(*, close: bool = True) -> None:
+            from agent_runtime.tools.builtins.shell import _normalize_command_output
+
+            outcomes = await (command_sessions.close_results() if close else command_sessions.cancel_results())
+            for continuation, output in outcomes:
+                if self.tool_orchestrator is not None:
+                    normalized = _normalize_command_output(output)
+                    await self.tool_orchestrator.close_continuation(
+                        continuation,
+                        {
+                            "structured_content": output.model_dump(mode="json"),
+                            "is_error": normalized.is_error,
+                            "error_code": normalized.error_code,
+                            "error_message": normalized.error_message,
+                        },
+                    )
+
+        async def cancel_live_commands() -> None:
+            await close_command_sessions(close=False)
+
+        self._cancel_live_commands = cancel_live_commands
+        self._stack.push_async_callback(close_command_sessions)
+
+    async def _drain_children(self, turn_id: str) -> None:
+        await self.subagents.drain(turn_id)
 
     async def run_child(
         self,
@@ -1371,117 +1473,198 @@ class Session:
         max_cost_micros: int | None = None,
         parent_turn_id: str | None = None,
     ) -> TurnResult:
+        """Awaited compatibility facade over the same attached-child lifecycle."""
         self._ensure_open()
-        task = asyncio.current_task()
-        assert task is not None
+        caller = asyncio.current_task()
+        assert caller is not None
         completed = asyncio.Event()
-        self._child_calls[task] = completed
+        self._child_calls[caller] = completed
+        child_id: str | None = None
         try:
-            thread_id = f"thread_{uuid4().hex}"
-            turn_id = f"turn_{uuid4().hex}"
-            source_binding = current_tool_binding()
-            if source_binding is None:
-                source_binding = dict(
-                    await self.store.run_async(
-                        self.binding_provider.snapshot, thread_id=self.thread_id, turn_id=parent_turn_id or turn_id
-                    )
-                )
-            binding = await self.store.run_async(
-                lambda: dict(
-                    self.binding_provider.snapshot(thread_id=thread_id, turn_id=turn_id, model_binding=source_binding)
-                )
+            prepared = await self._prepare_child(
+                parent_turn_id=parent_turn_id,
+                user_message=user_message,
+                max_steps=max_steps,
+                max_tokens_total=max_tokens_total,
+                max_cost_micros=max_cost_micros,
             )
-            from agent_runtime.tools.web_limits import WebLimits
+            handle = self.subagents._schedule(prepared)
+            child_id = str(handle["child_turn_id"])
+            return await asyncio.shield(self._subagent_tasks[child_id])
+        except asyncio.CancelledError:
+            if parent_turn_id is not None and child_id is not None:
 
-            web_limits = source_binding.get("web_limits")
-            if web_limits is None and parent_turn_id is not None:
-                web_limits = await self.store.run_async(
-                    lambda: self.store.read_turn(parent_turn_id).binding_manifest.get("web_limits")
+                async def cancel_child() -> None:
+                    assert parent_turn_id is not None and child_id is not None
+                    await self.subagents.cancel(parent_turn_id=parent_turn_id, child_turn_id=child_id)
+
+                await self._settle_cleanup(asyncio.create_task(cancel_child()))
+            elif child_id is not None:
+                self._subagent_tasks[child_id].cancel()
+                await asyncio.gather(self._subagent_tasks[child_id], return_exceptions=True)
+            raise
+        finally:
+            self._child_calls.pop(caller, None)
+            self._awaited_children.pop(caller, None)
+            completed.set()
+
+    async def _prepare_child(
+        self,
+        *,
+        user_message: str,
+        max_steps: int | None,
+        max_tokens_total: int | None,
+        max_cost_micros: int | None = None,
+        parent_turn_id: str | None = None,
+    ) -> dict[str, Any]:
+        from agent_runtime.harness.subagents import reserve_child
+
+        self._ensure_open()
+        if not isinstance(user_message, str) or not user_message.strip():
+            raise ValueError("child user_message must be non-empty")
+        thread_id = f"thread_{uuid4().hex}"
+        turn_id = f"turn_{uuid4().hex}"
+        caller = asyncio.current_task()
+        if caller is not None and caller in self._child_calls:
+            self._awaited_children[caller] = turn_id
+        source_binding = current_tool_binding()
+        if source_binding is None:
+            source_binding = dict(
+                await self.store.run_async(
+                    self.binding_provider.snapshot, thread_id=self.thread_id, turn_id=parent_turn_id or turn_id
                 )
-            if web_limits is None and self._agent is not None:
-                web_limits = self._agent.web_limits.model_dump(mode="json")
-            binding["web_limits"] = WebLimits.model_validate(web_limits or {}).model_dump(mode="json")
-            policy_value = source_binding["tool_execution_policy"]
-            if not isinstance(policy_value, Mapping):
-                raise RuntimeError("source Step has no tool execution policy")
-            binding["tool_execution_policy"] = dict(policy_value)
-            child_options = {
-                **self._service_options,
-                "model_binding": source_binding,
-                "tool_execution_context": replace(
-                    restore_tool_policy(
-                        self.tool_execution_context,
-                        policy_value,
-                        restore_session_grants=True,
-                    ),
-                    command_grants=(),
-                ),
-            }
-            # Borrow providers through the source binding, independent of the parent's next selection.
-            await self._prepare_step_binding(source_binding)
-            binding["model_step_budget"] = (
-                step_limit_from_binding(source_binding)
-                if max_steps is None
-                else step_limit_from_binding({"model_step_budget": max_steps})
             )
-            binding["completion_policy"] = {"require_workspace_change": False}
-            if parent_turn_id is None:
-                (
-                    await self.store.run_async(
-                        partial(turn_ops.create_thread, self.store), workspace=self.workspace_path, thread_id=thread_id
-                    )
+            if parent_turn_id is not None:
+                frozen = await self.store.run_async(self.store.read_turn, parent_turn_id)
+                # Direct API calls honor the same frozen source identity/policy
+                # as a tool call rather than inheriting later Session changes.
+                source_binding.update(frozen.binding_manifest)
+        binding = await self.store.run_async(
+            lambda: dict(
+                self.binding_provider.snapshot(thread_id=thread_id, turn_id=turn_id, model_binding=source_binding)
+            )
+        )
+        from agent_runtime.tools.web_limits import WebLimits
+
+        web_limits = source_binding.get("web_limits")
+        if web_limits is None and parent_turn_id is not None:
+            web_limits = await self.store.run_async(
+                lambda: self.store.read_turn(parent_turn_id).binding_manifest.get("web_limits")
+            )
+        if web_limits is None and self._agent is not None:
+            web_limits = self._agent.web_limits.model_dump(mode="json")
+        binding["web_limits"] = WebLimits.model_validate(web_limits or {}).model_dump(mode="json")
+        policy_value = source_binding["tool_execution_policy"]
+        if not isinstance(policy_value, Mapping):
+            raise RuntimeError("source Step has no tool execution policy")
+        binding["tool_execution_policy"] = dict(policy_value)
+        child_options = {
+            **self._service_options,
+            "model_binding": source_binding,
+            "tool_execution_context": replace(
+                restore_tool_policy(
+                    self.tool_execution_context,
+                    policy_value,
+                    restore_session_grants=True,
+                ),
+                command_grants=(),
+            ),
+        }
+
+        def guard_child_dispatch(store: RuntimeStore) -> None:
+            inherited_guard = getattr(self, "_dispatch_guard", None)
+            if inherited_guard is not None:
+                inherited_guard(store)
+            turn_ops._assert_no_pending_cancellation(store, turn_id)
+
+        child_options["dispatch_guard"] = guard_child_dispatch
+        # Borrow providers through the source binding, independent of the parent's next selection.
+        await self._prepare_step_binding(source_binding)
+        binding["model_step_budget"] = (
+            step_limit_from_binding(source_binding)
+            if max_steps is None
+            else step_limit_from_binding({"model_step_budget": max_steps})
+        )
+        binding["completion_policy"] = {"require_workspace_change": False}
+        if parent_turn_id is None:
+            (
+                await self.store.run_async(
+                    partial(turn_ops.create_thread, self.store), workspace=self.workspace_path, thread_id=thread_id
                 )
-                binding["budget_root_turn_id"] = turn_id
-                if max_tokens_total is not None:
-                    binding["model_token_budget_total"] = max_tokens_total
-                if max_cost_micros is not None:
-                    binding["model_cost_budget_total_micros"] = max_cost_micros
-            else:
-                parent = await self.store.run_async(self.store.read_turn, parent_turn_id)
-                if parent.thread_id != self.thread_id or parent.status != "running":
-                    raise RuntimeError("subagent parent Turn must still be running in this Session")
-                (
-                    await self.store.run_async(
-                        partial(budget_ops.start_budgeted_child_turn, self.store),
-                        parent_turn_id=parent_turn_id,
-                        child_thread_id=thread_id,
-                        child_turn_id=turn_id,
-                        user_message=user_message,
-                        binding_manifest=binding,
-                        requested_tokens=max_tokens_total,
-                        requested_cost_micros=max_cost_micros,
-                    )
+            )
+            binding["budget_root_turn_id"] = turn_id
+            if max_tokens_total is not None:
+                binding["model_token_budget_total"] = max_tokens_total
+            if max_cost_micros is not None:
+                binding["model_cost_budget_total_micros"] = max_cost_micros
+        else:
+            parent = await self.store.run_async(self.store.read_turn, parent_turn_id)
+            if parent.thread_id != self.thread_id or parent.status != "running":
+                raise RuntimeError("subagent parent Turn must still be running in this Session")
+            (
+                await self.store.run_async(
+                    partial(reserve_child, self),
+                    parent_turn_id=parent_turn_id,
+                    child_thread_id=thread_id,
+                    child_turn_id=turn_id,
+                    user_message=user_message,
+                    binding_manifest=binding,
+                    requested_tokens=max_tokens_total,
+                    requested_cost_micros=max_cost_micros,
                 )
-            # Child services and Store belong to a separate Session. The parent's
-            # live model and installed external tools are borrowed for this awaited call.
+            )
+        if parent_turn_id is None:
+            # Even standalone compatibility calls register the Turn before drive.
+            await self.store.run_async(
+                partial(turn_ops.start_turn, self.store),
+                thread_id=thread_id,
+                turn_id=turn_id,
+                user_message=user_message,
+                binding_manifest=binding,
+            )
+        return {
+            "turn_id": turn_id,
+            "thread_id": thread_id,
+            "parent_turn_id": parent_turn_id,
+            "child_options": child_options,
+        }
+
+    async def _drive_child(self, prepared: Mapping[str, Any]) -> TurnResult:
+        turn_id = prepared["turn_id"]
+        parent_turn_id = prepared["parent_turn_id"]
+        options = dict(prepared["child_options"])
+        command_sessions = None
+        if self._command_sessions is not None:
+            from agent_runtime.tools.builtins.command_sessions import DurableCommandSessions, create_manage_command_tool
+            from agent_runtime.tools.builtins.shell import create_run_command_tool
+            from agent_runtime.workspace import open_workspace
+
+            workspace = open_workspace(self.workspace_path)
+            command_sessions = DurableCommandSessions(workspace)
+            tools = dict(options.get("tools") or {})
+            tools["run_command"] = create_run_command_tool(workspace, command_sessions=command_sessions)
+            tools["manage_command"] = create_manage_command_tool(workspace, command_sessions)
+            options["tools"] = tools
+        try:
             async with await Session.open(
                 database=self.database,
                 workspace=self.workspace_path,
                 model=self.model,
-                thread_id=thread_id,
-                **child_options,
+                thread_id=prepared["thread_id"],
+                _preserve_children_on_exit=self._preserve_children_on_exit,
+                **options,
             ) as child:
+                self._subagent_sessions[turn_id] = child
+                if command_sessions is not None:
+                    child._own_command_sessions(command_sessions)
                 async with child._active_turn():
                     executor = await child.store.run_async(child._executor)
-                    if parent_turn_id is None:
-                        result = await executor.run(
-                            turn_id=turn_id,
-                            user_message=user_message,
-                            binding_manifest=binding,
-                        )
-                    else:
-                        result = await executor.drive(
-                            (await child.store.run_async(executor.restore_turn_context, turn_id)), start_step=1
-                        )
-                if parent_turn_id is not None and result.status in {"completed", "failed", "cancelled"}:
-                    state = await self.store.run_async(self.store.read_budget_state, turn_id)
-                    if state.reserved + state.uncertain + state.child_reserved == ResourceUsage():
-                        (
-                            await self.store.run_async(
-                                partial(budget_ops.settle_child_budget, self.store), child_turn_id=turn_id
-                            )
-                        )
+                    result = await executor.drive(
+                        (await child.store.run_async(executor.restore_turn_context, turn_id)),
+                        start_step=1,
+                    )
                 return result
         finally:
-            self._child_calls.pop(task)
-            completed.set()
+            self._subagent_sessions.pop(turn_id, None)
+            if parent_turn_id is not None:
+                await self.subagents._settle(turn_id)

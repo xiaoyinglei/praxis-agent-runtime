@@ -21,9 +21,14 @@ from agent_runtime.streaming.events import (
 
 if TYPE_CHECKING:
     from agent_runtime.agent import Agent, AgentEventSink
+    from agent_runtime.background import BackgroundHandle
 
 
 def __getattr__(name: str) -> object:
+    if name == "BackgroundHandle":
+        from agent_runtime.background import BackgroundHandle
+
+        return BackgroundHandle
     if name in {"Agent", "AgentEventSink"}:
         from agent_runtime.agent import Agent, AgentEventSink
 
@@ -37,6 +42,7 @@ __all__ = [
     "AgentPlan",
     "AgentResult",
     "AgentUsage",
+    "BackgroundHandle",
     "EventType",
     "ItemDeltaKind",
     "ItemStatus",

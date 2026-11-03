@@ -21,6 +21,14 @@ class TurnInputChangedError(RuntimeError):
     """A response no longer covers the active Turn's received user input."""
 
 
+class TurnChildrenPendingError(RuntimeError):
+    """Parent completion cannot discard an attached allocation's exposure."""
+
+    def __init__(self, children: tuple[str, ...]) -> None:
+        super().__init__("Attached child allocations remain active: " + ", ".join(children))
+        self.children = children
+
+
 def _validate_resource_usage_input(resource: str, initial_used: int) -> None:
     if not isinstance(resource, str) or not resource.strip() or len(resource) > 120:
         raise ValueError("resource must be a non-empty name of at most 120 characters")

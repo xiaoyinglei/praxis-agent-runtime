@@ -31,6 +31,7 @@ from agent_runtime.tools.web_limits import WebLimits
 from agent_runtime.workspace import DEFAULT_CHECKPOINT_PATH, DEFAULT_MODEL_SESSION_PATH
 
 if TYPE_CHECKING:
+    from agent_runtime.background import BackgroundHandle
     from agent_runtime.harness import BoundHarnessModel, Session
     from agent_runtime.harness.records import ItemSnapshot
     from agent_runtime.runtime.mcp import MCPConfigTrustDecision
@@ -204,6 +205,43 @@ class Agent:
         ) as session:
             return await session.submit(task, files=files)
 
+    async def start_background(
+        self,
+        task: str,
+        *,
+        input_id: str | None = None,
+        previous_turn_id: str | None = None,
+        files: Sequence[str] | None = None,
+        max_steps: int | None = None,
+        max_tokens_total: int | None = None,
+        max_cost_micros: int | None = None,
+        require_workspace_change: bool = False,
+        acceptance_command: str | None = None,
+        allow_write_tools: bool = False,
+        allow_execute_tools: bool = False,
+        allow_web_tools: bool = False,
+        autostart: bool = True,
+    ) -> BackgroundHandle:
+        """Commit a request before handing execution to the independent local host."""
+        from agent_runtime.background import submit_background
+
+        return await submit_background(
+            self, task, input_id=input_id, previous_turn_id=previous_turn_id, files=files,
+            max_steps=max_steps, max_tokens_total=max_tokens_total, max_cost_micros=max_cost_micros,
+            require_workspace_change=require_workspace_change, acceptance_command=acceptance_command,
+            allow_write_tools=allow_write_tools, allow_execute_tools=allow_execute_tools,
+            allow_web_tools=allow_web_tools, autostart=autostart,
+        )
+
+    def attach_background(self, *, thread_id: str, turn_id: str, autostart: bool = True) -> BackgroundHandle:
+        """Attach without starting a model or changing execution ownership."""
+        from agent_runtime.background import BackgroundHandle
+
+        return BackgroundHandle(
+            database=self._harness_database(), workspace=self.workspace_path,
+            thread_id=thread_id, turn_id=turn_id, autostart=autostart,
+        )
+
     @asynccontextmanager
     async def session(
         self,
@@ -255,8 +293,10 @@ class Agent:
         async with session:
             yield session
 
-    async def steer(self, text: str, *, expected_turn_id: str) -> ItemSnapshot:
-        """Persist guidance without opening a model; target must still be active."""
+    async def steer(
+        self, text: str, *, expected_turn_id: str, input_id: str | None = None
+    ) -> ItemSnapshot:
+        """Persist guidance without model I/O; an identical input_id retry returns its receipt."""
         from agent_runtime.harness import RuntimeStore
 
         async with await RuntimeStore.open(self._harness_database()) as store:
@@ -271,6 +311,8 @@ class Agent:
                 thread_id=turn.thread_id,
                 turn_id=expected_turn_id,
                 text=text,
+                input_id=input_id,
+                input_file_paths=(),
             )
 
     def input_status(self, item_id: str) -> str:

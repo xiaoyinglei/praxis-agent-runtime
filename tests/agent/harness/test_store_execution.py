@@ -496,6 +496,11 @@ async def test_session_close_cancellation_keeps_its_resource_owner(tmp_path):
         def __init__(self, connection):
             self.connection = connection
 
+        def __getattr__(self, name):
+            # Child ownership is reconciled before the database closes. Keep
+            # real query behavior while this wrapper gates only physical close.
+            return getattr(self.connection, name)
+
         def close(self):
             entered.set()
             assert release.wait(3)

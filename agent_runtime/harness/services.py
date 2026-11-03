@@ -26,8 +26,12 @@ from agent_runtime.tools.integrations.knowledge import (
 )
 from agent_runtime.tools.integrations.skills import create_skill_tools
 from agent_runtime.tools.integrations.subagent import (
+    ChildHandleInput,
+    SendAgentMessageInput,
     StandardSubagentOutput,
     SubagentInput,
+    WaitAgentInput,
+    create_async_subagent_tools,
     create_subagent_tool,
 )
 from agent_runtime.tools.permissions import ToolExecutionContext
@@ -92,7 +96,11 @@ class SessionBindingProvider:
         project_instructions: Callable[[str], Mapping[str, Any] | None] | None = None,
         model_binding: Mapping[str, Any] | None = None,
         request_settings: Callable[[], Mapping[str, Any]] | None = None,
+        subagent_limits: Mapping[str, int] | None = None,
     ) -> None:
+        from agent_runtime.harness.subagents import child_limits
+
+        self._subagent_limits = child_limits(subagent_limits)
         self._request_settings = request_settings
         self._model = model
         self._model_binding = model_binding
@@ -138,6 +146,7 @@ class SessionBindingProvider:
 
     def _static_snapshot(self, turn_id: str) -> dict[str, object]:
         binding: dict[str, object] = {}
+        binding["subagent_limits"] = dict(self._subagent_limits)
         binding["toolset_revision"] = toolset_revision_for_tools(self._tools)
         binding["tool_execution_revisions"] = {tool.definition.name: tool.execution_revision for tool in self._tools}
         binding["tool_execution_policy"] = dict(self._tool_execution_policy())
@@ -204,6 +213,7 @@ def configure_services(
     workspace_mcp_enabled: bool = True,
     mcp_config_trust: Mapping[str, object] | None = None,
     enable_subagents: bool = False,
+    subagent_limits: Mapping[str, int] | None = None,
     skill_runtime: HarnessSkillRuntime | None = None,
     max_steps: int | None = None,
     max_tokens_total: int | None = None,
@@ -233,6 +243,9 @@ def configure_services(
         cwd=workspace,
     )
     store = session.store
+    from agent_runtime.harness.subagents import child_limits
+
+    session._subagent_limits = child_limits(subagent_limits)
 
     async def run_subagent(arguments: Mapping[str, JsonValue]) -> object:
         payload = SubagentInput.model_validate(arguments)
@@ -246,51 +259,43 @@ def configure_services(
             max_tokens_total=payload.llm_budget_total,
             max_cost_micros=payload.llm_cost_budget_micros,
         )
-        child_turn = await store.run_async(store.read_turn, child.turn_id)
-        child_items = await store.run_async(store.list_items, child.turn_id)
-        pending = await store.run_async(
-            lambda: [
-                interaction for interaction in store.list_interactions(child.turn_id) if interaction.status == "pending"
-            ]
+        return await store.run_async(session.subagents._output, current_tool_turn_id(), child.turn_id)
+
+    async def spawn_agent(arguments: Mapping[str, JsonValue]) -> object:
+        payload = SubagentInput.model_validate(arguments)
+        message = payload.task
+        if payload.context_summary:
+            message += "\n\nContext supplied by the parent agent:\n" + payload.context_summary
+        return await session.subagents.spawn(
+            parent_turn_id=current_tool_turn_id(),
+            user_message=message,
+            max_steps=payload.max_turns,
+            max_tokens_total=payload.llm_budget_total,
+            max_cost_micros=payload.llm_cost_budget_micros,
         )
-        child_pause: dict[str, object] | None = None
-        if child.status == "paused":
-            if len(pending) != 1:
-                raise RuntimeError("paused child Turn requires one pending interaction")
-            request = pending[0].request
-            question = request.get("reason") or request.get("question")
-            child_pause = {
-                "request_id": pending[0].request_id,
-                "kind": pending[0].kind,
-                "question": (
-                    question
-                    if isinstance(question, str) and question
-                    else f"Input required for child {pending[0].kind}"
-                ),
-            }
-        execution_evidence = [
-            {
-                "kind": item.payload["verification_kind"],
-                "verifier": item.payload["verifier"],
-                "operation_id": item.payload["operation_id"],
-                "verified_resources": item.payload.get("verified_resources", []),
-            }
-            for item in child_items
-            if item.kind == "verification" and item.status == "completed" and item.producer == "runtime"
-        ]
-        conclusion = child.answer
-        if conclusion is None and child_pause is not None:
-            conclusion = str(child_pause["question"])
-        if conclusion is None:
-            conclusion = child_turn.terminal_message or ""
-        return {
-            "conclusion": conclusion,
-            "status": ("done" if child.status == "completed" else "paused" if child.status == "paused" else "failed"),
-            "child_turn_id": child.turn_id,
-            "stop_reason": child_turn.terminal_reason_code or child_turn.status,
-            "pause": child_pause,
-            "execution_evidence": execution_evidence,
-        }
+
+    async def send_agent_message(arguments: Mapping[str, JsonValue]) -> object:
+        payload = SendAgentMessageInput.model_validate(arguments)
+        return await session.subagents.send(
+            parent_turn_id=current_tool_turn_id(),
+            child_turn_id=payload.child_turn_id,
+            message=payload.message,
+            message_id=payload.message_id,
+        )
+
+    async def wait_agent(arguments: Mapping[str, JsonValue]) -> object:
+        payload = WaitAgentInput.model_validate(arguments)
+        return await session.subagents.wait(
+            parent_turn_id=current_tool_turn_id(),
+            child_turn_id=payload.child_turn_id,
+            timeout_seconds=payload.timeout_seconds,
+        )
+
+    async def cancel_agent(arguments: Mapping[str, JsonValue]) -> object:
+        payload = ChildHandleInput.model_validate(arguments)
+        return await session.subagents.cancel(
+            parent_turn_id=current_tool_turn_id(), child_turn_id=payload.child_turn_id
+        )
 
     async def search_knowledge(arguments: Mapping[str, JsonValue]) -> object:
         if knowledge_runner is None:
@@ -329,13 +334,16 @@ def configure_services(
                 execution_revision="harness-child-thread-v4",
                 output_model=StandardSubagentOutput,
             ),
+            *create_async_subagent_tools(
+                spawn=spawn_agent, send=send_agent_message, wait=wait_agent, cancel=cancel_agent
+            ),
         )
         if enable_subagents
         else (),
     )
     discoverable_names = (
         *tuple(discoverable_tool_names),
-        *(("task",) if enable_subagents else ()),
+        *(("task", "spawn_agent", "send_agent_message", "wait_agent", "cancel_agent") if enable_subagents else ()),
     )
     if READ_CONTEXT_NAME in discoverable_names:
         raise ValueError("read_context is a resident tool owned by the composition root")
@@ -392,6 +400,7 @@ def configure_services(
         execution_context=execution_context,
         worker_id=worker_id,
         checkpoints=CheckpointService(workspace),
+        dispatch_guard=session._guard_dispatch,
     )
     session.tool_execution_context = execution_context
     session.model = model
@@ -437,6 +446,7 @@ def configure_services(
         model_step_budget=max_steps,
         model_token_budget_total=max_tokens_total,
         model_cost_budget_total_micros=max_cost_micros,
+        subagent_limits=session._subagent_limits,
         project_instructions=project_instructions_for_turn,
         request_settings=(
             None if session.model_control_plane is None else session.model_control_plane.request_settings

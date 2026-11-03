@@ -1922,8 +1922,10 @@ async def _chat_facade_loop(
                     )
                 else:
                     assert session is not None
-                    submission = session.submit(
-                        query, event_sink=event_display, **({"files": list(pending_files)} if pending_files else {})
+                    submission = (
+                        session.submit(query, event_sink=event_display, files=list(pending_files))
+                        if pending_files
+                        else session.submit(query, event_sink=event_display)
                     )
                 result = await _ui.operation(submission) if _ui else await submission
                 event_display.update_usage(result.usage)
@@ -2776,6 +2778,8 @@ def agent_run(
         typer.Option("--last", help="从当前工作区最近的已完成 Turn 继续"),
     ] = False,
     non_interactive: Annotated[bool, typer.Option("--non-interactive", help="非交互模式")] = False,
+    background: Annotated[bool, typer.Option("--background", help="交给独立后台进程执行；立即返回Thread/Turn")] = False,
+    input_id: Annotated[str | None, typer.Option("--input-id", help="后台提交的稳定幂等ID")] = None,
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="详细输出")] = False,
     checkpoint_db: Annotated[
         Path,
@@ -2946,6 +2950,21 @@ def agent_run(
         web_limits_file=web_limits_file,
         _selection_requester="user",
     )
+    if background:
+        handle = _run_cli_async(facade.start_background(
+            task, input_id=input_id, previous_turn_id=effective_previous_turn_id,
+            files=_resolve_cli_input_files(input_files or ()), max_steps=max_turns,
+            max_tokens_total=max_tokens_total, require_workspace_change=require_workspace_change,
+            acceptance_command=acceptance_command, allow_write_tools=allow_write_tools,
+            allow_execute_tools=allow_execute_tools, allow_web_tools=allow_web_tools,
+        ))
+        typer.echo(json.dumps({
+            "thread_id": handle.thread_id, "turn_id": handle.turn_id,
+            "checkpoint_db": str(handle.database), "workspace": str(handle.workspace),
+        }, ensure_ascii=False))
+        return
+    if input_id is not None:
+        raise typer.BadParameter("--input-id requires --background")
     interactive_approval = not non_interactive and _is_interactive_terminal()
     event_display = _CLIToolEventDisplay()
     result = _run_cli_async(
@@ -3314,3 +3333,8 @@ def agent_watch(
             )
         )
     )
+
+
+from agent_runtime.background_cli import background_app as _background_app  # noqa: E402
+
+agent_app.add_typer(_background_app, name="background")
