@@ -21,7 +21,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import ExitStack
 from contextvars import ContextVar
 from pathlib import Path
-from typing import TYPE_CHECKING, BinaryIO, Literal
+from typing import TYPE_CHECKING, Any, BinaryIO, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -124,9 +124,35 @@ class RunCommandInput(BaseModel):
         ),
     )
     publish_on_failure: bool = Field(default=False, description=_FAILURE_PUBLICATION_DESCRIPTION)
+    verification_mode: Literal["none", "snapshot", "workspace"] = Field(
+        default="none", description=(
+            "snapshot runs the exact command in a frozen copy of tracked and ordinary untracked inputs. "
+            "It never publishes changes to the source. Ignored dependencies are not copied; prepare "
+            "dependencies explicitly or use installed system tools. workspace verifies in the current directory "
+            "and invalidates the result if input/directory identities change during execution. "
+            "Records version, cwd, environment, "
+            "times and input stability for record_delivery. This mode requires a bounded foreground command."
+        ),
+    )
+    verification_dependencies: list[str] | None = Field(
+        default=None, description=(
+            "Explicit absolute read paths forming the external toolchain/dependency boundary for verification. "
+            "Files and directories are fingerprinted before/after execution and rechecked at delivery. "
+            "Use [] to declare system OS tools only; omitted means dependency coverage is undeclared and "
+            "cannot support verified delivery. This declaration never grants read permission."
+        ),
+    )
 
     @model_validator(mode="after")
     def require_yield_for_unbounded_command(self) -> RunCommandInput:
+        if self.verification_mode != "none" and (
+            self.yield_time_seconds is not None or self.network or self.workspace_write
+        ):
+            raise ValueError(
+                "versioned verification requires a foreground command with inputs read-only and network disabled"
+            )
+        if any(not Path(p).is_absolute() for p in (self.verification_dependencies or ())):
+            raise ValueError("verification_dependencies require absolute read paths")
         if self.timeout_seconds is None and self.yield_time_seconds is None:
             raise ValueError("timeout_seconds=null requires yield_time_seconds and a live Session")
         if self.timeout_seconds is not None and self.timeout_seconds > 600 and self.yield_time_seconds is None:
@@ -154,6 +180,7 @@ class RunCommandOutput(BaseModel):
     log_next_offset: int | None = None
     log_end_offset: int | None = None
     log_truncated: bool = False
+    verification_receipt: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def validate_process_status(self) -> RunCommandOutput:
@@ -308,6 +335,10 @@ def create_run_command_tool(
 
     async def run(arguments: Mapping[str, JsonValue]) -> RunCommandOutput:
         request = RunCommandInput.model_validate(arguments)
+        if request.verification_mode != "none":
+            if command_sessions is not None and command_sessions.running:
+                return command_sessions.busy_output()
+            return await _run_snapshot_verification(workspace, request, float(termination_grace_seconds))
         if request.yield_time_seconds is not None:
             if command_sessions is None:
                 return RunCommandOutput(
@@ -328,7 +359,7 @@ def create_run_command_tool(
         arguments: Mapping[str, JsonValue],
         progress_sink: ToolProgressSink,
     ) -> RunCommandOutput:
-        if arguments.get("yield_time_seconds") is not None or (
+        if arguments.get("verification_mode", "none") != "none" or arguments.get("yield_time_seconds") is not None or (
             command_sessions is not None and command_sessions.running
         ):
             return await run(arguments)
@@ -388,7 +419,7 @@ def create_run_command_tool(
             }
         ),
         resolve_use=lambda arguments: _resolve_command_use(workspace, arguments),
-        execution_revision="builtin-run-command-v12-durable-sessions",
+        execution_revision="builtin-run-command-v13-versioned-verification",
         idempotent=False,
         concurrency_safe=False,
         cancellation_mode=CancellationMode.MANAGED_PROCESS,
@@ -479,6 +510,150 @@ def create_execute_python_tool(
     )
 
 
+async def _run_snapshot_verification(
+    workspace: WorkspaceRuntime, request: RunCommandInput, grace: float,
+) -> RunCommandOutput:
+    from dataclasses import replace
+    from functools import partial
+
+    from agent_runtime.permission_policy import relocate_workspace_permissions
+    from agent_runtime.tools.permissions import current_execution_context, execution_context_scope
+    from agent_runtime.workspace import open_workspace
+    from agent_runtime.workspace_snapshot import (
+        capture_snapshot,
+        dependency_manifest,
+        git_bytes,
+        source_observation,
+        working_entries,
+    )
+    from agent_runtime.worktrees import WorktreeManager
+
+    def authorize(path: Path) -> None:
+        workspace.ensure_readable(path)
+
+    # Capture uses D2's double-read/index preservation contract. The sandbox
+    # sees only copied bytes, so source edits during execution cannot alter the
+    # verifier's inputs. This is a mode of the normal process runner.
+    repository = WorktreeManager(workspace.root)._child_repository(create=True)
+    original_context = current_execution_context()
+    excluded = () if original_context is None else original_context.snapshot_excluded_paths
+    # The first capture supplies the complete effective path set. Observe its
+    # identities before the stable capture used by the command.
+    initial = await _blocking_phase(partial(
+        capture_snapshot, workspace.root, object_root=repository, authorize=authorize, excluded=excluded,
+    ))
+    before_source = source_observation(workspace.root, tuple(initial["entries"]))
+    captured = await _blocking_phase(partial(
+        capture_snapshot, workspace.root, object_root=repository, authorize=authorize, excluded=excluded,
+    ))
+    dependencies = tuple(Path(p).expanduser().absolute() for p in (request.verification_dependencies or ()))
+
+    def authorize_dependency(path: Path) -> None:
+        permissions = workspace.permissions
+        if permissions is not None and (
+            not permissions.path_access(path) or not permissions.path_access(path.resolve())
+        ):
+            raise PermissionError(f"verification dependency read denied: {path}")
+        if any(path.is_relative_to(p) or path.resolve().is_relative_to(p)
+               for p in (*excluded, workspace.root / ".praxis")):
+            raise PermissionError(f"verification dependency is private runtime state: {path}")
+    before_dependencies = await _blocking_phase(partial(
+        dependency_manifest, dependencies, authorize=authorize_dependency,
+    ))
+    # Bind the shell and selected executable as well as caller-declared inputs.
+    # This is not dependency inference for arbitrary shell programs: the caller
+    # still declares the remaining dependency closure and the receipt says so.
+    import shlex
+
+    try:
+        tokens = shlex.split(request.command)
+    except ValueError:
+        tokens = []  # Let the real shell report syntax errors as command failures.
+    with tempfile.TemporaryDirectory(prefix="praxis-verification-") as directory:
+        destination = Path(directory).resolve() / "workspace"
+        destination.mkdir()
+        for relative, entry in captured["entries"].items() if request.verification_mode == "snapshot" else ():
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            content = git_bytes(repository, "cat-file", "blob", entry["oid"])
+            if entry["mode"] == "120000":
+                target.symlink_to(os.fsdecode(content))
+            else:
+                target.write_bytes(content)
+                target.chmod(0o755 if entry["mode"] == "100755" else 0o644)
+        frozen = open_workspace(destination) if request.verification_mode == "snapshot" else workspace
+        destination = frozen.root
+        context = current_execution_context()
+        if workspace.permissions is not None and request.verification_mode == "snapshot":
+            permissions = relocate_workspace_permissions(workspace.permissions, workspace.root, destination)
+            frozen.permission_provider = lambda: permissions.intersection(
+                relocate_workspace_permissions(workspace.permissions, workspace.root, destination)
+            )
+        if context is not None and request.verification_mode == "snapshot":
+            context = replace(context, workspace_root=destination, cwd=destination,
+                              permissions=frozen.permissions, permission_provider=frozen.permission_provider,
+                              context_provider=None)
+        started = time.time()
+        environment: dict[str, str] = {}
+        toolchain: tuple[Path, ...] = ()
+        before_toolchain: dict[str, Any] = {}
+        executable_covered = False
+
+        def observe_environment(actual: dict[str, str]) -> None:
+            nonlocal toolchain, before_toolchain, executable_covered
+            environment.update(actual)
+            executable = shutil.which(tokens[0], path=actual["PATH"]) if tokens else None
+            if executable and not Path(executable).is_absolute():
+                executable = str(destination / request.working_dir / executable)
+            system_roots = ("/bin", "/usr/bin", "/usr/sbin", "/sbin", "/Library/Developer/CommandLineTools")
+            selected = Path(executable) if executable else None
+            executable_covered = selected is None or any(selected.is_relative_to(p) for p in system_roots)
+            if selected is not None:
+                executable_covered |= any(selected == p or selected.is_relative_to(p) for p in dependencies)
+                if selected.is_relative_to(destination):
+                    executable_covered |= str(selected.relative_to(destination)) in captured["entries"]
+            candidates = (Path("/bin/sh"),) + ((selected,) if selected else ())
+            readable = (*system_roots, "/opt/homebrew", "/usr/local")
+            toolchain = tuple(p for p in candidates if any(p.is_relative_to(root) for root in readable))
+            before_toolchain = dependency_manifest(toolchain)
+
+        with execution_context_scope(context):
+            output = await _run_command(frozen, request.model_copy(update={"verification_mode": "none"}),
+                                        termination_grace_seconds=grace, environment_observer=observe_environment)
+        unchanged = working_entries(destination, object_root=repository,
+                                    paths=tuple(captured["entries"])) == captured["entries"]
+        if request.verification_mode == "workspace":
+            after_source = await _blocking_phase(partial(
+                capture_snapshot, workspace.root, object_root=repository, authorize=authorize, excluded=excluded,
+            ))
+            unchanged = (unchanged and after_source["tree"] == captured["tree"]
+                         and after_source["source_head"] == captured["source_head"]
+                         and after_source["source_index_sha256"] == captured["source_index_sha256"]
+                         and before_source == source_observation(workspace.root, tuple(captured["entries"])))
+        return output.model_copy(update={"verification_receipt": {
+            "revision": "versioned-command-v1", "input_tree": captured["tree"],
+            "source_head": captured["source_head"], "source_index_sha256": captured["source_index_sha256"],
+            "mode": request.verification_mode,
+            "input_entries": captured["entries"], "source_workspace": str(workspace.root),
+            "command": request.command, "cwd": str(destination / request.working_dir),
+            "source_cwd": str(workspace.root / request.working_dir),
+            "started_at": started, "finished_at": time.time(), "inputs_unchanged": unchanged,
+            "environment": environment, "platform": platform.platform(),
+            "dependency_paths": [str(p) for p in dependencies],
+            "dependencies": before_dependencies,
+            "dependencies_declared": request.verification_dependencies is not None,
+            "dependencies_unchanged": before_dependencies == await _blocking_phase(partial(
+                dependency_manifest, dependencies, authorize=authorize_dependency,
+            )),
+            "toolchain_paths": [str(p) for p in toolchain], "toolchain": before_toolchain,
+            "executable_covered": executable_covered,
+            "toolchain_unchanged": before_toolchain == await _blocking_phase(dependency_manifest, toolchain),
+            "dependency_boundary": (
+                "Tracked and ordinary untracked files plus declared dependencies; ignored inputs are excluded."
+            ),
+        }})
+
+
 async def _run_command(
     workspace: WorkspaceRuntime,
     request: RunCommandInput,
@@ -487,6 +662,7 @@ async def _run_command(
     progress_sink: ToolProgressSink | None = None,
     capture_output: Callable[[ToolProgressKind, bytes], None] | None = None,
     authorize_publish: Callable[[], Awaitable[None]] | None = None,
+    environment_observer: Callable[[dict[str, str]], None] | None = None,
 ) -> RunCommandOutput:
     cwd = workspace.ensure_within_workspace(
         workspace.resolve_path(request.working_dir or "."),
@@ -534,6 +710,8 @@ async def _run_command(
             workspace_root=workspace.root,
             temporary_root=temporary_root,
         )
+        if environment_observer is not None:
+            environment_observer(environment)
         view = None
         initial: _LinuxSnapshot = {}
         protected: set[str] = set()

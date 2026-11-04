@@ -602,6 +602,16 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
         else:
             self._activity_status = "本轮已结束"
             text = ""
+        if result.delivery:
+            text += ("\n" if text else "") + "交付: " + str(result.delivery.get("status", "unverified"))
+            if result.delivery.get("delivery_id"):
+                text += "\n证据: " + str(result.delivery["delivery_id"])
+            scopes = result.delivery.get("verified_scope", ())
+            actions = result.delivery.get("next_actions", ())
+            for scope in scopes if isinstance(scopes, tuple) else ():
+                text += "\n已验证范围: " + safe_terminal_text(str(scope))
+            for action in actions if isinstance(actions, tuple) else ():
+                text += "\n续跑: " + safe_terminal_text(str(action))
         if result.files:
             text += (
                 ("\n" if text else "") + "文件引用：\n" + "\n".join(safe_terminal_text(path) for path in result.files)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -524,6 +525,17 @@ def _display_agent_result(
 
     if result.answer and not answer_streamed:
         print(f"\n{safe_terminal_text(result.answer)}")
+
+    if show_outcome and result.delivery:
+        print(f"\n交付: {result.delivery.get('status', 'unverified')}")
+        if result.delivery.get("delivery_id"):
+            print(f"  证据: {result.delivery['delivery_id']}")
+        scopes = result.delivery.get("verified_scope", ())
+        actions = result.delivery.get("next_actions", ())
+        for scope in scopes if isinstance(scopes, tuple) else ():
+            print(f"  已验证范围: {safe_terminal_text(str(scope))}")
+        for action in actions if isinstance(actions, tuple) else ():
+            print(f"  续跑: {safe_terminal_text(str(action))}")
 
     if result.status == "paused" and result.pause is None and result.needs_user_input:
         print(f"\n暂停原因: {result.needs_user_input}")
@@ -3338,3 +3350,16 @@ def agent_watch(
 from agent_runtime.background_cli import background_app as _background_app  # noqa: E402
 
 agent_app.add_typer(_background_app, name="background")
+
+
+@agent_app.command(name="delivery")
+def agent_delivery(
+    turn_id: str,
+    checkpoint_db: Annotated[Path, typer.Option("--rollout-db", "--checkpoint-db")],
+    workspace: Annotated[Path, typer.Option("--workspace")] = Path("."),
+) -> None:
+    """读取当前版本的交付证据；不启动模型或后台宿主。"""
+    from agent_runtime.agent import Agent
+
+    value = asyncio.run(Agent(workspace_path=workspace, checkpoint_db=checkpoint_db).read_result(turn_id))
+    typer.echo(json.dumps(copy.deepcopy(value.delivery), ensure_ascii=False))

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -70,6 +71,7 @@ def result(
         "thread_id": value.thread_id, "turn_id": value.turn_id, "status": value.status,
         "answer": value.answer, "stop_reason": value.stop_reason, "usage": asdict(value.usage),
         "diagnostics": [asdict(d) for d in value.diagnostics],
+        "delivery": copy.deepcopy(value.delivery),
     }, ensure_ascii=False))
 
 

@@ -47,6 +47,7 @@ def test_background_result_reads_the_sdk_result(tmp_path, monkeypatch):
         return SimpleNamespace(
             thread_id=self.thread_id, turn_id=self.turn_id, status="done", answer="verified result",
             stop_reason="completed", usage=AgentUsage(), diagnostics=(),
+            delivery={"status": "unverified", "next_actions": ["Record scope and evidence"]},
         )
 
     monkeypatch.setattr(BackgroundHandle, "result", result)
@@ -55,6 +56,7 @@ def test_background_result_reads_the_sdk_result(tmp_path, monkeypatch):
     ])
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)["answer"] == "verified result"
+    assert json.loads(result.output)["delivery"]["status"] == "unverified"
 
 
 def test_background_wait_preserves_timeout_semantics(tmp_path, monkeypatch):

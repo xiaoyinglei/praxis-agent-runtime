@@ -496,6 +496,12 @@ class TurnRunner:
             else:
                 turn_context = await self._store.run_async(self.restore_turn_context, turn_id)
         turn_id = turn_context.turn_id
+        if turn_context.binding_manifest.get("delivery_policy", {}).get("revision") == "delivery-v1":
+            from agent_runtime.harness.delivery import begin
+
+            current = await self._store.run_async(self._store.read_turn, turn_id)
+            if current.status == "running":
+                await self._commit(partial(begin, self._store, turn_id))
         thread_id = turn_context.thread_id
         if thread_id != self.thread_id:
             raise RuntimeError("Turn belongs to a different Session")

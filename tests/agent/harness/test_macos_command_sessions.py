@@ -101,6 +101,7 @@ def test_public_macos_command_lifecycle_approval_and_completion(tmp_path, monkey
             monkeypatch.setattr(fresh, "_model_factory", model_factory)
             result = asyncio.run(fresh.resume(result.turn_id, "allow_once"))
         assert result.status == "done", result
+        assert result.delivery["status"] == "unverified"
         assert not hasattr(result, "validation_status")
     else:
         original = cli._create_agent_facade

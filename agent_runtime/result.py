@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, cast
@@ -29,6 +29,38 @@ type AgentDiagnosticSeverity = Literal["warning", "error"]
 
 def _empty_json_mapping() -> Mapping[str, JsonValue]:
     return MappingProxyType({})
+
+
+class _DeliveryFacts(Mapping[str, JsonValue]):
+    """Immutable facts that remain compatible with dataclasses.asdict."""
+
+    __slots__ = ("_data",)
+    _data: Mapping[str, JsonValue]
+
+    def __init__(self, data: Mapping[str, JsonValue]) -> None:
+        object.__setattr__(self, "_data", data)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise TypeError("delivery facts are immutable")
+
+    def __getitem__(self, key: str) -> JsonValue:
+        return self._data[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __deepcopy__(self, memo: dict[int, object]) -> dict[str, object]:
+        def thaw(value: JsonValue) -> object:
+            if isinstance(value, Mapping):
+                return {k: thaw(v) for k, v in value.items()}
+            if isinstance(value, tuple):
+                return tuple(thaw(v) for v in value)
+            return value
+
+        return {k: thaw(v) for k, v in self._data.items()}
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +186,10 @@ class AgentResult:
     needs_user_input: str | None = None
     thread_id: str = ""
     model_error: ModelFailure | None = None
+    delivery: Mapping[str, JsonValue] = field(default_factory=_empty_json_mapping)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "delivery", _DeliveryFacts(_freeze_json_mapping(self.delivery)))
 
     @classmethod
     def _from_harness(
@@ -163,6 +199,8 @@ class AgentResult:
         store: RuntimeStore,
         files: tuple[str, ...] = (),
     ) -> AgentResult:
+        from agent_runtime.harness.delivery import inspect as inspect_delivery
+
         turn = store.read_turn(result.turn_id)
         thread = store.read_thread(result.thread_id)
         records = tuple(record for record in store.list_records(thread.thread_id) if record.turn_id == turn.turn_id)
@@ -508,6 +546,7 @@ class AgentResult:
             needs_user_input=None if pause is None else pause.question,
             thread_id=thread.thread_id,
             model_error=model_error,
+            delivery=inspect_delivery(store, turn.turn_id),
         )
 
 

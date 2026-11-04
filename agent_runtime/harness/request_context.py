@@ -215,6 +215,20 @@ class RequestContext:
             state["Resource limits (runtime ledger)"] = budget
         completion = turn.binding_manifest.get("completion_policy", {})
         state["acceptance_contract"] = dict(completion) if completion.get("acceptance_command") else None
+        delivery_policy = turn.binding_manifest.get("delivery_policy", {})
+        if delivery_policy.get("revision") == "delivery-v1" and delivery_policy.get("model_tools", True):
+            plans = [i for i in self._store.list_items(turn.turn_id) if i.kind == "delivery_plan"]
+            state["Delivery evidence contract"] = {
+                "plan": dict(plans[-1].payload) if plans else None,
+                "next_action": (
+                    "Use record_delivery to declare scope, exact checks and omissions; record trusted tool evidence "
+                    "and final review. A natural final stops execution; it does not imply verified delivery. "
+                    "Versioned commands use explicit verification_dependencies and read-only inputs. "
+                    "Verified delivery for explicit acceptance requires verification_mode=workspace "
+                    "at the configured cwd; "
+                    "otherwise prefer verification_mode=snapshot for a frozen input boundary."
+                ),
+            }
         return append_runtime_state(messages, state, acceptance=bool(completion.get("acceptance_command")))
 
     def _budget_status(self, turn: TurnContext) -> dict[str, Any]:
