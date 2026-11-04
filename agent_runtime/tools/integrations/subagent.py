@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -14,6 +15,7 @@ from agent_runtime.tools.tool import (
     Tool,
     ToolDefinition,
     ToolEffect,
+    ToolTarget,
     json_schema_output,
     pydantic_input,
 )
@@ -26,6 +28,10 @@ type SubagentRunner = Callable[
 
 class SubagentInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    workspace_mode: Literal["auto", "write", "read-only"] = Field(
+        default="auto",
+        description="auto isolates mutable toolsets; write freezes dirty source; read-only narrows authority.",
+    )
 
     task: str = Field(
         min_length=1,
@@ -120,6 +126,7 @@ class _SubagentResultFields(BaseModel):
         default_factory=list,
         max_length=50,
     )
+    environment: dict[str, JsonValue] | None = None
 
 
 class StandardSubagentOutput(_SubagentResultFields):
@@ -252,11 +259,28 @@ class WaitAgentInput(ChildHandleInput):
     )
 
 
+class IntegrateAgentInput(ChildHandleInput):
+    action: Literal["inspect", "apply", "reconcile", "resolve", "verify", "discard"] = "inspect"
+    artifact_id: str | None = Field(
+        default=None, description="Exact patch artifact returned by inspect; required for apply."
+    )
+    verification_tool_call_id: str | None = Field(
+        default=None, description="Parent run_command/manage_command call after integration, with workspace_write=true."
+    )
+    resolution_note: str | None = Field(
+        default=None, max_length=4000,
+        description="Required for resolve: explain manual parent conflict resolution; retained as a diff artifact.",
+    )
+    diff_offset: int = Field(default=0, ge=0, strict=True)
+    diff_limit: int = Field(default=100_000, ge=1, le=200_000, strict=True)
+
+
 class SpawnAgentOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     child_turn_id: str
     thread_id: str
     status: Literal["running"]
+    workspace: str | None = None
 
 
 class AgentStatusOutput(_SubagentResultFields):
@@ -271,12 +295,20 @@ class AgentMessageOutput(BaseModel):
     status: Literal["accepted"]
 
 
+class AgentIntegrationOutput(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    child_turn_id: str
+    status: str
+
+
 def create_async_subagent_tools(
     *,
     spawn: SubagentRunner,
     send: SubagentRunner,
     wait: SubagentRunner,
     cancel: SubagentRunner,
+    integrate: SubagentRunner | None = None,
+    workspace: Path | None = None,
 ) -> tuple[Tool, ...]:
     """Project lifecycle operations without introducing a second execution loop."""
     specs: tuple[
@@ -289,10 +321,12 @@ def create_async_subagent_tools(
             spawn,
             (
                 "Start an attached child agent in a fresh context and return its durable child_turn_id "
-                "immediately after budget reservation. Children share the workspace and inherit the parent's "
+                "after durable budget/environment reservation. Writing children execute in a dirty-source Git snapshot "
+                "with their own worktree, cwd and permissions. They inherit the parent's "
                 "frozen permissions/model and finite depth/count/budget ceilings. Supply only relevant "
                 "context_summary; arbitrary conversation forks are not supported. Use wait_agent for "
-                "completion/evidence. Parent completion drains attached children."
+                "completion/evidence, then integrate_agent inspect/apply or explicitly discard. Parent completion "
+                "requires terminal children and resolved artifacts; run verification in the parent after integration."
             ),
             frozenset({ToolEffect.NETWORK}),
             False,
@@ -338,6 +372,17 @@ def create_async_subagent_tools(
             True,
         ),
     )
+    if integrate is not None:
+        specs += ((
+            "integrate_agent", IntegrateAgentInput, AgentIntegrationOutput, integrate,
+            "Inspect an owned terminal child's actual patch and immutable artifact_id. Review that diff, then apply "
+            "the exact artifact to the parent workspace. Preimage conflicts leave both workspaces intact. Integration "
+            "does not stage or commit user files. Run parent verification with workspace_write=true after apply, then "
+            "verify using that command's tool_call_id. This records execution, not task correctness. "
+            "discard explicitly abandons "
+            "integration while retaining the child workspace. Unknown partial writes require explicit reconciliation.",
+            frozenset({ToolEffect.WRITE_WORKSPACE}), False,
+        ),)
     tools = []
     for name, input_model, output_model, runner, description, effects, idempotent in specs:
         input_schema, validate = pydantic_input(input_model)
@@ -348,18 +393,24 @@ def create_async_subagent_tools(
             output_model: type[BaseModel] = output_model,
             output_schema: Mapping[str, JsonValue] = output_schema,
         ) -> NormalizedToolOutput:
-            value = output_model.model_validate(raw)
-            data = value.model_dump(mode="json")
+            data = output_model.model_validate(raw).model_dump(mode="json")
             return NormalizedToolOutput(
                 structured_content=json_schema_output(output_schema, data),
-                is_error=getattr(value, "status", None) == "failed",
+                is_error=data.get("status") in {"failed", "conflict"},
                 metadata={"child_turn_id": data["child_turn_id"]},
             )
 
         def resolve(
             _arguments: Mapping[str, JsonValue],
             effects: frozenset[ToolEffect] = effects,
+            integration: bool = name == "integrate_agent",
         ) -> ResolvedToolUse:
+            if integration:
+                write = _arguments.get("action", "inspect") == "apply"
+                return ResolvedToolUse(
+                    effects=effects if write else frozenset(),
+                    targets=(ToolTarget(kind="workspace_path", value=str(workspace)),) if write else (),
+                )
             return ResolvedToolUse(effects=effects, targets=())
 
         tools.append(
@@ -369,9 +420,9 @@ def create_async_subagent_tools(
                 run=runner,
                 normalize_output=normalize,
                 output_schema=output_schema,
-                static_effects=effects,
+                static_effects=frozenset() if name == "integrate_agent" else effects,
                 resolve_use=resolve,
-                execution_revision="integration-subagent-async-v1",
+                execution_revision="integration-subagent-async-v2",
                 idempotent=idempotent,
                 concurrency_safe=True,
                 cancellation_mode=CancellationMode.COOPERATIVE,

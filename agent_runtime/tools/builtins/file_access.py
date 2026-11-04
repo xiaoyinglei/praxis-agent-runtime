@@ -107,14 +107,40 @@ def _entry_exists(parent: int, name: str) -> bool:
         return False
 
 
-def atomic_symlink(path: Path, target: str) -> None:
+def atomic_symlink(path: Path, target: str, *, expected: tuple[int, int, int, int, int] | None = None,
+                   create_only: bool = False) -> None:
     with parent_descriptor(path, create=True) as parent:
         temporary = '.praxis-' + secrets.token_hex(12)
         os.symlink(target, temporary, dir_fd=parent)
         try:
             if file_version(os.stat(path.parent, follow_symlinks=False))[:2] != file_version(os.fstat(parent))[:2]:
                 raise PermissionError('file parent changed during the operation')
-            os.replace(temporary, path.name, src_dir_fd=parent, dst_dir_fd=parent)
+            if expected is not None:
+                current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+                if file_version(current) != expected:
+                    raise PermissionError('file changed during the operation; inspect before retrying')
+            if create_only:
+                os.link(temporary, path.name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
+            else:
+                os.replace(temporary, path.name, src_dir_fd=parent, dst_dir_fd=parent)
         finally:
             if _entry_exists(parent, temporary):
                 os.unlink(temporary, dir_fd=parent)
+
+
+def unlink_file(path: Path, *, expected: tuple[int, int, int, int, int]) -> None:
+    """Delete only the version observed by the caller, through a held parent."""
+    with parent_descriptor(path) as parent:
+        current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        if file_version(current) != expected:
+            raise PermissionError('file changed during the operation; inspect before retrying')
+        os.unlink(path.name, dir_fd=parent)
+
+
+def remove_empty_directory(path: Path, *, identity: tuple[int, int]) -> None:
+    """Structural integration may remove only the originally observed directory."""
+    with parent_descriptor(path) as parent:
+        current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        if not stat.S_ISDIR(current.st_mode) or file_version(current)[:2] != identity:
+            raise PermissionError('directory changed during integration')
+        os.rmdir(path.name, dir_fd=parent)

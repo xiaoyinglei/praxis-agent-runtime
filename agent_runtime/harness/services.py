@@ -27,6 +27,7 @@ from agent_runtime.tools.integrations.knowledge import (
 from agent_runtime.tools.integrations.skills import create_skill_tools
 from agent_runtime.tools.integrations.subagent import (
     ChildHandleInput,
+    IntegrateAgentInput,
     SendAgentMessageInput,
     StandardSubagentOutput,
     SubagentInput,
@@ -258,6 +259,7 @@ def configure_services(
             max_steps=payload.max_turns,
             max_tokens_total=payload.llm_budget_total,
             max_cost_micros=payload.llm_cost_budget_micros,
+            workspace_mode=payload.workspace_mode,
         )
         return await store.run_async(session.subagents._output, current_tool_turn_id(), child.turn_id)
 
@@ -272,6 +274,7 @@ def configure_services(
             max_steps=payload.max_turns,
             max_tokens_total=payload.llm_budget_total,
             max_cost_micros=payload.llm_cost_budget_micros,
+            workspace_mode=payload.workspace_mode,
         )
 
     async def send_agent_message(arguments: Mapping[str, JsonValue]) -> object:
@@ -295,6 +298,16 @@ def configure_services(
         payload = ChildHandleInput.model_validate(arguments)
         return await session.subagents.cancel(
             parent_turn_id=current_tool_turn_id(), child_turn_id=payload.child_turn_id
+        )
+
+    async def integrate_agent(arguments: Mapping[str, JsonValue]) -> object:
+        payload = IntegrateAgentInput.model_validate(arguments)
+        return await session.subagents.integrate(
+            parent_turn_id=current_tool_turn_id(), child_turn_id=payload.child_turn_id,
+            action=payload.action, artifact_id=payload.artifact_id,
+            verification_tool_call_id=payload.verification_tool_call_id,
+            resolution_note=payload.resolution_note,
+            diff_offset=payload.diff_offset, diff_limit=payload.diff_limit,
         )
 
     async def search_knowledge(arguments: Mapping[str, JsonValue]) -> object:
@@ -331,11 +344,12 @@ def configure_services(
         (
             create_subagent_tool(
                 run_subagent,
-                execution_revision="harness-child-thread-v4",
+                execution_revision="harness-child-thread-v5",
                 output_model=StandardSubagentOutput,
             ),
             *create_async_subagent_tools(
-                spawn=spawn_agent, send=send_agent_message, wait=wait_agent, cancel=cancel_agent
+                spawn=spawn_agent, send=send_agent_message, wait=wait_agent, cancel=cancel_agent,
+                integrate=integrate_agent, workspace=workspace,
             ),
         )
         if enable_subagents
@@ -343,7 +357,10 @@ def configure_services(
     )
     discoverable_names = (
         *tuple(discoverable_tool_names),
-        *(("task", "spawn_agent", "send_agent_message", "wait_agent", "cancel_agent") if enable_subagents else ()),
+        *(
+            ("task", "spawn_agent", "send_agent_message", "wait_agent", "cancel_agent", "integrate_agent")
+            if enable_subagents else ()
+        ),
     )
     if READ_CONTEXT_NAME in discoverable_names:
         raise ValueError("read_context is a resident tool owned by the composition root")

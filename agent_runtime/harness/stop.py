@@ -217,6 +217,11 @@ class StopChecks:
             ),
             default=0,
         )
+        latest_change = max(latest_change, max((
+            result_order[item.item_id] for item in self._store.list_items(turn_id)
+            if item.kind == "child_workspace" and item.payload.get("status") == "integrated"
+            and item.payload.get("verification") == "required" and item.item_id in result_order
+        ), default=0))
         return latest_change, result_order
 
     def _write_origin(self, item: ItemSnapshot, operation: ToolOperationSnapshot) -> ToolOperationSnapshot:
@@ -434,7 +439,18 @@ class TurnStop:
             # Pre-upgrade records may contain an accept without a completed Turn.
             # Recheck current evidence: a child or a command continuation could
             # have changed the workspace while no parent owner was running.
-            decision = self._gate.evaluate(proposal)
+            from agent_runtime.harness.child_workspace_ops import unresolved
+
+            pending_artifacts = unresolved(self._store, turn_id, settled_only=True)
+            decision = (
+                CompletionDecision(
+                    action="continue", reason_code="child_integration_required",
+                    reason=json.dumps({"child_turn_ids": pending_artifacts,
+                        "next_action": (
+                            "Inspect and integrate each child artifact, run parent verification, or explicitly discard."
+                        )}),
+                ) if pending_artifacts else self._gate.evaluate(proposal)
+            )
             if decision.action == "continue" and (self._completion_continuation_limit_reached(turn_id)):
                 decision = replace(
                     decision,

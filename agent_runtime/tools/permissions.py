@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -145,6 +147,25 @@ class ToolExecutionContext:
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, Path(value).expanduser().resolve())
+
+
+_ACTIVE_EXECUTION_CONTEXT: ContextVar[ToolExecutionContext | None] = ContextVar(
+    "praxis_execution_context", default=None
+)
+
+
+def current_execution_context() -> ToolExecutionContext | None:
+    return _ACTIVE_EXECUTION_CONTEXT.get()
+
+
+@contextmanager
+def execution_context_scope(context: ToolExecutionContext | None) -> Iterator[None]:
+    """Keep runner-internal file access within the admitted call's authority."""
+    token = _ACTIVE_EXECUTION_CONTEXT.set(context)
+    try:
+        yield
+    finally:
+        _ACTIVE_EXECUTION_CONTEXT.reset(token)
 
 
 class ToolGuardError(ValueError):

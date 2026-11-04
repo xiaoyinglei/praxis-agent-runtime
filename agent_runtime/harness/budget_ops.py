@@ -35,6 +35,7 @@ def start_budgeted_child_turn(
     binding_manifest: Mapping[str, Any],
     requested_tokens: int | None,
     requested_cost_micros: int | None,
+    child_workspace: Path | None = None,
 ) -> TurnSnapshot:
     """Atomically carve a child budget from the parent and start its Turn.
 
@@ -120,7 +121,7 @@ def start_budgeted_child_turn(
 
         turn_ops.create_thread(
             store,
-            workspace=Path(str(parent["workspace"])),
+            workspace=child_workspace or Path(str(parent["workspace"])),
             thread_id=child_thread_id,
         )
         root_turn_id = parent_turn_id

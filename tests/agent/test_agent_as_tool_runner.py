@@ -128,7 +128,7 @@ async def test_standard_child_contract_rejects_unused_input_and_unproduced_outpu
     tool = create_subagent_tool(run, output_model=StandardSubagentOutput)
     properties = tool.output_schema["properties"]
     assert set(properties) == {
-        "conclusion", "status", "child_turn_id", "stop_reason", "pause", "execution_evidence",
+        "conclusion", "status", "child_turn_id", "stop_reason", "pause", "execution_evidence", "environment",
     }
     assert "tool_query" not in tool.definition.input_schema["properties"]
     executor = ToolExecutor({"task": tool})

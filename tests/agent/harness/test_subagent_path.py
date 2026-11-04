@@ -180,7 +180,7 @@ async def test_standard_child_schema_revision_rejects_saved_older_tool_binding(t
     ) as session:
         assert session.tool_orchestrator is not None
         task = session.tools["task"]
-        assert task.execution_revision == "integration-subagent-v2:harness-child-thread-v4"
+        assert task.execution_revision == "integration-subagent-v2:harness-child-thread-v5"
         assert "key_facts" not in task.output_schema["properties"]
         with pytest.raises(RuntimeError, match="original operation tool is unavailable: task"):
             session.tool_orchestrator.restore_tools(

@@ -41,7 +41,7 @@ uv run agent background cancel THREAD TURN --input-id cancel-001 --checkpoint-db
 uv run agent background serve --checkpoint-db /absolute/path/runtime.sqlite --concurrency 4
 ```
 
-普通后台提交会自动启动独立进程。同一数据库由 OS 文件锁保证只有一个宿主；单 Thread 只领取一个驱动命令。目前同一宿主还串行调度共享工作区的顶层驱动，子写任务的独立工作树与集成属于后续工作。
+普通后台提交会自动启动独立进程。同一数据库由 OS 文件锁保证只有一个宿主；单 Thread 只领取一个驱动命令。同一宿主串行调度共享工作区的顶层驱动；附着子任务使用独立来源快照和执行目录，具体合同见 [工作树与子任务集成](worktrees.md#子任务快照与主代理集成)。
 
 ## Python SDK
 
@@ -75,4 +75,13 @@ asyncio.run(main())
 - 已提交的响应和终态从 Harness 恢复；未知模型请求不会自动重发。
 - 子任务分配、暂停、结算和父任务唤醒均读取 canonical allocation/Turn；暂停子任务可用其 Thread/Turn 身份接入。
 - 工作区暂时不存在时保留待执行命令，环境恢复后重试领取。
-- 后台宿主不是系统开机服务，尚未实现跨关机自动启动、独立写工作树集成、完整渠道、CI/PR 和发布验收。
+- 后台宿主不是系统开机服务，尚未实现跨关机自动启动、完整渠道、CI/PR 后续和发布验收。
+
+
+## 独立子任务与重新接入
+
+`task` 和 `spawn_agent` 复用相同的附着子任务生命周期。新的附着子任务先冻结来源、持久分配执行目录和预算，再开始模型或工具。后台 `status.children[].environment` 显示来源、base、实际目录、产物和集成/验证状态。`done` 仅表示子 Turn 已结束，不表示主工作区已经集成或通过验收。
+
+在正常项目入口，可用子任务的 Thread/Turn 身份执行 `background status/events/send/respond/cancel`。SDK 中由父 `Agent.attach_background(thread_id=child_thread, turn_id=child_turn)` 接入也成立：接入会沿 canonical lineage 校验来源，随后使用实际子目录。其它工作区不能凭子任务 ID 接入。权限撤销与审批降级读取祖先最新的持久策略，宿主重启不会恢复旧写权限。
+
+主代理需要读取真实 patch，显式集成或放弃产物，并在主工作区重新运行验证。未集成、验证过期、子任务未知执行或未结清预算都会阻止正常完成。工具的验证记录只证明指定命令成功执行过；用户目标是否满足仍需审查，完整版本化交付证据属于后续交付工作。

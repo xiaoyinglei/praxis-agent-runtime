@@ -38,38 +38,45 @@ def child_limits(value: Mapping[str, object] | None = None) -> dict[str, int]:
     return limits
 
 
+def check_child_limits(session: Session, parent_turn_id: str) -> dict[str, int]:
+    """Read-only preflight; reservation repeats this under its write transaction."""
+    store = session.store
+    session._ensure_open()
+    parent = store.read_turn(parent_turn_id)
+    limits = child_limits(parent.binding_manifest.get("subagent_limits"))
+    limits = {k: min(v, session._subagent_limits[k]) for k, v in limits.items()}
+    edges: dict[str, str] = {}
+    for turn in store.list_turns():
+        try:
+            allocation = store.read_child_budget_allocation(turn.turn_id)
+        except KeyError:
+            continue
+        edges[turn.turn_id] = str(allocation["parent_turn_id"])
+    root, depth = parent.turn_id, 1
+    while root in edges:
+        root = edges[root]
+        depth += 1
+    if depth > limits["max_depth"]:
+        raise RuntimeError("subagent depth limit exceeded")
+    family = {root}
+    while True:
+        expanded = family | {c for c, p in edges.items() if p in family}
+        if expanded == family:
+            break
+        family = expanded
+    if len(family) - 1 >= limits["max_total"]:
+        raise RuntimeError("subagent total count limit exceeded")
+    active = sum(store.read_turn(c).status not in TERMINAL for c in family - {root})
+    if active >= limits["max_concurrent"]:
+        raise RuntimeError("subagent concurrent limit exceeded")
+    return limits
+
+
 def reserve_child(session: Session, **arguments: Any) -> TurnSnapshot:
     """Check lineage/count ceilings in the same write transaction as allocation."""
     store = session.store
     with store.tx.transaction():
-        session._ensure_open()
-        parent = store.read_turn(arguments["parent_turn_id"])
-        limits = child_limits(parent.binding_manifest.get("subagent_limits"))
-        limits = {k: min(v, session._subagent_limits[k]) for k, v in limits.items()}
-        edges: dict[str, str] = {}
-        for turn in store.list_turns():
-            try:
-                allocation = store.read_child_budget_allocation(turn.turn_id)
-            except KeyError:
-                continue
-            edges[turn.turn_id] = str(allocation["parent_turn_id"])
-        root, depth = parent.turn_id, 1
-        while root in edges:
-            root = edges[root]
-            depth += 1
-        if depth > limits["max_depth"]:
-            raise RuntimeError("subagent depth limit exceeded")
-        family = {root}
-        while True:
-            expanded = family | {c for c, p in edges.items() if p in family}
-            if expanded == family:
-                break
-            family = expanded
-        if len(family) - 1 >= limits["max_total"]:
-            raise RuntimeError("subagent total count limit exceeded")
-        active = sum(store.read_turn(c).status not in TERMINAL for c in family - {root})
-        if active >= limits["max_concurrent"]:
-            raise RuntimeError("subagent concurrent limit exceeded")
+        limits = check_child_limits(session, arguments["parent_turn_id"])
         binding = dict(arguments["binding_manifest"])
         binding["subagent_limits"] = limits
         return budget_ops.start_budgeted_child_turn(store, **{**arguments, "binding_manifest": binding})
@@ -103,6 +110,7 @@ class SubagentManager:
         max_steps: int | None = None,
         max_tokens_total: int | None = None,
         max_cost_micros: int | None = None,
+        workspace_mode: str = "auto",
     ) -> dict[str, object]:
         self.session._ensure_open()
         # Reservation commits before scheduling. The returned identity is already
@@ -113,6 +121,7 @@ class SubagentManager:
             max_steps=max_steps,
             max_tokens_total=max_tokens_total,
             max_cost_micros=max_cost_micros,
+            workspace_mode=workspace_mode,
         )
         return self._schedule(prepared)
 
@@ -122,7 +131,8 @@ class SubagentManager:
         self.session._subagent_tasks[turn_id] = task
         # Retrieve exceptions even when the parent deliberately doesn't wait.
         task.add_done_callback(lambda t: None if t.cancelled() else t.exception())
-        return {"child_turn_id": turn_id, "thread_id": prepared["thread_id"], "status": "running"}
+        return {"child_turn_id": turn_id, "thread_id": prepared["thread_id"], "status": "running",
+                "workspace": str(prepared.get("workspace", self.session.workspace_path))}
 
     async def send(
         self, *, parent_turn_id: str, child_turn_id: str, message: str, message_id: str
@@ -147,6 +157,33 @@ class SubagentManager:
             "status": "accepted",
         }
 
+    async def integrate(
+        self, *, parent_turn_id: str, child_turn_id: str, action: str = "inspect", artifact_id: str | None = None,
+        verification_tool_call_id: str | None = None,
+        resolution_note: str | None = None,
+        diff_offset: int = 0,
+        diff_limit: int = 100_000,
+    ) -> dict[str, Any]:
+        from agent_runtime.harness.child_workspaces import integrate
+
+        def authorize() -> None:
+            try:
+                self._owned(parent_turn_id, child_turn_id)
+            except PermissionError:
+                from agent_runtime.harness.child_workspace_ops import state
+
+                parent = self.session.store.read_turn(parent_turn_id)
+                if (action != "discard" or parent.thread_id != self.session.thread_id
+                        or state(self.session.store, parent_turn_id, child_turn_id) is None):
+                    raise
+
+        await self.session.store.run_async(authorize)
+        return await self.session.store.run_async(
+            integrate, self.session, parent_turn_id, child_turn_id, action, artifact_id,
+            verification_tool_call_id, resolution_note,
+            diff_offset, diff_limit,
+        )
+
     async def wait(
         self, *, parent_turn_id: str, child_turn_id: str, timeout_seconds: float = 10.0
     ) -> dict[str, object]:
@@ -165,6 +202,8 @@ class SubagentManager:
         return await self.session.store.run_async(self._output, parent_turn_id, child_turn_id)
 
     def _output(self, parent_turn_id: str, child_turn_id: str) -> dict[str, object]:
+        from agent_runtime.harness.child_workspace_ops import state
+
         child = self._owned(parent_turn_id, child_turn_id)
         store = self.session.store
         pending = [i for i in store.list_interactions(child_turn_id) if i.status == "pending"]
@@ -206,6 +245,7 @@ class SubagentManager:
             "stop_reason": child.terminal_reason_code or child.status,
             "pause": pause,
             "execution_evidence": evidence,
+            "environment": state(store, parent_turn_id, child_turn_id),
         }
 
     async def cancel(self, *, parent_turn_id: str, child_turn_id: str) -> dict[str, object]:
@@ -250,6 +290,7 @@ class SubagentManager:
             state = store.read_budget_state(child_turn_id)
             if child.status in TERMINAL and state.reserved + state.uncertain + state.child_reserved == ResourceUsage():
                 budget_ops.settle_child_budget(store, child_turn_id=child_turn_id)
+
 
         await store.run_async(settle)
 

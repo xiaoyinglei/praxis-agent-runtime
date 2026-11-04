@@ -345,7 +345,7 @@ async def test_real_parent_tool_batch_starts_two_children_before_either_finishes
 
 @pytest.mark.anyio
 @pytest.mark.usefixtures("fake_sandbox_exec")
-async def test_child_commands_have_separate_owners_and_cancel_reaps_only_target(tmp_path: Path):
+async def test_child_commands_have_separate_owners_and_cancel_reaps_only_target(tmp_path: Path, monkeypatch):
     import os
     from dataclasses import replace
 
@@ -391,13 +391,16 @@ async def test_child_commands_have_separate_owners_and_cancel_reaps_only_target(
                 )
             await asyncio.Event().wait()
 
-    workspace = open_workspace(tmp_path)
+    monkeypatch.setenv("PRAXIS_WORKTREE_ROOT", str(tmp_path / "trees-outside"))
+    source = tmp_path / "source"
+    source.mkdir()
+    workspace = open_workspace(source)
     owner = DurableCommandSessions(workspace)
     tools = (create_run_command_tool(workspace, command_sessions=owner), create_manage_command_tool(workspace, owner))
-    context = ToolExecutionContext(workspace_root=tmp_path, cwd=tmp_path, approval_mode="full")
+    context = ToolExecutionContext(workspace_root=source, cwd=source, approval_mode="full")
     async with await Session.open(
         database=tmp_path / "rollout.db",
-        workspace=tmp_path,
+        workspace=source,
         model=CommandModel(),
         completion_gate=AcceptAnswer(),
         tool_execution_context=context,
@@ -407,12 +410,23 @@ async def test_child_commands_have_separate_owners_and_cancel_reaps_only_target(
         p = parent(session)
         one = await session.subagents.spawn(parent_turn_id=p.turn_id, user_message="one", max_tokens_total=80)
         two = await session.subagents.spawn(parent_turn_id=p.turn_id, user_message="two", max_tokens_total=80)
+        roots = {
+            label: Path(session.store.read_thread(handle["thread_id"]).workspace)
+            for label, handle in (("one", one), ("two", two))
+        }
+        assert roots["one"] != roots["two"] != source
         try:
             async with asyncio.timeout(5):
-                while not all((tmp_path / f"{label}.pid").exists() for label in ("one", "two")):
+                while not all((roots[label] / f"{label}.pid").exists() for label in ("one", "two")):
+                    for handle in (one, two):
+                        task = session._subagent_tasks[handle["child_turn_id"]]
+                        if task.done():
+                            await task
                     await asyncio.sleep(0.01)
-            one_pid = int((tmp_path / "one.pid").read_text())
-            two_pid = int((tmp_path / "two.pid").read_text())
+            one_pid = int((roots["one"] / "one.pid").read_text())
+            two_pid = int((roots["two"] / "two.pid").read_text())
+            assert not (source / "one.pid").exists()
+            assert not (source / "two.pid").exists()
             assert session._subagent_sessions[one["child_turn_id"]]._command_sessions is not owner
             assert session._subagent_sessions[two["child_turn_id"]]._command_sessions is not owner
             await session.subagents.cancel(parent_turn_id=p.turn_id, child_turn_id=one["child_turn_id"])
@@ -545,7 +559,7 @@ async def test_ancestor_cancellation_rejects_grandchild_allocation(tmp_path: Pat
         p = parent(session)
         prepared = await session._prepare_child(parent_turn_id=p.turn_id, user_message="child",
                                                 max_steps=None, max_tokens_total=80)
-        async with await Session.open(database=database, workspace=tmp_path, model=model,
+        async with await Session.open(database=database, workspace=Path(prepared["workspace"]), model=model,
                                       completion_gate=AcceptAnswer(), thread_id=prepared["thread_id"]) as child:
             turn_ops.request_turn_cancellation(session.store, turn_id=p.turn_id, reason="stop entire subtree")
             try:
@@ -619,7 +633,7 @@ async def test_reopened_child_observes_cancelled_ancestor_without_live_dispatch_
         )
         turn_ops.request_turn_cancellation(parent_session.store, turn_id=p.turn_id, reason="stop subtree")
         async with await Session.open(
-            database=database, workspace=tmp_path, model=model,
+            database=database, workspace=Path(prepared["workspace"]), model=model,
             thread_id=prepared["thread_id"], completion_gate=AcceptAnswer()
         ) as reopened:
             runner = reopened._executor()
