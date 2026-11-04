@@ -21,6 +21,7 @@ from agent_runtime.tools.permissions import (
     UseToolDecision,
     can_use_tool,
     enforce_hard_guards,
+    execution_context_scope,
 )
 from agent_runtime.tools.tool import (
     ArtifactReference,
@@ -811,6 +812,58 @@ class ToolExecutor:
             decision=decision.decision,
         )
 
+    async def _check_live_invocation(
+        self, prepared: _PreparedExecution, cancellation_sink: ExecutionSink | None,
+    ) -> ToolExecutionContext | ToolExecution:
+        if prepared.context.invocation_guard is not None:
+            try:
+                guarded = prepared.context.invocation_guard(prepared.call)
+                if inspect.isawaitable(guarded):
+                    await guarded
+            except ExecutionStartRejectedError as rejected:
+                return await self._finish(
+                    call=prepared.call,
+                    result=_error_result(
+                        prepared.call,
+                        code=rejected.code,
+                        message=rejected.message,
+                        retryable=rejected.retryable,
+                        metadata=rejected.metadata,
+                    ),
+                    record=replace(prepared.record, status=ExecutionStatus.FAILED, error_code=rejected.code),
+                    prepared=prepared,
+                )
+        current = prepared.context
+        if prepared.context.context_provider is not None or prepared.context.permission_provider is not None:
+            try:
+                current = prepared.context.refreshed()
+                self._hard_guard(prepared.tool, prepared.arguments, prepared.resolved, current)
+                decision = self._permission_decider(prepared.tool, prepared.arguments, prepared.resolved, current)
+                revision = None if current.effective_permissions is None else current.effective_permissions.revision
+                changed = (decision.decision is not prepared.decision.decision
+                           or revision != prepared.permissions_revision)
+                if decision.decision is UseToolDecision.DENY or changed:
+                    code = "tool_denied" if decision.decision is UseToolDecision.DENY else "permission_changed"
+                    message = decision.reason if decision.decision is UseToolDecision.DENY else (
+                        "permissions changed after preparation; retry under the current policy"
+                    )
+                    return await self._finish(
+                        call=prepared.call,
+                        result=_error_result(prepared.call, code=code, message=message, retryable=False),
+                        record=replace(prepared.record, status=ExecutionStatus.FAILED, error_code=code),
+                        prepared=replace(prepared, decision=decision),
+                    )
+            except Exception as error:
+                return await self._finish(
+                    call=prepared.call,
+                    result=_error_result(prepared.call, code="permission_recheck_failed", error=error,
+                                         message="live permission recheck failed closed", retryable=False),
+                    record=replace(prepared.record, status=ExecutionStatus.FAILED,
+                                   error_code="permission_recheck_failed"),
+                    prepared=prepared,
+                )
+        return current
+
     async def _invoke(
         self,
         prepared: _PreparedExecution,
@@ -848,55 +901,13 @@ class ToolExecutor:
                 prepared=prepared,
             )
         prepared = replace(prepared, record=started_record)
-        if prepared.context.invocation_guard is not None:
-            try:
-                guarded = prepared.context.invocation_guard(prepared.call)
-                if inspect.isawaitable(guarded):
-                    await guarded
-            except ExecutionStartRejectedError as rejected:
-                return await self._finish(
-                    call=prepared.call,
-                    result=_error_result(
-                        prepared.call,
-                        code=rejected.code,
-                        message=rejected.message,
-                        retryable=rejected.retryable,
-                        metadata=rejected.metadata,
-                    ),
-                    record=replace(prepared.record, status=ExecutionStatus.FAILED, error_code=rejected.code),
-                    prepared=prepared,
-                )
-            except asyncio.CancelledError:
-                await self._finish_cancelled(prepared, cancellation_sink)
-                raise
-        if prepared.context.context_provider is not None or prepared.context.permission_provider is not None:
-            try:
-                current = prepared.context.refreshed()
-                self._hard_guard(prepared.tool, prepared.arguments, prepared.resolved, current)
-                decision = self._permission_decider(prepared.tool, prepared.arguments, prepared.resolved, current)
-                revision = None if current.effective_permissions is None else current.effective_permissions.revision
-                changed = (decision.decision is not prepared.decision.decision
-                           or revision != prepared.permissions_revision)
-                if decision.decision is UseToolDecision.DENY or changed:
-                    code = "tool_denied" if decision.decision is UseToolDecision.DENY else "permission_changed"
-                    message = decision.reason if decision.decision is UseToolDecision.DENY else (
-                        "permissions changed after preparation; retry under the current policy"
-                    )
-                    return await self._finish(
-                        call=prepared.call,
-                        result=_error_result(prepared.call, code=code, message=message, retryable=False),
-                        record=replace(prepared.record, status=ExecutionStatus.FAILED, error_code=code),
-                        prepared=replace(prepared, decision=decision),
-                    )
-            except Exception as error:
-                return await self._finish(
-                    call=prepared.call,
-                    result=_error_result(prepared.call, code="permission_recheck_failed", error=error,
-                                         message="live permission recheck failed closed", retryable=False),
-                    record=replace(prepared.record, status=ExecutionStatus.FAILED,
-                                   error_code="permission_recheck_failed"),
-                    prepared=prepared,
-                )
+        try:
+            checked = await self._check_live_invocation(prepared, cancellation_sink)
+        except asyncio.CancelledError:
+            await self._finish_cancelled(prepared, cancellation_sink)
+            raise
+        if isinstance(checked, ToolExecution):
+            return checked
         try:
             # Preparation may be far ahead of invocation. Observe changes only
             # after admission, so earlier conflicting calls are not attributed
@@ -908,11 +919,15 @@ class ToolExecutor:
                 )
                 prepared = replace(prepared, workspace_tree_before_sha256=before,
                                    workspace_file_before_sha256=files)
-            raw = await _run_with_timeout(
-                prepared.tool,
-                prepared.arguments,
-                progress_sink=progress_sink,
-            )
+            checked = await self._check_live_invocation(prepared, cancellation_sink)
+            if isinstance(checked, ToolExecution):
+                return checked
+            with execution_context_scope(checked):
+                raw = await _run_with_timeout(
+                    prepared.tool,
+                    prepared.arguments,
+                    progress_sink=progress_sink,
+                )
         except _CancelledTimeoutError:
             record = replace(
                 prepared.record,

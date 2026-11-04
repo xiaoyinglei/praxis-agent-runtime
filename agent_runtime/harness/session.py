@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Self
 from uuid import uuid4
 
 from agent_runtime.approval import ApprovalMode, CommandGrant
+from agent_runtime.budget import ResourceUsage
 from agent_runtime.core.generation_settings import ModelRequestPreferences
 from agent_runtime.harness import artifact_ops, budget_ops, memory_ops, turn_ops
 from agent_runtime.harness.context import validate_tool_history
@@ -53,7 +54,7 @@ from agent_runtime.harness.tool_orchestrator import ToolOrchestrator, current_to
 from agent_runtime.permission_policy import NetworkPolicy, PermissionPolicy, ResolvedPermissions
 from agent_runtime.result import AgentResult
 from agent_runtime.streaming.sink import TurnEventDispatcher
-from agent_runtime.tools.permissions import ToolExecutionContext
+from agent_runtime.tools.permissions import ToolExecutionContext, current_execution_context
 from agent_runtime.tools.tool import ToolEffect
 
 logger = logging.getLogger(__name__)
@@ -904,7 +905,15 @@ class Session:
     def permissions(self) -> ResolvedPermissions:
         """Return current effective authority, including administrator ceilings."""
         self._ensure_open()
-        return self.tool_execution_context.effective_permissions or PermissionPolicy().resolve(self.workspace_path)
+        context = self.tool_execution_context
+        head = self.head_turn_id
+        if head is not None:
+            from agent_runtime.harness.child_workspace_ops import ancestor_context
+
+            context = self.store.read_snapshot(lambda: ancestor_context(self.store, head, context))
+        effective = context.effective_permissions
+        current = self._resource_permissions()
+        return current if effective is None else current.intersection(effective)
 
     def update_permissions(self, policy: PermissionPolicy | Path | str) -> None:
         """Explicit user/host control; the model has no tool to widen authority."""
@@ -939,8 +948,12 @@ class Session:
         # the child's frozen ceiling while the parent supplies live revocations.
         # Resource cleanup still checks revocations after public Session access
         # has closed. It must not call the public open-only permissions method.
-        effective = self.tool_execution_context.effective_permissions or PermissionPolicy().resolve(self.workspace_path)
-        network_denied = ToolEffect.NETWORK in self.tool_execution_context.deny_effects
+        context = self.tool_execution_context
+        active = current_execution_context()
+        if active is not None and active.workspace_root == self.workspace_path:
+            context = active
+        effective = context.effective_permissions or PermissionPolicy().resolve(self.workspace_path)
+        network_denied = ToolEffect.NETWORK in context.deny_effects
         binding = current_tool_binding()
         if binding is not None:
             saved_policy = binding.get("tool_execution_policy", {})
@@ -1472,6 +1485,7 @@ class Session:
         max_tokens_total: int | None,
         max_cost_micros: int | None = None,
         parent_turn_id: str | None = None,
+        workspace_mode: str = "auto",
     ) -> TurnResult:
         """Awaited compatibility facade over the same attached-child lifecycle."""
         self._ensure_open()
@@ -1487,6 +1501,7 @@ class Session:
                 max_steps=max_steps,
                 max_tokens_total=max_tokens_total,
                 max_cost_micros=max_cost_micros,
+                workspace_mode=workspace_mode,
             )
             handle = self.subagents._schedule(prepared)
             child_id = str(handle["child_turn_id"])
@@ -1516,12 +1531,22 @@ class Session:
         max_tokens_total: int | None,
         max_cost_micros: int | None = None,
         parent_turn_id: str | None = None,
+        workspace_mode: str = "auto",
     ) -> dict[str, Any]:
-        from agent_runtime.harness.subagents import reserve_child
+        from agent_runtime.harness.subagents import check_child_limits, reserve_child
 
         self._ensure_open()
         if not isinstance(user_message, str) or not user_message.strip():
             raise ValueError("child user_message must be non-empty")
+        if parent_turn_id is not None:
+            def validate_parent() -> None:
+                parent = self.store.read_turn(parent_turn_id)
+                if parent.thread_id != self.thread_id or parent.status != "running":
+                    raise RuntimeError("subagent parent Turn must still be running in this Session")
+                turn_ops._assert_no_pending_cancellation(self.store, parent_turn_id)
+                check_child_limits(self, parent_turn_id)
+
+            await self.store.run_async(validate_parent)
         thread_id = f"thread_{uuid4().hex}"
         turn_id = f"turn_{uuid4().hex}"
         caller = asyncio.current_task()
@@ -1586,6 +1611,25 @@ class Session:
             else step_limit_from_binding({"model_step_budget": max_steps})
         )
         binding["completion_policy"] = {"require_workspace_change": False}
+        from agent_runtime.harness import child_workspaces
+        from agent_runtime.harness.services import _tool_execution_policy_snapshot
+
+        environment = await self.store.run_async(
+            child_workspaces.prepare, self, parent=parent_turn_id, child=turn_id, thread=thread_id,
+            mode=workspace_mode,
+        )
+        child_workspace = self.workspace_path if environment is None else Path(environment["workspace"])
+        context = child_workspaces.child_context(
+            child_options["tool_execution_context"], self.workspace_path, child_workspace,
+            read_only=environment is None or environment["mode"] == "read-only",
+        )
+        child_options["tool_execution_context"] = context
+        binding["tool_execution_policy"] = _tool_execution_policy_snapshot(context)
+        from agent_runtime.project_instructions import instruction_snapshot
+
+        binding["project_instructions"] = await self.store.run_async(instruction_snapshot, context)
+        if environment is not None:
+            binding["child_environment"] = environment
         if parent_turn_id is None:
             (
                 await self.store.run_async(
@@ -1611,6 +1655,7 @@ class Session:
                     binding_manifest=binding,
                     requested_tokens=max_tokens_total,
                     requested_cost_micros=max_cost_micros,
+                    child_workspace=child_workspace,
                 )
             )
         if parent_turn_id is None:
@@ -1627,34 +1672,112 @@ class Session:
             "thread_id": thread_id,
             "parent_turn_id": parent_turn_id,
             "child_options": child_options,
+            "workspace": child_workspace,
         }
 
     async def _drive_child(self, prepared: Mapping[str, Any]) -> TurnResult:
+        from agent_runtime.harness.tool_orchestrator import independent_tool_context
+
+        try:
+            with independent_tool_context():
+                return await self._drive_child_in_environment(prepared)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            error_type = type(error).__name__
+
+            def stopped_driver() -> TurnResult:
+                child = self.store.read_turn(prepared["turn_id"])
+                if child.status == "running":
+                    budget = self.store.read_budget_state(child.turn_id)
+                    pending_effects = (
+                        any(op.status in {"dispatched", "unknown"}
+                            for op in self.store.list_model_operations(child.turn_id))
+                        or any(op.status in {"running", "unknown"}
+                               for op in self.store.list_tool_operations(child.turn_id))
+                    )
+                    exposure = budget.reserved + budget.uncertain + budget.child_reserved
+                    if not pending_effects and exposure == ResourceUsage():
+                        child = turn_ops.fail_turn(self.store, turn_id=child.turn_id,
+                            reason_code="child_driver_failed", message=f"Child driver failed: {error_type}")
+                    else:
+                        child = turn_ops.pause_turn(self.store, turn_id=child.turn_id,
+                            reason="Child driver stopped with unresolved execution; inspect retained environment")
+                return TurnResult(thread_id=child.thread_id, turn_id=child.turn_id, answer=None,
+                                  status="failed" if child.status in {"failed", "cancelled"} else "paused")
+
+            return await self.store.run_async(stopped_driver)
+        finally:
+            if prepared["parent_turn_id"] is not None:
+                await self.subagents._settle(prepared["turn_id"])
+
+    async def _drive_child_in_environment(self, prepared: Mapping[str, Any]) -> TurnResult:
         turn_id = prepared["turn_id"]
-        parent_turn_id = prepared["parent_turn_id"]
         options = dict(prepared["child_options"])
+        child_workspace = Path(prepared.get("workspace", self.workspace_path))
+        child_agent = None
+        if self._agent is not None and child_workspace != self.workspace_path:
+            child_agent = copy.copy(self._agent)
+            child_agent.workspace_path = child_workspace
+            child_agent.checkpoint_db = self.database.resolve()
+            child_agent.model_session_path = None
+            child_agent._model_factory = lambda: self.model
+            trust = child_agent.mcp_config_trust
+            if trust is not None and trust.config_path.is_relative_to(self.workspace_path):
+                child_agent.mcp_config_trust = replace(
+                    trust, config_path=child_workspace / trust.config_path.relative_to(self.workspace_path)
+                )
         command_sessions = None
-        if self._command_sessions is not None:
-            from agent_runtime.tools.builtins.command_sessions import DurableCommandSessions, create_manage_command_tool
-            from agent_runtime.tools.builtins.shell import create_run_command_tool
+        rebound_workspace = None
+        if self._command_sessions is not None and child_agent is None:
+            from agent_runtime.tools.builtins.command_sessions import DurableCommandSessions
             from agent_runtime.workspace import open_workspace
 
-            workspace = open_workspace(self.workspace_path)
+            workspace = open_workspace(child_workspace)
             command_sessions = DurableCommandSessions(workspace)
+        if child_agent is None and (child_workspace != self.workspace_path or command_sessions is not None):
+            from agent_runtime.tools.builtins import create_resident_coding_tools
+            from agent_runtime.workspace import open_workspace
+
+            workspace = command_sessions.workspace if command_sessions is not None else open_workspace(child_workspace)
+            workspace.permission_provider = lambda: options["tool_execution_context"].effective_permissions
+            rebound_workspace = workspace
             tools = dict(options.get("tools") or {})
-            tools["run_command"] = create_run_command_tool(workspace, command_sessions=command_sessions)
-            tools["manage_command"] = create_manage_command_tool(workspace, command_sessions)
+            replacements = {tool.definition.name: tool for tool in create_resident_coding_tools(
+                workspace, plan_updater=lambda _args: {
+                    "accepted": True, "revision": 0, "message": "Plan recorded by child runtime",
+                },
+                command_sessions=command_sessions
+            )}
+            for name, original in tuple(tools.items()):
+                replacement = replacements.get(name)
+                bound_to_workspace = bool(original.static_effects & {
+                    ToolEffect.READ_WORKSPACE, ToolEffect.WRITE_WORKSPACE, ToolEffect.EXECUTE_PROCESS,
+                })
+                if not bound_to_workspace:
+                    continue
+                if replacement is not None and replacement.execution_revision == original.execution_revision:
+                    tools[name] = replacement
+                else:
+                    raise ValueError(f"custom workspace-bound tool requires isolated assembly: {name}")
             options["tools"] = tools
+            # A low-level runtime has no isolated assembly contract. Do not
+            # silently drop its capabilities or borrow source-bound skill paths.
+            if child_workspace != self.workspace_path and options.get("skill_runtime") is not None:
+                raise ValueError("custom skill runtime requires isolated assembly")
         try:
             async with await Session.open(
+                agent=child_agent,
                 database=self.database,
-                workspace=self.workspace_path,
+                workspace=child_workspace,
                 model=self.model,
                 thread_id=prepared["thread_id"],
                 _preserve_children_on_exit=self._preserve_children_on_exit,
                 **options,
             ) as child:
                 self._subagent_sessions[turn_id] = child
+                if rebound_workspace is not None:
+                    rebound_workspace.permission_provider = child._resource_permissions
                 if command_sessions is not None:
                     child._own_command_sessions(command_sessions)
                 async with child._active_turn():
@@ -1666,5 +1789,3 @@ class Session:
                 return result
         finally:
             self._subagent_sessions.pop(turn_id, None)
-            if parent_turn_id is not None:
-                await self.subagents._settle(turn_id)

@@ -7,7 +7,8 @@ import hashlib
 import json
 import logging
 import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -43,7 +44,7 @@ from agent_runtime.tools.executor import (
     ToolExecutor,
     _network_approval_id,
 )
-from agent_runtime.tools.permissions import ToolExecutionContext, UseToolDecision, can_use_tool
+from agent_runtime.tools.permissions import ToolExecutionContext, UseToolDecision, can_use_tool, execution_context_scope
 from agent_runtime.tools.tool import (
     ArtifactReference,
     CancellationMode,
@@ -85,6 +86,19 @@ def current_tool_turn_id() -> str:
     if turn_id is None:
         raise RuntimeError("tool runner is not executing inside a Harness Turn")
     return turn_id
+
+
+@contextmanager
+def independent_tool_context() -> Iterator[None]:
+    """A new Session must not inherit the caller's currently executing Tool."""
+    binding = _ACTIVE_TOOL_BINDING.set(None)
+    turn = _ACTIVE_TOOL_TURN_ID.set(None)
+    try:
+        with execution_context_scope(None):
+            yield
+    finally:
+        _ACTIVE_TOOL_TURN_ID.reset(turn)
+        _ACTIVE_TOOL_BINDING.reset(binding)
 
 
 class ToolApprovalRequiredError(RuntimeError):
@@ -424,7 +438,29 @@ class ToolOrchestrator:
         snapshot = self._step_snapshot(turn_id, call)
         return snapshot is not None and snapshot["input_revision"] != self._store.user_input_revision(turn_id)
 
-    def _guard_input(self, turn_id: str, call: ToolCall) -> None:
+    def _guard_ancestor_authority(self, turn_id: str, call: ToolCall, ceiling: ToolExecutionContext) -> None:
+        if self._store.tx.first("child_budget_allocations", where={"child_turn_id": turn_id}) is None:
+            return
+        from agent_runtime.harness.child_workspace_ops import ancestor_context
+
+        before = ceiling.refreshed()
+        after = ancestor_context(self._store, turn_id, before)
+
+        def signature(context: ToolExecutionContext) -> tuple[object, ...]:
+            policy = context.effective_permissions
+            return (None if policy is None else policy.revision, context.approval_mode,
+                    context.allow_write_tools, context.allow_execute_tools, context.allow_web_tools,
+                    context.auto_approve_sandboxed, context.deny_effects, context.denied_tool_names,
+                    context.require_confirmation_for, context.max_parallel_calls)
+
+        if signature(before) != signature(after):
+            raise ExecutionStartRejectedError(
+                "permission_changed", "Ancestor authority changed; re-evaluate this call under its current policy."
+            )
+
+    def _guard_input(self, turn_id: str, call: ToolCall, ceiling: ToolExecutionContext | None = None) -> None:
+        if ceiling is not None:
+            self._guard_ancestor_authority(turn_id, call, ceiling)
         if self.input_superseded(turn_id, call):
             raise ExecutionStartRejectedError("input_superseded", "New user input superseded this unstarted action.")
         from agent_runtime.project_instructions import extend_instructions, restored_instructions
@@ -500,7 +536,9 @@ class ToolOrchestrator:
             return await self._discard_superseded(turn_id, call)
         execution_context = replace(
             (await self._store.run_async(self._context_for_call, turn_id, call)),
-            invocation_guard=lambda invoked: self._store.run_async(self._guard_input, turn_id, invoked),
+            invocation_guard=lambda invoked: self._store.run_async(
+                self._guard_input, turn_id, invoked, execution_context
+            ),
         )
         tool = self._tools.get(call.tool_name)
         active_record: ToolExecutionRecord | None = None
@@ -513,6 +551,7 @@ class ToolOrchestrator:
                 turn_id=turn_id,
                 tool=tool,
                 record=record,
+                ceiling=execution_context,
             )
             if record.status is ExecutionStatus.STARTED:
                 active_record = record
@@ -721,7 +760,9 @@ class ToolOrchestrator:
         active: dict[str, ToolExecutionRecord] = {}
 
         async def persist(record: ToolExecutionRecord) -> None:
-            await self._persist_execution_record(turn_id=turn_id, tool=self._tools[record.tool_name], record=record)
+            await self._persist_execution_record(
+                turn_id=turn_id, tool=self._tools[record.tool_name], record=record, ceiling=contexts[0]
+            )
             if record.status is ExecutionStatus.STARTED:
                 active[record.tool_call_id] = record
 
@@ -747,7 +788,9 @@ class ToolOrchestrator:
                 calls,
                 context=replace(
                     contexts[0],
-                    invocation_guard=lambda invoked: self._store.run_async(self._guard_input, turn_id, invoked),
+                    invocation_guard=lambda invoked: self._store.run_async(
+                        self._guard_input, turn_id, invoked, contexts[0]
+                    ),
                 ),
                 records=(
                     await self._store.run_async(
@@ -908,7 +951,14 @@ class ToolOrchestrator:
             if (
                 operation.status == "failed"
                 and operation.error_code == record.error_code
-                and record.error_code in {"resource_busy", "input_superseded"}
+                and not operation.requires_reconciliation
+                and await self._store.run_async(lambda: any(
+                    fact.record_type == "tool_operation_start_rejected" and fact.producer == "runtime"
+                    and fact.payload.get("operation_id") == record.operation_id
+                    and fact.payload.get("error_code") == record.error_code
+                    and fact.payload.get("attempt_count") == operation.attempt_count
+                    for fact in self._store.list_turn_records(turn_id)
+                ))
             ):
                 await self._commit(
                     lambda: tool_ops.record_tool_result(
@@ -1248,7 +1298,9 @@ class ToolOrchestrator:
         cancellations = 0 if task is None else task.cancelling()
         active_record: ToolExecutionRecord | None = None
         context = replace(
-            context, invocation_guard=lambda invoked: self._store.run_async(self._guard_input, turn_id, invoked)
+            context, invocation_guard=lambda invoked: self._store.run_async(
+                self._guard_input, turn_id, invoked, context
+            ),
         )
 
         def capture_preflight(updated: ToolExecutionRecord, resolved: ResolvedToolUse) -> None:
@@ -1261,6 +1313,7 @@ class ToolOrchestrator:
                 turn_id=turn_id,
                 tool=tool,
                 record=updated,
+                ceiling=context,
             )
             if updated.status is ExecutionStatus.STARTED:
                 active_record = updated
@@ -1331,6 +1384,9 @@ class ToolOrchestrator:
 
     def _context_for_turn(self, turn_id: str, *, base: ToolExecutionContext | None = None) -> ToolExecutionContext:
         context = self._execution_context if base is None else base
+        from agent_runtime.harness.child_workspace_ops import ancestor_context
+
+        context = ancestor_context(self._store, turn_id, context)
         active_skill_ids = set(context.active_skill_ids)
         for item in self._store.list_items(turn_id):
             if item.kind != "tool_result" or item.status != "completed":
@@ -1358,6 +1414,7 @@ class ToolOrchestrator:
         turn_id: str,
         tool: Tool,
         record: ToolExecutionRecord,
+        ceiling: ToolExecutionContext | None = None,
     ) -> None:
         existing = (
             await self._store.run_async(
@@ -1407,6 +1464,8 @@ class ToolOrchestrator:
                 with self._store.tx.transaction():
                     if self._dispatch_guard is not None:
                         self._dispatch_guard(self._store)
+                    if ceiling is not None:
+                        self._guard_ancestor_authority(turn_id, call, ceiling)
                     claim = tool_ops.claim_tool_operation(
                         self._store,
                         operation_id=record.operation_id,
@@ -1441,6 +1500,12 @@ class ToolOrchestrator:
                     "resource_busy",
                     str(conflict),
                 ) from None
+            except ExecutionStartRejectedError as rejected:
+                rejection_code = rejected.code
+                await self._commit(lambda: tool_ops.reject_ready_tool_operation(
+                    self._store, operation_id=record.operation_id, error_code=rejection_code,
+                ))
+                raise
             return
         if record.status in {
             ExecutionStatus.COMPLETED,

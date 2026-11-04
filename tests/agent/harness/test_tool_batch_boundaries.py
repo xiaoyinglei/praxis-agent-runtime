@@ -537,3 +537,46 @@ async def test_repeated_cancellation_drains_cooperative_runner_cleanup(tmp_path:
         [operation] = [op for op in store.list_tool_operations(turn.turn_id) if op.attempt_count]
         assert operation.status == "failed" and operation.error_code == "cancelled" and operation.result_item_id
         assert store.verify().valid
+
+
+@pytest.mark.anyio
+async def test_cancel_during_final_dispatch_guard_settles_one_result(tmp_path, monkeypatch):
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+    ran = []
+    async def run(arguments):
+        ran.append(arguments)
+        return {'text': 'unexpected'}
+    store, turn, orchestrator, calls = await asyncio.to_thread(_setup, tmp_path, run)
+    original = orchestrator._guard_input
+    checks = 0
+    def guard(*arguments):
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            entered.set()
+            assert release.wait(5)
+        return original(*arguments)
+    monkeypatch.setattr(orchestrator, '_guard_input', guard)
+    with store:
+        driving = asyncio.create_task(orchestrator.execute(turn_id=turn.turn_id, call=calls[0]))
+        try:
+            assert await asyncio.to_thread(entered.wait, 3)
+            driving.cancel()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await driving
+        finally:
+            release.set()
+            if not driving.done():
+                driving.cancel()
+            await asyncio.gather(driving, return_exceptions=True)
+        assert ran == []
+        operation = store.list_tool_operations(turn.turn_id)[0]
+        assert operation.status == 'failed'
+        assert operation.result_item_id is not None
+        results = [i for i in store.list_items(turn.turn_id) if i.kind == 'tool_result']
+        assert len(results) == 1
+        assert store.verify().valid

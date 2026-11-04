@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import builtins
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -32,11 +33,13 @@ import sqlite3
 import subprocess
 import sys
 import uuid
+from collections.abc import Callable, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from agent_runtime.budget import ResourceUsage
 from agent_runtime.git_delivery import BASE_CONFIG_SUFFIX, git_environment
 from agent_runtime.harness.ownership import ConversationBusyError, execution_owner, workspace_owner
 from agent_runtime.harness.runtime_store import RuntimeStore
@@ -222,12 +225,93 @@ class WorktreeManager:
             included_files=included,
         )
 
+    def create_child_snapshot(
+        self, name: str, *, identity: Mapping[str, object], before_create: Callable[[dict[str, object]], None],
+        excluded: tuple[Path, ...] = (), authorize: Callable[[Path], None] | None = None,
+    ) -> tuple[CreateReport, dict[str, object]]:
+        """Freeze working bytes without touching the user's index or HEAD.
+
+        The callback commits the planned path/lineage before checkout creation.
+        Child environments are retained even if allocation or creation fails.
+        Unlike interactive worktrees, attached children may fork a managed tree.
+        """
+        from agent_runtime.workspace_snapshot import capture_snapshot, git_bytes
+
+        source = self._source
+        if self._root.is_relative_to(source):
+            raise WorktreeError("子任务 worktree 根目录必须位于源工作区之外。")
+        if (source / ".git").exists() and self._repository_root() != source:
+            raise WorktreeError("子任务快照要求工作区为 Git 仓库根目录。")
+        repository = self._child_repository(create=True)
+        snapshot = capture_snapshot(source, object_root=repository, excluded=excluded, authorize=authorize)
+        commit = git_bytes(
+            repository, "-c", "user.name=Praxis", "-c", "user.email=praxis@localhost",
+            "commit-tree", str(snapshot["tree"]), "-p", str(snapshot["source_head"]),
+            input=b"Praxis child source snapshot\n",
+        ).decode().strip()
+        bucket = self._allocate_bucket()
+        checkout = bucket / source.name
+        branch = self._available_branch(_sanitize_name(name), source=repository)
+        managed = ManagedWorktree(
+            name=branch[len(WORKTREE_BRANCH_PREFIX):], root=checkout, branch=branch,
+            base_commit=commit, source_root=source,
+            created_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+        )
+        environment: dict[str, object] = {
+            **identity, "workspace": str(checkout), "source_root": str(source),
+            "base_commit": commit, "base_tree": snapshot["tree"], "branch": branch,
+            "repository": str(self._common_git_directory(repository)),
+            "source_head": snapshot["source_head"], "source_index_sha256": snapshot["source_index_sha256"],
+            "snapshot_kind": "git" if (source / ".git").exists() else "directory",
+            "excluded_paths": [str(path) for path in excluded],
+        }
+        before_create(environment)
+        # No best-effort deletion: any interrupted/unknown preparation is evidence.
+        self._run_git(
+            repository, "-c", f"core.hooksPath={os.devnull}", "worktree", "add", "--no-checkout",
+            "-b", branch, str(checkout), commit, what="创建子任务 worktree", timeout=300,
+        )
+        _write_provenance(managed)
+        marker = checkout / ".praxis/child-environment.json"
+        marker.write_text(json.dumps(environment, ensure_ascii=False), encoding="utf-8")
+        git_bytes(checkout, "read-tree", commit)
+        for relative, entry in snapshot["entries"].items():
+            target = checkout / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            content = git_bytes(repository, "cat-file", "blob", entry["oid"])
+            if entry["mode"] == "120000":
+                target.symlink_to(os.fsdecode(content))
+            else:
+                target.write_bytes(content)
+                target.chmod(0o755 if entry["mode"] == "100755" else 0o644)
+        # No .worktreeinclude copying here: only frozen, declared source bytes.
+        dirty = len(self._dirty_lines(source)) if (source / ".git").exists() else len(snapshot["entries"])
+        return CreateReport(managed, dirty, ()), snapshot
+
+    def _child_repository(self, *, create: bool = False) -> Path:
+        if (self._source / ".git").exists():
+            return self._source
+        # Ordinary directories get an external object store, never an injected .git.
+        key = hashlib.sha256(os.fsencode(self._source)).hexdigest()
+        repository = self._root / ".sources" / (key + ".git")
+        if create and not repository.exists():
+            from agent_runtime.workspace_snapshot import git_bytes, tree_from_entries
+
+            repository.parent.mkdir(parents=True, exist_ok=True)
+            self._run_git(repository.parent, "init", "--bare", str(repository), what="创建目录快照对象库")
+            empty = tree_from_entries(repository, {})
+            commit = git_bytes(repository, "-c", "user.name=Praxis", "-c", "user.email=praxis@localhost",
+                               "commit-tree", empty, input=b"Praxis directory source\n").decode().strip()
+            git_bytes(repository, "update-ref", "refs/heads/main", commit)
+            git_bytes(repository, "symbolic-ref", "HEAD", "refs/heads/main")
+        return repository
+
     def list(self) -> list[ManagedWorktree]:
         """Return this repository's managed worktrees, newest first."""
         entries: list[ManagedWorktree] = []
         if not self._root.is_dir():
             return entries
-        repository = self._common_git_directory(self._source)
+        repository = self._common_git_directory(self._child_repository())
         for provenance in self._root.glob(f"*/*/{PROVENANCE_RELATIVE_PATH.as_posix()}"):
             try:
                 record = json.loads(provenance.read_text(encoding="utf-8"))
@@ -297,6 +381,33 @@ class WorktreeManager:
     def remove(self, name_or_root: str, *, force: bool = False) -> RemoveReport:
         """Remove a worktree; dirty or unmerged work requires explicit force."""
         entry = self.find(name_or_root)
+        child_marker = entry.root / ".praxis/child-environment.json"
+        if child_marker.exists():
+            try:
+                child_environment = json.loads(child_marker.read_text())
+                database = child_environment.get("database")
+                if database is not None:
+                    with RuntimeStore.open_sync(Path(database), read_only=True) as child_store:
+                        child = child_store.read_turn(child_environment["child_turn_id"])
+                        environment = child.binding_manifest.get("child_environment")
+                        if environment is None or Path(environment["workspace"]).resolve() != entry.root.resolve():
+                            raise WorktreeError("子任务环境身份未知，保留执行环境。")
+                        if child.status in {"running", "paused", "interrupted"}:
+                            raise WorktreeError("子任务未结束，不能回收其执行环境（包括 --force）。")
+                        budget = child_store.read_budget_state(child.turn_id)
+                        if (budget.reserved + budget.uncertain + budget.child_reserved != ResourceUsage()
+                                or any(op.status in {"running", "unknown"}
+                                       for op in child_store.list_tool_operations(child.turn_id))):
+                            raise WorktreeError("子任务存在未知执行暴露，保留执行环境（包括 --force）。")
+                        from agent_runtime.harness.child_workspace_ops import state
+
+                        integration = state(child_store, environment["parent_turn_id"], child.turn_id)
+                        if integration is None or integration["status"] not in {"integrated", "discarded", "read_only"}:
+                            raise WorktreeError("子任务尚未集成或显式放弃产物，保留执行环境。")
+            except (OSError, ValueError, KeyError, sqlite3.Error) as error:
+                raise WorktreeError("子任务运行状态未知，保留执行环境。") from error
+        if not force and child_marker.exists():
+            raise WorktreeError("子任务环境保留了来源或产物；不能自动回收，请显式核对后使用 --force。")
         try:
             with workspace_owner(entry.root, exclusive=True), ExitStack() as locks:
                 # Fence older workers that hold only a per-Thread lock.
@@ -352,7 +463,7 @@ class WorktreeManager:
             if inspection.ahead_count:
                 details.append(f"{inspection.ahead_count} 个未合并提交")
             raise WorktreeError(f"worktree {entry.name} 有{'、'.join(details)}；确认放弃后使用 --force 删除。")
-        cwd = entry.source_root if entry.source_root.is_dir() else entry.root
+        cwd = self._common_git_directory(entry.root) if entry.root.is_dir() else self._child_repository()
         # --force is always passed at the Git level: the protection decision was
         # already made above, and Git would otherwise refuse over this runtime's
         # own untracked .praxis state inside an otherwise clean worktree.
@@ -416,12 +527,12 @@ class WorktreeManager:
                 continue
             return bucket
 
-    def _available_branch(self, name: str) -> str:
+    def _available_branch(self, name: str, *, source: Path | None = None) -> str:
         base = f"{WORKTREE_BRANCH_PREFIX}{name or f'session-{uuid.uuid4().hex[:8]}'}"
         branch, suffix = base, 1
         while (
             self._run_git(
-                self._source,
+                source or self._source,
                 "rev-parse",
                 "--verify",
                 "--quiet",
@@ -436,7 +547,7 @@ class WorktreeManager:
         return branch
 
     def _delete_branch(self, entry: ManagedWorktree, *, force: bool) -> bool:
-        cwd = entry.source_root if entry.source_root.is_dir() else self._root
+        cwd = self._child_repository()
         exists = (
             self._run_git(
                 cwd,
@@ -537,6 +648,7 @@ class WorktreeManager:
         if self._git is None:
             raise WorktreeError("未找到 git 命令；请安装 Git 后重试。")
         environment = git_environment()
+        environment["GIT_OPTIONAL_LOCKS"] = "0"
         try:
             completed = subprocess.run(
                 (self._git, *arguments),

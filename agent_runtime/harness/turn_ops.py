@@ -335,6 +335,11 @@ def complete_turn(
             # parent rejects allocation. A preceding asynchronous drain alone
             # cannot establish this invariant.
             raise TurnChildrenPendingError(pending_children)
+        from agent_runtime.harness.child_workspace_ops import unresolved
+
+        pending_integration = unresolved(store, turn_id)
+        if pending_integration:
+            raise TurnChildrenPendingError(pending_integration)
         thread_id = turn["thread_id"]
         active = store.tx.first("threads", where={"thread_id": thread_id})
         if active is None or active["active_turn_id"] != turn_id:

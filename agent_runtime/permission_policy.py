@@ -448,3 +448,27 @@ def resolve_permission_sources(
         "sources": tuple(dict.fromkeys((*effective.sources, *protected))),
         "private_paths": tuple(dict.fromkeys((*effective.private_paths, str(private), str(private.resolve())))),
     })
+
+
+def relocate_workspace_permissions(policy: ResolvedPermissions, source: Path, destination: Path) -> ResolvedPermissions:
+    def path(value: str) -> str:
+        original = Path(value)
+        return str(destination / original.relative_to(source)) if original.is_relative_to(source) else value
+
+    translated = policy.model_copy(
+        update={
+            "workspace": str(destination),
+            "filesystem": tuple(rule.model_copy(update={"path": path(rule.path)}) for rule in policy.filesystem),
+            "private_paths": tuple(path(p) for p in policy.private_paths),
+            "ceilings": tuple(relocate_workspace_permissions(p, source, destination) for p in policy.ceilings),
+        }
+    )
+    translated = translated.model_copy(update={
+        "private_paths": tuple(dict.fromkeys((*translated.private_paths, str(destination / ".praxis"))))
+    })
+    # No external filesystem grants transfer to a child execution environment.
+    boundary = PermissionPolicy(profile="read-only" if policy.read_only else "workspace").resolve(destination)
+    # This ceiling narrows the filesystem only; network authority remains the
+    # intersection of the parent's actual policy and its existing ceilings.
+    boundary = boundary.model_copy(update={"network": NetworkPolicy(decision="allow")})
+    return translated.intersection(boundary)

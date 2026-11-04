@@ -9,10 +9,10 @@ import os
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Self
+from typing import Any, Self
 from uuid import uuid4
 
-from agent_runtime.background import permission_ceiling, restore_configuration
+from agent_runtime.background import current_configuration_permissions, permission_ceiling, restore_configuration
 from agent_runtime.core.runtime_diagnostics import exception_diagnostic
 from agent_runtime.harness import RuntimeStore, Session, host_ops, turn_ops
 from agent_runtime.harness.execution_facts import adopt_execution_protocol
@@ -20,6 +20,7 @@ from agent_runtime.harness.operation_values import TurnCancellationPendingError
 from agent_runtime.harness.ownership import ConversationBusyError
 from agent_runtime.harness.protocol import BoundHarnessModel
 from agent_runtime.harness.recovery import ContinuationKind, recovery_plan
+from agent_runtime.permission_policy import ResolvedPermissions, relocate_workspace_permissions
 from agent_runtime.tools.permissions import ToolExecutionContext, restore_tool_policy
 
 _TERMINAL = {"completed", "failed", "cancelled"}
@@ -109,6 +110,35 @@ class BackgroundHost:
                 return
             request = source.request
             configuration = request["configuration"]
+            source_configuration = configuration
+            thread = await self.store.run_async(self.store.read_thread, claim.thread_id)
+            ceiling = permission_ceiling(configuration)
+            source_ceiling = ceiling
+            environments: tuple[dict[str, Any], ...] = ()
+            if turn is not None and turn.binding_manifest.get("child_environment") is not None:
+                def environment_chain() -> list[dict[str, Any]]:
+                    result = []
+                    current = turn
+                    while current.binding_manifest.get("child_environment") is not None:
+                        env = current.binding_manifest["child_environment"]
+                        edge = self.store.read_child_budget_allocation(current.turn_id)
+                        if (env["child_turn_id"] != current.turn_id
+                                or env["parent_turn_id"] != edge["parent_turn_id"]
+                                or env["workspace"] != self.store.read_thread(current.thread_id).workspace):
+                            raise PermissionError("child environment conflicts with canonical lineage")
+                        result.append(env)
+                        current = self.store.read_turn(str(edge["parent_turn_id"]))
+                    if (self.store.read_thread(current.thread_id).workspace
+                            != configuration["agent"]["workspace_path"]):
+                        raise PermissionError("child source configuration crosses workspace boundary")
+                    return result
+
+                environments = tuple(reversed(await self.store.run_async(environment_chain)))
+                for env in environments:
+                    ceiling = relocate_workspace_permissions(ceiling, Path(env["source_root"]), Path(env["workspace"]))
+                configuration = {
+                    **configuration, "agent": {**configuration["agent"], "workspace_path": thread.workspace},
+                }
             workspace = Path(configuration["agent"]["workspace_path"])
             if not workspace.is_dir():
                 await self.store.run_async(
@@ -119,22 +149,30 @@ class BackgroundHost:
             agent = restore_configuration(configuration)
             if agent._harness_database() != self.database:
                 raise ValueError("background configuration names a different runtime database")
-            thread = await self.store.run_async(self.store.read_thread, claim.thread_id)
             if agent.workspace_path != Path(thread.workspace):
                 raise PermissionError("background configuration crosses workspace boundary")
             if self.model is not None:
                 model = self.model
                 agent._model_factory = lambda: model
             options = dict(request["options"])
-            ceiling = permission_ceiling(configuration)
             private = tuple(str(self.database) + suffix for suffix in (
                 "", "-wal", "-shm", ".artifacts", ".locks", ".host.lock", ".host.log"
             ))
             ceiling = ceiling.model_copy(update={
                 "private_paths": tuple(dict.fromkeys((*ceiling.private_paths, *private)))
             })
+
+            def inherited_permissions() -> ResolvedPermissions:
+                current = current_configuration_permissions(source_configuration).intersection(source_ceiling)
+                for environment in environments:
+                    current = relocate_workspace_permissions(
+                        current, Path(environment["source_root"]), Path(environment["workspace"])
+                    )
+                return current.intersection(ceiling)
+
             context = ToolExecutionContext(
                 workspace_root=workspace, cwd=workspace, permissions=ceiling,
+                permission_provider=inherited_permissions if environments else None,
                 approval_mode=agent.approval_mode or "ask",
                 allow_write_tools=options.pop("allow_write_tools"),
                 allow_execute_tools=options.pop("allow_execute_tools"),
@@ -147,6 +185,10 @@ class BackgroundHost:
                 context = restore_tool_policy(context, saved_policy, restore_session_grants=True)
                 if agent.approval_mode is None:
                     context = replace(context, approval_mode=saved_policy.get("approval_mode", "ask"))
+            if turn is not None:
+                from agent_runtime.harness.child_workspace_ops import ancestor_context
+
+                context = await self.store.run_async(ancestor_context, self.store, turn.turn_id, context)
             async with await Session.open(
                 agent=agent, thread_id=claim.thread_id if turn is None else None,
                 frozen_turn_id=None if turn is None else claim.turn_id,

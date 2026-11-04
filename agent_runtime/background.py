@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 from agent_runtime.harness import RuntimeStore, host_ops
 from agent_runtime.harness.events import RolloutEventReader
-from agent_runtime.permission_policy import PermissionPolicy, ResolvedPermissions
+from agent_runtime.permission_policy import PermissionPolicy, ResolvedPermissions, resolve_permission_sources
 
 if TYPE_CHECKING:
     from agent_runtime.agent import Agent
@@ -95,6 +95,23 @@ def permission_ceiling(configuration: Mapping[str, Any]) -> ResolvedPermissions:
     return ResolvedPermissions.model_validate_json(json.dumps(configuration["ceiling"]))
 
 
+def current_configuration_permissions(configuration: Mapping[str, Any]) -> ResolvedPermissions:
+    """Reload permission declarations in their original workspace domain."""
+    values = configuration["agent"]
+
+    def declaration(value: Any) -> PermissionPolicy | str | None:
+        if isinstance(value, Mapping):
+            return PermissionPolicy.model_validate_json(json.dumps(value))
+        if value is None or isinstance(value, str):
+            return value
+        raise ValueError("invalid saved permission declaration")
+
+    return resolve_permission_sources(
+        Path(values["workspace_path"]), declaration(values.get("permissions")),
+        declaration(values.get("managed_permissions")),
+    )
+
+
 def ensure_host(database: Path) -> None:
     """Start a detached process; its OS lock elects one host per database."""
     database = database.expanduser().resolve()
@@ -130,8 +147,7 @@ class BackgroundHandle:
         self.thread_id, self.turn_id, self.autostart = thread_id, turn_id, autostart
 
     def _authorize(self, store: RuntimeStore) -> None:
-        if Path(store.read_thread(self.thread_id).workspace).resolve() != self.workspace:
-            raise PermissionError("background attachment belongs to another workspace")
+        actual = Path(store.read_thread(self.thread_id).workspace).resolve()
         submission = host_ops.background_submission(store, self.turn_id)
         try:
             turn = store.read_turn(self.turn_id)
@@ -141,6 +157,31 @@ class BackgroundHandle:
         else:
             if turn.thread_id != self.thread_id:
                 raise PermissionError("background target belongs to another Thread")
+        if actual == self.workspace:
+            return
+        # A controller in the normal project entrypoint may attach its owned
+        # descendants. Only canonical edges plus matching environment provenance
+        # establish that authority; claimed binding parent IDs are insufficient.
+        current = self.turn_id
+        seen = set()
+        while current not in seen:
+            seen.add(current)
+            edge = store.tx.first("child_budget_allocations", where={"child_turn_id": current})
+            if edge is None:
+                break
+            child = store.read_turn(current)
+            environment = child.binding_manifest.get("child_environment")
+            parent = store.read_turn(str(edge["parent_turn_id"]))
+            parent_workspace = Path(store.read_thread(parent.thread_id).workspace).resolve()
+            if (environment is None or environment.get("parent_turn_id") != parent.turn_id
+                    or Path(environment["source_root"]).resolve() != parent_workspace
+                    or environment.get("workspace") != store.read_thread(child.thread_id).workspace):
+                break
+            if parent_workspace == self.workspace:
+                self.workspace = actual
+                return
+            current = parent.turn_id
+        raise PermissionError("background attachment belongs to another workspace")
 
     async def status(self) -> dict[str, Any]:
         async with await RuntimeStore.open(self.database, read_only=True) as store:
@@ -151,10 +192,12 @@ class BackgroundHandle:
                     turn = store.read_turn(self.turn_id)
                 except KeyError:
                     turn = None
+                from agent_runtime.harness.child_workspace_ops import state as environment_state
                 from agent_runtime.harness.recovery import recovery_plan
 
                 return {
                     "thread_id": self.thread_id, "turn_id": self.turn_id,
+                    "workspace": str(self.workspace),
                     "queue_status": submission.status,
                     "status": None if turn is None else turn.status,
                     "receipt": dict(submission.result),
@@ -170,6 +213,7 @@ class BackgroundHandle:
                             "thread_id": store.read_turn(str(c["child_turn_id"])).thread_id,
                             "status": store.read_turn(str(c["child_turn_id"])).status,
                             "allocation_status": c["status"],
+                            "environment": environment_state(store, self.turn_id, str(c["child_turn_id"])),
                             "recovery": recovery_plan(store, str(c["child_turn_id"])).as_dict(),
                         }
                         for c in store.tx.rows("child_budget_allocations", where={"parent_turn_id": self.turn_id})

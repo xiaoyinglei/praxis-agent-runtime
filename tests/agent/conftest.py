@@ -25,6 +25,9 @@ def isolate_user_model_registry(
     # Product MCP and permissions must not use real developer connections or
     # credentials, including in CLI subprocesses that inherit the test environment.
     monkeypatch.setenv("PRAXIS_CONFIG_DIR", str(tmp_path / "isolated-user-config"))
+    # Child execution snapshots must never write into the developer's real
+    # worktree inventory, and must remain outside tmp_path workspaces.
+    monkeypatch.setenv("PRAXIS_WORKTREE_ROOT", str(tmp_path.parent / f"{tmp_path.name}-worktrees"))
     monkeypatch.setenv(
         "PRAXIS_MODEL_REGISTRY_PATH",
         str(

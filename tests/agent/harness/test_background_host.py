@@ -178,6 +178,7 @@ async def test_host_recovers_reserved_child_and_wakes_the_waiting_parent(tmp_pat
         )
         child = await session._prepare_child(
             parent_turn_id=handle.turn_id, user_message="inspect files", max_steps=3, max_tokens_total=30,
+            workspace_mode="read-only",
         )
         await session.store.run_async(
             turn_ops.pause_turn, session.store, turn_id=handle.turn_id, reason="Attached child needs attention",
@@ -420,7 +421,9 @@ async def test_child_cancel_reaches_the_live_driver_owned_by_a_parent_session(tm
                 turn_ops.start_turn, session.store, thread_id=handle.thread_id, turn_id=handle.turn_id,
                 user_message="inspect", binding_manifest=binding,
             )
-            child = await session.subagents.spawn(parent_turn_id=handle.turn_id, user_message="inspect tests")
+            child = await session.subagents.spawn(
+                parent_turn_id=handle.turn_id, user_message="inspect tests", workspace_mode="read-only"
+            )
             await asyncio.wait_for(model.started.wait(), 3)
             attached = agent.attach_background(
                 thread_id=str(child["thread_id"]), turn_id=str(child["child_turn_id"]), autostart=False,
