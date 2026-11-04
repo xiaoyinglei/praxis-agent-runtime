@@ -3363,3 +3363,7 @@ def agent_delivery(
 
     value = asyncio.run(Agent(workspace_path=workspace, checkpoint_db=checkpoint_db).read_result(turn_id))
     typer.echo(json.dumps(copy.deepcopy(value.delivery), ensure_ascii=False))
+
+from agent_runtime.channels.cli import channel_app as _channel_app  # noqa: E402
+
+agent_app.add_typer(_channel_app, name='channel')

@@ -24,7 +24,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -211,6 +211,7 @@ class GitDelivery:
     def _run_git(
         self, *arguments: str, check: bool = True,
         timeout_seconds: float = 120.0, index: Path | None = None,
+        environment: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         # Every git/gh child process needs an upper bound: a hung fetch or
         # push would otherwise hang the whole delivery session.
@@ -218,7 +219,8 @@ class GitDelivery:
             completed = subprocess.run(
                 (self._git or "git", *arguments),
                 cwd=self._workspace,
-                env={**git_environment(), **({"GIT_INDEX_FILE": str(index)} if index is not None else {})},
+                env={**git_environment(), **({"GIT_INDEX_FILE": str(index)} if index is not None else {}),
+                     **(environment or {})},
                 capture_output=True,
                 text=True,
                 check=False,
@@ -439,6 +441,7 @@ class GitDelivery:
 
     def _gh_output(
         self, *arguments: str, timeout_seconds: float = 300.0,
+        environment: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         # gh talks to the GitHub API, so it is network-bound by nature and
         # gets a longer default budget than local git operations.
@@ -446,7 +449,7 @@ class GitDelivery:
             completed = subprocess.run(
                 ("gh", *arguments),
                 cwd=self._workspace,
-                env={**git_environment(), "GH_NO_UPDATE_NOTIFIER": "1"},
+                env={**git_environment(), "GH_NO_UPDATE_NOTIFIER": "1", **(environment or {})},
                 capture_output=True,
                 text=True,
                 check=False,

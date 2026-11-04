@@ -257,7 +257,7 @@ class RolloutEventReader:
     def _project_records(self, records: tuple[RolloutRecord, ...]) -> tuple[tuple[RolloutRecord, StreamEvent], ...]:
         projected: list[tuple[RolloutRecord, StreamEvent]] = []
         for record in records:
-            if record.payload_schema_version not in {1, 2, 3, 4, 5, 6, 7}:
+            if record.payload_schema_version not in {1, 2, 3, 4, 5, 6, 7, 8}:
                 raise RuntimeError(f"unsupported event record schema: {record.payload_schema_version}")
             self._validate_public_item_ids(record)
             current = self._legacy_event_record(record) if record.payload_schema_version < 3 else record

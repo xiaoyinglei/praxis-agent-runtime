@@ -32,6 +32,7 @@ from agent_runtime.workspace import DEFAULT_CHECKPOINT_PATH, DEFAULT_MODEL_SESSI
 
 if TYPE_CHECKING:
     from agent_runtime.background import BackgroundHandle
+    from agent_runtime.channels import Channels
     from agent_runtime.harness import BoundHarnessModel, Session
     from agent_runtime.harness.records import ItemSnapshot
     from agent_runtime.runtime.mcp import MCPConfigTrustDecision
@@ -204,6 +205,13 @@ class Agent:
             _event_dispatcher=_event_dispatcher,
         ) as session:
             return await session.submit(task, files=files)
+
+    @property
+    def channels(self) -> Channels:
+        """Model-free channel control over this Agent's canonical database."""
+        from agent_runtime.channels import Channels
+
+        return Channels(database=self._harness_database(), workspace=self.workspace_path, autostart=True)
 
     async def start_background(
         self,

@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 _ROW_FORMATS = (
     ("threads", "thread_id", storage._thread_row_payload),
     ("host_commands", "command_id", storage._host_command_row_payload),
+    ("channel_entries", "entry_id", storage._channel_entry_row_payload),
     ("turns", "turn_id", storage._turn_row_payload),
     ("items", "item_id", storage._item_row_payload),
     ("model_operations", "operation_id", storage._model_operation_row_payload),
@@ -88,8 +89,8 @@ def _threads(
         queries.extend(
             f"SELECT thread_id FROM {table}" for table in _TABLES
             if table != "model_attempts" and (
-                table != "host_commands" or connection.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_commands'"
+                table not in {"host_commands", "channel_entries"} or connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
                 ).fetchone() is not None
             )
         )
@@ -151,8 +152,8 @@ def _replay_thread(
 def _compare_projections(connection: sqlite3.Connection, thread_id: str, state: ProjectionState) -> list[str]:
     errors = []
     for table, key, row_payload in _ROW_FORMATS:
-        if table == "host_commands" and not state.host_commands and connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_commands'"
+        if table in {"host_commands", "channel_entries"} and not getattr(state, table) and connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
         ).fetchone() is None:
             continue  # Read-only historical snapshots have not run the additive migration.
         expected = getattr(state, table)

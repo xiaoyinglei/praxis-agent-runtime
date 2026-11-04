@@ -45,6 +45,7 @@ class ProjectionState:
     approvals: dict[str, dict[str, Any]] = field(default_factory=dict)
     artifacts: dict[str, dict[str, Any]] = field(default_factory=dict)
     host_commands: dict[str, dict[str, Any]] = field(default_factory=dict)
+    channel_entries: dict[str, dict[str, Any]] = field(default_factory=dict)
     # Transient replay bookkeeping, not a persisted projection or hash input.
     item_sequences: dict[str, int] = field(default_factory=dict)
 
@@ -90,6 +91,13 @@ def apply_record(
             }
         case "session_settings_updated":
             state.threads[thread_id]["settings"] = payload["settings"]
+            state.threads[thread_id]["applied_thread_sequence"] = sequence
+        case "channel_entry_updated":
+            state.channel_entries[payload["entry_id"]] = {
+                "entry_id": payload["entry_id"], "thread_id": thread_id,
+                "kind": payload["kind"], "key": payload["key"], "value": payload["value"],
+                "applied_thread_sequence": sequence, "reducer_version": reducer_version,
+            }
             state.threads[thread_id]["applied_thread_sequence"] = sequence
         case "host_command_received":
             state.host_commands[payload["command_id"]] = {
@@ -688,7 +696,7 @@ def _identity_v1(payload: Mapping[str, Any]) -> Mapping[str, Any]:
 
 _PAYLOAD_UPCASTERS = {
     1: _identity_v1, 2: _identity_v1, 3: _identity_v1, 4: _identity_v1,
-    5: _identity_v1, 6: _identity_v1, 7: _identity_v1,
+    5: _identity_v1, 6: _identity_v1, 7: _identity_v1, 8: _identity_v1,
 }
 
 
