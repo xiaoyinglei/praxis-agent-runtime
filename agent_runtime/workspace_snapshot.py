@@ -20,6 +20,77 @@ MAX_SNAPSHOT_FILES = 20_000
 MAX_SNAPSHOT_BYTES = 256 * 1024 * 1024
 
 
+def runtime_excluded_paths(database: Path) -> tuple[Path, ...]:
+    """Declared private state shared by source capture and verification."""
+    from agent_runtime.user_config import command_state_directory, user_config_directory
+
+    return (user_config_directory(), command_state_directory(), *(
+        Path(str(database.resolve()) + suffix) for suffix in
+        ("", "-wal", "-shm", ".artifacts", ".locks", ".host.lock", ".host.log")
+    ))
+
+
+def dependency_manifest(
+    paths: tuple[Path, ...], *, authorize: Callable[[Path], None] | None = None,
+) -> dict[str, Any]:
+    """Bound declared external dependencies by bytes and mutation identities.
+
+    Callers authorize original and resolved paths. Directory manifests include
+    directory identities, so create/delete and change/restore are observable.
+    This is a declared dependency boundary, not shell-program analysis.
+    """
+    result: dict[str, Any] = {}
+    total = 0
+    pending = list(paths)
+    while pending:
+        path = pending.pop().absolute()
+        label = str(path)
+        if label in result:
+            continue
+        if authorize is not None:
+            authorize(path)
+        info = path.lstat()
+        entry: dict[str, Any] = {"version": list(file_version(info)), "mode": info.st_mode}
+        if path.is_symlink():
+            entry["target"] = str(path.readlink())
+            pending.append(path.resolve(strict=True))
+        elif path.is_dir():
+            pending.extend(sorted(path.iterdir()))
+        elif path.is_file():
+            if info.st_size + total > MAX_SNAPSHOT_BYTES:
+                raise ValueError("dependency byte limit exceeded")
+            with open_binary(path.resolve()) as stream:
+                content = stream.read(MAX_SNAPSHOT_BYTES - total + 1)
+            total += len(content)
+            entry["sha256"] = hashlib.sha256(content).hexdigest()
+        else:
+            raise ValueError(f"unsupported dependency: {path}")
+        if file_version(path.lstat()) != file_version(info):
+            raise RuntimeError(f"dependency changed during capture: {path}")
+        result[label] = entry
+        if len(result) > MAX_SNAPSHOT_FILES or total > MAX_SNAPSHOT_BYTES:
+            raise ValueError("dependency snapshot resource limit exceeded")
+    return result
+
+
+def source_observation(root: Path, paths: tuple[str, ...]) -> dict[str, Any]:
+    """Observe input identities and ancestor directories, including ctime.
+
+    A shared verifier cannot claim stable inputs after change/restore or an
+    ephemeral create/delete. Runtime and declared output regions are not inputs.
+    Directory changes can conservatively invalidate a run even with equal bytes.
+    """
+    names = {".", *paths}
+    names.update(str(parent) for name in paths for parent in Path(name).parents)
+    result: dict[str, Any] = {}
+    for name in names:
+        try:
+            result[name] = list(file_version((root / name).lstat()))
+        except (FileNotFoundError, NotADirectoryError):
+            result[name] = None
+    return result
+
+
 def git_bytes(root: Path, *args: str, input: bytes | None = None, index: Path | None = None) -> bytes:
     env = git_environment()
     env["GIT_OPTIONAL_LOCKS"] = "0"

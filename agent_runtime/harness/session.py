@@ -61,6 +61,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from agent_runtime.agent import Agent, AgentEventSink
+    from agent_runtime.harness.delivery import DeliveryManager
     from agent_runtime.harness.memory import MemoryConfig
     from agent_runtime.models import ModelControlPlane, ModelSpec
     from agent_runtime.tools.tool import Tool
@@ -83,6 +84,7 @@ class Session:
 
     tool_execution_context: ToolExecutionContext
     store: RuntimeStore
+    delivery: DeliveryManager
     database: Path
     workspace_path: Path
     thread_id: str
@@ -186,6 +188,9 @@ class Session:
             self.workspace_path = Path(workspace).resolve()
             self._stack.enter_context(workspace_owner(self.workspace_path))
             self.store = await self._stack.enter_async_context(await RuntimeStore.open(self.database))
+            from agent_runtime.harness.delivery import DeliveryManager
+
+            self.delivery = DeliveryManager(self.store, lambda: self.thread_id)
             if sum(value is not None for value in (previous_turn_id, frozen_turn_id, thread_id)) > 1:
                 raise ValueError("choose one conversation anchor")
             integrity = await self.store.run_async(
@@ -287,6 +292,7 @@ class Session:
                 service_options.update(resource_options)
             if model is None:
                 raise ValueError("Session requires a bound model")
+            service_options.setdefault("enable_delivery_tools", agent is not None)
             self._service_options = dict(service_options)
             (
                 await self.store.run_async(

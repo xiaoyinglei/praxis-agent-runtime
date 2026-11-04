@@ -91,9 +91,11 @@ agent worktree prune                # 清理最旧的干净 worktree（保留最
 | `apply` | 传入 inspect 返回的确切 `artifact_id`。按记录基线检查每个实际目标，包含 ignored 文件。冲突返回路径，双方内容不被覆盖。不会 stage 或 commit 来源文件。 |
 | `resolve` | 主代理先手动解决冲突，再传相同 artifact 和 `resolution_note`；保存实际主目录 resolution diff，不自动猜测合并。 |
 | `reconcile` | 集成中断后，显式核对每个路径是基线还是目标前后像。未决用户修改仍报冲突；核对后才允许继续 apply。 |
-| `verify` | 在主工作区集成后运行实际 `run_command`（`workspace_write=true` 用于生成文件版本证明），必要时用 `manage_command` 等到终态，再提供该父命令的 `verification_tool_call_id`。命令必须成功且晚于集成；后续文件变化使记录失效。 |
+| `verify` | 在主工作区集成后运行实际 `run_command`（`verification_mode=workspace/snapshot` 提供稳定输入证明；旧写命令摘要仍作为兼容路径），必要时用 `manage_command` 等到终态，再提供该父命令的 `verification_tool_call_id`。命令必须成功且晚于集成；后续文件变化使记录失效。 |
 | `discard` | 显式放弃集成，保留子目录和 artifact。它不清除未知工具结果，也不退还未知预算。 |
 
 集成先持久写入意图，再修改文件。部分失败保留已写路径及前后像，状态为 `applying`，不会冒称整体回滚，也不会自动重放。删除、符号链接、目录/文件互换同样检查前像与实际文件版本；新建文件不覆盖同时出现的用户文件。
 
 活跃或 unknown 子环境即使 `--force` 也不能回收。带子任务标记的现场不由 prune 自动删除；有产物的环境需先完成 canonical 集成或显式 discard，再由用户核对是否强制移除。来源 artifact、结果和集成记录仍保存在 runtime 数据库中。父完成门槛依据这些持久事实，不能用一句子摘要代替代码集成与主目录验证。
+
+子集成验证也接受版本化命令的当前收据，复用 [交付证据](delivery-evidence.md) 的版本与环境核对。新流程无需为获取摘要而开放父目录写权限。

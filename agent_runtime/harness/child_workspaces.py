@@ -216,6 +216,15 @@ def integrate(
         result = store.read_item(operation.result_item_id)
         output = result.payload.get("structured_content", {})
         metadata = result.payload.get("metadata", {})
+        from agent_runtime.harness.delivery import receipt_issue
+
+        receipt = output.get("verification_receipt")
+        versioned = (
+            operation.execution_revision == "builtin-run-command-v13-versioned-verification"
+            and isinstance(receipt, dict)
+            and receipt.get("source_workspace") == str(session.workspace_path)
+            and receipt_issue(receipt, parent_snapshot())[0] is None
+        )
         integrated = max(
             i.sequence
             for i in store.list_items(parent)
@@ -232,8 +241,10 @@ def integrate(
             or output.get("status") in {"running", "cancelled"}
             or output.get("timed_out")
             or output.get("sandbox_error")
-            or metadata.get("workspace_tree_after_sha256") is None
-            or metadata["workspace_tree_after_sha256"] != workspace_tree_sha256(session.workspace_path)
+            or not versioned and (
+                metadata.get("workspace_tree_after_sha256") is None
+                or metadata["workspace_tree_after_sha256"] != workspace_tree_sha256(session.workspace_path)
+            )
         ):
             raise RuntimeError(
                 "parent verification is unsuccessful, stale, or lacks a workspace fingerprint; "
@@ -249,7 +260,11 @@ def integrate(
         )
         verified_snapshot = parent_snapshot()
         verified_entries = parent_entries(tuple(current.get("changed_paths", ())))
-        if metadata["workspace_tree_after_sha256"] != workspace_tree_sha256(session.workspace_path):
+        if (
+            versioned and receipt_issue(receipt, parent_snapshot())[0] is not None
+            or not versioned
+            and metadata["workspace_tree_after_sha256"] != workspace_tree_sha256(session.workspace_path)
+        ):
             raise RuntimeError("workspace changed while recording parent verification")
         current.update(
             verification="recorded",

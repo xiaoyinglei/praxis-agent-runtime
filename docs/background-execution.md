@@ -84,4 +84,6 @@ asyncio.run(main())
 
 在正常项目入口，可用子任务的 Thread/Turn 身份执行 `background status/events/send/respond/cancel`。SDK 中由父 `Agent.attach_background(thread_id=child_thread, turn_id=child_turn)` 接入也成立：接入会沿 canonical lineage 校验来源，随后使用实际子目录。其它工作区不能凭子任务 ID 接入。权限撤销与审批降级读取祖先最新的持久策略，宿主重启不会恢复旧写权限。
 
-主代理需要读取真实 patch，显式集成或放弃产物，并在主工作区重新运行验证。未集成、验证过期、子任务未知执行或未结清预算都会阻止正常完成。工具的验证记录只证明指定命令成功执行过；用户目标是否满足仍需审查，完整版本化交付证据属于后续交付工作。
+主代理需要读取真实 patch，显式集成或放弃产物，并在主工作区重新运行验证。未集成、验证过期、子任务未知执行或未结清预算都会阻止正常完成。工具的验证记录只证明指定命令成功执行过；用户目标是否满足仍需审查，版本化交付状态及新鲜度见 [交付证据](delivery-evidence.md)。
+
+交付证据现由 [版本化交付记录](delivery-evidence.md) 提供。`status/result.delivery` 独立于 Turn 生命周期；读取时重新检查新鲜度，`completed` 本身不代表 `verified`。

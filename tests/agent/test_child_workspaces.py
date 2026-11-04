@@ -258,6 +258,15 @@ async def test_integration_requires_parent_verification_before_completion(repo, 
         )
         with pytest.raises(Exception, match="child|子任务"):
             turn_ops.complete_turn(session.store, turn_id=p.turn_id, answer="unverified")
+        from tests.agent.test_versioned_delivery import command
+
+        result = await command(session.store, p.turn_id, repo, "versioned-parent-check", "true")
+        assert not result.is_error
+        verified = await session.subagents.integrate(
+            parent_turn_id=p.turn_id, child_turn_id=handle["child_turn_id"], action="verify",
+            verification_tool_call_id="versioned-parent-check",
+        )
+        assert verified["verification"] == "recorded"
 
 
 def test_child_snapshot_keeps_raw_bytes_despite_checkout_filters(repo, tmp_path):
@@ -366,8 +375,29 @@ def test_public_child_patch_integrate_and_verify_in_real_parent_process(repo, tm
                         "verification_tool_call_id": "observe" if "observe" in results else "check",
                     },
                 )
-            else:
+            elif "delivery-plan" not in results:
                 assert results["verified"]["verification"] == "recorded", results["verified"]
+                call = ModelToolCall(id="delivery-plan", name="record_delivery", arguments={
+                    "action": "plan", "scope": ["integrated code uses b = 30; user file preserved"],
+                    "commands": [
+                        '/usr/bin/python3 -c "from pathlib import Path; '
+                        "assert 'b = 30' in Path('code.py').read_text(); "
+                        "assert Path('user.txt').read_text() == 'keep user work'\""
+                    ],
+                })
+            elif "delivery-check" not in results:
+                call = ModelToolCall(id="delivery-check", name="run_command", arguments={
+                    "command": results["delivery-plan"]["commands"][0], "verification_mode": "snapshot",
+                    "verification_dependencies": [],
+                })
+            elif "delivery-record" not in results:
+                assert results["delivery-check"]["exit_code"] == 0, results["delivery-check"]
+                call = ModelToolCall(id="delivery-record", name="record_delivery", arguments={
+                    "action": "record", "tool_call_ids": ["delivery-check"],
+                    "review": "Inspected patch and integration; check covers code and preserved user input.",
+                })
+            else:
+                assert results["delivery-record"]["status"] == "verified", results["delivery-record"]
                 return HarnessModelResponse.from_parts(
                     text="integrated and checked in parent", usage={"input_tokens": 2, "output_tokens": 2}
                 )
@@ -385,9 +415,10 @@ def test_public_child_patch_integrate_and_verify_in_real_parent_process(repo, tm
         agent = Agent(workspace_path=repo, checkpoint_db=database, enable_workspace_mcp=False, approval_mode="full")
         monkeypatch.setattr(agent, "_model_factory", lambda: model)
         result = asyncio.run(
-            agent.run("delegate code change", allow_write_tools=True, allow_execute_tools=True, max_steps=16)
+            agent.run("delegate code change", allow_write_tools=True, allow_execute_tools=True, max_steps=20)
         )
         assert result.status == "done", result
+        assert result.delivery["status"] == "verified", result.delivery
     else:
         original = cli._create_agent_facade
 
@@ -408,7 +439,7 @@ def test_public_child_patch_integrate_and_verify_in_real_parent_process(repo, tm
                 "--allow-write-tools",
                 "--allow-execute-tools",
                 "--max-steps",
-                "16",
+                "20",
                 "--non-interactive",
                 "--disable-workspace-mcp",
                 "--rollout-db",
@@ -416,6 +447,7 @@ def test_public_child_patch_integrate_and_verify_in_real_parent_process(repo, tm
             ],
         )
         assert result.exit_code == 0, result.output
+        assert "交付: verified" in result.output
     assert (repo / "code.py").read_text() == "a = 10\nb = 30\n"
     assert (repo / "user.txt").read_text() == "keep user work"
     assert (repo / ".git/index").read_bytes() == original_index
@@ -426,6 +458,12 @@ def test_public_child_patch_integrate_and_verify_in_real_parent_process(repo, tm
         assert parent_turn.status == "completed"
         assert child.status == "completed"
         assert Path(store.read_thread(child.thread_id).workspace) != repo
+        from agent_runtime.harness import delivery
+        saved = delivery.inspect(store, parent_turn.turn_id)
+        assert saved["status"] == "verified", saved
+        (repo / "code.py").write_text("a = 10\nb = 40\n")
+        stale = delivery.inspect(store, parent_turn.turn_id)
+        assert stale["status"] != "verified" and stale["freshness"] == "stale"
 
 
 @pytest.mark.anyio

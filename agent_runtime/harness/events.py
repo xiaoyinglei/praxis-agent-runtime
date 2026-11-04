@@ -64,6 +64,9 @@ _SUPPRESSED_ITEM_KINDS = frozenset(
         "verification",
         "tool_continuation",
         "workspace_checkpoint",
+        "delivery_baseline",
+        "delivery_plan",
+        "delivery_record",
         "resource_usage",
     }
 )

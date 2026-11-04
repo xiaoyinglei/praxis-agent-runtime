@@ -67,6 +67,7 @@ class ToolExecutionContext:
     permissions: ResolvedPermissions | None = None
     permission_provider: Callable[[], ResolvedPermissions] | None = None
     context_provider: Callable[[], ToolExecutionContext] | None = None
+    snapshot_excluded_paths: tuple[Path, ...] = ()
     invocation_guard: Callable[[ToolCall], None | Awaitable[None]] | None = None
 
     def refreshed(self) -> ToolExecutionContext:

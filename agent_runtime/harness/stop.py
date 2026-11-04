@@ -518,6 +518,12 @@ class TurnStop:
                 status="failed",
             )
         try:
+            policy = self._store.read_turn(turn_id).binding_manifest.get("delivery_policy", {})
+            if policy.get("revision") == "delivery-v1":
+                from agent_runtime.harness import delivery
+
+                if not any(i.kind == "delivery_record" for i in self._store.list_items(turn_id)):
+                    delivery.record(self._store, turn_id)
             completed = turn_ops.complete_turn(
                 self._store,
                 turn_id=turn_id,

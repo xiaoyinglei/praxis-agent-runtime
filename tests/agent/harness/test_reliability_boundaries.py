@@ -365,7 +365,10 @@ async def test_public_agent_large_file_output_survives_next_dispatch_and_reopen(
     assert len(result.tool_calls) == 1
     assert not result.tool_calls[0].is_error and result.tool_calls[0].truncated
     async with await RuntimeStore.open(database) as store:
-        [artifact] = store.list_artifacts(result.turn_id)
+        [operation] = store.list_tool_operations(result.turn_id)
+        tool_result = store.read_item(operation.result_item_id)
+        [reference] = tool_result.payload["attachments"]
+        artifact = store.read_artifact_metadata(reference["artifact_id"])
         assert json.loads(store.read_artifact(artifact.artifact_id))["structured_content"]["content"] == body
         assert store.verify().valid
         store.rebuild_projections()

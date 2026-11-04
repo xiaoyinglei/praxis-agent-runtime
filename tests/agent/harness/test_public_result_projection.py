@@ -41,6 +41,7 @@ def test_public_result_dto_is_frozen_and_keeps_thread_turn_identity() -> None:
         "needs_user_input",
         "thread_id",
         "model_error",
+        "delivery",
     )
     call = AgentToolCall(
         tool_call_id="call-1",

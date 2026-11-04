@@ -98,10 +98,12 @@ class SessionBindingProvider:
         model_binding: Mapping[str, Any] | None = None,
         request_settings: Callable[[], Mapping[str, Any]] | None = None,
         subagent_limits: Mapping[str, int] | None = None,
+        delivery_tools_enabled: bool = False,
     ) -> None:
         from agent_runtime.harness.subagents import child_limits
 
         self._subagent_limits = child_limits(subagent_limits)
+        self._delivery_tools_enabled = delivery_tools_enabled
         self._request_settings = request_settings
         self._model = model
         self._model_binding = model_binding
@@ -155,11 +157,13 @@ class SessionBindingProvider:
         if self._mcp_config_trust is not None:
             mcp_policy.update(self._mcp_config_trust)
         binding["mcp_policy"] = mcp_policy
-        binding["completion_policy"] = {
+        completion_policy: dict[str, object] = {
             "revision": "completion-v2",
             "require_workspace_change": self._require_workspace_change,
             "acceptance_command": self._acceptance_command,
         }
+        binding["completion_policy"] = completion_policy
+        binding["delivery_policy"] = {"revision": "delivery-v1", "model_tools": self._delivery_tools_enabled}
         binding["model_retry_policy"] = RetryPolicy().to_payload()
         binding["model_response_recovery"] = {"revision": "restart-step-v1", "max_retries": 1}
         binding["tool_failure_recovery"] = {"revision": "one-replan-v1"}
@@ -214,6 +218,7 @@ def configure_services(
     workspace_mcp_enabled: bool = True,
     mcp_config_trust: Mapping[str, object] | None = None,
     enable_subagents: bool = False,
+    enable_delivery_tools: bool = False,
     subagent_limits: Mapping[str, int] | None = None,
     skill_runtime: HarnessSkillRuntime | None = None,
     max_steps: int | None = None,
@@ -335,8 +340,11 @@ def configure_services(
         if skill_runtime is not None
         else ()
     )
+    from agent_runtime.harness.delivery import create_delivery_tool
+
     registry = build_tool_registry(
         tuple((tools or {}).values()),
+        (create_delivery_tool(session.delivery),) if enable_delivery_tools else (),
         create_context_recall_tool(store),
         _memory_tools(session),
         knowledge_tools,
@@ -407,9 +415,12 @@ def configure_services(
     )
     resolved_completion_gate = completion_gate or StopChecks(store)
 
+    from agent_runtime.workspace_snapshot import runtime_excluded_paths
+
     execution_context = replace(
         execution_context,
         context_provider=execution_context.context_provider or (lambda: session.tool_execution_context),
+        snapshot_excluded_paths=runtime_excluded_paths(session.database),
     )
     session.tool_orchestrator = ToolOrchestrator(
         store=store,
@@ -464,6 +475,7 @@ def configure_services(
         model_token_budget_total=max_tokens_total,
         model_cost_budget_total_micros=max_cost_micros,
         subagent_limits=session._subagent_limits,
+        delivery_tools_enabled=enable_delivery_tools,
         project_instructions=project_instructions_for_turn,
         request_settings=(
             None if session.model_control_plane is None else session.model_control_plane.request_settings

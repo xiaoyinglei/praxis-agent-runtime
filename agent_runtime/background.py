@@ -193,6 +193,7 @@ class BackgroundHandle:
                 except KeyError:
                     turn = None
                 from agent_runtime.harness.child_workspace_ops import state as environment_state
+                from agent_runtime.harness.delivery import inspect as inspect_delivery
                 from agent_runtime.harness.recovery import recovery_plan
 
                 return {
@@ -200,6 +201,7 @@ class BackgroundHandle:
                     "workspace": str(self.workspace),
                     "queue_status": submission.status,
                     "status": None if turn is None else turn.status,
+                    "delivery": None if turn is None else inspect_delivery(store, self.turn_id),
                     "receipt": dict(submission.result),
                     "recovery": None if turn is None else recovery_plan(store, self.turn_id).as_dict(),
                     "commands": [

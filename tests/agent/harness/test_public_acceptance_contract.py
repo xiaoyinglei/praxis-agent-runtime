@@ -33,7 +33,9 @@ class CheckThenAnswer(PatchThenAnswerModel):
     async def dispatch(self, prepared, **_kwargs):
         calls = ()
         if prepared.request_ref["request_id"].endswith(":step:1"):
-            calls = (ModelToolCall(id="check", name="run_command", arguments={"command": self.command}),)
+            calls = (ModelToolCall(id="check", name="run_command", arguments={
+                "command": self.command, "verification_mode": "workspace", "verification_dependencies": [],
+            }),)
         return HarnessModelResponse.from_parts(
             text="checked" if not calls else "Run the configured acceptance check.",
             provider_response_id=None,
@@ -123,7 +125,9 @@ def test_approval_recovery_keeps_the_original_acceptance_contract_and_budget(tmp
                     text="Run original acceptance.",
                     provider_response_id=None,
                     usage={"input_tokens": 5, "output_tokens": 3},
-                    tool_calls=(ModelToolCall(id="verify", name="run_command", arguments={"command": command}),),
+                    tool_calls=(ModelToolCall(id="verify", name="run_command", arguments={
+                        "command": command, "verification_mode": "workspace", "verification_dependencies": [],
+                    }),),
                 )
             return await super().dispatch(prepared, **kwargs)
 

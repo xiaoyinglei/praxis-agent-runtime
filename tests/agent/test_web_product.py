@@ -127,7 +127,8 @@ async def test_product_fetch_persists_source_and_reopens_without_network(tmp_pat
     assert {"web_search", "web_fetch"}.issubset({t.definition.name for t in model.requests[0].tools})
     assert model.requests[0].binding_manifest["tool_execution_policy"]["allow_web_tools"] is True
     async with await RuntimeStore.open(database) as store:
-        artifacts = store.list_artifacts(result.turn_id)
+        artifacts = tuple(a for a in store.list_artifacts(result.turn_id)
+                          if a.media_type == "application/vnd.praxis.web-source+json")
         assert len(artifacts) == 2
         tool_output = next(
             i.payload["structured_content"] for i in store.list_items(result.turn_id) if i.kind == "tool_result"
