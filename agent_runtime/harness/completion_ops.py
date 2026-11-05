@@ -18,6 +18,7 @@ def record_final_proposal(
     turn_id: str,
     answer: str,
     source_item_id: str | None = None,
+    delivery_id: str | None = None,
 ) -> ItemSnapshot:
     if not isinstance(answer, str) or not answer.strip():
         raise ValueError("answer must be non-empty")
@@ -25,6 +26,8 @@ def record_final_proposal(
     with store.tx.transaction():
         thread_id = turn_ops._running_turn_thread_id(store, turn_id)
         payload = {"text": answer}
+        if delivery_id is not None:
+            payload["delivery_id"] = delivery_id
         if source_item_id is not None:
             source = store.read_item(source_item_id)
             if source.turn_id != turn_id or source.kind != "model_response" or source.status != "completed":

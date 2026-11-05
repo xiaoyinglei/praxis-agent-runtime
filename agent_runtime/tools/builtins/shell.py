@@ -518,7 +518,6 @@ async def _run_snapshot_verification(
 
     from agent_runtime.permission_policy import relocate_workspace_permissions
     from agent_runtime.tools.permissions import current_execution_context, execution_context_scope
-    from agent_runtime.workspace import open_workspace
     from agent_runtime.workspace_snapshot import (
         capture_snapshot,
         dependency_manifest,
@@ -569,10 +568,12 @@ async def _run_snapshot_verification(
         tokens = shlex.split(request.command)
     except ValueError:
         tokens = []  # Let the real shell report syntax errors as command failures.
+    snapshot_mode = request.verification_mode == "snapshot"
     with tempfile.TemporaryDirectory(prefix="praxis-verification-") as directory:
-        destination = Path(directory).resolve() / "workspace"
+        verification_root = Path(directory).resolve()
+        destination = verification_root / "workspace"
         destination.mkdir()
-        for relative, entry in captured["entries"].items() if request.verification_mode == "snapshot" else ():
+        for relative, entry in captured["entries"].items() if snapshot_mode else ():
             target = destination / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             content = git_bytes(repository, "cat-file", "blob", entry["oid"])
@@ -581,15 +582,17 @@ async def _run_snapshot_verification(
             else:
                 target.write_bytes(content)
                 target.chmod(0o755 if entry["mode"] == "100755" else 0o644)
-        frozen = open_workspace(destination) if request.verification_mode == "snapshot" else workspace
+        # Only materialized inputs belong in the mounted snapshot. Initializing
+        # workspace runtime state here would create a denied subtree in the mount.
+        frozen = WorkspaceRuntime(root=destination, is_temporary=False) if snapshot_mode else workspace
         destination = frozen.root
         context = current_execution_context()
-        if workspace.permissions is not None and request.verification_mode == "snapshot":
+        if workspace.permissions is not None and snapshot_mode:
             permissions = relocate_workspace_permissions(workspace.permissions, workspace.root, destination)
             frozen.permission_provider = lambda: permissions.intersection(
                 relocate_workspace_permissions(workspace.permissions, workspace.root, destination)
             )
-        if context is not None and request.verification_mode == "snapshot":
+        if context is not None and snapshot_mode:
             context = replace(context, workspace_root=destination, cwd=destination,
                               permissions=frozen.permissions, permission_provider=frozen.permission_provider,
                               context_provider=None)
@@ -618,8 +621,11 @@ async def _run_snapshot_verification(
             before_toolchain = dependency_manifest(toolchain)
 
         with execution_context_scope(context):
-            output = await _run_command(frozen, request.model_copy(update={"verification_mode": "none"}),
-                                        termination_grace_seconds=grace, environment_observer=observe_environment)
+            output = await _run_command(
+                frozen, request.model_copy(update={"verification_mode": "none"}),
+                termination_grace_seconds=grace, environment_observer=observe_environment,
+                scratch_parent=verification_root if snapshot_mode else None,
+            )
         unchanged = working_entries(destination, object_root=repository,
                                     paths=tuple(captured["entries"])) == captured["entries"]
         if request.verification_mode == "workspace":
@@ -663,6 +669,7 @@ async def _run_command(
     capture_output: Callable[[ToolProgressKind, bytes], None] | None = None,
     authorize_publish: Callable[[], Awaitable[None]] | None = None,
     environment_observer: Callable[[dict[str, str]], None] | None = None,
+    scratch_parent: Path | None = None,
 ) -> RunCommandOutput:
     cwd = workspace.ensure_within_workspace(
         workspace.resolve_path(request.working_dir or "."),
@@ -704,7 +711,7 @@ async def _run_command(
 
     with tempfile.TemporaryDirectory(
         prefix="run-command-",
-        dir=workspace.scratch,
+        dir=scratch_parent or workspace.scratch,
     ) as temporary_root, ExitStack() as resources:
         environment = _command_environment(
             workspace_root=workspace.root,

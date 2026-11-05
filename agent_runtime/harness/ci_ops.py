@@ -196,7 +196,8 @@ def record_evidence(
     verify must be a trusted provider signature/ingress verifier, not a Boolean
     from event text. A checks snapshot may contain a subset of subscribed IDs;
     only an exact, nonempty complete set of explicit pass states can pass.
-    Late old-SHA evidence is retained but cannot change current remote status.
+    Old-SHA checks cannot change current status. A signed dismissal may clear
+    its matching retained review even after the head advances.
     """
     value = _json_object(evidence, field="CI evidence")
     timestamp = _time(now)
@@ -245,25 +246,35 @@ def record_evidence(
             "repair_command_id": None,
         }
         ch.put(store, sub["thread_id"], "ci_evidence", evidence_id, receipt)
+        if stale:
+            retained = sub.get("reviews", {}).get(value.get("review_id"))
+            if (
+                kind != "review"
+                or value["state"] != "dismissed"
+                or value.get("review_kind") == "comment"
+                or retained is None
+                or retained.get("reviewer_id") != value.get("reviewer_id")
+            ):
+                return receipt
+        if kind == "query_error":
+            sub["check_status"] = "query_error"
+        elif kind == "review":
+            _update_reviews(sub, value)
+        else:
+            states = [c["state"] for c in checks]
+            sub["check_status"] = (
+                "none"
+                if not checks
+                else "fail"
+                if any(s in {"fail", "cancel"} for s in states)
+                else "pass"
+                if set(ids) == set(sub["check_ids"]) and all(s == "pass" for s in states)
+                else "pending"
+            )
+        sub["remote_status"] = "fail" if sub["review_state"] == "changes_requested" else sub["check_status"]
         if not stale:
-            if kind == "query_error":
-                sub["check_status"] = "query_error"
-            elif kind == "review":
-                _update_reviews(sub, value)
-            else:
-                states = [c["state"] for c in checks]
-                sub["check_status"] = (
-                    "none"
-                    if not checks
-                    else "fail"
-                    if any(s in {"fail", "cancel"} for s in states)
-                    else "pass"
-                    if set(ids) == set(sub["check_ids"]) and all(s == "pass" for s in states)
-                    else "pending"
-                )
-            sub["remote_status"] = "fail" if sub["review_state"] == "changes_requested" else sub["check_status"]
             sub["evidence_id"] = evidence_id
-            _save(store, sub)
+        _save(store, sub)
         return receipt
 
 

@@ -75,6 +75,7 @@ asyncio.run(main())
 - 已提交的响应和终态从 Harness 恢复；未知模型请求不会自动重发。
 - 子任务分配、暂停、结算和父任务唤醒均读取 canonical allocation/Turn；暂停子任务可用其 Thread/Turn 身份接入。
 - 工作区暂时不存在时保留待执行命令，环境恢复后重试领取。
+- 宿主切换前按 [Rollout 维护与升级](rollout-storage.md#维护与升级) 停接输入、备份并升级到新数据库。原有 Thread/Turn 身份可继续接入。
 - 后台宿主不是系统开机服务，尚未实现跨关机自动启动；渠道与 CI/PR 合同见 [渠道与远端后续](channels.md)，发布验收仍属于 G。
 
 

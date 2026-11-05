@@ -66,6 +66,8 @@ uv run agent channel ci-disable SUBSCRIPTION --checkpoint-db DB --workspace WORK
 
 本地 E 验证、远端检查与完成分开呈现。`delivery_complete` 还要求本地 verified 记录的最终 source HEAD 等于订阅 SHA。改 head 不重置轮询或续跑额度；耗尽后必须由用户选择新的显式授权。
 
+真实渠道验收使用已授权的专用话题、稳定的 HTTPS 回调和独立样例工作区。沿用上面的 `channel configure/bind/grant/serve`，再从 provider 发送测试任务。用 `agent background result` 确认受审回答、交付记录和验证树，再核对远端通知及重投去重。若还要验收 CI，先在样例中选定待交付提交，在该 HEAD 上重跑本地检查和提交审阅，再用 `channel ci-subscribe` 和 `channel ci-status` 核对同一 SHA 的完整检查集。测试撤权前记录原始投递和收据，撤权后重投同一原生事件，确认宿主和 outbox 均未产生新副作用。
+
 ## 独立远端副作用
 
 push、open_pr、review_reply 各需独立操作 grant、intent、精确 scope、GitDelivery preview ID、远端关联键和结果。先 `publication-preview`，把显示的预览 ID 及精确资源/正文写入配置，再 `publication-prepare CONFIG.json`；准备只持久化可审查 intent。`publication-execute OPERATION_ID` 执行该单项动作，`--reconcile` 只核对远端。SDK 同名方法同义。

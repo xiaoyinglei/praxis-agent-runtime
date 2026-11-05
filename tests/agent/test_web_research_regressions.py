@@ -181,7 +181,9 @@ async def test_web_cursor_survives_real_product_output_and_admission(tmp_path, m
             visible = str(messages)
             assert expected["source_id"] in visible and expected["error_message"] in visible
             contexts = [
-                json.loads(m["body"].removeprefix("Context compaction:\n")) for m in messages if m["role"] == "context"
+                json.loads(m["body"].removeprefix("Context compaction:\n"))
+                for m in messages
+                if m["context_category"] == "continuation_summary"
             ]
             data = next(
                 ref

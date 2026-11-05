@@ -68,6 +68,36 @@ def envelope(**changes):
     return SimpleNamespace(**data, model_dump=lambda **_: data)
 
 
+def test_explicit_channel_followup_does_not_require_previous_ci_authority(tmp_path):
+    from agent_runtime.harness import host_ops
+
+    with RuntimeStore.open_sync(tmp_path / "runtime.db") as store:
+        ch, initial, _ = channel_setup(store, tmp_path)
+        first = turn_ops.start_turn(
+            store, thread_id=initial.thread_id, turn_id=initial.turn_id, user_message="first", binding_manifest={}
+        )
+        turn_ops.complete_turn(store, turn_id=first.turn_id, answer="done")
+        repair = host_ops.receive_command(
+            store, workspace=tmp_path, kind="start", thread_id=initial.thread_id, payload={
+                "text": "repair", "previous_turn_id": first.turn_id,
+                "options": {"max_steps": 3},
+                "ci_authority": {"subscription_id": "previous", "head_sha": "old"},
+            },
+        )
+        turn = turn_ops.start_turn(
+            store, thread_id=repair.thread_id, turn_id=repair.turn_id, user_message="repair", binding_manifest={}
+        )
+        turn_ops.complete_turn(store, turn_id=turn.turn_id, answer="done")
+        with pytest.raises(PermissionError, match="CI continuation"):
+            ch.authorize_command(store, repair)
+        receipt = ch.receive(store, envelope())
+        followup = host_ops.read_command(store, receipt["command_id"])
+        ch.authorize_command(store, followup)
+        assert followup.request["previous_turn_id"] == repair.turn_id
+        assert followup.request["options"] == repair.request["options"]
+        assert followup.request["channel_authority"]["operation"] == "input"
+
+
 def test_receive_is_atomic_idempotent_and_revalidates_cached_authority(tmp_path):
     from agent_runtime.harness import host_ops
 
@@ -162,30 +192,69 @@ def test_outbox_finite_retry_after_and_dedup(tmp_path):
 
 
 @pytest.mark.anyio
-async def test_signed_event_public_service_to_host_outbox_and_mock_provider(tmp_path, monkeypatch):
+@pytest.mark.parametrize("coding", [False, True])
+async def test_signed_event_public_service_to_host_outbox_and_mock_provider(tmp_path, monkeypatch, coding):
+    import asyncio
     import hashlib
     import hmac
     import json
 
     import httpx
+    from typer.testing import CliRunner
 
     from agent_runtime import Agent
     from agent_runtime.channels import Channels
     from agent_runtime.channels.providers import ProviderClient, Source
+    from agent_runtime.cli import agent_app
+    from agent_runtime.harness import HarnessModelResponse, ModelToolCall
     from agent_runtime.harness import channel_ops as ch
     from agent_runtime.host import BackgroundHost
+    from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel
     from tests.agent.harness.test_subagent_budget import SmallAnswerModel
 
     monkeypatch.setenv("GH_SECRET", "secret")
     monkeypatch.setenv("GH_TOKEN", "token")
+    monkeypatch.setenv("PRAXIS_WORKTREE_ROOT", str(tmp_path / "trees"))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "value.txt").write_text("before\n")
+    check = "/usr/bin/grep -x after value.txt"
+    answer = "Updated value.txt and verified the new value."
+
+    class ChannelCodingModel(PatchThenAnswerModel):
+        async def dispatch(self, prepared, *, event_sink=None):
+            step = prepared.request_ref["request_id"].rsplit(":", 1)[-1]
+            calls = {
+                "1": ("record_delivery", {"action": "plan", "scope": ["new value"], "commands": [check]}),
+                "2": ("apply_patch", {"file_path": "value.txt", "old_string": "before", "new_string": "after"}),
+                "3": ("run_command", {
+                    "command": check, "verification_mode": "workspace", "verification_dependencies": [],
+                }),
+                "4": ("record_delivery", {
+                    "action": "submit", "answer": answer, "tool_call_ids": ["call-3"], "review": "Checked new value",
+                }),
+            }
+            name, arguments = calls[step]
+            return HarnessModelResponse.from_parts(tool_calls=(ModelToolCall(f"call-{step}", name, arguments),))
+
     agent = Agent(
-        workspace_path=tmp_path,
+        workspace_path=workspace,
         checkpoint_db=tmp_path / "runtime.sqlite",
         model_session_path=None,
         enable_workspace_mcp=False,
+        approval_mode="auto",
     )
-    handle = await agent.start_background("inspect", input_id="first", max_steps=3, autostart=False)
-    channels = Channels(database=handle.database, workspace=tmp_path)
+    handle = await agent.start_background(
+        "Wait for authenticated follow-up",
+        input_id="first",
+        max_steps=5,
+        autostart=False,
+        allow_write_tools=coding,
+        allow_execute_tools=coding,
+        require_workspace_change=coding,
+        acceptance_command=check if coding else None,
+    )
+    channels = Channels(database=handle.database, workspace=workspace)
     await channels.configure(
         handle.thread_id,
         Source(
@@ -214,7 +283,7 @@ async def test_signed_event_public_service_to_host_outbox_and_mock_provider(tmp_
             "sender": {"id": 7, "type": "User"},
             "action": "created",
             "issue": {"number": 1},
-            "comment": {"id": 9, "body": "inspect tests", "user": {"id": 7}},
+            "comment": {"id": 9, "body": "Set value.txt to after" if coding else "inspect tests", "user": {"id": 7}},
         }
     ).encode()
     headers = {
@@ -230,19 +299,39 @@ async def test_signed_event_public_service_to_host_outbox_and_mock_provider(tmp_
         sent.append(json.loads(request.content))
         return httpx.Response(201, json={"id": 99})
 
-    async with BackgroundHost(handle.database, model=SmallAnswerModel()) as host:
+    client = ProviderClient(transport=httpx.MockTransport(provider))
+    model = ChannelCodingModel() if coding else SmallAnswerModel()
+    async with BackgroundHost(handle.database, model=model, channel_client=client) as host:
         await host.tick()
-        assert (await handle.wait(timeout=4))["status"] == "completed"
+        assert (await handle.wait(timeout=10))["status"] == "completed"
+    result = await handle.result()
+    assert result.delivery["status"] == ("verified" if coding else "unverified"), result.delivery["next_actions"]
+    if coding:
+        assert (workspace / "value.txt").read_text() == "after\n"
+        assert result.answer == answer
+        assert result.delivery["answer_sha256"] == hashlib.sha256(answer.encode()).hexdigest()
+        assert result.delivery["checks"][0]["receipt"]["input_tree"] == result.delivery["final"]["tree"]
+        cli = await asyncio.to_thread(
+            CliRunner().invoke, agent_app,
+            ["background", "result", handle.thread_id, handle.turn_id, "--workspace", str(workspace),
+             "--rollout-db", str(handle.database)],
+        )
+        assert cli.exit_code == 0, cli.output
+        cli_result = json.loads(cli.output)
+        assert cli_result["answer"] == result.answer
+        assert cli_result["delivery"]["delivery_id"] == result.delivery["delivery_id"]
     await channels.collect()
-    assert await channels.deliver(client=ProviderClient(transport=httpx.MockTransport(provider)))
+    assert await channels.deliver(client=client)
     assert len(sent) == 1
     await channels.collect()
-    assert not await channels.deliver(client=ProviderClient(transport=httpx.MockTransport(provider)))
+    assert not await channels.deliver(client=client)
     assert len(sent) == 1
     async with await RuntimeStore.open(handle.database) as store:
         records = await store.run_async(ch.entries, store, "outbox")
         assert records[0]["status"] == "acknowledged"
-        assert records[0]["summary"]["delivery"] == "unverified"
+        assert records[0]["summary"]["turn_id"] == handle.turn_id
+        assert records[0]["summary"]["delivery"] == result.delivery["status"]
+        assert answer not in sent[0]["body"]
         assert (await store.run_async(store.verify)).valid
 
 
@@ -464,7 +553,7 @@ def test_legacy_readonly_and_schema_fence(tmp_path):
         assert store.verify().valid
     with RuntimeStore.open_sync(database) as store:
         assert store.verify().valid
-        assert store.tx.metadata("minimum_writer_schema") == "8"
+        assert store.tx.metadata("minimum_writer_schema") == "9"
 
 
 def test_native_id_conflict_is_not_an_unsigned_header_escape(tmp_path):

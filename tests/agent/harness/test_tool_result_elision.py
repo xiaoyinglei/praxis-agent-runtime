@@ -39,6 +39,43 @@ def exchange(store, turn_id, call_id, content):
     )
 
 
+@pytest.mark.anyio
+async def test_legacy_elision_keeps_the_clock_of_the_measured_candidate(tmp_path, monkeypatch):
+    from agent_runtime.harness import TurnRunner, request_context
+    from tests.agent.harness.test_compaction_consistency import Accept, model_for
+
+    first_time = "2026-11-05T01:00:00+00:00"
+    clock = {"current_time": first_time, "current_date": "2026-11-05", "timezone": "UTC", "utc_offset": "+00:00"}
+    monkeypatch.setattr(request_context, "capture_runtime_clock", clock.copy)
+    async with await RuntimeStore.open(tmp_path / "r.db") as store:
+        thread, turn = start(store, tmp_path)
+        exchange(store, turn.turn_id, "old", "old detail " * 2000)
+        exchange(store, turn.turn_id, "recent", "Current file")
+        model, gateway = model_for(25000)
+        manager = RolloutContextManager(store, max_total_bytes=7000)
+        runner = TurnRunner(
+            thread_id=thread.thread_id, store=store, model=model, context_manager=manager, completion_gate=Accept()
+        )
+        engine = runner._context_engine
+        capture = engine.capture_step_context
+        measured = set()
+
+        def capture_with_ticking_clock(turn_context, *, messages, **options):
+            projection = tuple((m.role, m.content) for m in messages)
+            if projection in measured:
+                clock["current_time"] = "2026-11-05T01:00:01+00:00"
+            measured.add(projection)
+            return capture(turn_context, messages=messages, **options)
+
+        monkeypatch.setattr(engine, "capture_step_context", capture_with_ticking_clock)
+        context, _ = await engine._prepare_compacted_step(runner.restore_turn_context(turn.turn_id), step=1)
+
+        assert context.binding_manifest["runtime_clock"]["current_time"] == first_time
+        assert any(item.payload.get("algorithm_revision") == "tool-output-elision-v5"
+                   for item in store.list_items(turn.turn_id) if item.kind == "context_compaction")
+        assert not gateway.requests
+
+
 def test_parallel_result_admission_keeps_all_calls_and_archives_originals(tmp_path):
     import asyncio
 

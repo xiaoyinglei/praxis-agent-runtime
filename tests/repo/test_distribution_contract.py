@@ -102,7 +102,7 @@ def test_macos_ci_runs_real_sandbox_command_file_and_terminal_regressions() -> N
         assert path in commands, f"missing native macOS regression: {path}"
 
 
-def test_linux_ci_runs_full_gates_then_smokes_the_installed_wheel() -> None:
+def test_linux_ci_runs_full_gates_then_smokes_installed_distributions() -> None:
     config = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
     # Inspect executable step bodies rather than YAML formatting. Shell line
     # continuations and indentation do not change the installation contract.
@@ -119,20 +119,11 @@ def test_linux_ci_runs_full_gates_then_smokes_the_installed_wheel() -> None:
         "tests/agent/test_connection_manager_browser.py",
         "sudo /usr/bin/python3 -I scripts/ubuntu/smoke-model-service.py --wheel-dir",
         "uv run --all-extras lint-imports",
-        "uv build",
         "uv run --all-extras python scripts/agent_cli_smoke.py",
         "uv run --all-extras python scripts/agent_delivery_smoke.py --fake-model --verbose",
         "uv run --all-extras python scripts/agent_public_path_benchmark.py validate",
         "uv run --all-extras python scripts/agent_model_quality_gate.py validate",
-        "uv export --locked --all-extras --no-dev --no-hashes --no-emit-project",
-        'uv venv --no-project --python 3.12 "$smoke_venv"',
-        'uv pip install --python "$smoke_venv/bin/python" --constraint "$smoke_root/constraints.txt" "$wheel"',
-        'cd "$smoke_root"',
-        '"$smoke_venv/bin/agent" --help',
-        '"$smoke_venv/bin/agent" run --help',
-        '"$smoke_venv/bin/python" "$GITHUB_WORKSPACE/scripts/agent_delivery_smoke.py" --fake-model',
-        'uv pip install --python "$smoke_venv/bin/python" --constraint "$smoke_root/constraints.txt" "${wheel}[rag]"',
-        '"$smoke_venv/bin/rag" --help',
+        "bash scripts/agent_install_smoke.sh",
     ]
 
     cursor = -1
@@ -143,9 +134,21 @@ def test_linux_ci_runs_full_gates_then_smokes_the_installed_wheel() -> None:
     assert "sudo apt-get install -y bubblewrap apparmor libseccomp2" in commands
     assert "/usr/bin/bwrap --unshare-user --unshare-pid --ro-bind / / /bin/true" in commands
     assert "python3 scripts/ubuntu/install-codex-patch.py --destination" in commands
-    assert 'mktemp -d "$RUNNER_TEMP/praxis-wheel-smoke.XXXXXX"' in workflow
-    assert "mapfile -d '' -t wheels" in workflow
-    assert '"${#wheels[@]}" -ne 1' in workflow
+    assert "--chromium" in workflow
+    smoke = (ROOT / "scripts/agent_install_smoke.sh").read_text(encoding="utf-8")
+    assert 'uv build --python 3.12 --out-dir "$out/dist"' in smoke
+    assert "uv export --locked --all-extras --no-dev --no-hashes --no-emit-project" in smoke
+    assert '[[ ${#wheel[@]} -eq 1 && ${#sdist[@]} -eq 1 ]]' in smoke
+    assert 'cd "$work/$profile/workspace"' in smoke
+    assert 'uv venv --no-project --python 3.12 "$venv"' in smoke
+    assert 'uv pip install --python "$python" --constraint "$out/constraints.txt" "$requirement"' in smoke
+    assert '"$venv/bin/agent" --help' in smoke
+    assert '"$venv/bin/agent" run --help' in smoke
+    assert '"$python" -I "$repo/scripts/agent_delivery_smoke.py" --fake-model' in smoke
+    assert '"$venv/bin/rag" --help' in smoke
+    assert 'verify wheel "${wheel[0]}" "${wheel[0]}"' in smoke
+    assert 'verify sdist "${sdist[0]}" "${sdist[0]}"' in smoke
+    assert 'verify rag "${wheel[0]}" "${wheel[0]}[rag]"' in smoke
 
 
 def test_mypy_allows_the_platform_only_mlx_dependency_to_be_absent() -> None:

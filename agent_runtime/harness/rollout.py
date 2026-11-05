@@ -33,6 +33,9 @@ from agent_runtime.harness.records import (
 from agent_runtime.harness.reducer import ProjectionState, apply_record
 
 _REDUCER_VERSION = 1
+_DATABASE_SCHEMA_VERSION = 1
+_WRITER_SCHEMA_VERSION = 9
+DATABASE_LOCATION_KEY = "database_location"
 _PROJECTIONS = {
     "threads": ("thread_id", "rowid"),
     "host_commands": ("command_id", "rowid"),
@@ -140,21 +143,20 @@ class RolloutStore:
             self._connection = sqlite3.connect(
                 f"{self._path.resolve().as_uri()}?mode=ro",
                 uri=True,
-                isolation_level=None,
+                autocommit=True,
             )
         else:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._connection = sqlite3.connect(self._path, isolation_level=None)
+            self._connection = sqlite3.connect(self._path, autocommit=True)
         self._connection.row_factory = sqlite3.Row
         # Multiple processes share this WAL database; BEGIN IMMEDIATE must
         # wait out another process's write lock instead of failing fast.
         self._connection.execute("PRAGMA busy_timeout = 30000")
+        self._check_schema_version()
         if not read_only:
             self._connection.execute("PRAGMA foreign_keys = ON")
             self._connection.execute("PRAGMA journal_mode = WAL")
-            self._create_schema()
-            self._upgrade_budget_reservation_sources()
-            self._ensure_writer_protocol()
+            self._migrate_schema()
         self._columns = {
             table: {row["name"] for row in self._connection.execute(f"PRAGMA table_info({table})")} | {"rowid"}
             for table in _PROJECTIONS
@@ -401,6 +403,13 @@ class RolloutStore:
         if self._pending_transaction_records is None:
             raise RuntimeError("metadata write requires a transaction")
         self._connection.execute("DELETE FROM store_metadata WHERE key = ?", (key,))
+
+    def database_origins(self) -> tuple[Path, ...]:
+        """Previous locations recorded by an explicit restore or upgrade."""
+        encoded = self.metadata(DATABASE_LOCATION_KEY)
+        if encoded is None:
+            return ()
+        return database_origins(encoded, self.path.resolve())
 
     @contextmanager
     def read_snapshot(self) -> Iterator[None]:
@@ -917,7 +926,7 @@ class RolloutStore:
                 turn_id,
                 sequence,
                 record_type,
-                8,
+                _WRITER_SCHEMA_VERSION,
                 producer,
                 payload_json,
                 payload_hash,
@@ -1502,24 +1511,46 @@ class RolloutStore:
                 ),
             )
 
-    def _ensure_writer_protocol(self) -> None:
+    def _check_schema_version(self) -> None:
+        version = self._connection.execute("PRAGMA user_version").fetchone()[0]
+        if not 0 <= version <= _DATABASE_SCHEMA_VERSION:
+            raise RuntimeError(f"runtime database schema {version} requires a newer version")
+        metadata = self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='store_metadata'"
+        ).fetchone()
+        if metadata is None:
+            return
+        writer = self._connection.execute(
+            "SELECT value FROM store_metadata WHERE key='minimum_writer_schema'"
+        ).fetchone()
+        if writer is None:
+            return
+        try:
+            required = int(writer[0])
+        except (ValueError, TypeError) as error:
+            raise RuntimeError("runtime writer schema is invalid") from error
+        if required < 1:
+            raise RuntimeError("runtime writer schema is invalid")
+        if required > _WRITER_SCHEMA_VERSION:
+            raise RuntimeError(f"runtime writer schema {required} requires a newer version")
+
+    def _migrate_schema(self) -> None:
+        # In explicit autocommit mode executescript keeps this transaction open.
+        # DDL, legacy row copying, and the new writer floor publish together.
         self._connection.execute("BEGIN IMMEDIATE")
         try:
+            self._check_schema_version()
+            self._create_schema()
+            self._upgrade_budget_reservation_sources()
             self._connection.execute("""INSERT INTO store_metadata(key, value)
-                VALUES ('minimum_writer_schema', '8') ON CONFLICT(key) DO UPDATE SET
-                value = CAST(MAX(CAST(value AS INTEGER), 8) AS TEXT)""")
-            required = int(
-                self._connection.execute(
-                    "SELECT value FROM store_metadata WHERE key='minimum_writer_schema'"
-                ).fetchone()[0]
-            )
-            if required > 8:
-                raise RuntimeError(f"runtime writer schema {required} requires a newer version")
+                VALUES ('minimum_writer_schema', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (str(_WRITER_SCHEMA_VERSION),))
             self._connection.execute("""CREATE TRIGGER IF NOT EXISTS rollout_writer_protocol_guard
                 BEFORE INSERT ON rollout_records
                 WHEN NEW.payload_schema_version < CAST((SELECT value FROM store_metadata
                     WHERE key='minimum_writer_schema') AS INTEGER)
                 BEGIN SELECT RAISE(ABORT, 'runtime writer protocol requires upgrade'); END""")
+            self._connection.execute(f"PRAGMA user_version = {_DATABASE_SCHEMA_VERSION}")
             self._connection.execute("COMMIT")
         except BaseException:
             self._rollback_quietly()
@@ -1529,22 +1560,16 @@ class RolloutStore:
         refs = tuple(self._connection.execute("PRAGMA foreign_key_list(budget_reservations)"))
         if not any(row[2] in {"model_operations", "model_attempts"} for row in refs):
             return
-        self._connection.execute("BEGIN IMMEDIATE")
-        try:
-            self._connection.execute("""CREATE TABLE budget_reservations_general (
-                reservation_id TEXT PRIMARY KEY,
-                thread_id TEXT NOT NULL REFERENCES threads(thread_id),
-                turn_id TEXT NOT NULL REFERENCES turns(turn_id),
-                scope_id TEXT NOT NULL, operation_id TEXT NOT NULL, attempt_id TEXT NOT NULL UNIQUE,
-                reserved_json TEXT NOT NULL, actual_json TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL,
-                applied_thread_sequence INTEGER NOT NULL, reducer_version INTEGER NOT NULL)""")
-            self._connection.execute("INSERT INTO budget_reservations_general SELECT * FROM budget_reservations")
-            self._connection.execute("DROP TABLE budget_reservations")
-            self._connection.execute("ALTER TABLE budget_reservations_general RENAME TO budget_reservations")
-            self._connection.execute("COMMIT")
-        except BaseException:
-            self._rollback_quietly()
-            raise
+        self._connection.execute("""CREATE TABLE budget_reservations_general (
+            reservation_id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL REFERENCES threads(thread_id),
+            turn_id TEXT NOT NULL REFERENCES turns(turn_id),
+            scope_id TEXT NOT NULL, operation_id TEXT NOT NULL, attempt_id TEXT NOT NULL UNIQUE,
+            reserved_json TEXT NOT NULL, actual_json TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL,
+            applied_thread_sequence INTEGER NOT NULL, reducer_version INTEGER NOT NULL)""")
+        self._connection.execute("INSERT INTO budget_reservations_general SELECT * FROM budget_reservations")
+        self._connection.execute("DROP TABLE budget_reservations")
+        self._connection.execute("ALTER TABLE budget_reservations_general RENAME TO budget_reservations")
 
     def _create_schema(self) -> None:
         self._connection.executescript(
@@ -1772,7 +1797,6 @@ class RolloutStore:
                 canonical_hash TEXT NOT NULL,
                 hash_version INTEGER NOT NULL DEFAULT 1
             );
-            PRAGMA user_version = 1;
             """
         )
         self._connection.execute(
@@ -1804,6 +1828,18 @@ class RolloutStore:
         metadata_columns = {str(row["name"]) for row in self._connection.execute("PRAGMA table_info(projection_meta)")}
         if "hash_version" not in metadata_columns:
             self._connection.execute("ALTER TABLE projection_meta ADD COLUMN hash_version INTEGER NOT NULL DEFAULT 1")
+
+
+def database_origins(encoded: str, database: Path) -> tuple[Path, ...]:
+    value = json.loads(encoded)
+    if not isinstance(value, dict) or not isinstance(value.get("origins"), list):
+        raise RuntimeError("Rollout database location metadata is invalid")
+    origins = value["origins"]
+    if any(not isinstance(origin, str) or not Path(origin).is_absolute() for origin in origins):
+        raise RuntimeError("Rollout database origin must be absolute")
+    if value.get("database") != str(database):
+        return ()
+    return tuple(Path(origin) for origin in origins)
 
 
 def _decoded_row(row: sqlite3.Row) -> Mapping[str, Any]:

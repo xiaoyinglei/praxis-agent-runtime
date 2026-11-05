@@ -56,6 +56,25 @@ for error in report.errors:
 
 大文件复制和 GC 扫描会占用当前 owner 与 SQLite 写锁；其他实例最多等待配置的 busy timeout，超时明确失败。本实现选择单一锁协议保证正确性，不承诺大文件期间的并行写吞吐。所有写入者与清理者须遵守同一协议；外部直接删除文件、混用不遵守协议的旧程序和不可靠文件系统不在该保证内。
 
+## 维护与升级
+
+以下命令可直接从安装后的 `agent` 执行。备份、恢复和升级的目标目录必须尚未存在，父目录需已创建。
+
+```sh
+agent rollout verify --rollout-db /absolute/old/runtime.sqlite
+agent rollout backup /absolute/release-backup --rollout-db /absolute/old/runtime.sqlite
+agent rollout restore /absolute/release-backup /absolute/restored
+agent rollout upgrade /absolute/upgraded --rollout-db /absolute/old/runtime.sqlite
+```
+
+Python 的对应函数是 `agent_runtime.maintenance.verify_rollout`、`backup_rollout`、`restore_rollout` 和 `upgrade_rollout`。后三者返回目标目录内的 `rollout.sqlite3`。这些操作均无需模型或渠道凭证。
+
+备份固定 SQLite 快照并校验每个引用 blob。数据库、同名 `.artifacts` 目录和 `manifest.json` 一同发布。恢复保留备份 schema，升级在临时副本完成迁移和审计后才发布。两者均保留 canonical ID 和记录水位。未知结果留在事实账本中，工作区和外部系统状态需要单独核对。数据库备份只包含已提交事实及其 artifacts，活进程、本机命令会话文件和工作区由各自的部署流程保全。
+
+升级前暂停 webhook 和其他输入生产者，停止前台写入，向旧宿主发送 `SIGTERM` 并等待退出。升级命令使用宿主锁拒绝仍有本机宿主拥有的数据库。检查新库后，先启动一套指向新库的宿主，再切换客户端与渠道。工作区路径、权限来源、凭证和模型定义仍按原绑定校验。进程中断留下的未知工具操作须核对后再继续，旧预算敞口继续保留。
+
+切换前失败可继续使用原库。新宿主开始执行之后，先停接并核对已发生和未知的外部副作用，再决定如何恢复。历史库读取支持 payload schema 1–9，旧 Turn 是否可执行仍取决于其冻结输入、模型绑定、工作区和工具的恢复条件。
+
 ## 验证
 
 回归覆盖 bytes/文件的异常与独立进程硬退出边界、真实独立进程 GC 与提交/回滚竞争、源摘要不符、分块读取、GC 部分失败与重跑，以及新请求拒绝非法输入版本和 Session 恢复前拒绝旧格式。CLI/SDK 的补充输入、摘要、取消和工具结果重开恢复继续走同一持久化实现。

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_runtime.permission_policy import PathRule, PermissionPolicy
 from agent_runtime.tools.builtins import shell
 from agent_runtime.workspace import open_workspace
 
@@ -99,6 +100,52 @@ def test_linux_argv_limits_host_mounts(tmp_path):
     assert ("--bind", str(scratch), str(scratch)) in mounts
     assert all(source != "/" for _, source, _ in mounts)
     assert all(source != str(Path.home()) for _, source, _ in mounts)
+
+
+@pytest.mark.anyio
+async def test_linux_snapshot_verification_plans_disjoint_input_and_scratch_mounts(tmp_path, monkeypatch):
+    workspace = open_workspace(tmp_path / "source", create=True)
+    (workspace.root / "input.txt").write_text("frozen input")
+    (workspace.root / ".praxis" / "secret").write_text("private runtime state")
+    policy = PermissionPolicy().resolve(workspace.root)
+    workspace.permission_provider = lambda: policy
+    monkeypatch.setenv("PRAXIS_WORKTREE_ROOT", str(tmp_path / "trees"))
+    monkeypatch.setattr(shell, "_SANDBOX_PLATFORM", "linux")
+    # Exercise the real Linux argument builder on either host OS. The launcher
+    # returns success without running the supplied command.
+    monkeypatch.setattr(shell, "_BWRAP_PATH", "/usr/bin/true")
+    build_argv = shell._linux_sandbox_argv
+    plans = []
+
+    def inspect_plan(**options):
+        argv = build_argv(**options)
+        frozen, scratch = Path(options["workspace_root"]), Path(options["temporary_root"])
+        assert (frozen / "input.txt").read_text() == "frozen input"
+        assert not (frozen / ".praxis").exists()
+        assert not options["permissions"].path_access(frozen / ".praxis")
+        assert not scratch.is_relative_to(frozen)
+        plans.append(argv)
+        return argv
+
+    monkeypatch.setattr(shell, "_linux_sandbox_argv", inspect_plan)
+    output = await shell.create_run_command_tool(workspace).run({"command": "true", "verification_mode": "snapshot"})
+
+    assert output.exit_code == 0, output.stderr
+    assert len(plans) == 1
+    assert str(workspace.root) not in plans[0]
+    assert output.verification_receipt["inputs_unchanged"] is True
+
+
+def test_linux_rejects_existing_explicit_deny_in_workspace_mount(tmp_path):
+    workspace = tmp_path / "workspace"
+    (workspace / "private").mkdir(parents=True)
+    policy = PermissionPolicy(filesystem=(PathRule(path="private", access="deny"),)).resolve(workspace)
+
+    with pytest.raises(ValueError, match="deny inside an exposed subtree"):
+        shell._linux_sandbox_argv(
+            workspace_root=workspace, temporary_root=tmp_path / "scratch",
+            additional_read_roots=(), permissions=policy,
+        )
 
 
 @pytest.mark.anyio

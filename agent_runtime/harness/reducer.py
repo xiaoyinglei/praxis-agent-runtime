@@ -696,7 +696,7 @@ def _identity_v1(payload: Mapping[str, Any]) -> Mapping[str, Any]:
 
 _PAYLOAD_UPCASTERS = {
     1: _identity_v1, 2: _identity_v1, 3: _identity_v1, 4: _identity_v1,
-    5: _identity_v1, 6: _identity_v1, 7: _identity_v1, 8: _identity_v1,
+    5: _identity_v1, 6: _identity_v1, 7: _identity_v1, 8: _identity_v1, 9: _identity_v1,
 }
 
 

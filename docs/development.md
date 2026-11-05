@@ -50,7 +50,7 @@ Store 只接纳并执行每次操作一次；SQLite 写锁等待也发生在 own
 
 正常 `Session.open()` 根据 canonical facts 找出所选会话、fork 祖先、父子预算和附件来源等恢复依赖，在同一个读快照中独立重放、比较投影并校验 blob。新会话不消费其他会话的历史。可变 metadata hash 不作为跳过重放的凭据。legacy v1 hash 首次追加仍在原写事务内完整审计后升级，包含跨线程引用，失败一并回滚；这是旧库一次性迁移成本，日常 v2 追加不做全库审计。也可通过显式重建统一升级旧投影。完整审计用于发现所有会话以及孤儿投影的损坏。
 
-维护入口不调用模型：
+已安装的 CLI 提供检查、备份、恢复和升级。SDK 使用 `agent_runtime.maintenance` 中的同名操作。流程见 [Rollout 维护](rollout-storage.md#维护与升级)。源码仓库仍可用诊断脚本重建投影。
 
 ```bash
 uv run python scripts/verify_agent_rollout.py --database /path/to/rollout.sqlite3
@@ -72,7 +72,7 @@ uv run python scripts/verify_agent_rollout.py --database /path/to/rollout.sqlite
 
 主机控制信息使用 `StepControl` 和 `ModelMessage.runtime_metadata`，文本是单向渲染结果。用户即使粘贴相同标题或 JSON 也不能产生主机控制状态。完整 Step 快照和冻结 canonical/wire 请求存入引用完整性可审计的 artifact；replay 校验 request/context/tool/wire 四个 hash，发送冻结 wire，不重新序列化 provider 请求。凭据从当前可信连接取得，不写入 artifact。旧记录仅在其保存的快照、版本和 hash 能精确恢复时继续执行，历史读取与安全取消独立保留。
 
-写入协议为 payload schema 5；读取器仍支持既有 1–4 记录。首次可写打开安装 SQLite 最低 writer 协议门禁，包括此前已打开的连接，旧二进制的 schema 3/4 INSERT 会在执行模型和工具之前被拒绝。升级前应按下文备份数据库和 artifact 目录；不要把数据库交回旧版本继续写入。
+写入协议为 payload schema 9，读取器保留 1–8 的历史兼容。首次可写打开原子安装 SQLite 最低 writer 协议门禁。旧版本重新打开时拒绝写入，已经打开的旧连接也无法追加低版本事实。发布升级使用副本，旧数据库可作为切换前的回退点。
 
 本次内核替换对照官方 [Codex 固定源码 a4c9194](https://github.com/openai/codex/tree/a4c9194247c6a1e79aa3e72cc6cd77238f2ed354)，Claude 参考仍为上文注明来源限制的历史镜像；不把 SDK 协议解析器当作完整执行内核源码。
 
@@ -88,6 +88,17 @@ uv build
 ```
 
 涉及可选依赖时使用 `uv sync --locked --all-extras --link-mode copy`，并在对应命令中保留 `--all-extras`。MLX 只适用于满足平台要求的机器；RAG 和浏览器具有各自依赖，未安装时相关测试可能明确跳过。
+
+从源码仓库运行发行包验收。请指定一个尚未创建的证据目录。
+
+```bash
+mkdir -p artifacts
+bash scripts/agent_install_smoke.sh artifacts/install-smoke
+```
+
+脚本构建 wheel 和 sdist，在仓库外分别创建全新的 Python 3.12 环境安装并验证 CLI、SDK、模型目录、连接页和 tokenizer 资源。浏览器与 RAG 各有独立的额外依赖环境。Apple Silicon 额外检查 MLX-LM 服务入口和 CPU 数组运算，并在 Metal 可用时验证 GPU 运算。输出目录保留发行包、SHA-256 和安装依赖版本。SDK 验收使用脚本模型。
+
+如需同时启动实际 Chromium，先用 Playwright 安装 headless shell，然后以同一绝对路径设置 `PLAYWRIGHT_BROWSERS_PATH`，调用验收脚本时追加 `--chromium`。该检查在 Chromium 内载入本地测试 HTML。
 
 CI 将两个受支持平台分为独立任务，每个 PR 都运行：
 

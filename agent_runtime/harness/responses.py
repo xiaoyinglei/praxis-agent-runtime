@@ -205,13 +205,14 @@ class ResponseHandler:
             )
             if handled is not None:
                 return handled
-        handled = await self._after_tool_batch(
-            thread_id=turn.thread_id,
-            turn_id=turn_id,
-            source_item_id=operation.response_item_id,
-        )
-        if handled is not None:
-            return handled
+        else:
+            handled = await self._after_tool_batch(
+                thread_id=turn.thread_id,
+                turn_id=turn_id,
+                source_item_id=operation.response_item_id,
+            )
+            if handled is not None:
+                return handled
         await self._commit(
             lambda: response_handled(
                 self._store,
@@ -360,11 +361,19 @@ class ResponseHandler:
         items = await self._store.run_async(self._store.list_items, turn_id)
         if any(i.kind == "completion_feedback" and i.payload.get("source_item_id") == source_item_id for i in items):
             return None  # A committed recovery grant belongs to this batch, not a new attempt.
-        call_ids = await self._store.run_async(
-            lambda: {
-                call.id for call in restore_model_response(self._store.read_item(source_item_id).payload).tool_calls
-            }
-        )
+        source = await self._store.run_async(self._store.read_item, source_item_id)
+        calls = restore_model_response(source.payload).tool_calls
+        if any(call.name == "record_delivery" and call.arguments.get("action") == "submit" for call in calls):
+            handled = await self._stop.finish(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                answer=None,
+                input_revision=revision,
+                source_item_id=source_item_id,
+            )
+            if handled is not None:
+                return handled
+        call_ids = {call.id for call in calls}
         failure = await self._store.run_async(
             lambda: next(
                 (

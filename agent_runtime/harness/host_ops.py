@@ -62,6 +62,36 @@ def list_commands(store: RuntimeStore, thread_id: str | None = None) -> tuple[Ho
     ))
 
 
+def _matches_relocated_start(store: RuntimeStore, prior: Mapping[str, Any], identity: Mapping[str, Any]) -> bool:
+    if prior["kind"] != "start" or identity["kind"] != "start":
+        return False
+    old_config = prior["request"].get("configuration")
+    new_config = identity["payload"].get("configuration")
+    if not isinstance(old_config, Mapping) or not isinstance(new_config, Mapping):
+        return False
+    old_agent = old_config.get("agent")
+    new_agent = new_config.get("agent")
+    if not isinstance(old_agent, Mapping) or not isinstance(new_agent, Mapping):
+        return False
+    old_database = old_agent.get("checkpoint_db")
+    if (
+        not isinstance(old_database, str)
+        or Path(old_database) not in store.persistence.database_origins()
+        or new_agent.get("checkpoint_db") != str(store.persistence.path.resolve())
+    ):
+        return False
+    equivalent = {
+        **identity,
+        "payload": {
+            **identity["payload"],
+            "configuration": {**new_config, "agent": {**new_agent, "checkpoint_db": old_database}},
+        },
+    }
+    request_hash = prior["request_hash"]
+    equivalent_hash = hashlib.sha256(_canonical_json(equivalent).encode()).hexdigest()
+    return isinstance(request_hash, str) and equivalent_hash == request_hash
+
+
 @owner_operation
 def receive_command(
     store: RuntimeStore, *, workspace: Path, kind: str, payload: Mapping[str, Any],
@@ -86,7 +116,7 @@ def receive_command(
     with store.tx.transaction():
         prior = store.tx.first("host_commands", where={"command_id": command_id})
         if prior is not None:
-            if prior["request_hash"] != digest:
+            if prior["request_hash"] != digest and not _matches_relocated_start(store, prior, identity):
                 raise ValueError("host command identity conflicts with an earlier request")
             return _snapshot(prior)
         try:

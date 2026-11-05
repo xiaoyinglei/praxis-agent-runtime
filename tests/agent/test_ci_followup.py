@@ -152,6 +152,28 @@ def test_authorization_and_signature_revalidated_before_cached_evidence(tmp_path
             ci.status(store, "ci-1", authorize=lambda _: False)
 
 
+def test_dismissal_clears_the_retained_review_without_changing_head_evidence(tmp_path):
+    from agent_runtime.harness import ci_ops as ci
+
+    with RuntimeStore.open_sync(tmp_path / "runtime.db") as store:
+        setup_subscription(store, tmp_path)
+        review = {"kind": "review", "review_id": "42", "reviewer_id": "7", "checks": []}
+        record(store, evidence("requested", **review, state="changes_requested"))
+        ci.update_head(store, "ci-1", "sha-2", authorize=lambda _: True)
+        current = record(store, evidence("current", head_sha="sha-2"))
+        assert ci.status(store, "ci-1", authorize=lambda _: True)["remote_status"] == "fail"
+        wrong = {**review, "review_id": "43"}
+        assert record(store, evidence("other-dismissal", **wrong, state="dismissed"))["stale"]
+        wrong_reviewer = {**review, "reviewer_id": "8"}
+        assert record(store, evidence("wrong-reviewer", **wrong_reviewer, state="dismissed"))["stale"]
+        assert ci.status(store, "ci-1", authorize=lambda _: True)["remote_status"] == "fail"
+        assert record(store, evidence("dismissal", **review, state="dismissed"))["stale"]
+        assert record(store, evidence("late-review", **review, state="changes_requested"))["stale"]
+        status = ci.status(store, "ci-1", authorize=lambda _: True)
+        assert status["remote_status"] == "pass"
+        assert status["evidence_id"] == current["evidence_id"]
+
+
 def test_finite_repair_copies_submission_and_reserves_cumulative_budget(tmp_path):
     from agent_runtime.harness import ci_ops as ci
 

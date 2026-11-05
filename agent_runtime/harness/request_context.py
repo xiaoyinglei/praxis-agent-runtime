@@ -222,7 +222,8 @@ class RequestContext:
                 "plan": dict(plans[-1].payload) if plans else None,
                 "next_action": (
                     "Use record_delivery to declare scope, exact checks and omissions; record trusted tool evidence "
-                    "and final review. A natural final stops execution; it does not imply verified delivery. "
+                    "and final review. Use record_delivery action=submit with the exact reviewed final answer "
+                    "to propose that answer without regenerating it. A natural final can end unverified. "
                     "Versioned commands use explicit verification_dependencies and read-only inputs. "
                     "Verified delivery for explicit acceptance requires verification_mode=workspace "
                     "at the configured cwd; "
