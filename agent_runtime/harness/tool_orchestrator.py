@@ -822,9 +822,9 @@ class ToolOrchestrator:
     ) -> None:
         turn_id = operation.turn_id
         hooks = self._lifecycle_hooks
-        pre = hooks is not None and await self._store.run_async(
+        pre = hooks is not None and bool(await self._store.run_async(
             hooks.configured, turn_id, "PreToolUse", tool_name=call.tool_name, effects=operation.effects,
-        )
+        ))
         frozen_scope = (operation.effects, operation.resources)
         prepared_scope = self._resolved_scopes.get(operation.operation_id)
 
@@ -837,9 +837,9 @@ class ToolOrchestrator:
 
         if hooks is not None and prepared_scope != frozen_scope:
             current_effects = () if prepared_scope is None else prepared_scope[0]
-            if pre or await self._store.run_async(
+            if pre or bool(await self._store.run_async(
                 hooks.configured, turn_id, "PreToolUse", tool_name=call.tool_name, effects=current_effects,
-            ):
+            )):
                 raise changed_scope()
             # PostToolUse selects against committed effects, so do not admit
             # a recovered operation whose observed scope would be mislabelled.

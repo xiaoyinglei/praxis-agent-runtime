@@ -7,7 +7,7 @@ import json
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from functools import partial
-from typing import Any
+from typing import Any, cast
 
 from agent_runtime.harness import completion_ops, tool_ops, turn_ops
 from agent_runtime.harness.execution_facts import (
@@ -246,9 +246,9 @@ class ResponseHandler:
         source_item_id = source.response_item_id
         revision = await self._store.run_async(self._store.request_input_revision, turn_id, prepared.request_ref)
         if response.status == "incomplete":
-            return await self._commit(
+            return cast(TurnResult | None, await self._commit(
                 partial(self._recover_incomplete, source, response.incomplete_reason, revision)
-            )
+            ))
         if not response.tool_calls and (
             revision != await self._store.run_async(self._store.user_input_revision, turn_id)
         ):

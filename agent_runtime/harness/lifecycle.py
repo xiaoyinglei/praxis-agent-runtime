@@ -68,7 +68,7 @@ class LifecycleHooks:
         evidence_revision = details.get("completion_revision")
         for spec in configured:
             name = spec["name"]
-            key_parts = (turn_id, event, target_id, name)
+            key_parts: tuple[str, ...] = (turn_id, event, target_id, name)
             if evidence_revision is not None:
                 key_parts += (evidence_revision,)
             key = "\0".join(key_parts)

@@ -140,12 +140,12 @@ def load_host_hooks(path: str, workspace: Path) -> tuple[LifecycleHook, ...]:
         if not isinstance(revision, str) or not revision.strip() or len(revision) > 128:
             raise ValueError("command hook revision must have 1–128 characters")
         executable = Path(argv[0]).resolve(strict=True)
-        argv = [str(executable), *argv[1:]]
+        command = (str(executable), *argv[1:])
         hooks.append(LifecycleHook(
             entry["event"],
             entry["name"],
-            partial(_run_command, tuple(argv), source.parent),
-            revision=canonical_hash({"argv": argv, "directory": str(source.parent), "revision": revision}),
+            partial(_run_command, command, source.parent),
+            revision=canonical_hash({"argv": command, "directory": str(source.parent), "revision": revision}),
             timeout_seconds=entry.get("timeout_seconds", 5.0),
             tool_names=entry.get("tool_names", ()),
             effects=entry.get("effects", ()),
@@ -169,16 +169,17 @@ async def _run_command(argv: tuple[str, ...], cwd: Path, request: HookRequest) -
         stderr=asyncio.subprocess.DEVNULL,
         start_new_session=True,
     )
-    assert proc.stdin is not None and proc.stdout is not None
+    stdin = proc.stdin
+    assert stdin is not None and proc.stdout is not None
 
     async def send() -> None:
         try:
-            proc.stdin.write(payload + b"\n")
-            await proc.stdin.drain()
+            stdin.write(payload + b"\n")
+            await stdin.drain()
         except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
-            proc.stdin.close()
+            stdin.close()
 
     sender = asyncio.create_task(send())
     try:

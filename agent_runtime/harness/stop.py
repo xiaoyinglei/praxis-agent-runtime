@@ -366,9 +366,9 @@ class TurnStop:
                         # whether any child should be stopped.
                         waiting.cancel()
                     await asyncio.gather(waiting, return_exceptions=True)
-            if self._lifecycle_hooks is not None and await self._store.run_async(
+            if self._lifecycle_hooks is not None and bool(await self._store.run_async(
                 self._lifecycle_hooks.configured, turn_id, "Stop"
-            ):
+            )):
                 prepared = await self._commit(prepare_proposal)
                 if prepared is None:
                     return None
