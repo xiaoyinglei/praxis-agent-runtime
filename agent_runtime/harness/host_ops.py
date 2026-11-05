@@ -146,6 +146,18 @@ def claim_next(
                 for c in commands
             ):
                 continue
+            from agent_runtime.harness.channel_ops import authorize_command
+
+            try:
+                authorize_command(store, _snapshot(row))
+            except PermissionError:
+                facts.append_fact(
+                    store, thread_id=row["thread_id"], turn_id=None,
+                    record_type="host_command_settled", producer="host",
+                    payload={"command_id": row["command_id"], "status": "rejected",
+                             "result": {"reason": "channel_authority_revoked"}, "available_at": 0.0},
+                )
+                continue
             facts.append_fact(
                 store, thread_id=row["thread_id"], turn_id=None, record_type="host_command_claimed", producer="host",
                 payload={"command_id": row["command_id"], "owner": owner, "generation": row["generation"] + 1,

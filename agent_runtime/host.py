@@ -9,7 +9,10 @@ import os
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Self
+from typing import TYPE_CHECKING, Any, Self
+
+if TYPE_CHECKING:
+    from agent_runtime.channels.providers import ProviderClient
 from uuid import uuid4
 
 from agent_runtime.background import current_configuration_permissions, permission_ceiling, restore_configuration
@@ -29,7 +32,7 @@ _TERMINAL = {"completed", "failed", "cancelled"}
 class BackgroundHost:
     def __init__(
         self, database: Path, *, concurrency: int = 4, model: BoundHarnessModel | None = None,
-        lease_seconds: float = 30,
+        lease_seconds: float = 30, channel_client: ProviderClient | None = None,
     ) -> None:
         if type(concurrency) is not int or not 1 <= concurrency <= 32:
             raise ValueError("host concurrency must be between 1 and 32")
@@ -42,6 +45,8 @@ class BackgroundHost:
         self._sessions: dict[str, Session] = {}
         self._workspaces: dict[str, str] = {}
         self._closing = False
+        self._channel_client = channel_client
+        self._channel_task: asyncio.Task[None] | None = None
 
     async def __aenter__(self) -> Self:
         self.database.parent.mkdir(parents=True, exist_ok=True)
@@ -70,6 +75,8 @@ class BackgroundHost:
             # Shutdown cancels in-process drivers and preserves their exact
             # unknown effects. It is different from a client detaching.
             tasks = list(self._drivers.values())
+            if self._channel_task is not None:
+                tasks.append(self._channel_task)
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -78,6 +85,11 @@ class BackgroundHost:
             os.close(self._lock)
 
     def _guard(self, claim: host_ops.HostCommand, store: RuntimeStore) -> None:
+        from agent_runtime.harness.channel_ops import authorize_command
+
+        authorize_command(store, claim)
+        if claim.kind != 'cancel' and not store.turn_cancellation_pending(claim.turn_id):
+            authorize_command(store, host_ops.background_submission(store, claim.turn_id))
         if not host_ops.claim_current(store, claim) or (
             host_ops.background_submission(store, claim.turn_id).status == "rejected"
         ):
@@ -94,6 +106,9 @@ class BackgroundHost:
     async def _execute(self, claim: host_ops.HostCommand) -> None:
         heartbeat = asyncio.create_task(self._heartbeat(claim))
         try:
+            from agent_runtime.harness.channel_ops import authorize_command
+
+            await self.store.run_async(authorize_command, self.store, claim)
             try:
                 turn = await self.store.run_async(self.store.read_turn, claim.turn_id)
             except KeyError:
@@ -321,7 +336,7 @@ class BackgroundHost:
 
         try:
             cancel = await self.store.run_async(apply)
-        except (ValueError, RuntimeError, KeyError) as error:
+        except (ValueError, RuntimeError, KeyError, PermissionError) as error:
             await self.store.run_async(
                 host_ops.settle_command, self.store, claim, status="rejected",
                 result={"reason": type(error).__name__, "diagnostic": exception_diagnostic(
@@ -344,9 +359,27 @@ class BackgroundHost:
                     child.cancel()
                 sessions.extend(session._subagent_sessions.values())
 
+    async def _channels(self) -> None:
+        from agent_runtime.channels.ci import poll_one, resume_eligible
+        from agent_runtime.channels.providers import ProviderClient
+        from agent_runtime.channels.service import collect_notifications, deliver_one, record_diagnostic
+
+        try:
+            await self.store.run_async(resume_eligible, self.store)
+            await self.store.run_async(collect_notifications, self.store)
+            await deliver_one(self.store, client=self._channel_client)
+            await poll_one(self.store, self._channel_client or ProviderClient())
+        except Exception as error:
+            # A channel failure must not cancel independent coding drivers.
+            await self.store.run_async(record_diagnostic, self.store, 'channel_lane', type(error).__name__)
+
     async def tick(self) -> None:
         if self._closing:
             return
+        if self._channel_task is None or self._channel_task.done():
+            if self._channel_task is not None:
+                self._channel_task.result() if not self._channel_task.cancelled() else None
+            self._channel_task = asyncio.create_task(self._channels())
         for _ in range(64):
             control = await self.store.run_async(
                 host_ops.claim_next, self.store, owner=self.owner, control=True, lease_seconds=self.lease_seconds
@@ -385,7 +418,17 @@ class BackgroundHost:
             await self.tick()
             commands = await self.store.run_async(host_ops.list_commands, self.store)
             pending = any(c.status in {"pending", "claimed"} for c in commands)
-            if pending or self._drivers:
+            from agent_runtime.harness import channel_ops
+            outbox_pending = await self.store.run_async(
+                lambda: any(r['status'] in {'pending', 'claimed', 'sending'}
+                            for r in channel_ops.entries(self.store, 'outbox'))
+            )
+            ci_pending = await self.store.run_async(
+                lambda: any(r['enabled'] and r['poll_attempts'] < r['poll_policy']['max_attempts']
+                            and time.time() < r['poll_policy']['deadline']
+                            for r in channel_ops.entries(self.store, 'ci_subscription'))
+            )
+            if pending or self._drivers or outbox_pending or ci_pending:
                 idle_since = time.monotonic()
             elif idle_timeout is not None and time.monotonic() - idle_since >= idle_timeout:
                 return

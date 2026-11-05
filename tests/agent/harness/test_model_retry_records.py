@@ -106,7 +106,7 @@ def test_writer_gate_rejects_old_schema_on_already_open_connection(tmp_path, old
     with RuntimeStore.open_sync(path) as store:
         thread = turn_ops.create_thread(store, workspace=tmp_path)
         record = store.list_records(thread.thread_id)[0]
-        assert record.payload_schema_version == 7
+        assert record.payload_schema_version == 8
         with pytest.raises(sqlite3.IntegrityError, match="writer protocol requires upgrade"):
             old.execute(
                 """INSERT INTO rollout_records(record_uuid,thread_id,turn_id,thread_sequence,record_type,

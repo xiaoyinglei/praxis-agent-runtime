@@ -36,6 +36,7 @@ _REDUCER_VERSION = 1
 _PROJECTIONS = {
     "threads": ("thread_id", "rowid"),
     "host_commands": ("command_id", "rowid"),
+    "channel_entries": ("entry_id", "rowid"),
     "turns": ("turn_id", "rowid"),
     "items": ("item_id", "sequence"),
     "model_operations": ("operation_id", "rowid"),
@@ -916,7 +917,7 @@ class RolloutStore:
                 turn_id,
                 sequence,
                 record_type,
-                7,
+                8,
                 producer,
                 payload_json,
                 payload_hash,
@@ -995,6 +996,7 @@ class RolloutStore:
                 ("approvals", "request_id", (record.payload.get("request_id"),), _approval_row_payload),
                 ("artifacts", "artifact_id", (record.payload.get("artifact_id"),), _artifact_row_payload),
                 ("host_commands", "command_id", (record.payload.get("command_id"),), _host_command_row_payload),
+                ("channel_entries", "entry_id", (record.payload.get("entry_id"),), _channel_entry_row_payload),
             ):
                 entities = getattr(state, table)
                 for identity in identities:
@@ -1060,6 +1062,8 @@ class RolloutStore:
             state.artifacts[row["artifact_id"]] = _artifact_row_payload(row)
         for row in self._connection.execute("SELECT * FROM host_commands WHERE thread_id = ?", (thread_id,)):
             state.host_commands[row["command_id"]] = _host_command_row_payload(row)
+        for row in self._connection.execute("SELECT * FROM channel_entries WHERE thread_id = ?", (thread_id,)):
+            state.channel_entries[row["entry_id"]] = _channel_entry_row_payload(row)
         return state
 
     def _persist_projection_state(
@@ -1089,6 +1093,7 @@ class RolloutStore:
                 state.approvals,
                 state.artifacts,
                 state.host_commands,
+                state.channel_entries,
             ):
                 for identity in tuple(entities):
                     if entities[identity]["applied_thread_sequence"] != changed_sequence:
@@ -1124,6 +1129,14 @@ class RolloutStore:
                     thread["applied_thread_sequence"],
                     thread["reducer_version"],
                 ),
+            )
+        for entry in state.channel_entries.values():
+            connection.execute(
+                "INSERT INTO channel_entries VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(entry_id) DO UPDATE SET value_json=excluded.value_json, "
+                "applied_thread_sequence=excluded.applied_thread_sequence, reducer_version=excluded.reducer_version",
+                (entry["entry_id"], entry["thread_id"], entry["kind"], entry["key"],
+                 _canonical_json(entry["value"]), entry["applied_thread_sequence"], entry["reducer_version"]),
             )
         for command in state.host_commands.values():
             columns = (
@@ -1493,14 +1506,14 @@ class RolloutStore:
         self._connection.execute("BEGIN IMMEDIATE")
         try:
             self._connection.execute("""INSERT INTO store_metadata(key, value)
-                VALUES ('minimum_writer_schema', '7') ON CONFLICT(key) DO UPDATE SET
-                value = CAST(MAX(CAST(value AS INTEGER), 7) AS TEXT)""")
+                VALUES ('minimum_writer_schema', '8') ON CONFLICT(key) DO UPDATE SET
+                value = CAST(MAX(CAST(value AS INTEGER), 8) AS TEXT)""")
             required = int(
                 self._connection.execute(
                     "SELECT value FROM store_metadata WHERE key='minimum_writer_schema'"
                 ).fetchone()[0]
             )
-            if required > 7:
+            if required > 8:
                 raise RuntimeError(f"runtime writer schema {required} requires a newer version")
             self._connection.execute("""CREATE TRIGGER IF NOT EXISTS rollout_writer_protocol_guard
                 BEFORE INSERT ON rollout_records
@@ -1570,6 +1583,11 @@ class RolloutStore:
                    OR record_type = 'tool_operation_prepared'
                    OR record_type = 'tool_operation_outcome_committed'
                    OR record_type = 'tool_operation_migrated';
+            CREATE TABLE IF NOT EXISTS channel_entries (
+                entry_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, kind TEXT NOT NULL, key TEXT NOT NULL,
+                value_json TEXT NOT NULL, applied_thread_sequence INTEGER NOT NULL, reducer_version INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS channel_entries_kind ON channel_entries(kind, key);
             CREATE TABLE IF NOT EXISTS host_commands (
                 command_id TEXT PRIMARY KEY,
                 thread_id TEXT NOT NULL REFERENCES threads(thread_id) DEFERRABLE INITIALLY DEFERRED,
@@ -1859,6 +1877,9 @@ def _projection_hash(state: ProjectionState, thread_id: str) -> str:
     host_commands = {key: value for key, value in state.host_commands.items() if value["thread_id"] == thread_id}
     if host_commands:
         payload["host_commands"] = host_commands
+    entries = {key: value for key, value in state.channel_entries.items() if value["thread_id"] == thread_id}
+    if entries:
+        payload["channel_entries"] = entries
     return hashlib.sha256(_canonical_json(payload).encode()).hexdigest()
 
 
@@ -2158,3 +2179,9 @@ def _approval_row_payload(row: sqlite3.Row) -> dict[str, Any]:
         "applied_thread_sequence": row["applied_thread_sequence"],
         "reducer_version": row["reducer_version"],
     }
+
+
+def _channel_entry_row_payload(row: sqlite3.Row) -> dict[str, Any]:
+    return {"entry_id": row["entry_id"], "thread_id": row["thread_id"], "kind": row["kind"],
+            "key": row["key"], "value": json.loads(row["value_json"]),
+            "applied_thread_sequence": row["applied_thread_sequence"], "reducer_version": row["reducer_version"]}

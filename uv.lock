@@ -2479,6 +2479,7 @@ source = { editable = "." }
 dependencies = [
     { name = "anyio" },
     { name = "beautifulsoup4" },
+    { name = "cryptography" },
     { name = "fastapi" },
     { name = "httpcore" },
     { name = "httpx", extra = ["socks"] },
@@ -2547,6 +2548,7 @@ requires-dist = [
     { name = "anyio", specifier = ">=4,<5" },
     { name = "beautifulsoup4", specifier = ">=4.13.3" },
     { name = "boto3", marker = "extra == 'rag'", specifier = ">=1.40.0" },
+    { name = "cryptography", specifier = ">=45,<49" },
     { name = "docling", marker = "extra == 'rag'", specifier = ">=2.82.0" },
     { name = "duckdb", marker = "extra == 'rag'", specifier = ">=1.2.0" },
     { name = "fastapi", specifier = ">=0.136.1" },
