@@ -14,11 +14,13 @@ from agent_runtime.core.model_request import toolset_revision_for_tools
 from agent_runtime.harness.context import RolloutContextManager
 from agent_runtime.harness.context_recall import READ_CONTEXT_NAME, create_context_recall_tool
 from agent_runtime.harness.execution_context import step_limit_from_binding
+from agent_runtime.harness.lifecycle import LifecycleHooks
 from agent_runtime.harness.protocol import BoundHarnessModel, CompletionGate
 from agent_runtime.harness.retry_policy import RetryPolicy
 from agent_runtime.harness.stop import StopChecks
 from agent_runtime.harness.tool_orchestrator import ToolOrchestrator, current_tool_turn_id
 from agent_runtime.harness.tool_router import DurableToolRouter
+from agent_runtime.hooks import LifecycleHook
 from agent_runtime.project_instructions import instruction_snapshot
 from agent_runtime.tools.integrations.knowledge import (
     KnowledgeSearchInput,
@@ -99,11 +101,13 @@ class SessionBindingProvider:
         request_settings: Callable[[], Mapping[str, Any]] | None = None,
         subagent_limits: Mapping[str, int] | None = None,
         delivery_tools_enabled: bool = False,
+        hooks: tuple[LifecycleHook, ...] = (),
     ) -> None:
         from agent_runtime.harness.subagents import child_limits
 
         self._subagent_limits = child_limits(subagent_limits)
         self._delivery_tools_enabled = delivery_tools_enabled
+        self._hook_binding = tuple(hook.binding() for hook in hooks)
         self._request_settings = request_settings
         self._model = model
         self._model_binding = model_binding
@@ -163,9 +167,16 @@ class SessionBindingProvider:
             "acceptance_command": self._acceptance_command,
         }
         binding["completion_policy"] = completion_policy
+        if self._hook_binding:
+            binding["lifecycle_hooks"] = [dict(spec) for spec in self._hook_binding]
+            binding["lifecycle_hook_protocol"] = "completion-evidence-v1"
         binding["delivery_policy"] = {"revision": "delivery-v1", "model_tools": self._delivery_tools_enabled}
         binding["model_retry_policy"] = RetryPolicy().to_payload()
-        binding["model_response_recovery"] = {"revision": "restart-step-v1", "max_retries": 1}
+        binding["model_response_recovery"] = {
+            "revision": "split-step-v2",
+            "max_retries": 1,
+            "max_turn_recoveries": 3,
+        }
         binding["tool_failure_recovery"] = {"revision": "one-replan-v1"}
         binding["completion_continuation_policy"] = {"revision": "bounded-v1", "max_continuations": 8}
         binding["execution_context_policy"] = {
@@ -221,6 +232,7 @@ def configure_services(
     enable_delivery_tools: bool = False,
     subagent_limits: Mapping[str, int] | None = None,
     skill_runtime: HarnessSkillRuntime | None = None,
+    hooks: tuple[LifecycleHook, ...] = (),
     max_steps: int | None = None,
     max_tokens_total: int | None = None,
     max_cost_micros: int | None = None,
@@ -422,12 +434,14 @@ def configure_services(
         context_provider=execution_context.context_provider or (lambda: session.tool_execution_context),
         snapshot_excluded_paths=runtime_excluded_paths(session.database),
     )
+    session.lifecycle_hooks = LifecycleHooks(store, hooks, dispatch_guard=session._guard_dispatch)
     session.tool_orchestrator = ToolOrchestrator(
         store=store,
         tools=tool_snapshot,
         execution_context=execution_context,
         worker_id=worker_id,
         checkpoints=CheckpointService(workspace),
+        lifecycle_hooks=session.lifecycle_hooks,
         dispatch_guard=session._guard_dispatch,
     )
     session.tool_execution_context = execution_context
@@ -476,6 +490,7 @@ def configure_services(
         model_cost_budget_total_micros=max_cost_micros,
         subagent_limits=session._subagent_limits,
         delivery_tools_enabled=enable_delivery_tools,
+        hooks=hooks,
         project_instructions=project_instructions_for_turn,
         request_settings=(
             None if session.model_control_plane is None else session.model_control_plane.request_settings

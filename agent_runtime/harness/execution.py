@@ -20,6 +20,7 @@ from agent_runtime.harness.context_engine import ContextEngine, SummaryStoppedEr
 from agent_runtime.harness.events import commit_and_publish
 from agent_runtime.harness.execution_context import StepContext, TurnContext, step_limit_from_binding
 from agent_runtime.harness.execution_facts import adopt_execution_protocol
+from agent_runtime.harness.lifecycle import LifecycleHooks
 from agent_runtime.harness.model_runner import ModelRunner
 from agent_runtime.harness.operation_values import TurnCancellationPendingError, TurnInputChangedError
 from agent_runtime.harness.ownership import ConversationRecoveryRequiredError, recover_owner_loss
@@ -72,6 +73,7 @@ class TurnRunner:
         binding_provider: BindingProvider | None = None,
         prepare_binding: Callable[[Mapping[str, Any]], Awaitable[None]] | None = None,
         before_completion: Callable[[str], Awaitable[None]] | None = None,
+        lifecycle_hooks: LifecycleHooks | None = None,
         dispatch_guard: Callable[[RuntimeStore], None] | None = None,
     ) -> None:
         store.read_thread(thread_id)
@@ -104,7 +106,8 @@ class TurnRunner:
             binding_provider=binding_provider,
         )
         self._stop = TurnStop(
-            store=store, gate=completion_gate, commit=self._commit, before_completion=before_completion
+            store=store, gate=completion_gate, commit=self._commit, before_completion=before_completion,
+            lifecycle_hooks=lifecycle_hooks, dispatch_guard=dispatch_guard,
         )
         self._responses = ResponseHandler(
             store=store,

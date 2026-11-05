@@ -61,6 +61,7 @@ def record_completion_decision(
     action: str,
     reason: str,
     reason_code: str | None = None,
+    hook_evidence_revision: str | None = None,
 ) -> ItemSnapshot:
     if action not in {"accept", "continue", "pause", "fail"}:
         raise ValueError(f"unsupported completion action: {action}")
@@ -95,6 +96,10 @@ def record_completion_decision(
                     "action": action,
                     "reason": reason,
                     **({"reason_code": reason_code} if reason_code is not None else {}),
+                    **(
+                        {"hook_evidence_revision": hook_evidence_revision}
+                        if hook_evidence_revision is not None else {}
+                    ),
                 },
             },
         )

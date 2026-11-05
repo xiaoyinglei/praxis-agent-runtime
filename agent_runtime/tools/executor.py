@@ -75,6 +75,13 @@ class ExecutionStatus(StrEnum):
     OUTCOME_UNKNOWN = "outcome_unknown"
 
 
+def resolve_tool_use(tool: Tool, arguments: Mapping[str, JsonValue]) -> ResolvedToolUse:
+    dynamic = tool.resolve_use(arguments)
+    if not isinstance(dynamic, ResolvedToolUse):
+        raise TypeError("resolve_use must return ResolvedToolUse")
+    return ResolvedToolUse(effects=tool.static_effects | dynamic.effects, targets=dynamic.targets)
+
+
 class ExecutionStartRejectedError(RuntimeError):
     """A durable scheduler rejected execution before the tool runner was called."""
 
@@ -539,13 +546,7 @@ class ToolExecutor:
             )
 
         try:
-            dynamic = tool.resolve_use(arguments)
-            if not isinstance(dynamic, ResolvedToolUse):
-                raise TypeError("resolve_use must return ResolvedToolUse")
-            resolved = ResolvedToolUse(
-                effects=tool.static_effects | dynamic.effects,
-                targets=dynamic.targets,
-            )
+            resolved = resolve_tool_use(tool, arguments)
         except Exception as error:
             return await self._finish(
                 call=call,
@@ -849,7 +850,10 @@ class ToolExecutor:
                     )
                     return await self._finish(
                         call=prepared.call,
-                        result=_error_result(prepared.call, code=code, message=message, retryable=False),
+                        result=_error_result(
+                            prepared.call, code=code, message=message, retryable=False,
+                            metadata={"execution_started": False},
+                        ),
                         record=replace(prepared.record, status=ExecutionStatus.FAILED, error_code=code),
                         prepared=replace(prepared, decision=decision),
                     )
@@ -857,7 +861,8 @@ class ToolExecutor:
                 return await self._finish(
                     call=prepared.call,
                     result=_error_result(prepared.call, code="permission_recheck_failed", error=error,
-                                         message="live permission recheck failed closed", retryable=False),
+                                         message="live permission recheck failed closed", retryable=False,
+                                         metadata={"execution_started": False}),
                     record=replace(prepared.record, status=ExecutionStatus.FAILED,
                                    error_code="permission_recheck_failed"),
                     prepared=prepared,
@@ -895,7 +900,8 @@ class ToolExecutor:
                     prepared.call,
                     code=rejected.code,
                     message=rejected.message,
-                    retryable=True,
+                    retryable=rejected.retryable or rejected.code == "resource_busy",
+                    metadata=rejected.metadata,
                 ),
                 record=record,
                 prepared=prepared,

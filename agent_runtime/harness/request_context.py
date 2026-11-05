@@ -106,6 +106,8 @@ class RequestContext:
         )
         # Old Turns do not acquire recovery by reopening with new defaults.
         binding.pop("model_response_recovery", None)
+        binding.pop("lifecycle_hooks", None)
+        binding.pop("lifecycle_hook_protocol", None)
         binding.pop("project_instructions", None)
         binding.pop("tool_failure_recovery", None)
         binding.pop("step_budget_policy", None)
@@ -113,6 +115,8 @@ class RequestContext:
         for name in (
             "completion_policy",
             "model_response_recovery",
+            "lifecycle_hooks",
+            "lifecycle_hook_protocol",
             "tool_failure_recovery",
             "execution_context_policy",
             "model_step_budget",

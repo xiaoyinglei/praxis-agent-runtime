@@ -31,10 +31,13 @@
 以及 [Claude Code 的已保存会话与活跃后台会话区分](https://code.claude.com/docs/en/sessions)。
 Claude Code 的公开 GitHub 仓库未提供这里所需的完整运行时源码。模型重试部分另核对了本地历史镜像，版本及证据边界见[模型错误与重试](model-failure-recovery.md)。
 
-新 Turn 对已知 `incomplete/max_output_tokens` 允许一次完整步骤重试，额度按整个 Turn 冻结，
-原步数、tokens 和费用预算照常扣除。截断的正文、reasoning 和工具调用不作为后续 assistant 消息重放，
-已完成工具结果保留；content_filter、未知终态和 summary 不走自动重试。重开进程不会重置额度，
-缺少该策略字段的旧 Turn 保持旧契约。缺失 provider 终态仍进入 unknown 的人工恢复路径。
+新 Turn 只对已知 `incomplete/max_output_tokens` 自动恢复。Runtime 丢弃截断的正文、
+reasoning 和工具调用，保留已结算的用量和工具结果，并在下一次请求提示把剩余工作拆小。
+每个逻辑步骤最多恢复一次。成功结算工具结果或收到新用户输入后，后续步骤可使用本 Turn
+的剩余额度。每个 Turn 最多授权三次恢复，下一次请求仍须通过常规步数、token 和费用准入。
+重开进程沿用已写入 Rollout 的恢复决定。冻结为 `restart-step-v1` 的 Turn 沿用原整轮额度，
+缺少策略字段的历史 Turn 沿用原契约。内容过滤和未知原因直接结束该步骤，摘要和缺失
+provider 终态继续走各自的恢复路径。
 
 模型服务错误、持久化退避、未知费用与同一请求重放的规则见[模型错误与重试](model-failure-recovery.md)。
 
@@ -111,7 +114,10 @@ claim 事件投递期间、runner 尚未进入时的取消会提交确定的取�
 无运行中或未知操作时继续；恢复跳过已有结果，只执行原来未开始的调用。
 `abort` 会为未执行调用闭合工具消息组。审批、澄清和对账仍走各自原有流程。
 
-工作区写的前快照在真正获准调用 runner 后拍摄。由于当前证据同时观察整个工作区树，
+首次工作区写入的 checkpoint 在 PreToolUse 阶段拍摄，位于解析和审批之后、
+领取执行 claim 之前。宿主 hook 的处理器注册、超时及回放合同见[使用指南](guide.md#宿主生命周期-hooks)。
+
+工具 runner 的工作区变更观测在领取 claim 后开始。由于当前证据同时观察整个工作区树，
 这些写操作互斥，避免将兄弟调用的修改归给 no-op 写；独立读保持有界并发。
 该互斥限于当前批次，不提供对其他 Thread、宿主进程写入或活跃后台命令的全局事务隔离。
 

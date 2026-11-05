@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 from agent_runtime.harness.events import ReplayEvent
 from agent_runtime.harness.memory import MemoryConfig
 from agent_runtime.harness.session import Session
+from agent_runtime.hooks import HookDecision, HookRequest, LifecycleHook
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.modeling.failures import ModelFailure
 from agent_runtime.models import ModelNotAvailableError, ModelSpec
@@ -44,6 +45,9 @@ __all__ = [
     "AgentUsage",
     "BackgroundHandle",
     "EventType",
+    "HookDecision",
+    "HookRequest",
+    "LifecycleHook",
     "ItemDeltaKind",
     "ItemStatus",
     "ModelNotAvailableError",

@@ -44,6 +44,7 @@ class EventType(StrEnum):
     INTERACTION_INVALIDATED = "interaction_invalidated"
     CONTEXT_COMPACTION_STARTED = "context_compaction_started"
     CONTEXT_COMPACTION_COMPLETED = "context_compaction_completed"
+    LIFECYCLE_HOOK_UPDATED = "lifecycle_hook_updated"
     COMPLETION_DECIDED = "completion_decided"
     VERIFICATION_COMPLETED = "verification_completed"
 
@@ -191,6 +192,7 @@ _RUNTIME_EVENTS = frozenset(
         EventType.INTERACTION_INVALIDATED,
         EventType.CONTEXT_COMPACTION_STARTED,
         EventType.CONTEXT_COMPACTION_COMPLETED,
+        EventType.LIFECYCLE_HOOK_UPDATED,
         EventType.COMPLETION_DECIDED,
         EventType.VERIFICATION_COMPLETED,
     }
@@ -281,6 +283,12 @@ class StreamEvent:
             if self.type is EventType.CONTEXT_COMPACTION_COMPLETED:
                 if required_string("status") not in {"completed", "failed", "cancelled", "outcome_unknown"}:
                     raise ValueError("unsupported compaction status")
+        elif self.type is EventType.LIFECYCLE_HOOK_UPDATED:
+            required_string("invocation_id")
+            required_string("hook_event")
+            required_string("hook_name")
+            required_string("target_id")
+            required_string("status")
         elif self.type is EventType.COMPLETION_DECIDED:
             required_string("proposal_item_id")
             if required_string("action") not in {"accept", "continue", "pause", "fail"}:

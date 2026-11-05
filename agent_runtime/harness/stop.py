@@ -14,8 +14,19 @@ from functools import partial
 from pathlib import Path
 from typing import Any, cast
 
+from agent_runtime.core.model_request import canonical_hash, freeze_json_mapping
 from agent_runtime.harness import completion_ops, turn_ops
-from agent_runtime.harness.operation_values import TurnChildrenPendingError, TurnInputChangedError
+from agent_runtime.harness.command_evidence import (
+    command_succeeded,
+    trusted_command_results,
+    trusted_tool_results,
+)
+from agent_runtime.harness.lifecycle import LifecycleHooks
+from agent_runtime.harness.operation_values import (
+    TurnCancellationPendingError,
+    TurnChildrenPendingError,
+    TurnInputChangedError,
+)
 from agent_runtime.harness.protocol import (
     CompletionDecision,
     CompletionGate,
@@ -26,26 +37,39 @@ from agent_runtime.harness.protocol import (
 from agent_runtime.harness.records import ItemSnapshot, ToolOperationSnapshot
 from agent_runtime.harness.runtime_store import RuntimeStore
 
+_BOUNDED_STOP_FEEDBACK = frozenset({"stop_hook_blocked", "stop_evidence_changed", "delivery_evidence_stale"})
 
 class StopChecks:
     def __init__(self, store: RuntimeStore) -> None:
         self._store = store
 
     def evaluate(self, proposal: CompletionProposal) -> CompletionDecision:
-        policy = self._store.read_turn(proposal.turn_id).binding_manifest.get("completion_policy", {})
-        if not isinstance(policy, Mapping):
-            return CompletionDecision(
-                "fail", "The frozen stop policy is invalid.", reason_code="invalid_completion_policy"
-            )
-        # Historical policies retain their explicit requirements, without reviving
-        # inferred verifier classification. Saved decisions/wire stay immutable.
-        return self._evaluate(proposal, policy)
+        return self.assess(proposal)[0]
 
-    def _evaluate(self, proposal: CompletionProposal, policy: Mapping[str, object]) -> CompletionDecision:
+    def assess(self, proposal: CompletionProposal) -> tuple[CompletionDecision, dict[str, Any]]:
+        policy = self._store.read_turn(proposal.turn_id).binding_manifest.get("completion_policy", {})
+        evidence: dict[str, Any] = {}
+        if not isinstance(policy, Mapping):
+            return (
+                CompletionDecision(
+                    "fail", "The frozen stop policy is invalid.", reason_code="invalid_completion_policy",
+                ),
+                evidence,
+            )
+        return self._evaluate(proposal, policy, evidence), evidence
+
+    def _evaluate(
+        self, proposal: CompletionProposal, policy: Mapping[str, object], evidence: dict[str, Any],
+    ) -> CompletionDecision:
         """Keep lifecycle, recorded mutations and user-selected acceptance distinct."""
         require_change = policy.get("require_workspace_change", False)
         raw_command = policy.get("acceptance_command")
         command = raw_command.strip() if isinstance(raw_command, str) else None
+        evidence.update(
+            require_workspace_change=require_change,
+            command=command,
+            command_status="not_evaluated" if command else "not_configured",
+        )
 
         def reject(code: str, message: str, **details: object) -> CompletionDecision:
             feedback = {"reason_code": code, "message": message, **details}
@@ -66,30 +90,10 @@ class StopChecks:
                 reason="The model turn ended; task acceptance was not evaluated.",
             )
 
-        records = self._trusted_results(proposal.turn_id)
-        launches: dict[str, tuple[ItemSnapshot, Mapping[str, object]]] = {}
-        command_results = []
-        for item, operation, arguments in sorted(records, key=lambda entry: entry[0].sequence):
-            output = item.payload.get("structured_content")
-            if not isinstance(output, Mapping):
-                continue
-            session_id = output.get("session_id")
-            if operation.tool_name == "run_command":
-                command_results.append((item, operation, arguments))
-                if isinstance(session_id, str) and operation.status == "succeeded":
-                    launches[session_id] = (item, arguments)
-            elif (
-                operation.tool_name == "manage_command"
-                and isinstance(session_id, str)
-                and arguments.get("session_id") == session_id
-                and session_id in launches
-                and output.get("status") in {"completed", "cancelled"}
-            ):
-                launch, original_arguments = launches[session_id]
-                if item.sequence > launch.sequence:
-                    command_results.append((item, operation, original_arguments))
-
         latest_change, result_order = self._workspace_change_order(proposal.turn_id)
+        evidence["workspace_change_item_id"] = next(
+            (item_id for item_id, order in result_order.items() if order == latest_change), None,
+        )
         if require_change and not latest_change:
             return reject(
                 "workspace_change_missing",
@@ -105,7 +109,7 @@ class StopChecks:
         turn = self._store.read_turn(proposal.turn_id)
         workspace = Path(self._store.read_thread(turn.thread_id).workspace).resolve()
         candidates = []
-        for item, operation, arguments in command_results:
+        for item, operation, arguments in trusted_command_results(self._store, proposal.turn_id):
             actual_command = arguments.get("command")
             if (
                 not isinstance(actual_command, str)
@@ -125,32 +129,31 @@ class StopChecks:
                 continue
             candidates.append((item, operation))
         if not candidates:
+            evidence["command_status"] = "missing"
             return reject(
                 "acceptance_command_missing",
                 "The configured acceptance command has no trusted execution in this workspace.",
                 next_action="Run command exactly with run_command from working_dir and inspect its result.",
             )
         item, operation = max(candidates, key=lambda pair: result_order[pair[0].item_id])
+        evidence.update(
+            result_item_id=item.item_id, operation_id=operation.operation_id, tool_call_id=operation.tool_call_id,
+        )
         result = item.payload.get("structured_content")
-        exit_code = result.get("exit_code") if isinstance(result, Mapping) else None
         if isinstance(result, Mapping) and result.get("status") == "running":
+            evidence["command_status"] = "pending"
             return reject(
                 "acceptance_command_pending",
                 "Observe the configured acceptance command with manage_command.",
                 tool_call_id=operation.tool_call_id,
                 session_id=result.get("session_id"),
             )
-        if (
-            operation.status != "succeeded"
-            or item.payload.get("is_error") is not False
-            or not isinstance(result, Mapping)
-            or not isinstance(exit_code, int)
-            or isinstance(exit_code, bool)
-            or exit_code != 0
-            or result.get("status") in {"running", "cancelled"}
-            or result.get("timed_out")
-            or result.get("sandbox_error")
+        if not isinstance(result, Mapping) or not command_succeeded(
+            operation_status=operation.status,
+            is_error=item.payload.get("is_error"),
+            output=result,
         ):
+            evidence["command_status"] = "failed"
             return reject(
                 "acceptance_command_failed",
                 "The latest configured acceptance command did not complete successfully.",
@@ -161,12 +164,14 @@ class StopChecks:
         # attested mutation is part of that check; a subsequent operation's
         # mutation still requires a fresh execution of the frozen command.
         if result_order[item.item_id] < latest_change:
+            evidence["command_status"] = "stale"
             return reject(
                 "acceptance_command_stale",
                 "The workspace changed after the configured acceptance command succeeded.",
                 tool_call_id=operation.tool_call_id,
                 next_action="Rerun command exactly with run_command from working_dir against the updated workspace.",
             )
+        evidence["command_status"] = "passed"
         return CompletionDecision(
             action="accept",
             reason="The configured acceptance command completed successfully after the latest workspace mutation.",
@@ -212,7 +217,7 @@ class StopChecks:
             (
                 result_order[item.item_id]
                 for current in family
-                for item, operation, _arguments in self._trusted_results(current)
+                for item, operation, _arguments in trusted_tool_results(self._store, current)
                 if item.item_id in result_order and _is_workspace_change(item, self._write_origin(item, operation))
             ),
             default=0,
@@ -240,65 +245,6 @@ class StopChecks:
                 return origin
         return operation
 
-    def _trusted_results(
-        self,
-        turn_id: str,
-    ) -> tuple[tuple[ItemSnapshot, ToolOperationSnapshot, Mapping[str, object]], ...]:
-        items = {item.item_id: item for item in self._store.list_items(turn_id)}
-        calls = {
-            item.payload.get("tool_call_id"): item
-            for item in items.values()
-            if item.kind == "tool_call" and item.status == "completed" and item.producer == "model"
-        }
-        trusted = []
-        for operation in self._store.list_tool_operations(turn_id):
-            if (
-                operation.status not in {"succeeded", "failed", "denied", "cancelled", "unknown"}
-                or operation.result_item_id is None
-            ):
-                continue
-            item = items.get(operation.result_item_id)
-            call = calls.get(operation.tool_call_id)
-            if (
-                item is None
-                or call is None
-                or item.kind != "tool_result"
-                or item.status != "completed"
-                or item.producer != "tool"
-                or call.payload.get("tool_name") != operation.tool_name
-                or item.payload.get("tool_name") != operation.tool_name
-                or item.payload.get("tool_call_id") != operation.tool_call_id
-                or item.sequence <= call.sequence
-                or not isinstance(call.payload.get("arguments"), Mapping)
-            ):
-                continue
-            trusted.append((item, operation, call.payload["arguments"]))
-        # A live owner can close while a Turn is paused. Its confirmed outcome
-        # remains available after process handles and the Session are gone.
-        launches = {
-            operation.operation_id: (item, operation, arguments)
-            for item, operation, arguments in trusted
-            if operation.tool_name == "run_command"
-        }
-        for item in items.values():
-            if item.kind != "tool_continuation" or item.producer != "runtime" or item.status != "completed":
-                continue
-            operation_id = item.payload.get("operation_id")
-            source = launches.get(operation_id) if isinstance(operation_id, str) else None
-            if source is None:
-                continue
-            launch, operation, arguments = source
-            initial = launch.payload.get("structured_content")
-            output = item.payload.get("structured_content")
-            if (
-                item.payload.get("source_result_item_id") == launch.item_id
-                and isinstance(initial, Mapping)
-                and isinstance(output, Mapping)
-                and item.payload.get("key") == initial.get("session_id") == output.get("session_id")
-                and output.get("status") in {"completed", "cancelled"}
-            ):
-                trusted.append((item, operation, arguments))
-        return tuple(trusted)
 
 
 def _is_workspace_change(item: ItemSnapshot, operation: ToolOperationSnapshot) -> bool:
@@ -325,11 +271,15 @@ class TurnStop:
         gate: CompletionGate,
         commit: Callable[[Callable[[], Any]], Awaitable[Any]],
         before_completion: Callable[[str], Awaitable[None]] | None = None,
+        lifecycle_hooks: LifecycleHooks | None = None,
+        dispatch_guard: Callable[[RuntimeStore], None] | None = None,
     ) -> None:
         self._store = store
         self._gate = gate
         self._commit = commit
         self._before_completion = before_completion
+        self._lifecycle_hooks = lifecycle_hooks
+        self._dispatch_guard = dispatch_guard
 
     async def finish(
         self,
@@ -340,18 +290,51 @@ class TurnStop:
         input_revision: int,
         source_item_id: str | None = None,
     ) -> TurnResult | None:
+        proposal: ItemSnapshot | None = None
+        hook_block: str | None = None
+        hook_evidence_revision: str | None = None
+
+        def prepare_proposal() -> tuple[ItemSnapshot, Mapping[str, Any] | None, bool] | None:
+            with self._store.tx.transaction():
+                item = self._proposal(
+                    turn_id, answer, input_revision, source_item_id,
+                    proposal_id=None if proposal is None else proposal.item_id,
+                )
+                if item is None:
+                    return None
+                items = self._store.list_items(turn_id)
+                prior = self._prior_decision(items, item.item_id)
+                if prior is not None and prior.payload["action"] != "accept":
+                    return item, None, False
+                binding = self._store.read_turn(turn_id).binding_manifest
+                if binding.get("lifecycle_hook_protocol") != "completion-evidence-v1":
+                    return item, None, True
+                _, evidence = self._review(item, items, include_hook_evidence=True)
+                return item, evidence, True
+
         def finish_atomically() -> TurnResult | None:
             # Evidence observation, decision, feedback/terminal transition share
             # one transaction. No accepted decision can be stranded before
             # completion while another owner appends a workspace mutation.
-            with self._store.tx.transaction():
-                return self._finish(
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    answer=answer,
-                    input_revision=input_revision,
-                    source_item_id=source_item_id,
+            try:
+                with self._store.tx.transaction():
+                    if proposal is not None and self._dispatch_guard is not None:
+                        self._dispatch_guard(self._store)
+                    return self._finish(
+                        thread_id=thread_id,
+                        turn_id=turn_id,
+                        answer=answer,
+                        input_revision=input_revision,
+                        source_item_id=source_item_id,
+                        hook_proposal_id=None if proposal is None else proposal.item_id,
+                        hook_block=hook_block,
+                        hook_evidence_revision=hook_evidence_revision,
+                    )
+            except TurnCancellationPendingError:
+                turn_ops.request_turn_cancellation(
+                    self._store, turn_id=turn_id, reason="Execution authority revoked before completion",
                 )
+                raise
 
         def pause_if_current(reason: str) -> TurnResult | None:
             with self._store.tx.transaction():
@@ -383,6 +366,21 @@ class TurnStop:
                         # whether any child should be stopped.
                         waiting.cancel()
                     await asyncio.gather(waiting, return_exceptions=True)
+            if self._lifecycle_hooks is not None and await self._store.run_async(
+                self._lifecycle_hooks.configured, turn_id, "Stop"
+            ):
+                prepared = await self._commit(prepare_proposal)
+                if prepared is None:
+                    return None
+                proposal, evidence, invoke_hook = prepared
+                hook_block = None
+                hook_evidence_revision = None if evidence is None else canonical_hash(evidence)
+                if invoke_hook:
+                    hook_block = await self._lifecycle_hooks.run(
+                        self._commit, "Stop", turn_id=turn_id, target_id=proposal.item_id,
+                        source_item_id=proposal.item_id, answer=proposal.payload["text"], input_revision=input_revision,
+                        completion=evidence, completion_revision=hook_evidence_revision,
+                    )
             try:
                 return cast(TurnResult | None, await self._commit(finish_atomically))
             except TurnChildrenPendingError as exc:
@@ -392,15 +390,11 @@ class TurnStop:
                 # transaction. Drain it and retry this same answer; do not ask
                 # the model to poll or regenerate an already received answer.
 
-    def _finish(
-        self,
-        *,
-        thread_id: str,
-        turn_id: str,
-        answer: str | None,
-        input_revision: int,
-        source_item_id: str | None = None,
-    ) -> TurnResult | None:
+    def _proposal(
+        self, turn_id: str, answer: str | None, input_revision: int, source_item_id: str | None,
+        *, proposal_id: str | None = None,
+    ) -> ItemSnapshot | None:
+        turn_ops._assert_no_pending_cancellation(self._store, turn_id)
         if self._store.user_input_revision(turn_id) != input_revision:
             return None
         delivery_id = None
@@ -411,72 +405,144 @@ class TurnStop:
             if submission is None:
                 return None
             answer, delivery_id = submission
-        items = self._store.list_items(turn_id)
-        proposal_item = next(
-            (
-                i
-                for i in items
-                if i.kind == "final_proposal"
-                and source_item_id is not None
-                and i.payload.get("source_item_id") == source_item_id
-            ),
-            None,
+        for item in self._store.list_items(turn_id):
+            if (
+                item.kind == "final_proposal"
+                and item.payload.get("source_item_id") == source_item_id
+                and item.payload.get("delivery_id") == delivery_id
+                and (source_item_id is not None or item.item_id == proposal_id)
+            ):
+                return item
+        return completion_ops.record_final_proposal(
+            self._store, turn_id=turn_id, answer=answer, source_item_id=source_item_id, delivery_id=delivery_id,
         )
-        if proposal_item is None:
-            proposal_item = completion_ops.record_final_proposal(
-                self._store,
-                turn_id=turn_id,
-                answer=answer,
-                source_item_id=source_item_id,
-                delivery_id=delivery_id,
-            )
-        proposal = CompletionProposal(
-            thread_id=thread_id,
-            turn_id=turn_id,
-            item_id=proposal_item.item_id,
-            answer=answer,
-        )
-        decision_item = next(
-            (
-                i
-                for i in reversed(items)
-                if i.kind == "completion_decision" and i.payload.get("proposal_item_id") == proposal.item_id
-            ),
-            None,
-        )
-        if decision_item is None or decision_item.payload.get("action") == "accept":
-            # Pre-upgrade records may contain an accept without a completed Turn.
-            # Recheck current evidence: a child or a command continuation could
-            # have changed the workspace while no parent owner was running.
-            from agent_runtime.harness.child_workspace_ops import unresolved
 
-            pending_artifacts = unresolved(self._store, turn_id, settled_only=True)
-            decision = (
-                CompletionDecision(
-                    action="continue", reason_code="child_integration_required",
-                    reason=json.dumps({"child_turn_ids": pending_artifacts,
-                        "next_action": (
-                            "Inspect and integrate each child artifact, run parent verification, or explicitly discard."
-                        )}),
-                ) if pending_artifacts else self._gate.evaluate(proposal)
+    @staticmethod
+    def _prior_decision(items: tuple[ItemSnapshot, ...], proposal_id: str) -> ItemSnapshot | None:
+        return next(
+            (
+                item for item in reversed(items)
+                if item.kind == "completion_decision" and item.payload.get("proposal_item_id") == proposal_id
+            ),
+            None,
+        )
+
+    def _review(
+        self, item: ItemSnapshot, items: tuple[ItemSnapshot, ...], *, include_hook_evidence: bool,
+    ) -> tuple[CompletionDecision, Mapping[str, Any]]:
+        from agent_runtime.harness.child_workspace_ops import unresolved
+
+        turn_id = item.turn_id
+        proposal = CompletionProposal(item.thread_id, turn_id, item.item_id, item.payload["text"])
+        pending_artifacts = unresolved(self._store, turn_id, settled_only=True)
+        acceptance = None
+        if pending_artifacts:
+            decision = CompletionDecision(
+                action="continue", reason_code="child_integration_required",
+                reason=json.dumps({
+                    "child_turn_ids": pending_artifacts,
+                    "next_action": (
+                        "Inspect and integrate each child artifact, run parent verification, or explicitly discard."
+                    ),
+                }),
             )
-            if decision.action == "continue" and (self._completion_continuation_limit_reached(turn_id)):
+        elif include_hook_evidence and isinstance(self._gate, StopChecks):
+            decision, acceptance = self._gate.assess(proposal)
+        else:
+            decision = self._gate.evaluate(proposal)
+        delivery_id = item.payload.get("delivery_id")
+        report = None
+        if (delivery_id is not None and decision.action == "accept") or (
+            include_hook_evidence and any(i.kind == "delivery_record" for i in items)
+        ):
+            from agent_runtime.harness import delivery
+
+            report = delivery.inspect(self._store, turn_id, include_live_evidence=include_hook_evidence)
+            if delivery_id is not None and decision.action == "accept" and report.get("freshness") == "stale":
+                decision = CompletionDecision(
+                    "continue",
+                    "Delivery evidence changed before completion. Record current evidence and resubmit.",
+                    reason_code="delivery_evidence_stale",
+                )
+        if not include_hook_evidence:
+            return decision, {}
+        stop_hook_continuations = sum(
+            i.kind == "completion_decision" and i.payload.get("reason_code") == "stop_hook_blocked" for i in items
+        )
+        evidence = freeze_json_mapping({
+            "input_revision": self._store.user_input_revision(turn_id),
+            "decision": {"action": decision.action, "reason_code": decision.reason_code, "reason": decision.reason},
+            "acceptance": acceptance,
+            "pending_child_turn_ids": pending_artifacts,
+            "stop_hook_active": stop_hook_continuations > 0,
+            "stop_hook_continuations": stop_hook_continuations,
+            "delivery": None if report is None else {
+                key: report[key] for key in (
+                    "delivery_id", "status", "freshness", "source_item_ids",
+                    "live_workspace", "receipt_evidence", "verified_scope",
+                ) if key in report
+            },
+        })
+        return decision, evidence
+
+    def _finish(
+        self,
+        *,
+        thread_id: str,
+        turn_id: str,
+        answer: str | None,
+        input_revision: int,
+        source_item_id: str | None = None,
+        hook_proposal_id: str | None = None,
+        hook_block: str | None = None,
+        hook_evidence_revision: str | None = None,
+    ) -> TurnResult | None:
+        proposal_item = self._proposal(
+            turn_id, answer, input_revision, source_item_id, proposal_id=hook_proposal_id,
+        )
+        if proposal_item is None or (hook_proposal_id is not None and proposal_item.item_id != hook_proposal_id):
+            return None
+        answer = proposal_item.payload["text"]
+        delivery_id = proposal_item.payload.get("delivery_id")
+        items = self._store.list_items(turn_id)
+        decision_item = self._prior_decision(items, proposal_item.item_id)
+        if decision_item is None or decision_item.payload.get("action") == "accept":
+            # Evaluate live facts again in the terminal transaction.
+            decision, evidence = self._review(
+                proposal_item, items, include_hook_evidence=hook_evidence_revision is not None,
+            )
+            applied_hook_revision = None
+            if decision.action == "accept":
+                if hook_evidence_revision is not None and canonical_hash(evidence) != hook_evidence_revision:
+                    decision = CompletionDecision(
+                        "continue",
+                        "Completion evidence changed during Stop. Check the current facts and propose again.",
+                        reason_code="stop_evidence_changed",
+                    )
+                else:
+                    applied_hook_revision = hook_evidence_revision
+                    if hook_block is not None:
+                        decision = CompletionDecision("continue", hook_block, reason_code="stop_hook_blocked")
+            bounded_across_batches = decision.reason_code in _BOUNDED_STOP_FEEDBACK
+            if decision.action == "continue" and self._completion_continuation_limit_reached(
+                turn_id, across_batches=bounded_across_batches
+            ):
                 decision = replace(
                     decision,
                     action="fail",
-                    reason_code="completion_continuation_limit",
-                    reason=(
-                        "Completion checks exhausted their consecutive continuation allowance without a tool "
-                        "exchange or new user input. The last check did not accept the result: " + decision.reason
+                    reason_code=(
+                        "stop_hook_continuation_limit" if bounded_across_batches else "completion_continuation_limit"
                     ),
+                    reason="Completion checks exhausted their continuation allowance. " + decision.reason,
                 )
             decision_item = completion_ops.record_completion_decision(
                 self._store,
                 turn_id=turn_id,
-                proposal_item_id=proposal.item_id,
+                proposal_item_id=proposal_item.item_id,
                 action=decision.action,
                 reason=decision.reason,
                 reason_code=decision.reason_code,
+                hook_evidence_revision=applied_hook_revision,
             )
         else:
             decision = CompletionDecision(
@@ -548,7 +614,7 @@ class TurnStop:
             answer=answer,
         )
 
-    def _completion_continuation_limit_reached(self, turn_id: str) -> bool:
+    def _completion_continuation_limit_reached(self, turn_id: str, *, across_batches: bool) -> bool:
         """Bound Stop feedback itself; tool exchanges are not proof of task progress."""
         policy = self._store.read_turn(turn_id).binding_manifest.get("completion_continuation_policy", {})
         if not isinstance(policy, Mapping) or policy.get("revision") != "bounded-v1":
@@ -559,6 +625,10 @@ class TurnStop:
         continuations = 0
         for item in reversed(self._store.list_items(turn_id)):
             if item.status != "completed":
+                continue
+            if across_batches:
+                if item.kind == "completion_decision" and item.payload.get("reason_code") in _BOUNDED_STOP_FEEDBACK:
+                    continuations += 1
                 continue
             if item.kind == "user_message" or (
                 item.kind == "model_response"

@@ -23,6 +23,7 @@ from agent_runtime.harness.context import validate_tool_history
 from agent_runtime.harness.events import commit_and_publish
 from agent_runtime.harness.execution import TurnRunner
 from agent_runtime.harness.execution_context import step_limit_from_binding
+from agent_runtime.harness.lifecycle import LifecycleHooks
 from agent_runtime.harness.operation_values import TurnCancellationPendingError
 from agent_runtime.harness.ownership import (
     OWNERSHIP_REVISION,
@@ -93,6 +94,7 @@ class Session:
     model_control_plane: ModelControlPlane | None
     context_manager: ContextManager
     completion_gate: CompletionGate
+    lifecycle_hooks: LifecycleHooks
     tool_router: ToolRouter | None
     tool_orchestrator: ToolOrchestrator | None
     tools: Mapping[str, Tool]
@@ -290,6 +292,7 @@ class Session:
                     ),
                 )
                 service_options.update(resource_options)
+                service_options["hooks"] = agent.hooks
             if model is None:
                 raise ValueError("Session requires a bound model")
             service_options.setdefault("enable_delivery_tools", agent is not None)
@@ -539,6 +542,7 @@ class Session:
             binding_provider=self.binding_provider,
             prepare_binding=self._prepare_step_binding,
             before_completion=self._drain_children,
+            lifecycle_hooks=self.lifecycle_hooks,
             dispatch_guard=self._guard_dispatch,
         )
         executor.attach_event_dispatcher(self.event_dispatcher)

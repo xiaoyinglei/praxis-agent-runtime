@@ -23,7 +23,7 @@ from agent_runtime.harness.protocol import (
     TurnResult,
     restore_model_response,
 )
-from agent_runtime.harness.records import ItemSnapshot
+from agent_runtime.harness.records import ItemSnapshot, ModelOperationSnapshot
 from agent_runtime.harness.runtime_store import RuntimeStore
 from agent_runtime.harness.stop import TurnStop
 from agent_runtime.harness.tool_orchestrator import (
@@ -97,6 +97,8 @@ class ResponseHandler:
                 response=response,
                 prepared=prepared,
             )
+            if response.status == "incomplete":
+                return handled  # Recovery settled the response with its decision.
             await self._commit(
                 lambda: response_handled(
                     self._store,
@@ -123,6 +125,8 @@ class ResponseHandler:
         )
         for call in response.tool_calls:
             if call.id in committed_results:
+                if self._tool_orchestrator is not None:
+                    await self._tool_orchestrator.notify_post_tool(turn_id, call.id)
                 continue
             tool_operation = tool_operations.get(call.id)
             if tool_operation is None:
@@ -170,6 +174,8 @@ class ResponseHandler:
                 or result_payload.get("tool_call_id") != call.id
             ):
                 raise RuntimeError("committed tool result linkage is malformed")
+            if self._tool_orchestrator is not None:
+                await self._tool_orchestrator.notify_post_tool(turn_id, call.id)
         token_budget = turn.binding_manifest.get("model_token_budget_total")
         if (
             token_budget is not None
@@ -239,41 +245,14 @@ class ResponseHandler:
         )
         source_item_id = source.response_item_id
         revision = await self._store.run_async(self._store.request_input_revision, turn_id, prepared.request_ref)
-        if revision != (await self._store.run_async(self._store.user_input_revision, turn_id)) and (
-            response.status == "incomplete" or not response.tool_calls
+        if response.status == "incomplete":
+            return await self._commit(
+                partial(self._recover_incomplete, source, response.incomplete_reason, revision)
+            )
+        if not response.tool_calls and (
+            revision != await self._store.run_async(self._store.user_input_revision, turn_id)
         ):
             return None
-        if response.status == "incomplete":
-            policy = await self._store.run_async(
-                lambda: self._store.read_turn(turn_id).binding_manifest.get("model_response_recovery", {})
-            )
-            # Count canonical committed outcomes, not process-local retries.
-            # One retry per Turn; summaries and unknown transport outcomes have
-            # separate recovery contracts. Every retry spends an ordinary step.
-            incomplete = await self._store.run_async(
-                lambda: sum(
-                    item.kind == "model_response" and item.payload.get("response_status") == "incomplete"
-                    for item in self._store.list_items(turn_id)
-                )
-            )
-            if (
-                isinstance(policy, Mapping)
-                and policy.get("revision") == "restart-step-v1"
-                and type(policy.get("max_retries")) is int
-                and policy["max_retries"] == 1
-                and response.incomplete_reason == "max_output_tokens"
-                and incomplete <= 1
-            ):
-                return None
-            return await self._fail_turn(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                reason_code="model_response_incomplete",
-                message=(
-                    f"Model returned an incomplete agent step: {response.incomplete_reason}; "
-                    "recovery unavailable or exhausted."
-                ),
-            )
         if response.tool_calls:
             if self._tool_orchestrator is None:
                 raise RuntimeError("model requested tools but no ToolOrchestrator exists")
@@ -329,6 +308,99 @@ class ResponseHandler:
             input_revision=revision,
             source_item_id=source_item_id,
         )
+
+    def _recover_incomplete(
+        self, source: ModelOperationSnapshot, reason: str | None, input_revision: int
+    ) -> TurnResult | None:
+        store = self._store
+        turn_id = source.turn_id
+        source_id = source.response_item_id
+        assert source_id is not None
+        with store.tx.transaction():
+            turn_ops._assert_no_pending_cancellation(store, turn_id)
+            if store.user_input_revision(turn_id) != input_revision:
+                response_handled(
+                    store,
+                    turn_id=turn_id,
+                    operation_id=source.operation_id,
+                    response_item_id=source_id,
+                    disposition="input_superseded",
+                )
+                return None
+            unavailable = self._output_recovery_limit(source, reason)
+            if unavailable is None:
+                policy = store.read_turn(turn_id).binding_manifest["model_response_recovery"]
+                if policy["revision"] == "split-step-v2":
+                    completion_ops.record_completion_feedback(
+                        store,
+                        turn_id=turn_id,
+                        source_item_id=source_id,
+                        reason_code="model_output_recovery",
+                        reason=(
+                            "The previous model step hit the output limit. Its partial output was discarded "
+                            "and no tools from it ran. Split the remaining work into smaller steps. "
+                            "Produce one complete next step with fewer or smaller tool calls, "
+                            "or a concise final answer if the task is already complete. "
+                            "Use committed history and do not repeat completed actions."
+                        ),
+                    )
+                response_handled(
+                    store,
+                    turn_id=turn_id,
+                    operation_id=source.operation_id,
+                    response_item_id=source_id,
+                    disposition="output_recovery",
+                )
+                return None
+            turn_ops.fail_turn(
+                store,
+                turn_id=turn_id,
+                reason_code="model_response_incomplete",
+                message=f"Model returned an incomplete agent step ({reason}): {unavailable}.",
+            )
+        return TurnResult(thread_id=source.thread_id, turn_id=turn_id, answer=None, status="failed")
+
+    def _output_recovery_limit(self, source: ModelOperationSnapshot, reason: str | None) -> str | None:
+        if reason != "max_output_tokens":
+            return "automatic recovery is only available for the output token limit"
+        store = self._store
+        turn_id = source.turn_id
+        policy = store.read_turn(turn_id).binding_manifest.get("model_response_recovery", {})
+        if not isinstance(policy, Mapping):
+            return "no supported frozen recovery policy"
+        limit = policy.get("max_retries")
+        if type(limit) is not int or limit < 1:
+            return "no frozen recovery allowance"
+        items = store.list_items(turn_id)
+        if policy.get("revision") == "restart-step-v1":
+            count = sum(
+                i.kind == "model_response" and i.payload.get("response_status") == "incomplete" for i in items
+            )
+            return "legacy Turn recovery allowance exhausted" if count > limit else None
+
+        turn_limit = policy.get("max_turn_recoveries")
+        if policy.get("revision") != "split-step-v2" or type(turn_limit) is not int or turn_limit < 1:
+            return "no supported frozen recovery policy"
+        grants = [
+            i for i in items
+            if i.kind == "completion_feedback" and i.payload.get("reason_code") == "model_output_recovery"
+        ]
+        if len(grants) >= turn_limit:
+            return "Turn output recovery allowance exhausted"
+
+        # A completed successful tool outcome or fresh user input makes the
+        # next step independent. Summaries and partial/failed calls do not.
+        successful = {
+            item_id for item_id, result in canonical_tool_results(store, turn_id)
+            if result.get("is_error") is False
+        }
+        progress = max(
+            (i.sequence for i in items if i.item_id in successful or i.kind == "user_message"),
+            default=0,
+        )
+        if sum(grant.sequence > progress for grant in grants) >= limit:
+            return "output limit persisted without a completed tool action or new user input"
+        return None
 
     async def _after_tool_batch(
         self,
