@@ -470,3 +470,69 @@ def test_explanation_sources_follow_trusted_read_effects_instead_of_tool_name(co
         answer="The observed source is recorded.",
     )
     assert saved["status"] == "verified", saved["next_actions"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("action", "acceptance"), [("record", None), ("submit", None), ("submit", "false")])
+async def test_public_delivery_can_publish_exact_reviewed_answer(tmp_path, monkeypatch, action, acceptance):
+    import hashlib
+
+    from agent_runtime import Agent
+    from agent_runtime.harness import HarnessModelResponse, ModelToolCall
+    from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "source.txt").write_text("original evidence\n")
+    database = tmp_path / "runtime.db"
+    answer = "The file contains original evidence.\n\nNo changes were needed."
+    different = "A regenerated final with different wording."
+    monkeypatch.setenv("PRAXIS_WORKTREE_ROOT", str(tmp_path / "trees"))
+
+    class ReviewModel(PatchThenAnswerModel):
+        async def dispatch(self, prepared, *, event_sink=None):
+            step = prepared.request_ref["request_id"].rsplit(":", 1)[-1]
+            calls = {
+                "1": ("record_delivery", {
+                    "action": "plan", "scope": ["Explain source"], "omissions": ["No files changed"],
+                }),
+                "2": ("read_file", {"path": "source.txt"}),
+                "3": ("record_delivery", {
+                    "action": action, "source_item_ids": ["read"], "review": "Checked the source against the answer",
+                    "answer": answer,
+                }),
+            }
+            if step not in calls:
+                return HarnessModelResponse.from_parts(text=different)
+            name, arguments = calls[step]
+            call_id = "read" if step == "2" else f"delivery-{step}"
+            return HarnessModelResponse.from_parts(tool_calls=(ModelToolCall(call_id, name, arguments),))
+
+    agent = Agent(workspace_path=workspace, checkpoint_db=database, enable_workspace_mcp=False)
+    monkeypatch.setattr(agent, "_model_factory", lambda: ReviewModel())
+    result = await agent.run("Explain what source.txt contains.", acceptance_command=acceptance, max_steps=4)
+    if acceptance:
+        assert result.status == "failed"
+        assert result.answer != answer
+        assert result.delivery["status"] == "unverified"
+        async with await RuntimeStore.open(database, read_only=True) as store:
+            items = await store.run_async(store.list_items, result.turn_id)
+        proposal = next(i for i in items if i.kind == "final_proposal")
+        decision = next(i for i in items if i.kind == "completion_decision")
+        assert proposal.payload["text"] == answer
+        assert decision.payload["proposal_item_id"] == proposal.item_id
+        assert decision.payload["reason_code"] == "acceptance_command_missing"
+        return
+    assert result.status == "done"
+    assert result.answer == (answer if action == "submit" else different)
+    assert result.delivery["status"] == ("verified" if action == "submit" else "unverified")
+    assert result.delivery["answer_sha256"] == hashlib.sha256(answer.encode()).hexdigest()
+    restored = await agent.read_result(result.turn_id)
+    assert restored.answer == result.answer
+    assert dict(restored.delivery) == dict(result.delivery)
+    if action == "submit":
+        (workspace / "source.txt").write_text("new evidence\n")
+        stale = await agent.read_result(result.turn_id)
+        assert stale.answer == answer
+        assert stale.delivery["status"] == "unverified"
+        assert stale.delivery["freshness"] == "stale"

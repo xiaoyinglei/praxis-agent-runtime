@@ -829,10 +829,10 @@ class ContextEngine:
                     ) as candidates:
                         async for bounded_candidate in candidates:
                             try:
-                                await accept(bounded_candidate)
+                                context, prepared = await accept(bounded_candidate)
                             except ContextBudgetExceededError:
                                 continue
-                            fitting_candidate = bounded_candidate
+                            fitting_candidate = bounded_candidate, context, prepared
                             break
                     if fitting_candidate is None:
                         if limit == 0:
@@ -842,10 +842,8 @@ class ContextEngine:
                         best = fitting_candidate
                         low = limit + 1
                 if best is not None:
-                    context, prepared = await accept(best)
-                    await self._commit(partial(manager.commit_compaction, best))
-                    if (await self._store.run_async(manager.build, turn.turn_id)) != best.messages:
-                        raise RuntimeError("Committed tool projection differs from the measured candidate.")
+                    candidate, context, prepared = best
+                    await commit_candidate(candidate, context)
                     return context, prepared
             retained = await self._store.run_async(manager.semantic_retained_tail, turn.turn_id)
             try:

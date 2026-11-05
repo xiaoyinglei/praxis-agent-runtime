@@ -279,7 +279,10 @@ def receive(store: RuntimeStore, envelope: Any) -> dict[str, Any]:
                 payload["text"] = text
                 if turn is not None and turn.status in {"completed", "failed", "cancelled"}:
                     source = host_ops.background_submission(store, turn_id)
-                    payload = {**dict(source.request), **payload, "previous_turn_id": turn_id, "files": []}
+                    execution = {
+                        key: source.request[key] for key in ("configuration", "options") if key in source.request
+                    }
+                    payload = {**execution, **payload, "previous_turn_id": turn_id, "files": []}
                     kind, turn_id = "start", "turn_channel_" + key
                 elif turn is not None and turn.status != "running":
                     raise ValueError("paused target requires explicit response to its current interaction")

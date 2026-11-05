@@ -118,6 +118,7 @@ async def test_adapter_rejects_end_turn_with_tool_blocks_before_runtime_executio
     from agent_runtime.core.messages import StopReason
     from agent_runtime.harness import GatewayHarnessModel, HarnessModelRequest, Session
     from agent_runtime.modeling.contracts import normalize_llm_usage
+    from agent_runtime.modeling.failures import ModelCallFailed
     from agent_runtime.modeling.gateway import AgentModelResponse
     from agent_runtime.modeling.openai_wire import serialize_openai_request
     from tests.agent.harness.test_model_adapter import _resolved_model
@@ -162,8 +163,11 @@ async def test_adapter_rejects_end_turn_with_tool_blocks_before_runtime_executio
             binding_manifest={},
         )
     )
-    with pytest.raises(RuntimeError, match="end-turn.*tool calls"):
+    with pytest.raises(ModelCallFailed, match="end-turn.*tool calls") as caught:
         await model.dispatch(prepared)
+    assert caught.value.failure.kind == "protocol_error"
+    assert caught.value.failure.message == "Provider response violated the model protocol."
+    assert not caught.value.failure.retryable
 
     marker = tmp_path / "executed"
     tool = replace(_tool("write_file", schema={"type": "object"}), run=lambda _: marker.write_text("executed"))

@@ -463,3 +463,25 @@ async def test_host_failure_records_bounded_redacted_diagnostics(tmp_path, monke
         assert "[REDACTED]" in diagnostic["message"]
         assert len(diagnostic["traceback"]) <= 12
         assert secret not in json.dumps(state)
+
+
+@pytest.mark.anyio
+async def test_stop_during_claim_returns_unstarted_submission_to_queue(tmp_path, monkeypatch):
+    handle = await agent_at(tmp_path).start_background("inspect", input_id="during-stop", autostart=False)
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    original_claim = host_ops.claim_next
+
+    def claim(*args, **kwargs):
+        command = original_claim(*args, **kwargs)
+        if command is not None:
+            loop.call_soon_threadsafe(stop.set)
+        return command
+
+    monkeypatch.setattr(host_ops, "claim_next", claim)
+    async with BackgroundHost(handle.database, model=SmallAnswerModel()) as host:
+        await asyncio.wait_for(host.serve(stop=stop), 3)
+        assert not host._drivers
+        state = await handle.status()
+        assert state["queue_status"] == "pending"
+        assert state["status"] is None

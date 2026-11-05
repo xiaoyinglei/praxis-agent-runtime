@@ -74,6 +74,10 @@ class _GatewayDispatch:
     stage: LLMCallStage = LLMCallStage.AGENT_STEP
 
 
+class _ResponseProtocolError(RuntimeError):
+    """A fixed diagnostic from this adapter's response validation."""
+
+
 class GatewayHarnessModel:
     """Prepare canonical bytes synchronously; perform provider I/O only in dispatch."""
 
@@ -423,27 +427,27 @@ class GatewayHarnessModel:
             raise ModelCallFailed(classify_model_failure(exc, output_started=bool(stream_state.outputs))) from None
         try:
             if response.provider_wire_hash != payload.wire_hash:
-                raise RuntimeError("provider wire changed between prepare and dispatch")
+                raise _ResponseProtocolError("provider wire changed between prepare and dispatch")
+            turn = response.turn
+            incomplete = response.stop_reason in {StopReason.MAX_TOKENS, StopReason.INCOMPLETE}
+            if not incomplete:
+                if response.stop_reason is StopReason.TOOL_USE and not turn.tool_calls:
+                    raise _ResponseProtocolError("tool-use stop reason did not include tool calls")
+                if response.stop_reason is StopReason.END_TURN and any(
+                    output.kind == "tool_call" for output in response.outputs
+                ):
+                    raise _ResponseProtocolError("end-turn response unexpectedly included tool calls")
+                if not turn.text.strip() and not turn.tool_calls:
+                    raise _ResponseProtocolError("model returned neither text nor tool calls")
             if event_sink is not None:
                 if not stream_state.started:
                     await _emit_complete_model_response(forward_event, response)
                 if not stream_state.completed:
                     raise ConnectionError("model stream ended without a terminal response")
                 if stream_state.outputs != response.outputs:
-                    raise RuntimeError("model stream output snapshots disagree with the terminal response")
+                    raise _ResponseProtocolError("model stream output snapshots disagree with the terminal response")
                 if stream_state.provider_response_id != response.provider_response_id:
-                    raise RuntimeError("model stream response identity disagrees with the terminal response")
-            turn = response.turn
-            incomplete = response.stop_reason in {StopReason.MAX_TOKENS, StopReason.INCOMPLETE}
-            if not incomplete:
-                if response.stop_reason is StopReason.TOOL_USE and not turn.tool_calls:
-                    raise RuntimeError("tool-use stop reason did not include tool calls")
-                if response.stop_reason is StopReason.END_TURN and any(
-                    output.kind == "tool_call" for output in response.outputs
-                ):
-                    raise RuntimeError("end-turn response unexpectedly included tool calls")
-                if not turn.text.strip() and not turn.tool_calls:
-                    raise RuntimeError("model returned neither text nor tool calls")
+                    raise _ResponseProtocolError("model stream response identity disagrees with the terminal response")
             result = HarnessModelResponse(
                 provider_response_id=response.provider_response_id,
                 usage=_priced_usage_payload(response.usage.model_dump(mode="json"), resolved),
@@ -468,6 +472,11 @@ class GatewayHarnessModel:
                     stop_reason=result.stop_reason,
                 )
             return result
+        except _ResponseProtocolError as exc:
+            raise ModelCallFailed(
+                classify_model_failure(exc, output_started=bool(stream_state.outputs)),
+                validation_message=str(exc),
+            ) from None
         except Exception as exc:
             raise ModelCallFailed(classify_model_failure(exc, output_started=bool(stream_state.outputs))) from None
 

@@ -11,6 +11,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+from collections.abc import Callable, Mapping
 from contextlib import closing
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -19,7 +20,14 @@ if TYPE_CHECKING:
     from agent_runtime.harness.rollout import RolloutStore
 
 
-def backup_store(store: RolloutStore, destination: Path) -> Path:
+def backup_store(
+    store: RolloutStore,
+    destination: Path,
+    *,
+    validate: Callable[[Path], None] | None = None,
+    expected_manifest: Mapping[str, object] | None = None,
+    source_database: Path | None = None,
+) -> Path:
     """Copy a pinned database snapshot and its referenced blobs, then publish once.
 
     The destination's parent must exist. Existing destinations are never replaced,
@@ -75,8 +83,6 @@ def backup_store(store: RolloutStore, destination: Path) -> Path:
                     )
                     copied[digest] = size
 
-            with database.open("rb") as stream:
-                os.fsync(stream.fileno())
             manifest = {
                 "format": "praxis-rollout-backup",
                 "format_version": 1,
@@ -87,6 +93,16 @@ def backup_store(store: RolloutStore, destination: Path) -> Path:
                 "artifact_count": artifact_count,
                 "blob_count": len(copied),
             }
+            if expected_manifest is not None and manifest != {
+                key: value for key, value in expected_manifest.items() if key != "source_database"
+            }:
+                raise RuntimeError("backup manifest does not match the SQLite snapshot and artifacts")
+            if source_database is not None:
+                manifest["source_database"] = str(source_database)
+            if validate is not None:
+                validate(database)
+            with database.open("rb") as stream:
+                os.fsync(stream.fileno())
             with (temporary / "manifest.json").open("x", encoding="utf-8") as stream:
                 json.dump(manifest, stream, ensure_ascii=False, sort_keys=True)
                 stream.write("\n")

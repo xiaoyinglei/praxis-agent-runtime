@@ -22,6 +22,16 @@ def test_default_dependency_profile_preserves_agent_data_capabilities_without_ra
     assert {"mlx-lm", "transformers"} <= extras["local-mlx"]
 
 
+def test_local_mlx_dependencies_are_selected_only_on_apple_silicon() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+    for requirement in project["optional-dependencies"]["local-mlx"]:
+        marker = Requirement(requirement).marker
+        assert marker is not None
+        assert marker.evaluate({"sys_platform": "darwin", "platform_machine": "arm64"})
+        assert not marker.evaluate({"sys_platform": "darwin", "platform_machine": "x86_64"})
+        assert not marker.evaluate({"sys_platform": "linux", "platform_machine": "aarch64"})
+
+
 def test_reduced_server_profile_is_covered_by_default_locked_export() -> None:
     lock = tomllib.loads((ROOT / "uv.lock").read_text())
     packages = {package["name"]: package for package in lock["package"]}

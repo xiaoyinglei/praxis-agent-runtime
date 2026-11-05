@@ -119,9 +119,11 @@ class ModelFailure:
 class ModelCallFailed(RuntimeError):  # noqa: N818 - public failure contract
     """One provider attempt failed, carrying only safe serializable facts."""
 
-    def __init__(self, failure: ModelFailure) -> None:
+    def __init__(self, failure: ModelFailure, *, validation_message: str | None = None) -> None:
+        # Only use a validation message defined by our code. The durable failure
+        # always derives its own message, independent of exception diagnostics.
         self.failure = failure
-        super().__init__(failure.message)
+        super().__init__(validation_message or failure.message)
 
 
 def _identifier(value: object) -> str | None:

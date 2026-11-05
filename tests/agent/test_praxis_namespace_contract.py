@@ -67,6 +67,7 @@ def test_distribution_and_console_entrypoint_use_praxis_namespace() -> None:
     assert config["tool"]["hatch"]["build"]["targets"]["wheel"]["force-include"] == {
         "configs/agent-models.yaml": "agent_runtime/_data/models.yaml",
         "configs/model-catalog.yaml": "agent_runtime/_data/model-catalog.yaml",
+        "configs/models.yaml": "rag/_data/models.yaml",
     }
 
 

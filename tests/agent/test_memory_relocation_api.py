@@ -4,6 +4,7 @@ import asyncio
 import json
 from pathlib import Path
 
+import click
 import pytest
 from typer.testing import CliRunner
 
@@ -213,7 +214,7 @@ def test_cli_reports_missing_source_option_and_stale_revision(tmp_path: Path) ->
     common = ["--workspace", str(new), "--checkpoint-db", str(database)]
     missing = runner.invoke(agent_app, ["memory", "relocate", *common])
     assert missing.exit_code != 0
-    assert "--from-workspace" in missing.output
+    assert "--from-workspace" in click.unstyle(missing.output)
     stale = runner.invoke(
         agent_app,
         ["memory", "relocate", "--from-workspace", str(old), "--expected-version", str(memory["version"] - 1), *common],

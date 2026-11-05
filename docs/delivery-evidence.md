@@ -18,8 +18,10 @@ Python 可用 `await agent.read_result(turn_id)` 重新计算当前新鲜度。�
 
 1. `record_delivery(action="plan", scope=[...], commands=[精确命令], omissions=[省略理由])` 声明范围及验证计划。SDK 对应 `await session.delivery.plan(turn_id, scope=..., commands=..., omissions=...)`。
 2. 使用原来的 `run_command` 执行检查，添加 `verification_mode` 与 `verification_dependencies`。
-3. `record_delivery(action="record", tool_call_ids=[...], review="最终审查结论与覆盖范围")`，SDK 对应 `await session.delivery.record(turn_id, ...)`。指定旧成功不能隐藏相同精确命令的后续失败。
-4. 自然 final 结束执行。未记录交付声明时，宿主仍保存最终版本与 diff，诚实显示未验证。重新读取时核对文件、计划、需求版本、依赖、未决执行和所引用 artifacts；旧证据保留，不洗成成功。
+3. 工作仍在进行时，用 `record_delivery(action="record", tool_call_ids=[...], review="审查结论与覆盖范围")` 保存证据。SDK 对应 `await session.delivery.record(turn_id, ...)`。指定旧成功不能隐藏相同精确命令的后续失败。
+4. 准备交付时，用 `record_delivery(action="submit", tool_call_ids=[...], review="最终审查结论与覆盖范围", answer="用户应收到的完整最终回答")`。宿主读取该次工具调用的确切文本作为最终提案，沿用正常的完成检查和输入版本校验。CLI 和 SDK 的 Agent 入口共用这条路径。自然 final 也可以结束执行，若与已记录的回答不一致，交付显示 `unverified`。
+
+未记录交付声明时，宿主仍保存最终版本与 diff。重新读取时核对文件、计划、需求版本、依赖、未决执行和所引用的 artifacts，保留旧证据供追查。
 
 `record_delivery` 的工具文档是 ACI 合同，不授予权限。没有显式命令时，主代理依据仓库和需求自行制定计划；没有检查不等于通过。检查失败可修复后重跑，最新成功且版本一致后恢复证明。
 

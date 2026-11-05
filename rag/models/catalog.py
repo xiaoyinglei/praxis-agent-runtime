@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,7 @@ _DEFAULT_CATALOG_PATH = "configs/models.yaml"
 
 
 class ModelCatalog:
-    """Loads model definitions from configs/models.yaml.
+    """Loads model definitions from a workspace or the bundled catalog.
 
     This is the ONLY module that reads models.yaml.
     Business code MUST NOT construct a ModelCatalog directly —
@@ -40,12 +41,14 @@ class ModelCatalog:
         self._llm_stage_budgets = llm_stage_budgets
 
     @classmethod
-    def from_yaml(cls, path: str = _DEFAULT_CATALOG_PATH) -> ModelCatalog:
-        resolved = Path(path)
-        if not resolved.exists():
-            raise FileNotFoundError(f"Model catalog not found: {resolved}")
-        with resolved.open("r", encoding="utf-8") as handle:
-            data = yaml.safe_load(handle)
+    def from_yaml(cls, path: str | None = None) -> ModelCatalog:
+        resolved = Path(_DEFAULT_CATALOG_PATH if path is None else path)
+        source = files("rag").joinpath("_data", "models.yaml") if path is None and not resolved.exists() else resolved
+        try:
+            text = source.read_text(encoding="utf-8")
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"Model catalog not found: {source}") from exc
+        data = yaml.safe_load(text)
         if not isinstance(data, dict):
             raise ValueError(f"Invalid model catalog: expected a dict, got {type(data).__name__}")
         return cls._parse(data)

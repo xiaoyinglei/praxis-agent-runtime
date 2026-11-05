@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import hashlib
 import math
 import os
@@ -20,7 +19,7 @@ from agent_runtime.core.runtime_diagnostics import exception_diagnostic
 from agent_runtime.harness import RuntimeStore, Session, host_ops, turn_ops
 from agent_runtime.harness.execution_facts import adopt_execution_protocol
 from agent_runtime.harness.operation_values import TurnCancellationPendingError
-from agent_runtime.harness.ownership import ConversationBusyError
+from agent_runtime.harness.ownership import ConversationBusyError, acquire_background_owner
 from agent_runtime.harness.protocol import BoundHarnessModel
 from agent_runtime.harness.recovery import ContinuationKind, recovery_plan
 from agent_runtime.permission_policy import ResolvedPermissions, relocate_workspace_permissions
@@ -50,12 +49,7 @@ class BackgroundHost:
 
     async def __aenter__(self) -> Self:
         self.database.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = os.open(str(self.database) + ".host.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-        try:
-            fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            os.close(self._lock)
-            raise RuntimeError("a background host already owns this database") from None
+        self._lock = acquire_background_owner(self.database)
         try:
             self.store = await RuntimeStore.open(self.database)
             report = await self.store.run_async(self.store.verify)
@@ -161,18 +155,25 @@ class BackgroundHost:
                     result={"reason": "workspace_offline"}, retry_after=5,
                 )
                 return
+            source_database = Path(configuration["agent"]["checkpoint_db"])
+            origins = await self.store.run_async(self.store.persistence.database_origins)
+            if source_database != self.database:
+                if source_database not in origins:
+                    raise ValueError("background configuration names a different runtime database")
+                configuration = {
+                    **configuration, "agent": {**configuration["agent"], "checkpoint_db": str(self.database)},
+                }
             agent = restore_configuration(configuration)
-            if agent._harness_database() != self.database:
-                raise ValueError("background configuration names a different runtime database")
             if agent.workspace_path != Path(thread.workspace):
                 raise PermissionError("background configuration crosses workspace boundary")
             if self.model is not None:
                 model = self.model
                 agent._model_factory = lambda: model
             options = dict(request["options"])
-            private = tuple(str(self.database) + suffix for suffix in (
-                "", "-wal", "-shm", ".artifacts", ".locks", ".host.lock", ".host.log"
-            ))
+            private = tuple(
+                str(database) + suffix for database in (self.database, *origins)
+                for suffix in ("", "-wal", "-shm", ".artifacts", ".locks", ".host.lock", ".host.log")
+            )
             ceiling = ceiling.model_copy(update={
                 "private_paths": tuple(dict.fromkeys((*ceiling.private_paths, *private)))
             })
@@ -373,28 +374,43 @@ class BackgroundHost:
             # A channel failure must not cancel independent coding drivers.
             await self.store.run_async(record_diagnostic, self.store, 'channel_lane', type(error).__name__)
 
-    async def tick(self) -> None:
-        if self._closing:
+    async def _stop_admission(self, stop: asyncio.Event | None, claim: host_ops.HostCommand | None = None) -> bool:
+        if not self._closing and (stop is None or not stop.is_set()):
+            return False
+        if claim is not None:
+            await self.store.run_async(
+                host_ops.settle_command, self.store, claim, status="pending", result={"reason": "host_stopping"},
+            )
+        return True
+
+    async def tick(self, *, stop: asyncio.Event | None = None) -> None:
+        if await self._stop_admission(stop):
             return
         if self._channel_task is None or self._channel_task.done():
             if self._channel_task is not None:
                 self._channel_task.result() if not self._channel_task.cancelled() else None
             self._channel_task = asyncio.create_task(self._channels())
         for _ in range(64):
+            if await self._stop_admission(stop):
+                return
             control = await self.store.run_async(
                 host_ops.claim_next, self.store, owner=self.owner, control=True, lease_seconds=self.lease_seconds
             )
             if control is None:
                 break
+            if await self._stop_admission(stop, control):
+                return
             await self._control(control)
         for command_id, task in tuple(self._drivers.items()):
             if task.done():
                 task.result() if not task.cancelled() else None
                 self._drivers.pop(command_id)
                 self._workspaces.pop(command_id)
+        if await self._stop_admission(stop):
+            return
         await self.store.run_async(host_ops.enqueue_wakeups, self.store)
         for _ in range(self.concurrency * 2):
-            if len(self._drivers) >= self.concurrency:
+            if len(self._drivers) >= self.concurrency or await self._stop_admission(stop):
                 break
             claim = await self.store.run_async(
                 host_ops.claim_next, self.store, owner=self.owner, lease_seconds=self.lease_seconds,
@@ -403,6 +419,8 @@ class BackgroundHost:
             if claim is None:
                 break
             workspace = (await self.store.run_async(self.store.read_thread, claim.thread_id)).workspace
+            if await self._stop_admission(stop, claim):
+                return
             if workspace in self._workspaces.values():
                 await self.store.run_async(
                     host_ops.settle_command, self.store, claim, status="pending",
@@ -415,7 +433,9 @@ class BackgroundHost:
     async def serve(self, *, stop: asyncio.Event | None = None, idle_timeout: float | None = 60) -> None:
         idle_since = time.monotonic()
         while stop is None or not stop.is_set():
-            await self.tick()
+            await self.tick(stop=stop)
+            if stop is not None and stop.is_set():
+                return
             commands = await self.store.run_async(host_ops.list_commands, self.store)
             pending = any(c.status in {"pending", "claimed"} for c in commands)
             from agent_runtime.harness import channel_ops

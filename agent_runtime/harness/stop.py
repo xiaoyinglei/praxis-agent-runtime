@@ -336,7 +336,7 @@ class TurnStop:
         *,
         thread_id: str,
         turn_id: str,
-        answer: str,
+        answer: str | None,
         input_revision: int,
         source_item_id: str | None = None,
     ) -> TurnResult | None:
@@ -397,12 +397,20 @@ class TurnStop:
         *,
         thread_id: str,
         turn_id: str,
-        answer: str,
+        answer: str | None,
         input_revision: int,
         source_item_id: str | None = None,
     ) -> TurnResult | None:
         if self._store.user_input_revision(turn_id) != input_revision:
             return None
+        delivery_id = None
+        if answer is None:
+            from agent_runtime.harness import delivery
+
+            submission = delivery.submitted_answer(self._store, turn_id, source_item_id) if source_item_id else None
+            if submission is None:
+                return None
+            answer, delivery_id = submission
         items = self._store.list_items(turn_id)
         proposal_item = next(
             (
@@ -420,6 +428,7 @@ class TurnStop:
                 turn_id=turn_id,
                 answer=answer,
                 source_item_id=source_item_id,
+                delivery_id=delivery_id,
             )
         proposal = CompletionProposal(
             thread_id=thread_id,
@@ -529,7 +538,7 @@ class TurnStop:
                 turn_id=turn_id,
                 answer=answer,
                 expected_input_revision=input_revision,
-                source_item_id=source_item_id,
+                source_item_id=source_item_id if delivery_id is None else None,
             )
         except TurnInputChangedError:
             return None

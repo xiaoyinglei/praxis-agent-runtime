@@ -25,7 +25,7 @@ def resolve_runtime_config(
     overrides: RuntimeOverrides | None = None,
     *,
     catalog: ModelCatalog | None = None,
-    catalog_path: str = "configs/models.yaml",
+    catalog_path: str | None = None,
 ) -> ModelRuntimeConfig:
     """Single entry point for model selection.
 

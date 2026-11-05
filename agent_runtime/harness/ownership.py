@@ -28,6 +28,19 @@ class ConversationRecoveryRequiredError(ValueError):
     """An uncertain tool effect must be reconciled before a new Turn."""
 
 
+def acquire_background_owner(database: Path) -> int:
+    """Take the local host lock until the caller closes the returned descriptor."""
+    descriptor = os.open(str(database.resolve()) + ".host.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException as error:
+        os.close(descriptor)
+        if isinstance(error, BlockingIOError):
+            raise RuntimeError("a background host already owns this database") from None
+        raise
+    return descriptor
+
+
 @contextmanager
 def execution_owner(database: Path, thread_id: str) -> Iterator[None]:
     """Hold a nonblocking per-Thread lock; process exit releases it automatically.

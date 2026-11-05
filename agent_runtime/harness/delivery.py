@@ -16,6 +16,7 @@ from typing import Any
 from uuid import uuid4
 
 from agent_runtime.harness import artifact_ops, facts, turn_ops
+from agent_runtime.harness.protocol import item_text, restore_model_response
 from agent_runtime.harness.runtime_store import RuntimeStore, owner_operation
 from agent_runtime.workspace_snapshot import (
     archive_tree,
@@ -27,6 +28,7 @@ from agent_runtime.workspace_snapshot import (
 from agent_runtime.worktrees import WorktreeManager
 
 REVISION = "delivery-v1"
+_TOOL_REVISION = "builtin-record-delivery-v2"
 
 
 def _append(store: RuntimeStore, turn_id: str, kind: str, payload: dict[str, Any]) -> str:
@@ -523,9 +525,15 @@ def _assess(store: RuntimeStore, turn_id: str, value: dict[str, Any]) -> dict[st
             and current_plan["omissions"]
         ):
             reasons.append("Record source evidence and answer coverage, or run applicable verification.")
-    proposal = next((i for i in reversed(store.list_items(turn_id)) if i.kind == "final_proposal"), None)
-    if value.get("answer_sha256") and proposal is not None:
-        if hashlib.sha256(proposal.payload["text"].encode()).hexdigest() != value["answer_sha256"]:
+    if value.get("answer_sha256"):
+        answer_item = (
+            store.read_turn_answer(turn_id)
+            if store.read_turn(turn_id).status == "completed"
+            else next((i for i in reversed(store.list_items(turn_id)) if i.kind == "final_proposal"), None)
+        )
+        if answer_item is not None and (
+            hashlib.sha256(item_text(answer_item).encode()).hexdigest() != value["answer_sha256"]
+        ):
             reasons.append("Final answer differs from the reviewed answer coverage; record a fresh review.")
     unresolved = [
         op.operation_id
@@ -585,6 +593,47 @@ def inspect(store: RuntimeStore, turn_id: str) -> dict[str, Any]:
     return _assess(store, turn_id, value)
 
 
+def submitted_answer(store: RuntimeStore, turn_id: str, response_id: str) -> tuple[str, str] | None:
+    """Resolve an explicit submission from a settled batch and its canonical evidence."""
+    response = store.read_item(response_id)
+    if response.turn_id != turn_id or response.kind != "model_response" or response.status != "completed":
+        return None
+    submissions = [
+        call
+        for call in restore_model_response(response.payload).tool_calls
+        if call.name == "record_delivery" and call.arguments.get("action") == "submit"
+    ]
+    if len(submissions) != 1:
+        return None
+    call = submissions[0]
+    answer = call.arguments.get("answer")
+    if not isinstance(answer, str) or not answer.strip():
+        return None
+    operation = next((op for op in store.list_tool_operations(turn_id) if op.tool_call_id == call.id), None)
+    if (
+        operation is None
+        or operation.execution_revision != _TOOL_REVISION
+        or operation.status != "succeeded"
+        or operation.result_item_id is None
+    ):
+        return None
+    result = store.read_item(operation.result_item_id)
+    output = result.payload.get("structured_content")
+    record = next((i for i in reversed(store.list_items(turn_id)) if i.kind == "delivery_record"), None)
+    if (
+        result.kind != "tool_result"
+        or result.producer != "tool"
+        or result.payload.get("is_error") is not False
+        or not isinstance(output, Mapping)
+        or record is None
+        or output.get("delivery_id") != record.item_id
+        or record.payload.get("input_revision") != store.user_input_revision(turn_id)
+        or record.payload.get("answer_sha256") != hashlib.sha256(answer.encode()).hexdigest()
+    ):
+        return None
+    return answer, record.item_id
+
+
 class DeliveryManager:
     """CLI/model and SDK share these owner-serialized delivery operations."""
 
@@ -629,7 +678,7 @@ def create_delivery_tool(manager: DeliveryManager) -> Any:
 
     class DeliveryInput(BaseModel):
         model_config = ConfigDict(extra="forbid")
-        action: Literal["plan", "record", "inspect"]
+        action: Literal["plan", "record", "submit", "inspect"]
         scope: list[str] = Field(default_factory=list)
         commands: list[str] = Field(default_factory=list)
         omissions: list[str] = Field(default_factory=list)
@@ -648,7 +697,9 @@ def create_delivery_tool(manager: DeliveryManager) -> Any:
             return await manager.plan(
                 turn_id, scope=payload.scope, commands=payload.commands, omissions=payload.omissions
             )
-        if payload.action == "record":
+        if payload.action in {"record", "submit"}:
+            if payload.action == "submit" and (not payload.answer or not payload.answer.strip()):
+                raise ValueError("submit requires the exact non-empty reviewed final answer")
             return await manager.record(
                 turn_id,
                 tool_call_ids=payload.tool_call_ids,
@@ -671,10 +722,12 @@ def create_delivery_tool(manager: DeliveryManager) -> Any:
             input_schema=schema,
             description=(
                 "Record versioned delivery evidence separately from ending a Turn. plan declares scope, exact "
-                "commands and omission reasons; run those via run_command verification_mode=snapshot; record "
-                "references their tool_call_ids and review. For unchanged explanation tasks, reference trusted "
-                "source tool result Item IDs (or call IDs), the exact final answer in answer, its coverage in review, "
-                "and explain omitted commands. A changed answer invalidates that review. "
+                "commands and omission reasons; run those via run_command verification_mode=snapshot. When ready "
+                "to finish, call submit once with the exact final answer in answer, tool_call_ids and review. "
+                "The runtime uses those exact words for the final proposal and applies normal completion checks. "
+                "Use record to save evidence while work continues. For unchanged explanation tasks, include trusted "
+                "source tool result Item IDs (or call IDs), review answer coverage, and explain omitted commands. "
+                "If you later write a different final answer, its review becomes invalid. "
                 "Missing evidence is unverified; failures/unknown are blocked. inspect rechecks freshness. "
                 "This records declared coverage, not automatic semantic correctness or permission."
             ),
@@ -684,7 +737,7 @@ def create_delivery_tool(manager: DeliveryManager) -> Any:
         normalize_output=normalize,
         static_effects=frozenset({ToolEffect.READ_WORKSPACE}),
         resolve_use=lambda _: ResolvedToolUse(effects=frozenset({ToolEffect.READ_WORKSPACE}), targets=()),
-        execution_revision="builtin-record-delivery-v1",
+        execution_revision=_TOOL_REVISION,
         idempotent=True,
         concurrency_safe=False,
         cancellation_mode=CancellationMode.COOPERATIVE,

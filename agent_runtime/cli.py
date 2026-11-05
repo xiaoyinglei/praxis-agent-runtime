@@ -3348,8 +3348,10 @@ def agent_watch(
 
 
 from agent_runtime.background_cli import background_app as _background_app  # noqa: E402
+from agent_runtime.maintenance_cli import rollout_app as _rollout_app  # noqa: E402
 
 agent_app.add_typer(_background_app, name="background")
+agent_app.add_typer(_rollout_app, name="rollout")
 
 
 @agent_app.command(name="delivery")
