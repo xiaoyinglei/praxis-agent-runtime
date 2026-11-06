@@ -729,7 +729,11 @@ class TerminalChatApp:
         if self._selection_start is None or self._selection_end is None:
             return None
         start, end = sorted((self._selection_start, self._selection_end), key=lambda p: (p.y, p.x))
-        return (start, end) if start != end else None
+        if start == end:
+            return None
+        # Mouse coordinates identify characters. Convert the last character
+        # to an exclusive boundary shared by highlighting and copying.
+        return start, Point(x=end.x + 1, y=end.y)
 
     def _selected_text(self) -> str:
         bounds = self._selection_bounds()
