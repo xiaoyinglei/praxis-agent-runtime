@@ -722,7 +722,8 @@ async def test_model_picker_fits_terminal_and_scrolls_after_resize():
                     pass
 
 
-def test_drag_selection_copies_unicode_without_toggling(monkeypatch):
+@pytest.mark.parametrize("start, end", [(0, 5), (5, 0)])
+def test_drag_selection_highlights_and_copies_both_endpoints(monkeypatch, start, end):
     from prompt_toolkit.data_structures import Point
     from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
     from prompt_toolkit.output import DummyOutput
@@ -735,15 +736,20 @@ def test_drag_selection_copies_unicode_without_toggling(monkeypatch):
     copied = []
     monkeypatch.setattr(ui, "_copy_text", copied.append)
     mouse = ui._handler(None, 0)
-    for kind, x in [(MouseEventType.MOUSE_DOWN, 0), (MouseEventType.MOUSE_MOVE, 5), (MouseEventType.MOUSE_UP, 5)]:
+    for kind, x in [
+        (MouseEventType.MOUSE_DOWN, start),
+        (MouseEventType.MOUSE_MOVE, end),
+        (MouseEventType.MOUSE_UP, end),
+    ]:
         mouse(MouseEvent(Point(x, 0), kind, MouseButton.LEFT, frozenset()))
-    assert copied == ["你好 Py"]
+    assert copied == ["你好 Pyt"]
+    assert "".join(text for style, text, *_ in ui.fragments() if "reverse" in style) == copied[0]
     mouse(MouseEvent(Point(9, 0), MouseEventType.MOUSE_MOVE, MouseButton.NONE, frozenset()))
-    assert ui._selected_text() == "你好 Py"
+    assert ui._selected_text() == copied[0]
 
 
 @pytest.mark.anyio
-async def test_vt100_drag_paste_and_native_mouse_toggle(monkeypatch):
+async def test_vt100_drag_replayed_command_paste_and_native_mouse_toggle(monkeypatch):
     import asyncio
     import io
 
@@ -754,27 +760,33 @@ async def test_vt100_drag_paste_and_native_mouse_toggle(monkeypatch):
     from agent_runtime.terminal_app import TerminalChatApp
 
     with create_pipe_input() as pipe:
-        output = Vt100_Output(io.StringIO(), lambda: Size(rows=24, columns=80), enable_cpr=True)
-        ui = TerminalChatApp(model="test", workspace="/tmp", input=pipe, output=output)
-        ui._mouse_enabled = True
-        ui.view.message("你好 Python", "notice")
+        output = Vt100_Output(io.StringIO(), lambda: Size(rows=24, columns=80), enable_cpr=False)
+        ui = TerminalChatApp(model="test", workspace="/tmp", input=pipe, output=output, ui_mode="fullscreen")
+        command = "echo 你好"
         copied = []
         monkeypatch.setattr(ui, "_copy_text", copied.append)
-        task = asyncio.create_task(ui.run(ui.prompt))
+
+        async def replay_and_prompt():
+            await ui.replay_messages([("user", command)])
+            await ui.prompt()
+
+        task = asyncio.create_task(ui.run(replay_and_prompt))
         try:
             async with asyncio.timeout(3):
                 while not ui.waiting or ui.app.renderer._last_screen is None:
                     await asyncio.sleep(.01)
-            pipe.send_text("\x1b[1;1R")
-            await asyncio.sleep(.03)
             ui.app._redraw()
             window = next(w for w in ui.app.layout.find_all_windows() if w.content is ui.body)
-            y, start = window.render_info._rowcol_to_yx[(0, 0)]
-            _, end = window.render_info._rowcol_to_yx[(0, 5)]
+            command_start = ui._plain_lines[0].index(command)
+            y, start = window.render_info._rowcol_to_yx[(0, command_start)]
+            _, end = window.render_info._rowcol_to_yx[(0, command_start + len(command) - 1)]
             y += ui.app.renderer.rows_above_layout
-            pipe.send_text(f"\x1b[<0;{start + 1};{y + 1}M\x1b[<32;{end + 1};{y + 1}M\x1b[<0;{end + 1};{y + 1}m")
-            await asyncio.sleep(.08)
-            assert copied == ["你好 Py"]
+            for target in (end, end + 3):
+                pipe.send_text(
+                    f"\x1b[<0;{start + 1};{y + 1}M\x1b[<32;{target + 1};{y + 1}M\x1b[<0;{target + 1};{y + 1}m"
+                )
+                await asyncio.sleep(.08)
+            assert copied == [command, command]
             pipe.send_text("\x1b[200~第一行\n第二行\x1b[201~")
             await asyncio.sleep(.05)
             assert ui.editor.text == "第一行\n第二行"
