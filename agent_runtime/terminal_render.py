@@ -685,6 +685,14 @@ class TerminalToolEventDisplay:
                 self._activity_status = "等待模型" if status != "retry_prepared" else "重试模型请求"
             elif status == "unknown":
                 self._activity_status = "模型结果待核对"
+        elif event.type is EventType.LIFECYCLE_HOOK_UPDATED:
+            status = event.data["status"]
+            label = f"{event.data['hook_event']} · {event.data['hook_name']}"
+            if status == "started":
+                self._activity_status = label
+            elif status not in {"allowed", "observed"} or self._verbose:
+                feedback = event.data.get("feedback") or status
+                self._write_runtime_notification(f"→ {label} · {feedback}")
         elif str(event.type) == "model_retry_scheduled":
             self._render_model_retry(event)
         elif event.type is EventType.TURN_CANCELLATION_REQUESTED:

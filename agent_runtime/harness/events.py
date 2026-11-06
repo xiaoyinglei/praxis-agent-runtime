@@ -61,6 +61,7 @@ _SUPPRESSED_ITEM_KINDS = frozenset(
         "context_summary_response",
         "compaction_job",
         "context_message",
+        "lifecycle_hook",
         "verification",
         "tool_continuation",
         "workspace_checkpoint",
@@ -604,6 +605,14 @@ class RolloutEventReader:
                 compaction_id=payload.get("item_id"),
                 status="completed" if payload.get("status", "success") == "success" else payload["status"],
             )
+        elif payload.get("kind") == "lifecycle_hook" and record.record_type in {"item_started", "item_completed"}:
+            event_type = EventType.LIFECYCLE_HOOK_UPDATED
+            data = {"invocation_id": payload["item_id"], "status": "started", **{
+                key: payload[key] for key in ("hook_event", "hook_name", "target_id", "completion_revision")
+                if key in payload
+            }}
+            if record.record_type == "item_completed":
+                data.update(payload["payload"])
         elif record.record_type == "item_completed" and payload.get("kind") == "completion_decision":
             event_type = EventType.COMPLETION_DECIDED
             body = payload.get("payload", {})
@@ -614,6 +623,7 @@ class RolloutEventReader:
                     "action",
                     "reason",
                     "reason_code",
+                    "hook_evidence_revision",
                 )
                 if key in body
             }

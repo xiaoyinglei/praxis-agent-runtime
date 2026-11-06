@@ -473,11 +473,20 @@ def test_explanation_sources_follow_trusted_read_effects_instead_of_tool_name(co
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(("action", "acceptance"), [("record", None), ("submit", None), ("submit", "false")])
-async def test_public_delivery_can_publish_exact_reviewed_answer(tmp_path, monkeypatch, action, acceptance):
+@pytest.mark.parametrize(
+    ("action", "acceptance", "stop_mode"),
+    [
+        ("record", None, None),
+        ("submit", None, None),
+        ("submit", "false", "allow"),
+        ("submit", None, "block"),
+        ("submit", None, "mutate"),
+    ],
+)
+async def test_public_delivery_can_publish_exact_reviewed_answer(tmp_path, monkeypatch, action, acceptance, stop_mode):
     import hashlib
 
-    from agent_runtime import Agent
+    from agent_runtime import Agent, HookDecision, LifecycleHook
     from agent_runtime.harness import HarnessModelResponse, ModelToolCall
     from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel
 
@@ -508,10 +517,61 @@ async def test_public_delivery_can_publish_exact_reviewed_answer(tmp_path, monke
             call_id = "read" if step == "2" else f"delivery-{step}"
             return HarnessModelResponse.from_parts(tool_calls=(ModelToolCall(call_id, name, arguments),))
 
-    agent = Agent(workspace_path=workspace, checkpoint_db=database, enable_workspace_mcp=False)
+    proposals = []
+    reviews = []
+
+    async def stop(request):
+        proposals.append(request.answer)
+        reviews.append(request)
+        if request.answer != answer:
+            return None
+        if stop_mode == "mutate":
+            (workspace / "source.txt").write_text("changed during Stop")
+        if stop_mode == "block":
+            return HookDecision(block=True, feedback="Revise the reviewed wording.")
+        return None
+
+    agent = Agent(
+        workspace_path=workspace,
+        checkpoint_db=database,
+        enable_workspace_mcp=False,
+        hooks=() if stop_mode is None else (LifecycleHook("Stop", "review", stop),),
+    )
     monkeypatch.setattr(agent, "_model_factory", lambda: ReviewModel())
     result = await agent.run("Explain what source.txt contains.", acceptance_command=acceptance, max_steps=4)
+    if stop_mode is not None:
+        reviewed = reviews[0]
+        assert reviewed.completion_revision
+        assert reviewed.completion["delivery"]["delivery_id"] == result.delivery["delivery_id"]
+        assert reviewed.completion["delivery"]["freshness"] == "current"
+        assert reviewed.completion["delivery"]["source_item_ids"]
+        if acceptance:
+            assert reviewed.completion["decision"]["reason_code"] == "acceptance_command_missing"
+        else:
+            assert reviewed.completion["decision"]["action"] == "accept"
+            assert reviewed.completion["delivery"]["status"] == "verified"
+    if stop_mode in {"block", "mutate"}:
+        assert proposals == [answer, different]
+        assert result.status == "done"
+        assert result.answer == different
+        assert result.delivery["status"] == "unverified"
+        async with await RuntimeStore.open(database, read_only=True) as store:
+            items = await store.run_async(store.list_items, result.turn_id)
+        decision = next(i for i in items if i.kind == "completion_decision")
+        assert decision.payload["reason_code"] == (
+            "stop_hook_blocked" if stop_mode == "block" else "delivery_evidence_stale"
+        )
+        if stop_mode == "mutate":
+            from agent_runtime.workspace_snapshot import git_bytes
+            from agent_runtime.worktrees import WorktreeManager
+
+            repository = WorktreeManager(workspace)._child_repository()
+            oid = git_bytes(repository, "hash-object", "--stdin", input=b"changed during Stop").decode().strip()
+            with pytest.raises(RuntimeError, match="cat-file"):
+                git_bytes(repository, "cat-file", "-e", oid)
+        return
     if acceptance:
+        assert proposals == [answer, different]
         assert result.status == "failed"
         assert result.answer != answer
         assert result.delivery["status"] == "unverified"
@@ -536,3 +596,62 @@ async def test_public_delivery_can_publish_exact_reviewed_answer(tmp_path, monke
         assert stale.answer == answer
         assert stale.delivery["status"] == "unverified"
         assert stale.delivery["freshness"] == "stale"
+
+
+@pytest.mark.anyio
+async def test_stop_discards_a_verdict_when_a_declared_dependency_changes(tmp_path, monkeypatch):
+    from agent_runtime import Agent, LifecycleHook, PathRule, PermissionPolicy
+    from agent_runtime.harness import HarnessModelResponse, ModelToolCall
+    from tests.agent.harness.test_lifecycle_hooks import ScriptModel
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "source.txt").write_text("source")
+    dependency = tmp_path / "dependency.txt"
+    dependency.write_text("original")
+    db = tmp_path / "run.db"
+    command_text = "/usr/bin/true"
+    model = ScriptModel([
+        HarnessModelResponse.from_parts(tool_calls=(ModelToolCall("plan", "record_delivery", {
+            "action": "plan", "scope": ["source"], "commands": [command_text],
+        }),)),
+        HarnessModelResponse.from_parts(tool_calls=(ModelToolCall("check", "run_command", {
+            "command": command_text, "verification_mode": "workspace",
+            "verification_dependencies": [str(dependency)],
+        }),)),
+        HarnessModelResponse.from_parts(tool_calls=(ModelToolCall("submit", "record_delivery", {
+            "action": "submit", "tool_call_ids": ["check"], "review": "Checked declared scope", "answer": "first",
+        }),)),
+        HarnessModelResponse.from_parts(text="revised"),
+    ])
+    reviews = []
+
+    async def stop(request):
+        reviews.append(request)
+        if request.answer == "first":
+            dependency.write_text("changed")
+
+    agent = Agent(
+        workspace_path=workspace, checkpoint_db=db, enable_workspace_mcp=False,
+        permissions=PermissionPolicy(filesystem=(PathRule(path=str(dependency), access="read"),)),
+        hooks=(LifecycleHook("Stop", "review", stop),),
+    )
+    monkeypatch.setattr(agent, "_model_factory", lambda: model)
+    result = await agent.run("Verify", acceptance_command=command_text, allow_execute_tools=True, max_steps=4)
+
+    assert result.answer == "revised"
+    before, after = reviews
+    assert before.completion["acceptance"]["command_status"] == "passed"
+    [receipt] = before.completion["delivery"]["receipt_evidence"]
+    assert receipt["status"] == "current"
+    assert receipt["source_result_item_id"] == before.completion["acceptance"]["result_item_id"]
+    assert receipt["verification_item_id"]
+    assert after.completion["delivery"]["freshness"] == "current"
+    assert after.completion["delivery"]["receipt_evidence"][0]["status"] == "unverified"
+    assert result.delivery["status"] == "unverified"
+    async with await RuntimeStore.open(db, read_only=True) as store:
+        items = await store.run_async(store.list_items, result.turn_id)
+        rejected, accepted = [i for i in items if i.kind == "completion_decision"]
+        assert rejected.payload["reason_code"] == "stop_evidence_changed"
+        assert accepted.payload["hook_evidence_revision"] == after.completion_revision
+        assert (await store.run_async(store.verify)).valid

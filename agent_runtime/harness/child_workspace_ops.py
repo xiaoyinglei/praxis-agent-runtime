@@ -13,7 +13,7 @@ from agent_runtime.harness import facts, turn_ops
 from agent_runtime.harness.runtime_store import RuntimeStore
 from agent_runtime.permission_policy import ResolvedPermissions, relocate_workspace_permissions
 from agent_runtime.tools.permissions import ToolExecutionContext, restore_tool_policy
-from agent_runtime.workspace_snapshot import capture_snapshot, working_entries
+from agent_runtime.workspace_snapshot import observe_snapshot, working_entries
 
 KIND = "child_workspace"
 
@@ -75,7 +75,7 @@ def unresolved(store: RuntimeStore, parent: str, *, settled_only: bool = False) 
         if environment["status"] == "integrated" and environment.get("verification") == "recorded":
             if current_tree is None:
                 workspace = Path(store.read_thread(store.read_turn(parent).thread_id).workspace)
-                current_tree = capture_snapshot(
+                current_tree = observe_snapshot(
                     workspace,
                     object_root=Path(environment["repository"]),
                     excluded=tuple(Path(p) for p in environment.get("excluded_paths", ())),
@@ -85,6 +85,7 @@ def unresolved(store: RuntimeStore, parent: str, *, settled_only: bool = False) 
                 object_root=Path(environment["repository"]),
                 paths=tuple(environment.get("changed_paths", ())),
                 include_directories=True,
+                write_objects=False,
             )
             if current_tree == environment.get("verified_tree") and current_entries == environment.get(
                 "verified_entries"

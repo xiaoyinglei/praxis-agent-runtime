@@ -34,6 +34,8 @@ def _policy(value: PermissionPolicy | Path | str | None) -> dict[str, Any] | str
 
 def freeze_configuration(agent: Agent) -> dict[str, Any]:
     """Snapshot choices and permission ceilings, without opening a model provider."""
+    if agent._hooks_explicit and agent.hooks:
+        raise ValueError("Background workers require command hooks configured through PRAXIS_HOOKS_CONFIG")
     plane = agent._get_model_control_plane()
     spec = plane.current_model()
     settings = agent.request_settings()
@@ -58,6 +60,7 @@ def freeze_configuration(agent: Agent) -> dict[str, Any]:
     }
     return {
         "agent": values, "ceiling": agent.effective_permissions().model_dump(mode="json"),
+        **({"hook_binding": [hook.binding() for hook in agent.hooks]} if agent.hooks else {}),
         "model_definition": plane.catalog.definition(spec.id).model_dump(mode="json"),
     }
 
@@ -84,7 +87,12 @@ def restore_configuration(configuration: Mapping[str, Any]) -> Agent:
     for name in ("permissions", "managed_permissions"):
         if isinstance(values.get(name), Mapping):
             values[name] = PermissionPolicy.model_validate_json(json.dumps(values[name]))
+    hook_binding = configuration.get("hook_binding", [])
+    if not hook_binding:
+        values["hooks"] = ()
     agent = Agent(**values)
+    if [hook.binding() for hook in agent.hooks] != hook_binding:
+        raise ValueError("queued hook configuration changed; submit with the intended host configuration")
     plane = agent._get_model_control_plane()
     if plane.catalog.definition(plane.current_model().id).model_dump(mode="json") != configuration["model_definition"]:
         raise ValueError("queued model definition changed; resubmit with the intended model configuration")

@@ -16,6 +16,7 @@ from agent_runtime.approval import MODE_ORDER, ApprovalMode
 from agent_runtime.harness import memory_ops, turn_ops
 from agent_runtime.harness.memory import MemoryConfig
 from agent_runtime.harness.protocol import item_text
+from agent_runtime.hooks import LifecycleHook, load_host_hooks, validate_hooks
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.models import (
     ModelControlPlane,
@@ -69,6 +70,7 @@ class Agent:
         approval_mode: ApprovalMode | None = None,
         reasoning_effort: str | None = None,
         max_output_tokens: int | None = None,
+        hooks: Sequence[LifecycleHook] | None = None,
         _selection_requester: ModelSwitchRequester = "system",
     ) -> None:
         if approval_mode is not None and approval_mode not in MODE_ORDER:
@@ -97,6 +99,13 @@ class Agent:
 
         workspace = Path.cwd() if workspace_path is None else Path(workspace_path)
         self.workspace_path = workspace.expanduser().resolve()
+        self._hooks_explicit = hooks is not None
+        hook_config = os.environ.get("PRAXIS_HOOKS_CONFIG")
+        self.hooks = (
+            validate_hooks(tuple(hooks)) if hooks is not None
+            else load_host_hooks(hook_config, self.workspace_path) if hook_config
+            else ()
+        )
         for value in (permissions, managed_permissions):
             if value is not None and not isinstance(value, (PermissionPolicy, Path, str)):
                 raise TypeError("permissions must be PermissionPolicy, a policy file path, or None")

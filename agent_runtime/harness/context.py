@@ -206,7 +206,7 @@ class RolloutContextManager:
         semantic_cut = _tool_safe_boundary(messages, first_uncertain)
         item_kinds = {item.item_id: item.kind for item in items}
         for index in range(len(projected) - 1, -1, -1):
-            if item_kinds.get(projected[index][0]) not in {"context_message", "completion_feedback"}:
+            if item_kinds.get(projected[index][0]) not in {"context_message", "completion_feedback", "lifecycle_hook"}:
                 break
             cut = min(cut, index)
             semantic_cut = min(semantic_cut, index)
@@ -806,6 +806,8 @@ def _item_message(
         response = restore_model_response(item.payload)
         outputs = response.outputs
         if item.payload.get("response_status") == "incomplete":
+            if item.payload.get("explicit_recovery_feedback") is True:
+                return None
             # Do not replay partial assistant text, reasoning, or a tool group
             # for which no execution/result exists. This also survives compaction.
             return ModelMessage(
@@ -837,6 +839,18 @@ def _item_message(
                 tool_call_id=result["tool_call_id"],
                 body=content if isinstance(content, str) else _json(dict(result)),
             )
+    if (
+        item.kind == "lifecycle_hook"
+        and item.producer == "runtime"
+        and item.payload.get("status") == "observed"
+        and item.payload.get("feedback")
+    ):
+        return ModelMessage(
+            role="context",
+            body="Host hook observation (separate from the tool result): " + _json({
+                key: item.payload[key] for key in ("hook_name", "source_item_id", "feedback")
+            }),
+        )
     if item.kind in {"completion_feedback", "context_message"} and isinstance(text, str):
         return ModelMessage(role="context", body=text)
     if item.kind == "tool_continuation" and item.producer == "runtime":

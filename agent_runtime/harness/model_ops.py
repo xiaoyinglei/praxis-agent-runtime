@@ -807,10 +807,14 @@ def complete_model_attempt(
                 **public_metadata,
             },
         )
-        result_order = (
-            store.read_turn(str(operation["turn_id"]))
-            .binding_manifest.get("execution_context_policy", {})
-            .get("tool_result_order")
+        binding = store.read_turn(str(operation["turn_id"])).binding_manifest
+        result_order = binding.get("execution_context_policy", {}).get("tool_result_order")
+        recovery = binding.get("model_response_recovery")
+        explicit_recovery_feedback = (
+            not internal_summary
+            and response.status == "incomplete"
+            and isinstance(recovery, Mapping)
+            and recovery.get("revision") == "split-step-v2"
         )
         facts.append_fact(
             store,
@@ -824,6 +828,7 @@ def complete_model_attempt(
                 **public_metadata,
                 "payload": {
                     **response_payload,
+                    **({"explicit_recovery_feedback": True} if explicit_recovery_feedback else {}),
                     **({"tool_result_order": "call-v1"} if result_order == "call-v1" else {}),
                 },
             },

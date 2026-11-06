@@ -666,6 +666,61 @@ asyncio.run(main())
 
 扩展沿用统一的工具权限、参数验证、审批、结果和事件记录。项目支持工作区 Skills、配置的 MCP 和受预算、权限约束的子智能体；它们是任务能力的扩展，不替代核心执行链路。具体接口以源码与公共测试为准，见[开发指南](development.md)。
 
+### 宿主生命周期 hooks
+
+Python 可在构造 Agent 时显式注册异步处理器。每个事件可注册多个不同名称的 hook，按注册顺序调用。修改实现时更新 `revision`，使已有 Turn 可以识别注册版本变化。
+
+```python
+from agent_runtime import Agent, HookDecision, HookRequest, LifecycleHook
+
+
+async def review(request: HookRequest) -> HookDecision | None:
+    if request.tool_name == "apply_patch":
+        return HookDecision(block=True, feedback="此宿主要求通过独立流程修改文件。")
+    return None
+
+
+agent = Agent(hooks=(LifecycleHook("PreToolUse", "patch-policy", review, tool_names=("apply_patch",)),))
+```
+
+| 事件 | 调用点 | 合同 |
+| --- | --- | --- |
+| `PreToolUse` | 参数通过解析和权限审批后，领取工具执行 claim 前 | 输入包含规范操作 ID、原调用参数、作用类别及 Runtime 记录的文件系统资源（绝对目标和读写类型）。重开后目标发生变化时，该调用会被拒绝，模型需重新提出。`block=True` 拒绝动作。Runtime 随后复核用户输入、执行权限与 claim。首次写入前的 checkpoint 也在此时保存，捕获失败会跳过。 |
+| `PostToolUse` | 真实执行结果或已确认的对账结果落盘后 | 输入包含规范结果 Item ID、只读结果与原操作记录的资源。`feedback` 作为独立上下文给模型；原工具结果保留。`block=True` 属于无效返回。 |
+| `Stop` | 自然最终答复或 `record_delivery(action="submit")` 形成提案并完成首轮验收检查后 | 输入包含提案 ID、回答、输入版本及只读 `completion` 事实。`block=True` 可拒绝结束并将反馈交给下一次模型请求。Runtime 在提交终态的事务里复核权限、输入、未决子任务和验收事实。每个 Turn 的 hook 拒绝与证据过期续跑共用 8 次额度。 |
+
+CLI 和后台宿主通过环境变量 `PRAXIS_HOOKS_CONFIG` 显式选中工作区之外的绝对 JSON 路径。示例配置如下，`argv[0]` 是工作区之外的绝对可执行文件。
+
+```json
+[
+  {
+    "event": "Stop",
+    "name": "review",
+    "argv": ["/absolute/path/to/review-command"],
+    "revision": "1",
+    "timeout_seconds": 5
+  }
+]
+```
+
+PreToolUse 和 PostToolUse 支持可选的 `tool_names` 与 `effects`，CLI JSON 使用数组，SDK
+使用元组。例如 `"effects": ["write_workspace"]` 在 Runtime 已解析出写入作用时触发。
+每个数组内任一项匹配即可，同时填写两种选择器时需要两者都命中。空数组表示该项不限。
+工具名精确匹配，匹配在启动处理器前完成，两个选择器随 Turn 冻结。
+
+Stop 的 `completion` 包含 Runtime 当前决定、显式验收命令状态和结果 Item ID、未集成的子产物、
+本 Turn 的 Stop 续跑状态，以及已记录交付的状态、新鲜度和命令收据引用。不存在交付记录时
+`completion.delivery` 为 `null`。收据引用包含规范结果 ID 和可用的验证 Item ID；
+依赖或工具链的变化可使收据失效，即使工作区树未改变。
+`completion_revision` 标识这份快照。终态事务按最新事实核对版本，变化时会要求模型基于最新事实
+重新提案。提案与证据版本相同的已结算 hook 在重开时复用，旧 Turn 沿用原 Stop 合同。
+
+命令在配置文件所在目录运行，经 stdin 读一行与 `HookRequest` 同字段的 JSON，经 stdout 返回 `{"block": true, "feedback": "请补充验证记录"}` 或以空 stdout 成功退出。宿主直接运行 argv，环境仅含系统默认 `PATH`。命令使用宿主权限，应由操作者控制配置、程序及其依赖。工作区规则和 Rollout 里的历史记录不能注册可执行程序。后台进程支持这套命令配置。SDK 的 `hooks=None` 沿用该环境配置；传入空元组可关闭。进程内 SDK 回调适用于当前 Python 宿主。
+
+最多注册 16 个 hook。反馈上限为 2 KiB UTF-8，命令 stdout 上限为 16 KiB。默认超时 5 秒，可在 30 秒内调整。SDK 回调需协作响应异步取消；宿主命令超时会清理进程组。PreToolUse 和 Stop 在处理器失败、超时、注册不可用或上次结果未知时拒绝当前动作。PostToolUse 记录诊断，工具结果继续可用。取消的工具调用不启动新的观察处理器。
+
+Hook 注册身份随 Turn 冻结，调用使用稳定的操作、结果或提案身份。已结算调用在恢复时复用；已开始但无结算记录的调用标记 `unknown`，由使用者检查外部副作用。每次调用的 `invocation_id` 可用作外部幂等键。SDK 事件流和 Rollout 回放提供 `lifecycle_hook_updated`。宿主回调在事务外运行；外部副作用的幂等性由处理器实现。
+
 ## 项目规则与执行收尾
 
 在工作区根目录放置 `AGENTS.md`，下一轮请求会自动加载。相同目录的 `AGENTS.override.md` 优先，空的 override 文件也会覆盖普通文件。根目录规则适用于工作区及其子目录；子目录可以提供更具体的同名规则，冲突时更深目录优先，用户明确指令优先于项目规则。
@@ -675,6 +730,8 @@ asyncio.run(main())
 子目录规则按文件工具的结构化目标、命令工作目录和声明的文件目标逐级发现。首次遇到尚未展示的规则，原动作会以 `project_instructions_required` 暂缓，下一次请求先展示规则，再由模型调整或重试动作。这也适用于直接写文件。运行在根目录的脚本如果间接访问其他子目录，Runtime 无法静态知道脚本的全部文件访问；需要显式指定相关工作目录或先读取对应目录的文件。项目规则是模型指导，不是文件系统权限的替代品。
 
 默认不设置固定执行步数上限。需要限制时，使用 CLI 的 `--max-steps`（旧名 `--max-turns`）或 SDK 的 `max_steps` 显式指定正整数；它限制每个 Turn 的普通模型决策轮数，一次决策可包含多个工具调用。该值在创建 Turn 时冻结，恢复只认原记录；缺少步数字段或值为 `None` 表示没有步数上限，不追加 16 或 128，也不使用当前 Session 的值压低原上限。达到显式上限仍未结束时失败并保留执行证据；没有步数预算时仍遵守已配置的 token、费用、上下文容量、取消和执行恢复约束，不编造剩余步数。
+
+已知模型输出上限触发的截断会保留用量和诊断，丢弃该次不完整输出与工具调用，并在下一次请求提示把剩余工作拆小。每个逻辑步骤最多恢复一次；成功结算工具结果或收到新用户输入后，后续步骤可使用剩余的 Turn 恢复次数。每个新 Turn 最多恢复三次，沿用现有的逐请求输出限额和普通步骤、token 及费用账本。内容过滤、未知原因、传输结果待核对和内部摘要沿各自的处理路径。已存在的 Turn 继续使用其冻结策略。
 
 子任务不再有独立的 50 步硬上限：未指定时继承父 Turn 的上限，可显式收紧；不能扩大父 Turn 已设置的上限。步数按各自 Turn 计数，token 和费用仍通过父任务持久分配共享，不能凭子任务参数创造额度。上下文摘要是内部维护请求，不消耗普通决策轮编号；其调用数由测得的摘要工作树限定，并与正常执行共享 token、费用以及续跑余量，不再另复制一份普通步数额度。已保存摘要计划中的明确次数和重试限制继续按原记录执行。
 

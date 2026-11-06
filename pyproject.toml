@@ -121,6 +121,8 @@ module = [
   "datasets",
   "mlx",
   "mlx.*",
+  "mlx_lm",
+  "mlx_lm.*",
   "ocrmac",
   "openpyxl",
   "openpyxl.*",

@@ -418,3 +418,77 @@ def test_real_streaming_protocol_discards_prefix_and_partial_tool_json(tmp_path)
         )
         assert completed[-1].status == ItemStatus.SUCCESS
         assert store.verify().valid
+
+
+@pytest.mark.parametrize(("truncations", "status", "calls"), [(2, "done", 4), (4, "failed", 7)])
+def test_successful_exchanges_reset_the_step_allowance_only(tmp_path, monkeypatch, truncations, status, calls):
+    from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel
+
+    class TruncationsWithProgress(TruncatedThenAnswer):
+        def prepare(self, request):
+            return replace(
+                super().prepare(request),
+                request_ref={**PatchThenAnswerModel().prepare(request).request_ref, "step": request.step},
+            )
+
+        async def dispatch(self, prepared, **kwargs):
+            step = prepared.request_ref["step"]
+            if step % 2 and step < truncations * 2:
+                return await TruncatedThenAnswer(repeat=True).dispatch(prepared)
+            if step < truncations * 2:
+                return HarnessModelResponse.from_parts(
+                    text="",
+                    provider_response_id=None,
+                    usage={"input_tokens": 8, "output_tokens": 3, "total_tokens": 11},
+                    tool_calls=(ModelToolCall(
+                        id=f"read-source-{step}",
+                        name="read_file",
+                        arguments={"path": "source.txt"},
+                    ),),
+                )
+            return await super().dispatch(prepared, **kwargs)
+
+    (tmp_path / "source.txt").write_text("source")
+    model = TruncationsWithProgress()
+    database = tmp_path / "run.db"
+    agent = Agent(workspace_path=tmp_path, checkpoint_db=database, enable_workspace_mcp=False)
+    monkeypatch.setattr(agent, "_model_factory", lambda: model)
+
+    result = asyncio.run(agent.run("Read the source and explain", max_steps=10))
+
+    assert result.status == status
+    assert result.usage.model_calls == calls
+    with RuntimeStore.open_sync(database) as store:
+        turn = store.read_turn(result.turn_id)
+        operations = store.list_tool_operations(result.turn_id)
+        assert len(operations) == truncations - 1
+        assert all(operation.status == "succeeded" for operation in operations)
+        if status == "failed":
+            assert "Turn output recovery allowance exhausted" in turn.terminal_message
+        assert store.verify().valid
+
+
+def test_output_recovery_cannot_reserve_more_than_the_remaining_cost(tmp_path, monkeypatch):
+    class PricedTruncation(TruncatedThenAnswer):
+        def prepare(self, request):
+            prepared = super().prepare(request)
+            return replace(prepared, resource_request=replace(prepared.resource_request, cost_micros=40))
+
+        async def dispatch(self, prepared, **kwargs):
+            response = await super().dispatch(prepared, **kwargs)
+            return replace(response, usage={**response.usage, "cost_micros": 40})
+
+    db = tmp_path / "run.db"
+    agent = Agent(workspace_path=tmp_path, checkpoint_db=db, enable_workspace_mcp=False)
+    monkeypatch.setattr(agent, "_model_factory", PricedTruncation)
+    result = asyncio.run(agent.run("Explain", max_steps=4, max_cost_micros=60))
+
+    assert result.status == "failed"
+    assert result.stop_reason == "model_budget_limit_exceeded"
+    assert result.usage.model_calls == 1
+    with RuntimeStore.open_sync(db) as store:
+        budget = store.read_budget_state(result.turn_id)
+        assert "cost_micros" in store.read_turn(result.turn_id).terminal_message
+        assert budget.used.cost_micros == 40
+        assert budget.reserved.cost_micros == 0
+        assert store.verify().valid

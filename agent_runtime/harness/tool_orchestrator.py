@@ -20,14 +20,16 @@ from agent_runtime.approval import CommandGrant, command_grant
 from agent_runtime.checkpoints import (
     CheckpointError,
     CheckpointService,
-    CheckpointSnapshot,
     CheckpointUnavailableError,
 )
 from agent_runtime.core.messages import tool_result_message
+from agent_runtime.core.model_request import freeze_json_mapping
 from agent_runtime.core.runtime_diagnostics import exception_diagnostic
 from agent_runtime.harness import artifact_ops, tool_ops, turn_ops
 from agent_runtime.harness.events import commit_and_publish
+from agent_runtime.harness.lifecycle import LifecycleHooks
 from agent_runtime.harness.operation_values import ResourceClaimConflictError, TurnCancellationPendingError
+from agent_runtime.harness.records import ToolOperationSnapshot
 from agent_runtime.harness.runtime_store import RuntimeStore
 from agent_runtime.streaming.events import (
     ItemDeltaKind,
@@ -43,6 +45,7 @@ from agent_runtime.tools.executor import (
     ToolExecutionRecord,
     ToolExecutor,
     _network_approval_id,
+    resolve_tool_use,
 )
 from agent_runtime.tools.permissions import ToolExecutionContext, UseToolDecision, can_use_tool, execution_context_scope
 from agent_runtime.tools.tool import (
@@ -221,6 +224,7 @@ class ToolOrchestrator:
         lease_seconds: float = 300.0,
         event_dispatcher: TurnEventDispatcher | None = None,
         checkpoints: CheckpointService | None = None,
+        lifecycle_hooks: LifecycleHooks | None = None,
         dispatch_guard: Callable[[RuntimeStore], None] | None = None,
     ) -> None:
         self._store = store
@@ -231,6 +235,8 @@ class ToolOrchestrator:
         self._lease_seconds = lease_seconds
         self._event_dispatcher = event_dispatcher
         self._checkpoints = checkpoints
+        self._checkpoint_lock = asyncio.Lock()
+        self._lifecycle_hooks = lifecycle_hooks
         self._dispatch_guard = dispatch_guard
         self._claims: dict[str, tuple[int, str]] = {}
         self._resolved_scopes: dict[
@@ -685,6 +691,8 @@ class ToolOrchestrator:
                 },
             )
             raise ToolResultCommitError(result) from None
+        if execution.result.metadata.get("execution_cancellation_requested") is not True:
+            await self.notify_post_tool(turn_id, call.tool_call_id)
 
     async def execute_batch(self, *, turn_id: str, calls: Sequence[ToolCall]) -> tuple[ToolResult, ...]:
         """Preflight before I/O, then run bounded, resource-safe local tools.
@@ -730,8 +738,6 @@ class ToolOrchestrator:
         return tuple(results)
 
     async def _execute_batch_segment(self, *, turn_id: str, calls: Sequence[ToolCall]) -> tuple[ToolResult, ...]:
-        if self._checkpoints is not None:
-            await self._ensure_turn_checkpoint(turn_id, calls)
         if await self._store.run_async(lambda: any(self.input_superseded(turn_id, call) for call in calls)):
             return tuple([await self.execute(turn_id=turn_id, call=call) for call in calls])
         contexts = await self._store.run_async(lambda: tuple(self._context_for_call(turn_id, call) for call in calls))
@@ -811,29 +817,82 @@ class ToolOrchestrator:
             _ACTIVE_TOOL_BINDING.reset(binding_token)
             _ACTIVE_TOOL_TURN_ID.reset(token)
 
-    async def _ensure_turn_checkpoint(self, turn_id: str, calls: Sequence[ToolCall]) -> None:
-        """Snapshot the workspace once per Turn before its first mutation attempt.
+    async def _before_tool_use(
+        self, call: ToolCall, operation: ToolOperationSnapshot, ceiling: ToolExecutionContext | None,
+    ) -> None:
+        turn_id = operation.turn_id
+        hooks = self._lifecycle_hooks
+        pre = hooks is not None and bool(await self._store.run_async(
+            hooks.configured, turn_id, "PreToolUse", tool_name=call.tool_name, effects=operation.effects,
+        ))
+        frozen_scope = (operation.effects, operation.resources)
+        prepared_scope = self._resolved_scopes.get(operation.operation_id)
 
-        The single rule covers every write path: any tool call resolving to
-        WRITE_WORKSPACE (apply_patch, workspace-write commands, Python outputs)
-        triggers the checkpoint. Checkpoints are a safety net, never a gate:
-        failures disable or skip the snapshot and the tool call proceeds.
-        """
-        checkpoints = self._checkpoints
-        if checkpoints is None:
-            return
-        if await self._store.run_async(
-            lambda: any(
-                item.kind == "workspace_checkpoint"
-                and item.status == "completed"
-                and (item.payload.get("trigger") == "pre_write")
-                for item in self._store.list_items(turn_id)
+        def changed_scope() -> ExecutionStartRejectedError:
+            return ExecutionStartRejectedError(
+                "pre_tool_hook_blocked",
+                "Resolved tool scope changed. Propose a new call for the current target.",
+                metadata={"execution_started": False},
             )
-        ):
+
+        if hooks is not None and prepared_scope != frozen_scope:
+            current_effects = () if prepared_scope is None else prepared_scope[0]
+            if pre or bool(await self._store.run_async(
+                hooks.configured, turn_id, "PreToolUse", tool_name=call.tool_name, effects=current_effects,
+            )):
+                raise changed_scope()
+            # PostToolUse selects against committed effects, so do not admit
+            # a recovered operation whose observed scope would be mislabelled.
+            for effects in {operation.effects, current_effects}:
+                if await self._store.run_async(
+                    hooks.configured, turn_id, "PostToolUse", tool_name=call.tool_name, effects=effects,
+                ):
+                    raise changed_scope()
+
+        checkpoint = self._checkpoints is not None and ToolEffect.WRITE_WORKSPACE.value in operation.effects
+        if not pre and not checkpoint:
             return
-        for call in calls:
-            if call.argument_error is not None or not self._call_writes_workspace(call):
-                continue
+        await self._store.run_async(self._guard_input, turn_id, call, ceiling)
+        if pre and hooks is not None:
+            blocked = await hooks.run(
+                self._commit, "PreToolUse", turn_id=turn_id, target_id=operation.operation_id,
+                operation_id=operation.operation_id, tool_call_id=call.tool_call_id,
+                tool_name=call.tool_name, arguments=call.arguments, effects=operation.effects,
+                resources=operation.resources,
+            )
+            if blocked is not None:
+                raise ExecutionStartRejectedError(
+                    "pre_tool_hook_blocked", blocked, metadata={"execution_started": False},
+                )
+        if checkpoint:
+            await self._checkpoint_before_write(turn_id)
+        if pre:
+            tool = self._tools[call.tool_name]
+            try:
+                resolved = resolve_tool_use(tool, tool.validate_input(call.arguments))
+                current_scope = _durable_tool_scope(resolved.effects, resolved.targets)
+            except Exception as error:
+                raise changed_scope() from error
+            prepared_targets = self._instruction_targets[(turn_id, call.tool_call_id)]
+            if current_scope != frozen_scope or resolved.targets != prepared_targets:
+                raise changed_scope()
+
+    def _operation_for_call(self, turn_id: str, call_id: str) -> ToolOperationSnapshot | None:
+        return next((op for op in self._store.list_tool_operations(turn_id) if op.tool_call_id == call_id), None)
+
+    async def _checkpoint_before_write(self, turn_id: str) -> None:
+        """Built-in PreToolUse handler for the first admitted workspace write."""
+        async with self._checkpoint_lock:
+            checkpoints = self._checkpoints
+            if checkpoints is None or await self._store.run_async(
+                lambda: any(
+                    item.kind == "workspace_checkpoint"
+                    and item.status == "completed"
+                    and item.payload.get("trigger") == "pre_write"
+                    for item in self._store.list_items(turn_id)
+                )
+            ):
+                return
             try:
                 snapshot = await checkpoints.snapshot(trigger="pre_write", turn_id=turn_id)
             except CheckpointUnavailableError as error:
@@ -843,16 +902,7 @@ class ToolOrchestrator:
             except (CheckpointError, OSError) as error:
                 logger.warning("workspace checkpoint skipped: %s", error)
                 return
-            await self._record_turn_checkpoint(turn_id, snapshot)
-            return
-
-    async def _record_turn_checkpoint(
-        self,
-        turn_id: str,
-        snapshot: CheckpointSnapshot,
-    ) -> None:
-        def persist() -> None:
-            tool_ops.record_workspace_checkpoint(
+            await self._commit(lambda: tool_ops.record_workspace_checkpoint(
                 self._store,
                 turn_id=turn_id,
                 checkpoint_id=snapshot.checkpoint_id,
@@ -860,21 +910,38 @@ class ToolOrchestrator:
                 tree_sha256=snapshot.tree_sha256,
                 changed_file_count=snapshot.changed_file_count,
                 wall_time=time.time(),
-            )
+            ))
 
-        await self._commit(persist)
-
-    def _call_writes_workspace(self, call: ToolCall) -> bool:
-        """Mirror the executor's effect resolution: static ∪ dynamic effects."""
-        tool = self._tools.get(call.tool_name)
-        if tool is None:
-            return False
-        try:
-            arguments = tool.validate_input(call.arguments)
-            resolved = tool.resolve_use(arguments)
-        except Exception:
-            return False
-        return ToolEffect.WRITE_WORKSPACE in tool.static_effects | resolved.effects
+    async def notify_post_tool(self, turn_id: str, call_id: str) -> None:
+        if self._lifecycle_hooks is None or not await self._store.run_async(
+            self._lifecycle_hooks.configured, turn_id, "PostToolUse"
+        ):
+            return
+        operation = await self._store.run_async(self._operation_for_call, turn_id, call_id)
+        if (
+            operation is None or operation.result_item_id is None or operation.attempt_count == 0
+            or operation.requires_reconciliation or operation.status not in {"succeeded", "failed"}
+            or operation.error_code == "cancelled"
+        ):
+            return
+        result = await self._store.run_async(self._store.read_item, operation.result_item_id)
+        if result.turn_id != turn_id or result.status != "completed" or (
+            (result.kind, result.producer) not in {("tool_result", "tool"), ("tool_reconciliation", "reconciler")}
+        ):
+            raise RuntimeError("PostToolUse requires a canonical committed tool result")
+        payload = result.payload.get("result") if result.kind == "tool_reconciliation" else result.payload
+        if not isinstance(payload, Mapping) or payload.get("tool_call_id") != call_id:
+            raise RuntimeError("PostToolUse result does not match the committed call")
+        if payload.get("metadata", {}).get("execution_started") is False:
+            return
+        call = await self._store.run_async(self._committed_tool_call, turn_id=turn_id, tool_call_id=call_id)
+        await self._lifecycle_hooks.run(
+            self._commit, "PostToolUse", turn_id=turn_id, target_id=result.item_id,
+            source_item_id=result.item_id, operation_id=operation.operation_id, tool_call_id=call_id,
+            tool_name=operation.tool_name, arguments=call.arguments, effects=operation.effects,
+            resources=operation.resources,
+            result=freeze_json_mapping(dict(payload)),
+        )
 
     async def _execute_in_turn(
         self,
@@ -934,6 +1001,7 @@ class ToolOrchestrator:
         execution: ToolExecution,
     ) -> None:
         record = execution.record
+        result_payload = _tool_result_payload(execution.result)
         operation_id = None if record is None else record.operation_id
         if record is None:
             await self._commit(
@@ -941,13 +1009,26 @@ class ToolOrchestrator:
                     self._store,
                     turn_id=turn_id,
                     operation_id=None,
-                    result=_tool_result_payload(execution.result),
+                    result=result_payload,
                 )
             )
             return
         claim = self._claims.get(record.operation_id)
         if claim is None:
             operation = await self._store.run_async(self._store.read_tool_operation, record.operation_id)
+            if operation.status == "ready" and record.error_code == "pre_tool_hook_blocked":
+                def commit_pre_hook_rejection() -> None:
+                    with self._store.tx.transaction():
+                        tool_ops.reject_ready_tool_operation(
+                            self._store, operation_id=record.operation_id, error_code="pre_tool_hook_blocked",
+                        )
+                        tool_ops.record_tool_result(
+                            self._store, turn_id=turn_id, operation_id=operation_id,
+                            result=result_payload,
+                        )
+
+                await self._commit(commit_pre_hook_rejection)
+                return
             if (
                 operation.status == "failed"
                 and operation.error_code == record.error_code
@@ -965,7 +1046,7 @@ class ToolOrchestrator:
                         self._store,
                         turn_id=turn_id,
                         operation_id=operation_id,
-                        result=_tool_result_payload(execution.result),
+                        result=result_payload,
                     )
                 )
                 return
@@ -989,7 +1070,7 @@ class ToolOrchestrator:
                 error_code=record.error_code,
                 requires_reconciliation=record.requires_reconciliation,
                 duration_ms=execution.trace.duration_ms,
-                result=_tool_result_payload(execution.result),
+                result=result_payload,
             )
         )
         if not accepted:
@@ -1446,15 +1527,6 @@ class ToolOrchestrator:
             call = await self._store.run_async(
                 self._committed_tool_call, turn_id=turn_id, tool_call_id=record.tool_call_id
             )
-            if await self._store.run_async(self.input_superseded, turn_id, call):
-                await self._commit(
-                    lambda: tool_ops.reject_ready_tool_operation(
-                        self._store,
-                        operation_id=record.operation_id,
-                        error_code="input_superseded",
-                    )
-                )
-                raise ExecutionStartRejectedError("input_superseded", "New user input superseded this action.")
             lease_seconds = max(
                 self._lease_seconds,
                 tool.timeout_seconds + _TOOL_LEASE_GRACE_SECONDS,
@@ -1466,6 +1538,11 @@ class ToolOrchestrator:
                         self._dispatch_guard(self._store)
                     if ceiling is not None:
                         self._guard_ancestor_authority(turn_id, call, ceiling)
+                    if self.input_superseded(turn_id, call):
+                        raise ExecutionStartRejectedError(
+                            "input_superseded", "New user input superseded this action.",
+                            metadata={"execution_started": False},
+                        )
                     claim = tool_ops.claim_tool_operation(
                         self._store,
                         operation_id=record.operation_id,
@@ -1482,12 +1559,29 @@ class ToolOrchestrator:
                 return claim
 
             try:
+                if existing is None or existing.status != "ready":
+                    raise RuntimeError("PreToolUse requires a ready tool operation")
+                try:
+                    await self._before_tool_use(call, existing, ceiling)
+                except asyncio.CancelledError as error:
+                    # No claim or tool dispatch exists. Settle the rejected
+                    # admission, then let the Turn observe task cancellation.
+                    raise ExecutionStartRejectedError(
+                        "cancelled", "Tool admission was cancelled before invocation.",
+                        metadata={"execution_started": False},
+                    ) from error
                 await self._commit(claim_operation)
             except TurnCancellationPendingError:
                 await self._commit(lambda: turn_ops.request_turn_cancellation(
                     self._store, turn_id=turn_id, reason="Execution admission revoked before tool dispatch"
                 ))
-                raise
+                await self._commit(lambda: tool_ops.reject_ready_tool_operation(
+                    self._store, operation_id=record.operation_id, error_code="cancelled",
+                ))
+                raise ExecutionStartRejectedError(
+                    "cancelled", "Tool admission was revoked before invocation.",
+                    metadata={"execution_started": False},
+                ) from None
             except ResourceClaimConflictError as conflict:
                 await self._commit(
                     lambda: tool_ops.reject_ready_tool_operation(
@@ -1502,9 +1596,12 @@ class ToolOrchestrator:
                 ) from None
             except ExecutionStartRejectedError as rejected:
                 rejection_code = rejected.code
-                await self._commit(lambda: tool_ops.reject_ready_tool_operation(
-                    self._store, operation_id=record.operation_id, error_code=rejection_code,
-                ))
+                if rejection_code != "pre_tool_hook_blocked":
+                    await self._commit(lambda: tool_ops.reject_ready_tool_operation(
+                        self._store, operation_id=record.operation_id, error_code=rejection_code,
+                    ))
+                # A hook denial is settled with the tool result. Until then
+                # the ready operation can recover from the durable verdict.
                 raise
             return
         if record.status in {

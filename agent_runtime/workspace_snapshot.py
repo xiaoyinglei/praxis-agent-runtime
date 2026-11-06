@@ -91,11 +91,16 @@ def source_observation(root: Path, paths: tuple[str, ...]) -> dict[str, Any]:
     return result
 
 
-def git_bytes(root: Path, *args: str, input: bytes | None = None, index: Path | None = None) -> bytes:
+def git_bytes(
+    root: Path, *args: str, input: bytes | None = None, index: Path | None = None,
+    object_directory: Path | None = None,
+) -> bytes:
     env = git_environment()
     env["GIT_OPTIONAL_LOCKS"] = "0"
     if index is not None:
         env["GIT_INDEX_FILE"] = str(index)
+    if object_directory is not None:
+        env["GIT_OBJECT_DIRECTORY"] = str(object_directory)
     result = subprocess.run(
         ["git", "-c", "core.fsmonitor=false", "-c", f"core.hooksPath={os.devnull}", "-C", str(root), *args],
         input=input,
@@ -117,6 +122,8 @@ def working_entries(
     paths: tuple[str, ...] | None = None,
     observations: dict[str, tuple[int, int, int, int, int] | None] | None = None,
     include_directories: bool = False,
+    object_directory: Path | None = None,
+    write_objects: bool = True,
 ) -> dict[str, dict[str, str]]:
     repository = object_root or root
     if paths is not None:
@@ -197,12 +204,17 @@ def working_entries(
         total += len(content)
         if total > MAX_SNAPSHOT_BYTES or len(entries) >= MAX_SNAPSHOT_FILES:
             raise ValueError("snapshot resource limit exceeded")
-        oid = git_bytes(repository, "hash-object", "-w", "--stdin", input=content).decode().strip()
+        oid = git_bytes(
+            repository, "hash-object", *(("-w",) if write_objects else ()), "--stdin",
+            input=content, object_directory=object_directory,
+        ).decode().strip()
         entries[path] = {"mode": mode, "oid": oid}
     return entries
 
 
-def tree_from_entries(root: Path, entries: dict[str, dict[str, str]]) -> str:
+def tree_from_entries(
+    root: Path, entries: dict[str, dict[str, str]], *, object_directory: Path | None = None,
+) -> str:
     with tempfile.TemporaryDirectory(prefix="praxis-index-") as temporary:
         index = Path(temporary) / "index"
         git_bytes(root, "read-tree", "--empty", index=index)
@@ -211,7 +223,7 @@ def tree_from_entries(root: Path, entries: dict[str, dict[str, str]]) -> str:
             for path, entry in sorted(entries.items())
         )
         git_bytes(root, "update-index", "-z", "--index-info", input=records, index=index)
-        return git_bytes(root, "write-tree", index=index).decode().strip()
+        return git_bytes(root, "write-tree", index=index, object_directory=object_directory).decode().strip()
 
 
 def capture_snapshot(
@@ -220,6 +232,7 @@ def capture_snapshot(
     object_root: Path | None = None,
     excluded: tuple[Path, ...] = (),
     authorize: Callable[[Path], None] | None = None,
+    object_directory: Path | None = None,
 ) -> dict[str, Any]:
     repository = object_root or root
     head = git_bytes(repository, "rev-parse", "--verify", "HEAD").decode().strip()
@@ -250,10 +263,15 @@ def capture_snapshot(
                     if raw:
                         authorize(root / os.fsdecode(raw))
             staged = git_bytes(root, *options, "--binary", *pathspec, index=frozen_index)
-    entries = working_entries(root, object_root=repository, excluded=excluded, authorize=authorize)
-    tree = tree_from_entries(repository, entries)
+    def read_entries() -> dict[str, dict[str, str]]:
+        return working_entries(
+            root, object_root=repository, excluded=excluded, authorize=authorize, object_directory=object_directory,
+        )
+
+    entries = read_entries()
+    tree = tree_from_entries(repository, entries, object_directory=object_directory)
     if (
-        working_entries(root, object_root=repository, excluded=excluded, authorize=authorize) != entries
+        read_entries() != entries
         or git_bytes(repository, "rev-parse", "HEAD").decode().strip() != head
         or (index_path.read_bytes() if index_path.exists() else b"") != original_index
     ):
@@ -266,6 +284,21 @@ def capture_snapshot(
         "source_index_hex": original_index.hex(),
         "source_index_patch_hex": staged.hex(),
     }
+
+
+
+def observe_snapshot(
+    root: Path,
+    *,
+    object_root: Path | None = None,
+    excluded: tuple[Path, ...] = (),
+    authorize: Callable[[Path], None] | None = None,
+) -> dict[str, Any]:
+    """Measure the same Git snapshot identity without retaining observed files."""
+    with tempfile.TemporaryDirectory(prefix="praxis-observed-objects-") as directory:
+        return capture_snapshot(
+            root, object_root=object_root, excluded=excluded, authorize=authorize, object_directory=Path(directory),
+        )
 
 
 def tree_entries(root: Path, tree: str) -> dict[str, dict[str, str]]:

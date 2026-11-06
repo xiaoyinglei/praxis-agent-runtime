@@ -16,12 +16,14 @@ from typing import Any
 from uuid import uuid4
 
 from agent_runtime.harness import artifact_ops, facts, turn_ops
+from agent_runtime.harness.command_evidence import command_succeeded, trusted_command_results
 from agent_runtime.harness.protocol import item_text, restore_model_response
 from agent_runtime.harness.runtime_store import RuntimeStore, owner_operation
 from agent_runtime.workspace_snapshot import (
     archive_tree,
     capture_snapshot,
     git_bytes,
+    observe_snapshot,
     runtime_excluded_paths,
     tree_from_entries,
 )
@@ -90,7 +92,7 @@ def _effective_permissions(store: RuntimeStore, turn_id: str) -> Any:
     return ancestor_context(store, turn_id, context).effective_permissions
 
 
-def _capture(store: RuntimeStore, turn_id: str) -> dict[str, Any]:
+def _capture(store: RuntimeStore, turn_id: str, *, retain_objects: bool = True) -> dict[str, Any]:
     permissions = _effective_permissions(store, turn_id)
 
     def authorize(path: Path) -> None:
@@ -98,7 +100,10 @@ def _capture(store: RuntimeStore, turn_id: str) -> dict[str, Any]:
             raise PermissionError(f"delivery source path denied: {path}")
 
     workspace = Path(store.read_thread(store.read_turn(turn_id).thread_id).workspace)
-    return snapshot(workspace, excluded=_excluded(store), authorize=authorize)
+    if retain_objects:
+        return snapshot(workspace, excluded=_excluded(store), authorize=authorize)
+    repository = WorktreeManager(workspace)._child_repository()
+    return observe_snapshot(workspace, object_root=repository, excluded=_excluded(store), authorize=authorize)
 
 
 def _retain(store: RuntimeStore, turn_id: str, value: dict[str, Any], name: str) -> dict[str, Any]:
@@ -180,27 +185,10 @@ def plan(
 
 
 def _command_evidence(store: RuntimeStore, turn_id: str, ids: Sequence[str]) -> list[dict[str, Any]]:
-    from agent_runtime.harness.stop import StopChecks
-
-    records = sorted(StopChecks(store)._trusted_results(turn_id), key=lambda entry: entry[0].sequence)
-    launches: dict[str, Mapping[str, Any]] = {}
-    trusted = {}
-    for item, operation, arguments in records:
-        output = item.payload.get("structured_content")
-        output = output if isinstance(output, Mapping) else {}
-        session_id = output.get("session_id")
-        if operation.tool_name == "run_command" and isinstance(session_id, str):
-            launches[session_id] = arguments
-        elif operation.tool_name == "manage_command":
-            if (
-                not isinstance(session_id, str)
-                or arguments.get("session_id") != session_id
-                or session_id not in launches
-                or output.get("status") not in {"completed", "cancelled"}
-            ):
-                continue
-            arguments = launches[session_id]
-        trusted[operation.tool_call_id] = (item, operation, arguments)
+    trusted = {
+        operation.tool_call_id: (item, operation, arguments)
+        for item, operation, arguments in trusted_command_results(store, turn_id)
+    }
     selected = list(ids)
     declared = _latest(store, turn_id, "delivery_plan") or {}
     commands = set(declared.get("commands", ()))
@@ -209,14 +197,12 @@ def _command_evidence(store: RuntimeStore, turn_id: str, ids: Sequence[str]) -> 
         commands.add(policy_command)
     commands.update(trusted[identity][2].get("command") for identity in ids if identity in trusted)
     latest: dict[tuple[Any, Any], str] = {}
-    for identity, (item, operation, args) in trusted.items():
+    for identity, (item, _operation, args) in trusted.items():
         actual_command = args.get("command")
         matches_explicit = (
             isinstance(actual_command, str) and policy_command and actual_command.strip() == policy_command.strip()
         )
-        if operation.tool_name in {"run_command", "manage_command"} and (
-            actual_command in commands or matches_explicit
-        ):
+        if actual_command in commands or matches_explicit:
             key = (args.get("command"), args.get("working_dir", "."))
             if key not in latest or item.sequence > trusted[latest[key]][0].sequence:
                 latest[key] = identity
@@ -235,8 +221,6 @@ def _command_evidence(store: RuntimeStore, turn_id: str, ids: Sequence[str]) -> 
         if identity not in trusted:
             raise ValueError(f"unknown trusted command source: {identity}")
         item, operation, args = trusted[identity]
-        if operation.tool_name not in {"run_command", "manage_command"}:
-            raise ValueError("delivery verification requires a command result")
         raw_output = item.payload.get("structured_content")
         output = raw_output if isinstance(raw_output, Mapping) else {}
         receipt = output.get("verification_receipt")
@@ -336,9 +320,8 @@ def record(
 
             for check in checks:
                 if (
-                    check["operation_status"] == "succeeded"
-                    and check["is_error"] is False
-                    and check["exit_code"] == 0
+                    command_succeeded(operation_status=check["operation_status"],
+                                      is_error=check["is_error"], output=check)
                     and receipt_issue(check["receipt"], final, permissions=_effective_permissions(store, turn_id))[0]
                     is None
                 ):
@@ -435,8 +418,9 @@ def receipt_issue(
     return None, False
 
 
-def current_workspace_command(store: RuntimeStore, turn_id: str, tool_call_id: str) -> str | None:
-    check = next(c for c in _command_evidence(store, turn_id, [tool_call_id]) if c["tool_call_id"] == tool_call_id)
+def _current_workspace_command(
+    store: RuntimeStore, turn_id: str, check: Mapping[str, Any], live: Mapping[str, Any] | None,
+) -> str | None:
     receipt = check.get("receipt")
     root = Path(store.read_thread(store.read_turn(turn_id).thread_id).workspace).resolve()
     if (
@@ -448,20 +432,22 @@ def current_workspace_command(store: RuntimeStore, turn_id: str, tool_call_id: s
         return (
             "Run the exact acceptance command with verification_mode=workspace and explicit verification_dependencies."
         )
-    try:
-        return receipt_issue(receipt, _capture(store, turn_id), permissions=_effective_permissions(store, turn_id))[0]
-    except (OSError, ValueError, RuntimeError) as error:
-        return f"Cannot inspect current acceptance inputs: {error}"
+    if live is None:
+        return "Cannot inspect current acceptance inputs."
+    return receipt_issue(receipt, live, permissions=_effective_permissions(store, turn_id))[0]
 
 
-def _assess(store: RuntimeStore, turn_id: str, value: dict[str, Any]) -> dict[str, Any]:
+def _assess(
+    store: RuntimeStore, turn_id: str, value: dict[str, Any], *, include_live_evidence: bool = False,
+) -> dict[str, Any]:
     problems = list(value.get("blockers", ()))
     reasons = []
     final = value.get("final")
     current_plan = value.get("plan")
     stale = False
+    live = None
     try:
-        live = _capture(store, turn_id)
+        live = _capture(store, turn_id, retain_objects=False)
         stale = final is None or live["tree"] != final["tree"]
     except (OSError, ValueError, RuntimeError) as error:
         problems.append(str(error))
@@ -473,6 +459,11 @@ def _assess(store: RuntimeStore, turn_id: str, value: dict[str, Any]) -> dict[st
     if current_plan != _latest(store, turn_id, "delivery_plan"):
         stale = True
         reasons.append("Verification scope or plan changed; record evidence for the current plan.")
+    version_keys = ("tree", "source_head", "source_index_sha256")
+    live_version = None if live is None else {key: live.get(key) for key in version_keys}
+    same_live_version = live_version is not None and live_version == {
+        key: (final or {}).get(key) for key in version_keys
+    }
     referenced_artifacts = {value["diff_artifact_id"]}
     for version in (value.get("baseline"), final):
         if version:
@@ -486,23 +477,31 @@ def _assess(store: RuntimeStore, turn_id: str, value: dict[str, Any]) -> dict[st
         reasons.append("Record the final review conclusion and its coverage.")
     checks = _command_evidence(store, turn_id, [c["tool_call_id"] for c in value.get("checks", ())])
     valid_commands = set()
+    receipt_evidence = []
     for check in checks:
-        receipt = check.get("receipt")
-        if (
-            check["operation_status"] != "succeeded"
-            or check.get("is_error") is not False
-            or check.get("exit_code") != 0
-            or check.get("timed_out")
-            or check.get("sandbox_error")
-            or check.get("status") not in {None, "completed"}
-        ):
+        if command_succeeded(operation_status=check["operation_status"], is_error=check["is_error"], output=check):
+            issue, blocked = receipt_issue(
+                check.get("receipt"), final, permissions=_effective_permissions(store, turn_id),
+            )
+            if issue:
+                (problems if blocked else reasons).append(f"{issue}: {check['command']}")
+                receipt_status = "unavailable" if blocked else "unverified"
+            else:
+                valid_commands.add(check["command"])
+                if live_version is None:
+                    receipt_status = "unavailable"
+                else:
+                    receipt_status = "current" if not stale and same_live_version else "stale"
+        else:
             problems.append(f"Command failed or unresolved: {check['command']}")
-            continue
-        issue, blocked = receipt_issue(receipt, final, permissions=_effective_permissions(store, turn_id))
-        if issue:
-            (problems if blocked else reasons).append(f"{issue}: {check['command']}")
-            continue
-        valid_commands.add(check["command"])
+            receipt_status = "command_failed"
+        if include_live_evidence:
+            receipt_evidence.append({
+                **{key: check[key] for key in (
+                    "command", "working_dir", "source_result_item_id", "verification_item_id",
+                )},
+                "status": receipt_status,
+            })
     explicit = store.read_turn(turn_id).binding_manifest.get("completion_policy", {}).get("acceptance_command")
     if explicit:
         candidates = [c for c in checks if isinstance(c["command"], str) and c["command"].strip() == explicit.strip()]
@@ -510,7 +509,7 @@ def _assess(store: RuntimeStore, turn_id: str, value: dict[str, Any]) -> dict[st
             reasons.append("Run and record the exact configured acceptance command in the current workspace.")
         else:
             candidate = max(candidates, key=lambda c: c["sequence"])
-            issue = current_workspace_command(store, turn_id, candidate["tool_call_id"])
+            issue = _current_workspace_command(store, turn_id, candidate, live)
             if issue:
                 reasons.append(issue)
     if current_plan:
@@ -564,6 +563,10 @@ def _assess(store: RuntimeStore, turn_id: str, value: dict[str, Any]) -> dict[st
         "verified_scope": current_plan["scope"] if status == "verified" and current_plan else [],
         "next_actions": list(dict.fromkeys([*problems, *reasons])),
         "unknown_operations": unresolved,
+        **({
+            "live_workspace": live_version,
+            "receipt_evidence": receipt_evidence,
+        } if include_live_evidence else {}),
         "boundary": (
             "Evidence covers declared scope and dependencies in the recorded environment; "
             "semantic correctness and dependency completeness remain review judgments."
@@ -572,7 +575,7 @@ def _assess(store: RuntimeStore, turn_id: str, value: dict[str, Any]) -> dict[st
 
 
 @owner_operation
-def inspect(store: RuntimeStore, turn_id: str) -> dict[str, Any]:
+def inspect(store: RuntimeStore, turn_id: str, *, include_live_evidence: bool = False) -> dict[str, Any]:
     value = _latest(store, turn_id, "delivery_record")
     if value is None:
         unknown = [op.operation_id for op in store.list_tool_operations(turn_id) if op.status == "unknown"]
@@ -590,7 +593,7 @@ def inspect(store: RuntimeStore, turn_id: str) -> dict[str, Any]:
             "next_actions": actions or ["Record delivery scope and evidence."],
         }
     value["delivery_id"] = next(i.item_id for i in reversed(store.list_items(turn_id)) if i.kind == "delivery_record")
-    return _assess(store, turn_id, value)
+    return _assess(store, turn_id, value, include_live_evidence=include_live_evidence)
 
 
 def submitted_answer(store: RuntimeStore, turn_id: str, response_id: str) -> tuple[str, str] | None:
