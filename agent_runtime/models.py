@@ -108,6 +108,7 @@ class ModelSpec:
     output_cost_per_1m: float | None = None
     runtime: ModelRuntimeSpec | None = None
     reasoning: ReasoningCapabilities | None = None
+    remote_model_id: str | None = None
 
 
 class ModelCatalog:
@@ -688,9 +689,9 @@ class ModelControlPlane:
         state, diagnostics = (
             _load_session_state(
                 catalog=catalog,
-                initial_model_id=initial_model_id,
+                initial_model_id=initial_model_id or registry.user_default_model,
                 initial_selection_requester=(
-                    initial_selection_requester
+                    "user" if initial_model_id is None and registry.user_default_model else initial_selection_requester
                 ),
                 session_path=session_path,
                 policy=effective_policy,
@@ -1313,6 +1314,7 @@ def _to_public_definition_spec(
         protocol=definition.protocol,
         base_url=definition.base_url,
         api_key_env=definition.api_key_env,
+        remote_model_id=definition.remote_model_id,
         max_output_tokens=definition.max_output_tokens,
         reasoning=definition.reasoning,
         input_cost_per_1m=definition.input_cost_per_1m,
@@ -1341,6 +1343,7 @@ def _to_public_spec(
         protocol=spec.protocol,
         base_url=endpoint.base_url,
         api_key_env=spec.api_key_env,
+        remote_model_id=spec.remote_model_id,
         max_output_tokens=spec.max_output_tokens,
         reasoning=spec.reasoning,
         input_cost_per_1m=spec.input_cost_per_1m,

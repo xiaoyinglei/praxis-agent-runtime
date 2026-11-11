@@ -44,11 +44,10 @@ Linux 命令执行需要 Bubblewrap 和 libseccomp 系统后端，见 [Ubuntu �
 
 ```sh
 cd /path/to/my-project
-agent setup
-agent chat
+agent
 ```
 
-首次 `setup` 默认接入 **DeepSeek**，按提示隐藏输入你自己的 API Key。连接检查会产生少量真实模型用量，可跳过 GitHub 等可选服务。其他云端模型和本地模型通过 `agent model add` 接入，再用 `agent model switch MODEL_ID` 切换，见[接入模型](docs/guide.md#接入模型)。MLX 和本地模型权重不会随普通安装下载。
+首次缺少模型凭据时，终端会打开配置向导。可使用内置 **DeepSeek**，也可填写自己的 OpenAI 兼容地址、模型 ID 和 API Key。配置后直接运行 `agent`，聊天中用 `/model` 切换。需要添加连接或更换 Key 时运行 `agent model`。连接验证会发送一条测试消息。见[接入模型](docs/guide.md#接入模型)。
 
 macOS 将 Key 保存到系统 Keychain，Linux 使用个人配置目录中的私有凭据文件。个人模型配置默认位于 `~/.config/praxis`，聊天记录保存在各项目的 `.praxis/` 中。
 
@@ -87,8 +86,7 @@ git clone https://github.com/xiaoyinglei/praxis-agent-runtime.git
 cd praxis-agent-runtime
 uv sync --locked --link-mode copy
 
-uv run agent setup
-uv run agent chat
+uv run agent
 ```
 
 </details>

@@ -36,9 +36,12 @@ from agent_runtime.tools.tool import (
     json_schema_input,
 )
 
+_PROBE_MAX_OUTPUT_TOKENS = 512
+
 
 class ProbeLevel(StrEnum):
     CONNECTIVITY = "connectivity"
+    CHAT = "chat"
     STREAM = "stream"
     FULL = "full"
 
@@ -74,12 +77,14 @@ class ModelProbe:
         definition: ModelExecutionDefinition,
         *,
         level: ProbeLevel,
+        api_key: str | None = None,
     ) -> ModelProbeEvidence:
         if not isinstance(level, ProbeLevel):
             raise TypeError("level must be a ProbeLevel")
-        self._registry.load_definition_credentials(definition)
+        if api_key is None:
+            self._registry.load_definition_credentials(definition)
         credential_name = definition.api_key_env
-        if credential_name is not None:
+        if credential_name is not None and api_key is None:
             endpoint = normalize_model_endpoint(provider=definition.provider, base_url=definition.base_url,
                                                location=definition.location)
             credential = resolve_model_credential(credential_name, endpoint.base_url)
@@ -90,9 +95,15 @@ class ModelProbe:
                 )
         resolved = await _safe_phase(
             "resolve",
-            lambda: asyncio.to_thread(self._registry.resolve_definition, definition),
+            lambda: asyncio.to_thread(
+                self._registry.resolve_definition, definition,
+                **({"api_key": api_key} if api_key is not None else {}),
+            ),
             definition=definition,
         )
+        if level is ProbeLevel.CHAT:
+            text_delta_count = await self._check_stream(resolved, definition)
+            return ModelProbeEvidence(level, True, text_delta_count, True, None, None)
         await self._check_connectivity(resolved, definition)
         if level is ProbeLevel.CONNECTIVITY:
             return ModelProbeEvidence(level, True, 0, False, None, None)
@@ -134,10 +145,10 @@ class ModelProbe:
             lambda: asyncio.to_thread(list_models),
             definition=definition,
         )
-        if definition.model_id not in model_ids:
+        if definition.wire_model_id not in model_ids:
             raise ModelProbeError(
                 phase="model_identity",
-                detail=f"configured model {definition.model_id!r} was not advertised",
+                detail=f"configured model {definition.wire_model_id!r} was not advertised",
             )
 
     async def _check_stream(
@@ -152,7 +163,12 @@ class ModelProbe:
             if isinstance(delta, ModelOutputDelta) and delta.delta_kind == "text" and delta.content:
                 delta_count += 1
 
-        request = _probe_request(definition=definition, tools=(), tool_choice=ToolChoice.none())
+        request = _probe_request(
+            definition=definition,
+            prompt="Reply with the text probe.",
+            tools=(),
+            tool_choice=ToolChoice.none(),
+        )
         gateway = _gateway(resolved)
         response = await _safe_phase(
             "stream",
@@ -181,8 +197,9 @@ class ModelProbe:
         tool = _probe_tool()
         request = _probe_request(
             definition=definition,
+            prompt=f"Call the {tool.definition.name} tool with ok set to true.",
             tools=(tool,),
-            tool_choice=ToolChoice.named(tool.definition.name),
+            tool_choice=ToolChoice.auto(),
         )
         gateway = _gateway(resolved)
         response = await _safe_phase(
@@ -200,7 +217,7 @@ class ModelProbe:
         if len(calls) != 1 or calls[0].name != tool.definition.name:
             raise ModelProbeError(
                 phase="tool_call",
-                detail="provider did not return the forced probe tool call",
+                detail="provider did not return exactly one probe tool call",
             )
         await _safe_phase(
             "tool_call",
@@ -220,16 +237,6 @@ class ModelProbe:
             exclude_none=True,
         )
 
-        max_output_tokens = (
-            resolved.capabilities.max_output_tokens
-        )
-
-        probe_output_limit = (
-            32
-            if max_output_tokens is None
-            else min(max_output_tokens, 32)
-        )
-
         result = await _safe_phase(
             "structured_output",
             lambda: gateway.agenerate_structured(
@@ -238,7 +245,7 @@ class ModelProbe:
                 schema=_StructuredProbe,
                 kwargs={
                     **request_defaults,
-                    "max_tokens": probe_output_limit,
+                    "max_tokens": _probe_output_limit(resolved.capabilities.max_output_tokens),
                 },
             ),
             definition=definition,
@@ -276,22 +283,18 @@ async def _safe_phase[T](
     raise failure
 
 
+def _probe_output_limit(model_limit: int | None) -> int:
+    return min(model_limit or _PROBE_MAX_OUTPUT_TOKENS, _PROBE_MAX_OUTPUT_TOKENS)
+
+
 def _probe_request(
     *,
     definition: ModelExecutionDefinition,
+    prompt: str,
     tools: tuple[Tool, ...],
     tool_choice: ToolChoice,
 ) -> ModelRequest:
     defaults = definition.defaults
-
-    probe_output_limit = (
-        32
-        if definition.max_output_tokens is None
-        else min(
-            definition.max_output_tokens,
-            32,
-        )
-    )
 
     provider_options = (
         defaults.provider_options.model_dump(
@@ -308,12 +311,12 @@ def _probe_request(
             instructions=(
                 "You are a provider capability probe.",
             ),
-            initial_user_task="Reply with the text probe.",
+            initial_user_task=prompt,
         ),
         selected_tools=tools,
         settings=ModelSettings(
             model=definition.model_id,
-            max_output_tokens=probe_output_limit,
+            max_output_tokens=_probe_output_limit(definition.max_output_tokens),
             temperature=(
                 defaults.temperature
                 if defaults.temperature is not None
@@ -338,7 +341,7 @@ def _probe_request(
 def _probe_tool() -> Tool:
     schema: dict[str, JsonValue] = {
         "type": "object",
-        "properties": {"ok": {"const": True}},
+        "properties": {"ok": {"type": "boolean", "const": True}},
         "required": ("ok",),
         "additionalProperties": False,
     }

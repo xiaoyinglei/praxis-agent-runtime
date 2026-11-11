@@ -305,6 +305,8 @@ def test_model_list_and_show_are_read_only_and_do_not_construct_provider(
     )
 
     assert listed.exit_code == 0, listed.output
+    assert "catalog_mode: merged" in listed.output
+    assert "user_registry:" in listed.output
     assert "source=builtin" in listed.output
     assert " -> " not in listed.output
     assert "model=" not in listed.output
@@ -314,6 +316,7 @@ def test_model_list_and_show_are_read_only_and_do_not_construct_provider(
     assert "alias:" not in shown.output
     assert "\nmodel:" not in shown.output
     assert "source: builtin" in shown.output
+    assert "source_path:" in shown.output
 
 
 def test_model_current_surfaces_stale_session_repair_diagnostic(tmp_path: Path) -> None:

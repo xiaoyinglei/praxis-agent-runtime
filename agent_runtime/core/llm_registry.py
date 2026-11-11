@@ -6,6 +6,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from importlib.resources import as_file, files
+from importlib.resources.abc import Traversable
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
 
@@ -102,7 +103,7 @@ class ModelResolver(Protocol):
 class ModelRegistry:
     """按模型 ID 解析并缓存 Generator 实例。
 
-    加载顺序：AGENT_MODELS_PATH(YAML) > AGENT_MODELS(JSON) > models.yaml 内置默认
+    整库覆盖优先。常规启动合并内置 Agent 目录与个人模型注册表。
     """
 
     _BUNDLED_CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "agent-models.yaml"
@@ -139,6 +140,7 @@ class ModelRegistry:
             ResolvedModel,
         ] = {}
         self._credential_env_path: Path | None = None
+        self.user_default_model: str | None = None
 
     @property
     def default_model(self) -> str:
@@ -223,7 +225,7 @@ class ModelRegistry:
         if host_env:
             # An explicitly selected host file may provide configuration overrides.
             _load_env_file(resolved_env_path)
-        config, origins = cls._load_effective_config(
+        config, origins, user_default = cls._load_effective_config(
             workspace=resolved_workspace,
             worktree=resolved_worktree,
         )
@@ -238,6 +240,7 @@ class ModelRegistry:
                 }
             )
         registry = cls(config, origins=origins)
+        registry.user_default_model = default_model or user_default
         registry._credential_env_path = resolved_env_path
         if not host_env:
             _load_env_file(resolved_env_path, allowed_names=frozenset(
@@ -263,10 +266,10 @@ class ModelRegistry:
         *,
         workspace: Path,
         worktree: Path,
-    ) -> tuple[AgentModelsConfig, dict[str, Literal["builtin", "user", "override"]]]:
+    ) -> tuple[AgentModelsConfig, dict[str, Literal["builtin", "user", "override"]], str | None]:
         if os.environ.get("RAG_AGENT_MODELS_PATH") or os.environ.get("RAG_AGENT_MODELS"):
             override = cls._load_config()
-            return override, {model_id: "override" for model_id in override.models}
+            return override, {model_id: "override" for model_id in override.models}, None
 
         built_in = cls._load_config()
         registry_path = user_model_registry_path()
@@ -288,12 +291,18 @@ class ModelRegistry:
                 for model_id, definition in user_snapshot.document.models.items()
             }
         )
-        effective = built_in.model_copy(update={"models": models}, deep=True)
+        default_model = user_snapshot.document.default_model
+        if default_model not in models:
+            default_model = None
+        effective = built_in.model_copy(
+            update={"models": models, "default_model": default_model or built_in.default_model},
+            deep=True,
+        )
         origins: dict[str, Literal["builtin", "user", "override"]] = {
             model_id: "builtin" for model_id in built_in.models
         }
         origins.update({model_id: "user" for model_id in user_snapshot.document.models})
-        return effective, origins
+        return effective, origins, default_model
 
     @classmethod
     def _load_config(cls) -> AgentModelsConfig:
@@ -307,22 +316,29 @@ class ModelRegistry:
         if json_text:
             return AgentModelsConfig.model_validate(json.loads(json_text))
 
-        # 3. wheel 中 force-included 的 models.yaml
-        resource = files(cls._BUNDLED_CONFIG_PACKAGE)
-        for part in cls._BUNDLED_CONFIG_RESOURCE:
-            resource = resource.joinpath(part)
-        if resource.is_file():
-            with as_file(resource) as resource_path:
-                return cls._load_yaml_file(resource_path)
-
-        # 4. 源码仓库中的 models.yaml（不依赖进程 cwd）
-        if cls._BUNDLED_CONFIG_PATH.is_file():
-            return cls._load_yaml_file(cls._BUNDLED_CONFIG_PATH)
+        source = cls._bundled_config_source()
+        if source.is_file():
+            with as_file(source) as path:
+                return cls._load_yaml_file(path)
 
         raise FileNotFoundError(
             "No agent model config found. Set RAG_AGENT_MODELS_PATH, "
             "RAG_AGENT_MODELS, or install a distribution with bundled models.yaml."
         )
+
+    @classmethod
+    def _bundled_config_source(cls) -> Traversable:
+        packaged = files(cls._BUNDLED_CONFIG_PACKAGE).joinpath(*cls._BUNDLED_CONFIG_RESOURCE)
+        return packaged if packaged.is_file() else cls._BUNDLED_CONFIG_PATH
+
+    @classmethod
+    def catalog_source(cls) -> str:
+        yaml_path = os.environ.get("RAG_AGENT_MODELS_PATH")
+        if yaml_path:
+            return str(Path(yaml_path).absolute())
+        if os.environ.get("RAG_AGENT_MODELS"):
+            return "env:RAG_AGENT_MODELS"
+        return str(cls._bundled_config_source())
 
     @staticmethod
     def _load_yaml_file(path: Path) -> AgentModelsConfig:
@@ -430,7 +446,7 @@ class ModelRegistry:
         available = ", ".join(sorted(self._config.models))
         return UnknownModelIdError(f"Model ID {model_id!r} not found in config. Available IDs: {available}")
 
-    def resolve_definition(self, definition: ModelExecutionDefinition) -> ResolvedModel:
+    def resolve_definition(self, definition: ModelExecutionDefinition, *, api_key: str | None = None) -> ResolvedModel:
         """Resolve one complete frozen definition without a catalog alias lookup."""
 
         normalized = ModelExecutionDefinition.model_validate(definition.model_dump(mode="python", exclude_none=False))
@@ -439,6 +455,7 @@ class ModelRegistry:
             definition=normalized,
             spec=_model_spec_from_definition(normalized),
             subject=f"definition {revision!r}",
+            api_key=api_key,
         )
 
     def _resolve_definition(
@@ -447,6 +464,7 @@ class ModelRegistry:
         definition: ModelExecutionDefinition,
         spec: ModelSpec,
         subject: str,
+        api_key: str | None = None,
     ) -> ResolvedModel:
         from agent_runtime.modeling.gateway import (
             LLMGateway,
@@ -459,8 +477,9 @@ class ModelRegistry:
         build_error: Exception | None = None
         try:
             generator = _build_chat_generator(
-                model_id=definition.model_id,
+                model_id=definition.wire_model_id,
                 spec=spec,
+                **({"api_key": api_key} if api_key is not None else {}),
             )
         except Exception as error:
             build_error = error
@@ -486,8 +505,8 @@ class ModelRegistry:
         token_accounting = TokenAccountingService(
             TokenizerContract(
                 embedding_model_name=definition.model_id,
-                tokenizer_model_name=(definition.tokenizer_model or definition.model_id),
-                chunking_tokenizer_model_name=(definition.tokenizer_model or definition.model_id),
+                tokenizer_model_name=(definition.tokenizer_model or definition.wire_model_id),
+                chunking_tokenizer_model_name=(definition.tokenizer_model or definition.wire_model_id),
                 tokenizer_backend="auto",
                 max_context_tokens=capabilities.context_window_tokens,
                 prompt_reserved_tokens=512,
@@ -597,7 +616,7 @@ def _generation_config_from_definition(
     )
 
 
-def _build_chat_generator(*, model_id: str, spec: ModelSpec) -> object:
+def _build_chat_generator(*, model_id: str, spec: ModelSpec, api_key: str | None = None) -> object:
     """Construct only the chat capability required by AgentRuntime.
 
     Embedding and reranking construction remains owned by RAG assembly.
@@ -605,7 +624,7 @@ def _build_chat_generator(*, model_id: str, spec: ModelSpec) -> object:
     optional HTTP clients or model backends.
     """
 
-    config = _chat_provider_config(spec)
+    config = _chat_provider_config(spec, api_key=api_key)
     if spec.provider in {ModelProvider.MLX, ModelProvider.OPENAI_COMPATIBLE}:
         from agent_runtime.modeling.chat import OpenAICompatibleChatGenerator
 
@@ -627,7 +646,7 @@ def _build_chat_generator(*, model_id: str, spec: ModelSpec) -> object:
     raise ValueError(f"Unsupported provider: {spec.provider}")
 
 
-def _chat_provider_config(spec: ModelSpec) -> ChatProviderConfig:
+def _chat_provider_config(spec: ModelSpec, *, api_key: str | None = None) -> ChatProviderConfig:
     endpoint = normalize_model_endpoint(
         provider=spec.provider,
         base_url=spec.base_url,
@@ -638,7 +657,7 @@ def _chat_provider_config(spec: ModelSpec) -> ChatProviderConfig:
     if spec.provider in {ModelProvider.MLX, ModelProvider.OPENAI_COMPATIBLE}:
         return ChatProviderConfig(
             base_url=endpoint.base_url,
-            api_key=_api_key_from_env(spec.api_key_env, endpoint.base_url),
+            api_key=api_key if api_key is not None else _api_key_from_env(spec.api_key_env, endpoint.base_url),
         )
     raise ValueError(f"Unsupported provider: {spec.provider}")
 
@@ -914,6 +933,10 @@ def user_model_registry_path() -> Path:
     configured = os.environ.get("PRAXIS_MODEL_REGISTRY_PATH")
     if configured:
         return Path(configured)
+    if os.environ.get("PRAXIS_CONFIG_DIR"):
+        from agent_runtime.user_config import user_config_directory
+
+        return user_config_directory() / "models.yaml"
     config_home = os.environ.get("XDG_CONFIG_HOME")
     root = Path(config_home) if config_home else Path.home() / ".config"
     return root / "praxis" / "models.yaml"

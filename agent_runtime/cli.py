@@ -49,7 +49,7 @@ from agent_runtime.models import (
 from agent_runtime.result import AgentDiagnostic, AgentResult
 from agent_runtime.runtime.builder import build_model_admin_service
 from agent_runtime.runtime_clock import capture_runtime_clock
-from agent_runtime.setup_cli import setup
+from agent_runtime.setup_cli import configure_model, setup
 from agent_runtime.terminal_input import CHAT_COMMANDS, TerminalComposer, resolve_pause_choice
 from agent_runtime.terminal_render import (
     TerminalToolEventDisplay,
@@ -69,17 +69,41 @@ if TYPE_CHECKING:
     from agent_runtime.terminal_app import TerminalChatApp
     from agent_runtime.worktrees import CreateReport
 
-agent_app = typer.Typer(add_completion=False, no_args_is_help=True)
-model_app = typer.Typer(add_completion=False, no_args_is_help=True)
+agent_app = typer.Typer(add_completion=False, invoke_without_command=True)
+model_app = typer.Typer(add_completion=False, invoke_without_command=True)
 model_trust_app = typer.Typer(add_completion=False, no_args_is_help=True)
 worktree_app = typer.Typer(add_completion=False, no_args_is_help=True)
-agent_app.add_typer(model_app, name="model", help="查看和切换当前模型会话。")
+agent_app.add_typer(model_app, name="model", help="配置、查看和验证模型连接。")
 agent_app.add_typer(mcp_app, name="mcp", help="注册、认证和检查 MCP 连接。")
 agent_app.add_typer(worktree_app, name="worktree", help="管理并行会话的 Git worktree。")
 agent_app.add_typer(web_app, name="web", help="配置和检查搜索与网页读取。")
 agent_app.command("setup")(setup)
 agent_app.command("connections")(connections_command)
 agent_app.command("commands")(commands)
+
+
+@agent_app.callback()
+def _start_chat(ctx: typer.Context) -> None:
+    if ctx.invoked_subcommand is not None:
+        return
+    if _is_interactive_terminal():
+        from agent_runtime.model_credentials import resolve_model_credential
+
+        service = _model_admin_service(DEFAULT_MODEL_SESSION_PATH)
+        spec = _model_admin_call(service.current)
+        if spec.api_key_env and not resolve_model_credential(spec.api_key_env, spec.base_url):
+            configure_model()
+    web_limits = os.environ.get("PRAXIS_WEB_LIMITS")
+    if web_limits:
+        agent_chat(web_limits_file=Path(web_limits))
+    else:
+        agent_chat()
+
+
+@model_app.callback()
+def _model_configuration(ctx: typer.Context) -> None:
+    if ctx.invoked_subcommand is None:
+        configure_model()
 
 
 def _open_cli_worktree(name: str | None) -> CreateReport:
@@ -1004,7 +1028,8 @@ def _print_chat_help() -> None:
     print("交互命令:")
     for command, description in CHAT_COMMANDS.items():
         print(f"  {command:<18}{description}")
-    print("  /model             交互终端内用 ↑↓ 选择模型，Enter 确认，Esc 取消")
+    print("  /model             选择模型并记住为新会话默认")
+    print("  /model session ID  仅切换当前聊天")
     print("  输入 / 自动显示命令；继续输入前缀筛选；↑↓ 选择，Tab 补全，Enter 确认候选后再按一次执行")
     print("  执行记录：Ctrl+O 切换最近记录；Tab 进入记录，方向键移动，Enter 切换")
     print("  Ctrl+J / Alt+Enter 换行；PageUp/PageDown 滚动记录；Ctrl+End 回到底部；Ctrl+C 取消")
@@ -1796,7 +1821,11 @@ async def _chat_facade_loop(
             if query in {"/new", "/clear"}:
                 await stack.aclose()
                 stack.callback(event_display.finish)
-                if session is not None:
+                if callable(getattr(facade, "set_default_model", None)):
+                    facade.model = None
+                    facade._followup_model_id = None
+                    model_id = facade.current_model().id
+                elif session is not None:
                     facade.model = model_id
                 facade.knowledge = default_chat_knowledge
                 session = None
@@ -1836,10 +1865,20 @@ async def _chat_facade_loop(
                     if selected is None:
                         continue
                     query = f"/model switch {selected}"
-                _handle_model_slash_command(
+                switched = _handle_model_slash_command(
                     query,
                     agent=model_control,
                 )
+                if switched is not None and query.split(maxsplit=2)[1] != "session":
+                    save_default = getattr(facade, "set_default_model", None)
+                    if callable(save_default):
+                        try:
+                            if save_default(switched.id):
+                                print("已记为新会话默认模型。")
+                            else:
+                                print("当前使用整库覆盖，本次仅切换当前会话。")
+                        except (OSError, ValueError, RuntimeError) as error:
+                            print(f"当前会话已切换，默认模型未保存：{safe_terminal_text(str(error))}")
                 model_id = model_control.current_model().id
                 if _ui:
                     _ui.model = model_id
@@ -2085,14 +2124,16 @@ def _handle_model_slash_command(
     query: str,
     *,
     agent: Agent | Session | None,
-) -> None:
+) -> ModelSpec | None:
+    from agent_runtime.agent import Agent
+
     if agent is None:
         print("模型控制平面不可用。")
-        return
-    parts = query.split()
+        return None
+    parts = query.split(maxsplit=2)
     if len(parts) == 1:
         _print_model_menu(agent)
-        return
+        return None
     action = parts[1] if len(parts) > 1 else "current"
     try:
         if action == "list":
@@ -2101,26 +2142,30 @@ def _handle_model_slash_command(
                 current_model_id=agent.current_model().id,
             ):
                 print(line)
-            return
+            return None
         if action == "current":
             _print_current_model(agent.current_model())
-            return
-        if action in {"switch", "use"}:
+            return None
+        if action in {"switch", "use", "session"}:
             if len(parts) < 3:
-                print("用法: /model switch <model_id>")
-                return
-            spec = agent.switch_model(parts[2])
+                print(f"用法: /model {action} <model_id>")
+                return None
+            if action == "session" and isinstance(agent, Agent):
+                spec = agent.switch_model(parts[2], persist=False)
+            else:
+                spec = agent.switch_model(parts[2])
             print(f"已切换模型: {spec.id}")
-            return
+            return spec
         if len(parts) == 2:
             spec = agent.switch_model(action)
             print(f"已切换模型: {spec.id}")
-            return
+            return spec
     except (ModelPolicyError, UnknownModelIdError) as exc:
         print(f"模型切换失败: {exc}")
         _print_model_menu(agent)
-        return
-    print("用法: /model [current|list|switch <model_id>]")
+        return None
+    print("用法: /model [current|list|switch <model_id>|session <model_id>]")
+    return None
 
 
 # ── CLI Commands ──
@@ -2139,6 +2184,12 @@ def model_list(
 ) -> None:
     """列出可用模型，并标记当前会话模型。"""
     service = _model_admin_service(session_path)
+    if source:
+        override = service.whole_catalog_override_active
+        print(f"catalog_mode: {'override' if override else 'merged'}")
+        print(f"catalog_source: {safe_terminal_text(service.source_path('override' if override else 'builtin'))}")
+        registry_path = safe_terminal_text(service.source_path("user"))
+        print(f"user_registry: {registry_path}" + (" (ignored in override mode)" if override else ""))
     selection = _model_admin_call(service.current_selection)
     _print_model_session_diagnostics(selection.diagnostics)
     current_id = selection.spec.id
@@ -2157,9 +2208,13 @@ def model_show(
     ] = DEFAULT_MODEL_SESSION_PATH,
 ) -> None:
     """显示一个模型的规范化定义摘要，不解析凭据值。"""
-    entry = _model_admin_call(lambda: _model_admin_service(session_path).show(model_id))
+    service = _model_admin_service(session_path)
+    entry = _model_admin_call(lambda: service.show(model_id))
     print(f"model_id: {entry.model_id}")
+    if entry.definition.remote_model_id is not None:
+        print(f"remote_model_id: {entry.definition.remote_model_id}")
     print(f"source: {entry.origin}")
+    print(f"source_path: {safe_terminal_text(service.source_path(entry.origin))}")
     print(f"provider: {entry.definition.provider.value}")
     print(f"provider_name: {entry.definition.provider_name or '<none>'}")
     print(f"protocol: {entry.spec.protocol or '<none>'}")
@@ -2174,6 +2229,15 @@ def model_show(
     print(f"supports_tools: {str(entry.spec.supports_tools).lower()}")
     print(f"supports_structured_output: {str(entry.spec.supports_structured_output).lower()}")
     print(f"definition_revision: {entry.definition_revision}")
+
+
+@model_app.command(name="compact", hidden=True)
+def model_compact() -> None:
+    """Migrate the personal registry to the shared connection layout."""
+    service = _model_admin_service(DEFAULT_MODEL_SESSION_PATH)
+    result = _model_admin_call(service.compact)
+    message = "已整理模型配置" if result.changed else "模型配置已是共享连接格式"
+    print(f"{message}: {safe_terminal_text(service.source_path('user'))}")
 
 
 @model_app.command(name="current")
@@ -2197,8 +2261,10 @@ def model_switch(
         typer.Option("--session-path", help="模型 session state 文件"),
     ] = DEFAULT_MODEL_SESSION_PATH,
 ) -> None:
-    """切换当前模型 session state，不修改 models.yaml。"""
-    spec = _model_admin_call(lambda: _model_admin_service(session_path).switch(model_id))
+    """切换模型并记住为新会话默认。"""
+    service = _model_admin_service(session_path)
+    spec = _model_admin_call(lambda: service.switch(model_id))
+    _model_admin_call(lambda: service.set_default(model_id))
     print(f"已切换模型: {spec.id}")
 
 
@@ -2207,7 +2273,7 @@ def model_probe(
     model_id: Annotated[str, typer.Argument(help="模型 id")],
     level: Annotated[
         ProbeLevel,
-        typer.Option("--level", help="connectivity、stream 或 full"),
+        typer.Option("--level", help="chat、connectivity、stream 或 full"),
     ] = ProbeLevel.FULL,
     session_path: Annotated[
         Path,
@@ -2623,7 +2689,7 @@ def agent_chat(
     ] = None,
     model: Annotated[
         str | None,
-        typer.Option("--model", help="主生成模型 ID，对应 configs/models.yaml 中 capability=chat 的条目"),
+        typer.Option("--model", help="为本次聊天指定主生成模型 ID"),
     ] = None,
     max_tokens_total: Annotated[
         int | None,
@@ -2820,7 +2886,7 @@ def agent_run(
     ] = None,
     model: Annotated[
         str | None,
-        typer.Option("--model", "-m", help="主生成模型 ID，对应 configs/models.yaml 中 capability=chat 的条目"),
+        typer.Option("--model", "-m", help="为本次执行指定主生成模型 ID"),
     ] = None,
     knowledge_config: Annotated[
         Path | None,

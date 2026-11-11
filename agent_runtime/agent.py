@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from agent_runtime.channels import Channels
     from agent_runtime.harness import BoundHarnessModel, Session
     from agent_runtime.harness.records import ItemSnapshot
+    from agent_runtime.model_admin import ModelAdminService
     from agent_runtime.runtime.mcp import MCPConfigTrustDecision
     from agent_runtime.tools.builtins.shell import RunCommandOutput
 
@@ -138,6 +139,49 @@ class Agent:
     def current_model(self) -> ModelSpec:
         return self._get_model_control_plane().current_model()
 
+    def set_default_model(self, model_id: str) -> bool:
+        """Save the model used by future sessions without switching this Agent."""
+        return self._model_admin().set_default(model_id)
+
+    async def configure_openai_model(
+        self,
+        model: str,
+        *,
+        base_url: str,
+        api_key: str | None = None,
+        model_id: str | None = None,
+        connection_name: str | None = None,
+        context_window_tokens: int = 32_768,
+        make_default: bool = True,
+    ) -> str:
+        """Verify and register an OpenAI Chat Completions connection."""
+        from agent_runtime.model_admin import openai_model_arguments
+        from agent_runtime.model_probe import ProbeLevel
+
+        selected_id = model if model_id is None else model_id
+        arguments = openai_model_arguments(
+            base_url=base_url,
+            connection_name=connection_name,
+            remote_model_id=model if selected_id != model else None,
+            context_window_tokens=context_window_tokens,
+            authenticated=api_key is not None,
+        )
+        if arguments.location == "cloud" and api_key is None:
+            raise ValueError("A cloud connection requires an API key")
+        result = await self._model_admin().add(
+            selected_id, arguments=arguments, from_path=None, skip_probe=False,
+            probe_level=ProbeLevel.CHAT, make_default=make_default, api_key_to_save=api_key,
+        )
+        return result.model_id
+
+    def _model_admin(self) -> ModelAdminService:
+        from agent_runtime.runtime.builder import build_model_admin_service
+
+        workspace = self._workspace_path()
+        return build_model_admin_service(
+            workspace=workspace, session_path=workspace / DEFAULT_MODEL_SESSION_PATH,
+        )
+
     def request_settings(self) -> dict[str, Any]:
         return self._get_model_control_plane().request_settings()
 
@@ -161,11 +205,11 @@ class Agent:
         self._pending_request_settings[settings["model_id"]] = self._request_overrides[settings["model_id"]]
         return settings
 
-    def switch_model(self, model_id: str) -> ModelSpec:
+    def switch_model(self, model_id: str, *, persist: bool = True) -> ModelSpec:
         spec = self._get_model_control_plane().switch_model(
             model_id,
             requested_by="user",
-            persist=self.model_session_path is not None,
+            persist=persist and self.model_session_path is not None,
         )
         self.model = spec.id
         self._followup_model_id = spec.id

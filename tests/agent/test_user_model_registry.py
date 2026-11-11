@@ -215,6 +215,56 @@ def test_registry_identity_is_only_the_models_mapping_key(tmp_path: Path) -> Non
     assert "model" not in persisted["models"]["org/model"]
 
 
+def test_compact_shares_connection_without_changing_model_definitions(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    models = {
+        "a": _definition(provider_name="gateway", api_key_env="MY_GATEWAY_KEY"),
+        "b": _definition(provider_name="gateway", api_key_env="MY_GATEWAY_KEY", max_output_tokens=4096),
+        "c": _definition(provider_name="gateway", api_key_env="OTHER_GATEWAY_KEY"),
+    }
+    store.path.write_text(yaml.safe_dump({
+        "version": 1,
+        "revision": 7,
+        "default_model": "b",
+        "models": {name: definition.to_persisted_mapping() for name, definition in models.items()},
+    }))
+    previous = store.read()
+
+    result = store.compact(expected=previous.version)
+    persisted = yaml.safe_load(store.path.read_text())
+    assert persisted["version"] == 2
+    assert len(persisted["connections"]) == 2
+    assert persisted["models"]["a"]["connection"] == persisted["models"]["b"]["connection"]
+    assert persisted["models"]["c"]["connection"] != persisted["models"]["b"]["connection"]
+    assert "base_url" not in persisted["models"]["a"]
+    assert store.read().document.models == previous.document.models
+    assert store.read().document.default_model == previous.document.default_model
+    assert result.snapshot.document.revision == 8
+    assert not store.compact(expected=result.snapshot.version).changed
+    updated = store.update(
+        "a", ModelDefinitionPatch(changes={"base_url": "http://127.0.0.1:8081/v1"}), expected=result.snapshot.version,
+    )
+    assert updated.snapshot.document.models["b"] == models["b"]
+    persisted = yaml.safe_load(store.path.read_text())
+    assert persisted["models"]["a"]["connection"] != persisted["models"]["b"]["connection"]
+
+
+@pytest.mark.parametrize("model_entry", [
+    {"connection": "missing", "context_window_tokens": 32768},
+    {"connection": "gateway", "base_url": "https://other.example/v1", "context_window_tokens": 32768},
+])
+def test_grouped_registry_rejects_unknown_and_overridden_connections(tmp_path: Path, model_entry: dict) -> None:
+    store = _store(tmp_path)
+    store.path.write_text(yaml.safe_dump({
+        "version": 2,
+        "revision": 1,
+        "connections": {"gateway": {"provider": "openai_compatible"}},
+        "models": {"a": model_entry},
+    }))
+    with pytest.raises(RegistryConfigValidationError, match="connection"):
+        store.read()
+
+
 def test_schema_rejects_nested_model_identity() -> None:
     with pytest.raises(ValidationError):
         UserModelDefinition.model_validate(
@@ -550,8 +600,9 @@ def test_remove_retains_empty_versioned_document_and_monotonic_revision(tmp_path
     assert removed.snapshot.document == UserModelRegistryDocument(revision=2, models={})
     assert store.path.exists()
     assert yaml.safe_load(store.path.read_text(encoding="utf-8")) == {
-        "version": 1,
+        "version": 2,
         "revision": 2,
+        "connections": {},
         "models": {},
     }
     with pytest.raises(RegistryEntryNotFound):

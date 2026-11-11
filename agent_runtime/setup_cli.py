@@ -7,8 +7,10 @@ import os
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import urlsplit
 
 import click
 import typer
@@ -17,7 +19,7 @@ from agent_runtime import mcp_admin
 from agent_runtime.core.llm_config import ModelProvider, normalize_model_endpoint, validate_api_key_env_name
 from agent_runtime.core.runtime_diagnostics import redact_sensitive_text
 from agent_runtime.mcp_cli import check_mcp_connection
-from agent_runtime.model_admin import ModelAdminService, ModelDefinitionArguments
+from agent_runtime.model_admin import ModelAdminService, ModelDefinitionArguments, openai_model_arguments
 from agent_runtime.model_config_io import validate_user_config_path
 from agent_runtime.model_credentials import credential_directory, resolve_model_credential, save_model_credential
 from agent_runtime.model_probe import ProbeLevel
@@ -42,19 +44,24 @@ def _probe_key(name: str | None, key: str | None) -> Iterator[None]:
                 os.environ[name] = previous
 
 
-def _configure_model(service: ModelAdminService, model_id: str | None) -> str:
-    typer.echo("1/3 选择模型")
+def _configure_model(service: ModelAdminService, model_id: str | None, *, simple: bool = False) -> str:
+    typer.echo("配置 OpenAI 兼容模型" if simple else "1/3 选择模型")
+    if simple and service.whole_catalog_override_active:
+        source = safe_terminal_text(service.source_path("override"))
+        typer.echo(f"正在使用整库覆盖（{source}）。个人模型注册表未加载。")
     entries = service.list_models()
-    if model_id is None and len(entries) == 1:
+    adding = False
+    if model_id is None and len(entries) == 1 and not simple:
         model_id = entries[0].model_id
         typer.echo("默认模型：" + safe_terminal_text(model_id))
     elif model_id is None:
         for entry in entries:
-            typer.echo("  " + safe_terminal_text(entry.model_id))
+            typer.echo("  " + safe_terminal_text(f"{entry.model_id} · {entry.spec.provider}"))
         model_id = typer.prompt("模型 ID（输入 new 添加模型）", default=service.current().id)
         if model_id == "new":
+            adding = True
             model_id = typer.prompt("服务商提供的实际模型 ID")
-    known = model_id in {entry.model_id for entry in entries}
+    known = not adding and model_id in {entry.model_id for entry in entries}
     arguments: ModelDefinitionArguments | None = None
     if known:
         definition = service.show(model_id).definition
@@ -63,43 +70,76 @@ def _configure_model(service: ModelAdminService, model_id: str | None) -> str:
         ).base_url
         name = definition.api_key_env
     else:
+        if service.whole_catalog_override_active:
+            raise ValueError("当前使用整库覆盖，请取消 RAG_AGENT_MODELS_PATH / RAG_AGENT_MODELS 后再添加个人模型")
         typer.echo("添加兼容 OpenAI 接口的模型；本地模型服务需先启动。")
-        endpoint = typer.prompt("API 地址（例如 https://provider.example/v1）")
+        endpoint = typer.prompt("Base URL（例如 https://provider.example/v1）").strip().rstrip("/")
         normalized = normalize_model_endpoint(
             provider=ModelProvider.OPENAI_COMPATIBLE, base_url=endpoint, location=None
         )
         endpoint = normalized.base_url
-        window = typer.prompt("上下文窗口 tokens（按服务说明填写）", type=click.IntRange(min=1))
-        name = typer.prompt("API Key 环境变量名（无认证服务输入 none）", default="PRAXIS_MODEL_API_KEY")
-        name = None if name == "none" else name
-        validate_api_key_env_name(name)
-        arguments = ModelDefinitionArguments(
-            provider=ModelProvider.OPENAI_COMPATIBLE,
-            base_url=endpoint,
-            api_key_env=name,
-            context_window_tokens=window,
-            location=normalized.location,
-        )
+        remote_model_id = None
+        connection = urlsplit(endpoint).netloc
+        if simple:
+            if any(entry.model_id == model_id for entry in entries):
+                connection = typer.prompt("连接名称", default=connection).strip()
+                if not connection or any(char.isspace() for char in connection):
+                    raise ValueError("连接名称不能为空或包含空格")
+                remote_model_id, model_id = model_id, f"{model_id}@{connection}"
+                if any(entry.model_id == model_id for entry in entries):
+                    raise ValueError(f"连接已存在，请选择 {model_id} 或使用其他连接名称")
+            arguments = openai_model_arguments(
+                base_url=endpoint, connection_name=connection, remote_model_id=remote_model_id,
+            )
+            name = arguments.api_key_env
+        else:
+            window = typer.prompt("上下文窗口 tokens（按服务说明填写）", type=click.IntRange(min=1))
+            name = typer.prompt("API Key 环境变量名（无认证服务输入 none）", default="PRAXIS_MODEL_API_KEY")
+            name = None if name == "none" else name
+            validate_api_key_env_name(name)
+            arguments = ModelDefinitionArguments(
+                provider=ModelProvider.OPENAI_COMPATIBLE,
+                base_url=endpoint,
+                api_key_env=name,
+                context_window_tokens=window,
+                location=normalized.location,
+            )
         arguments.for_add()  # Validate before requesting a secret.
 
-    typer.echo("2/3 验证并保存模型连接（会产生少量模型请求）")
+    typer.echo("验证并保存模型连接（会发送测试消息）" if simple else "2/3 验证并保存模型连接（会产生少量模型请求）")
     key = None
     if name is not None:
         existing = resolve_model_credential(name, endpoint)
         if existing is None or not typer.confirm("已有凭据，是否复用？", default=True):
             validate_user_config_path(credential_directory(), workspace=service.workspace, worktree=service.worktree)
-            key = typer.prompt("API Key", hide_input=True)
-            if not key.strip() or any(ord(char) < 32 for char in key):
+            if simple and arguments is not None and arguments.location == "local":
+                key = typer.prompt("API Key（本地无认证可留空）", hide_input=True, default="", show_default=False)
+                if not key:
+                    arguments = replace(arguments, api_key_env=None)
+                    name, key = None, None
+            else:
+                key = typer.prompt("API Key", hide_input=True)
+            if key is not None and (not key.strip() or any(ord(char) < 32 for char in key)):
                 raise ValueError("API Key 不能为空或包含控制字符")
         else:
             typer.echo("复用已有凭据。")
     try:
-        with _probe_key(name, key):
-            if known:
-                asyncio.run(service.probe(model_id, level=ProbeLevel.FULL))
-            else:
-                assert arguments is not None
-                asyncio.run(service.add(model_id, arguments=arguments, from_path=None, skip_probe=False))
+        level = ProbeLevel.CHAT if simple else ProbeLevel.FULL
+        if simple and arguments is not None:
+            asyncio.run(service.add(
+                model_id, arguments=arguments, from_path=None, skip_probe=False,
+                probe_level=level, make_default=True, api_key_to_save=key,
+            ))
+            if key is not None:
+                typer.echo("凭据已保存。")
+                key = None
+        else:
+            with _probe_key(name, key):
+                if known:
+                    asyncio.run(service.probe(model_id, level=level))
+                else:
+                    assert arguments is not None
+                    asyncio.run(service.add(model_id, arguments=arguments, from_path=None, skip_probe=False))
         if name is not None and key is not None:
             save_model_credential(name, endpoint, key)
             location = "macOS Keychain" if sys.platform == "darwin" else "工作区外的私有凭据文件"
@@ -114,9 +154,20 @@ def _configure_model(service: ModelAdminService, model_id: str | None) -> str:
             message = message.replace(key, "[redacted]")
         raise ValueError(message) from None
     refreshed = ModelAdminService.from_env(workspace=service.workspace, session_path=service.session_path)
+    if known or not simple:
+        refreshed.set_default(model_id)
     refreshed.switch(model_id)
     typer.echo("模型验证通过，已选择：" + safe_terminal_text(model_id))
     return model_id
+
+
+def configure_model(model_id: str | None = None) -> None:
+    try:
+        service = ModelAdminService.from_env(session_path=DEFAULT_MODEL_SESSION_PATH)
+        _configure_model(service, model_id, simple=True)
+    except (OSError, ValueError, RuntimeError) as error:
+        typer.echo("模型配置未完成：" + safe_terminal_text(redact_sensitive_text(error)), err=True)
+        raise typer.Exit(1) from None
 
 
 def setup(
@@ -130,7 +181,7 @@ def setup(
     """首次配置：模型连接、联网搜索，再按需连接 GitHub。"""
     try:
         service = ModelAdminService.from_env(session_path=session_path)
-        model_id = _configure_model(service, model)
+        _configure_model(service, model)
     except (OSError, ValueError, RuntimeError) as error:
         typer.echo("模型配置未完成：" + safe_terminal_text(redact_sensitive_text(error)), err=True)
         raise typer.Exit(1) from None
@@ -155,4 +206,4 @@ def setup(
         except (OSError, ValueError, RuntimeError) as error:
             typer.echo("模型已配置；GitHub 连接未完成：" + safe_terminal_text(redact_sensitive_text(error)), err=True)
             raise typer.Exit(1) from None
-    typer.echo("配置完成。当前项目可运行：agent chat --model " + safe_terminal_text(model_id))
+    typer.echo("配置完成。运行 agent 启动，聊天中用 /model 切换。")
