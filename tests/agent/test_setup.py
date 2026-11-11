@@ -11,6 +11,120 @@ from agent_runtime.model_probe import ModelProbe, ModelProbeError, ModelProbeEvi
 from tests.agent.test_model_probe import provider_server as provider_server
 
 
+def test_agent_without_subcommand_opens_chat(monkeypatch):
+    from agent_runtime import cli
+
+    calls = []
+    monkeypatch.delenv("PRAXIS_WEB_LIMITS", raising=False)
+    monkeypatch.setattr(cli, "agent_chat", lambda: calls.append("chat"))
+    result = CliRunner().invoke(agent_app)
+
+    assert result.exit_code == 0, result.output
+    assert calls == ["chat"]
+
+
+def test_first_interactive_launch_opens_model_configuration(setup_environment, monkeypatch):
+    from agent_runtime import cli, model_credentials
+
+    calls = []
+    monkeypatch.delenv("PRAXIS_WEB_LIMITS", raising=False)
+    monkeypatch.setattr(cli, "_is_interactive_terminal", lambda: True)
+    monkeypatch.setattr(model_credentials, "resolve_model_credential", lambda *args: None)
+    monkeypatch.setattr(cli, "configure_model", lambda: calls.append("configure"))
+    monkeypatch.setattr(cli, "agent_chat", lambda: calls.append("chat"))
+
+    result = CliRunner().invoke(agent_app)
+
+    assert result.exit_code == 0, result.output
+    assert calls == ["configure", "chat"]
+
+
+def test_chat_switch_is_saved_and_session_only_switch_is_not(setup_environment, monkeypatch):
+    from agent_runtime import Agent, cli
+
+    monkeypatch.setattr(cli, "_is_interactive_terminal", lambda: False)
+    runner = CliRunner()
+    result = runner.invoke(
+        agent_app, input="/model kimi-k3\n/model session deepseek-flash\n/model current\n/new\n/model current\n/exit\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "已切换模型: deepseek-flash" in result.output
+    assert "> deepseek-flash\nprovider: deepseek" in result.output
+    assert "> kimi-k3\nprovider: kimi" in result.output
+    assert "已记为新会话默认模型" in result.output
+    assert Agent().current_model().id == "kimi-k3"
+    result = runner.invoke(agent_app, input="/model current\n/exit\n")
+    assert result.exit_code == 0, result.output
+    assert "Agent 就绪 (模型: kimi-k3)" in result.output
+
+
+def test_model_wizard_registers_a_second_connection_for_the_same_wire_model(
+    setup_environment, monkeypatch, provider_server,
+):
+    from agent_runtime import model_credentials
+    from agent_runtime.core.llm_registry import ModelRegistry
+
+    monkeypatch.setattr(model_credentials, "_PLATFORM", "linux")
+    state, endpoint = provider_server
+    result = CliRunner().invoke(
+        agent_app, ["model"],
+        input=f"new\nqwen3.8-max\n{endpoint}\nmy-gateway\nprobe-secret\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "probe-secret" not in result.output
+    assert state.model_list_requests == 0
+    assert [request["model"] for request in state.requests] == ["qwen3.8-max"]
+    registry = ModelRegistry.from_env()
+    assert registry.origin("qwen3.8-max") == "builtin"
+    assert registry.get_model_definition("qwen3.8-max@my-gateway").remote_model_id == "qwen3.8-max"
+    assert registry.default_model == "qwen3.8-max@my-gateway"
+    from agent_runtime import Agent
+
+    another_project = setup_environment.parent / "another-project"
+    another_project.mkdir()
+    assert Agent(workspace_path=another_project).current_model().id == "qwen3.8-max@my-gateway"
+    model_file = Path(os.environ["PRAXIS_MODEL_REGISTRY_PATH"])
+    assert "probe-secret" not in model_file.read_text()
+
+
+@pytest.mark.anyio
+async def test_sdk_registers_openai_connection_without_process_environment(
+    setup_environment, monkeypatch, provider_server,
+):
+    from agent_runtime import Agent, model_credentials
+    from agent_runtime.core.llm_registry import ModelRegistry
+
+    monkeypatch.setattr(model_credentials, "_PLATFORM", "linux")
+    state, endpoint = provider_server
+    agent = Agent(workspace_path=setup_environment)
+    model_id = await agent.configure_openai_model(
+        "probe-model", model_id="sdk-gateway", base_url=endpoint, api_key="probe-secret",
+    )
+
+    assert model_id == "sdk-gateway"
+    assert [request["model"] for request in state.requests] == ["probe-model"]
+    assert state.model_list_requests == 0
+    assert Agent(workspace_path=setup_environment).current_model().id == model_id
+    registry = ModelRegistry.from_env()
+    definition = registry.get_model_definition(model_id)
+    assert definition.api_key_env not in os.environ
+
+    from agent_runtime.models import ModelControlPlane
+
+    plane = ModelControlPlane.from_env(workspace=setup_environment)
+    plane.ensure_model_binding_trust(has_existing_bindings=False)
+    try:
+        binding = plane.freeze_model_binding(thread_id="sdk-thread", turn_id="sdk-turn")
+        agent.set_default_model("deepseek-flash")
+        resolved = plane.resolve_frozen_binding(binding, thread_id="sdk-thread", turn_id="sdk-turn")
+        assert resolved.model_id == "sdk-gateway"
+        assert resolved.generator.chat_model_name == "probe-model"
+    finally:
+        plane.close()
+
+
 @pytest.fixture
 def setup_environment(tmp_path, monkeypatch):
     workspace = tmp_path / "project"

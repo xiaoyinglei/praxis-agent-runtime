@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
-from agent_runtime.core.llm_config import ModelProvider
+from agent_runtime.core.llm_config import ModelProvider, normalize_model_endpoint
 from agent_runtime.core.llm_registry import ModelRegistry, user_model_registry_path
-from agent_runtime.model_config_io import discover_git_worktree
+from agent_runtime.model_config_io import discover_git_worktree, validate_user_config_path
+from agent_runtime.model_credentials import credential_directory, save_model_credential
 from agent_runtime.model_definition import ModelExecutionDefinition
 from agent_runtime.model_probe import ModelProbe, ModelProbeEvidence, ProbeLevel
 from agent_runtime.model_registry import (
@@ -31,6 +34,7 @@ class CurrentModelRemovalError(ValueError):
 @dataclass(frozen=True, slots=True)
 class ModelDefinitionArguments:
     provider: ModelProvider | None = None
+    remote_model_id: str | None = None
     tokenizer_model: str | None = None
     provider_name: str | None = None
     protocol: str | None = None
@@ -65,6 +69,7 @@ class ModelDefinitionArguments:
     def _changes(self) -> dict[str, object]:
         values = {
             "provider": self.provider,
+            "remote_model_id": self.remote_model_id,
             "tokenizer_model": self.tokenizer_model,
             "provider_name": self.provider_name,
             "protocol": self.protocol,
@@ -80,6 +85,31 @@ class ModelDefinitionArguments:
             "location": self.location,
         }
         return {key: value for key, value in values.items() if value is not None}
+
+
+def openai_model_arguments(
+    *,
+    base_url: str,
+    connection_name: str | None = None,
+    remote_model_id: str | None = None,
+    context_window_tokens: int = 32_768,
+    authenticated: bool = True,
+) -> ModelDefinitionArguments:
+    endpoint = normalize_model_endpoint(
+        provider=ModelProvider.OPENAI_COMPATIBLE, base_url=base_url.strip().rstrip("/"), location=None,
+    )
+    connection = connection_name or urlsplit(endpoint.base_url).netloc
+    credential_id = hashlib.sha256(f"{endpoint.base_url}\n{connection}".encode()).hexdigest()[:20].upper()
+    return ModelDefinitionArguments(
+        provider=ModelProvider.OPENAI_COMPATIBLE,
+        provider_name=connection,
+        remote_model_id=remote_model_id,
+        base_url=endpoint.base_url,
+        api_key_env=f"PRAXIS_MODEL_KEY_{credential_id}" if authenticated else None,
+        context_window_tokens=context_window_tokens,
+        supports_structured_output=False,
+        location=endpoint.location,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,17 +156,19 @@ class ModelAdminService:
             worktree=self.worktree,
         )
         self.catalog = ModelCatalog.from_registry(self.registry)
-        bundled = ModelRegistry._load_config()
+        self.catalog_source = self.registry.catalog_source()
+        self.whole_catalog_override_active = bool(
+            os.environ.get("RAG_AGENT_MODELS_PATH") or os.environ.get("RAG_AGENT_MODELS")
+        )
         registry_path = user_model_registry_path()
         self.store = UserModelRegistryStore(
             path=registry_path,
             workspace=self.workspace,
             worktree=self.worktree,
-            built_in_model_ids=bundled.models,
-            whole_catalog_override_active=bool(
-                os.environ.get("RAG_AGENT_MODELS_PATH")
-                or os.environ.get("RAG_AGENT_MODELS")
+            built_in_model_ids=tuple(
+                model_id for model_id in self.registry.model_ids if self.registry.origin(model_id) == "builtin"
             ),
+            whole_catalog_override_active=self.whole_catalog_override_active,
         )
         self.probe_service = ModelProbe(self.registry)
         self.trust_domain = ModelBindingTrustDomain(
@@ -165,6 +197,13 @@ class ModelAdminService:
     def show(self, model_id: str) -> ModelAdminEntry:
         return self._entry(model_id)
 
+    def source_path(self, origin: ModelOrigin) -> str:
+        return str(self.store.path) if origin == "user" else self.catalog_source
+
+    def compact(self) -> RegistryMutationResult:
+        snapshot = self.store.read()
+        return self.store.compact(expected=snapshot.version)
+
     def current(self) -> ModelSpec:
         return self.current_selection().spec
 
@@ -177,6 +216,14 @@ class ModelAdminService:
 
     def switch(self, model_id: str) -> ModelSpec:
         return self._control_plane().switch_model(model_id, requested_by="user")
+
+    def set_default(self, model_id: str) -> bool:
+        self.show(model_id)
+        if self.whole_catalog_override_active:
+            return False
+        snapshot = self.store.read()
+        self.store.set_default(model_id, expected=snapshot.version)
+        return True
 
     def trust_init(self) -> TrustDomainStatus:
         return self.trust_domain.initialize()
@@ -197,6 +244,9 @@ class ModelAdminService:
         arguments: ModelDefinitionArguments,
         from_path: Path | None,
         skip_probe: bool,
+        probe_level: ProbeLevel = ProbeLevel.FULL,
+        make_default: bool = False,
+        api_key_to_save: str | None = None,
     ) -> ModelMutationOutcome:
         if from_path is not None and not arguments.is_empty():
             raise ValueError("--from cannot be combined with model definition flags")
@@ -208,8 +258,19 @@ class ModelAdminService:
         snapshot = self.store.read()
         candidate = self.store.preview_add(model_id, definition, snapshot=snapshot)
         execution = self.registry.execution_definition_for_user_model(model_id, candidate)
-        evidence = None if skip_probe else await self.probe_service.run(execution, level=ProbeLevel.FULL)
-        result = self.store.add(model_id, candidate, expected=snapshot.version)
+        evidence: ModelProbeEvidence | None
+        if api_key_to_save is not None:
+            if skip_probe or execution.api_key_env is None or execution.base_url is None:
+                raise ValueError("Saving a model API key requires a verified connection and a credential reference")
+            if not api_key_to_save.strip() or any(ord(char) < 32 for char in api_key_to_save):
+                raise ValueError("API Key must be nonempty and contain no control characters")
+            validate_user_config_path(credential_directory(), workspace=self.workspace, worktree=self.worktree)
+            api_key_to_save = api_key_to_save.strip()
+            evidence = await self.probe_service.run(execution, level=probe_level, api_key=api_key_to_save)
+            save_model_credential(execution.api_key_env, execution.base_url, api_key_to_save)
+        else:
+            evidence = None if skip_probe else await self.probe_service.run(execution, level=probe_level)
+        result = self.store.add(model_id, candidate, expected=snapshot.version, make_default=make_default)
         return _mutation_outcome(
             model_id=model_id,
             execution=execution,

@@ -248,9 +248,9 @@ async def _run_probe(
         "expected_probe_limit",
     ),
     [
-        (None, 32),
+        (None, 512),
         (16, 16),
-        (4_096, 32),
+        (4_096, 512),
     ],
 )
 async def test_probe_output_limit_is_probe_policy_not_model_capability(
@@ -321,7 +321,7 @@ async def test_stream_probe_observes_real_deltas_and_authoritative_completion(
 
 
 @pytest.mark.anyio
-async def test_full_probe_forces_harmless_tool_without_executing_it_and_checks_structured_output(
+async def test_full_probe_checks_normal_tool_selection_without_executing_it_and_checks_structured_output(
     provider_server: tuple[_ProviderState, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -333,10 +333,13 @@ async def test_full_probe_forces_harmless_tool_without_executing_it_and_checks_s
     assert evidence.tool_call_ok is True
     assert evidence.structured_output_ok is True
     tool_request = next(request for request in state.requests if request.get("tools"))
-    assert tool_request["tool_choice"] == {
-        "type": "function",
-        "function": {"name": "probe_capability"},
+    assert tool_request["tool_choice"] == "auto"
+    assert tool_request["messages"][-1] == {
+        "role": "user",
+        "content": "Call the probe_capability tool with ok set to true.",
     }
+    parameters = tool_request["tools"][0]["function"]["parameters"]
+    assert parameters["properties"]["ok"] == {"type": "boolean", "const": True}
 
 
 @pytest.mark.anyio
@@ -348,7 +351,7 @@ async def test_full_probe_forces_harmless_tool_without_executing_it_and_checks_s
         ("invalid_tool", "tool_call"),
     ],
 )
-async def test_probe_rejects_malformed_stream_and_missing_forced_tool(
+async def test_probe_rejects_malformed_stream_and_missing_or_invalid_tool(
     provider_server: tuple[_ProviderState, str],
     monkeypatch: pytest.MonkeyPatch,
     mode: str,

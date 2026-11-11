@@ -61,7 +61,11 @@ class LocalProviderProbe:
         if not health_url:
             raise LocalRuntimeError(f"Local model {spec.id!r} has no base_url")
 
-        expected = (getattr(runtime, "expected_model_contains", None) if runtime is not None else None) or spec.id
+        expected = (
+            (getattr(runtime, "expected_model_contains", None) if runtime is not None else None)
+            or getattr(spec, "remote_model_id", None)
+            or spec.id
+        )
 
         try:
             if self._request_json is _request_json:

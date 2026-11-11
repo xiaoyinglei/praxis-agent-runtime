@@ -187,6 +187,7 @@ class ModelSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     provider: ModelProvider
+    remote_model_id: str | None = Field(default=None, min_length=1)
     tokenizer_model: str | None = Field(
         default=None,
         min_length=1,

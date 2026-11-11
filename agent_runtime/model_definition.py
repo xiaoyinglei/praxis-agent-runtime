@@ -173,6 +173,7 @@ class ModelExecutionDefinition(BaseModel):
     protocol: str | None
 
     model_id: str = Field(min_length=1)
+    remote_model_id: str | None = Field(default=None, min_length=1)
     tokenizer_model: str | None
 
     context_window_tokens: int = Field(
@@ -238,10 +239,14 @@ class ModelExecutionDefinition(BaseModel):
             payload.pop("auto_compact_token_limit", None)
         if self.continuation_summary_role is None:
             payload.pop("continuation_summary_role", None)
-        for key in ("reasoning", "agent_output_policy"):
+        for key in ("reasoning", "agent_output_policy", "remote_model_id"):
             if getattr(self, key) is None:
                 payload.pop(key, None)
         return dict(payload)
+
+    @property
+    def wire_model_id(self) -> str:
+        return self.remote_model_id or self.model_id
 
     @field_validator("base_url")
     @classmethod
@@ -311,7 +316,7 @@ def build_model_execution_definition(
     payload = spec.model_dump(mode="python")
     payload.update(
         model_id=model_id,
-        tokenizer_model=spec.tokenizer_model or model_id,
+        tokenizer_model=spec.tokenizer_model or spec.remote_model_id or model_id,
         base_url=endpoint.base_url,
         location=endpoint.location,
         defaults=RequestDefaultsDefinition.model_validate(deepcopy(spec.defaults)),

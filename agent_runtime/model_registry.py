@@ -52,6 +52,7 @@ _UNSET_PATHS = frozenset(
     }
 )
 _SINGLE_DEFINITION_FILE_LIMIT = 4 * 1024 * 1024
+_CONNECTION_FIELDS = ("provider", "provider_name", "protocol", "base_url", "api_key_env", "location")
 
 
 class RegistryCollisionError(ValueError):
@@ -87,6 +88,7 @@ class UserModelDefinition(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     provider: ModelProvider
+    remote_model_id: str | None = Field(default=None, min_length=1)
     tokenizer_model: str | None = Field(default=None, min_length=1)
     provider_name: str | None = Field(default=None, min_length=1)
     protocol: str | None = Field(default=None, min_length=1)
@@ -107,7 +109,7 @@ class UserModelDefinition(BaseModel):
     continuation_summary_role: Literal["context", "assistant"] = "context"
     reasoning: ReasoningCapabilities | None = None
 
-    @field_validator("tokenizer_model", "provider_name", "protocol")
+    @field_validator("remote_model_id", "tokenizer_model", "provider_name", "protocol")
     @classmethod
     def reject_blank_or_padded_text(cls, value: str | None) -> str | None:
         return _reject_blank_or_padded_text(value)
@@ -153,12 +155,13 @@ class UserModelDefinition(BaseModel):
 
 
 class UserModelRegistryDocument(BaseModel):
-    """The complete versioned user registry persisted in one YAML file."""
+    """The normalized registry after expanding any on-disk connections."""
 
     model_config = ConfigDict(extra="forbid")
 
     version: Literal[1] = 1
     revision: int = Field(ge=0, strict=True)
+    default_model: str | None = None
     models: dict[str, UserModelDefinition] = Field(default_factory=dict)
 
     @field_validator("models")
@@ -169,14 +172,23 @@ class UserModelRegistryDocument(BaseModel):
         return value
 
     def to_persisted_mapping(self) -> dict[str, object]:
-        return {
-            "version": self.version,
-            "revision": self.revision,
-            "models": {
-                model_id: definition.to_persisted_mapping()
-                for model_id, definition in sorted(self.models.items())
-            },
-        }
+        payload: dict[str, object] = {"version": 2, "revision": self.revision}
+        if self.default_model is not None:
+            payload["default_model"] = self.default_model
+        connections: dict[str, dict[str, object]] = {}
+        models: dict[str, dict[str, object]] = {}
+        for model_id, definition in sorted(self.models.items()):
+            fields = definition.to_persisted_mapping()
+            connection = {key: fields.pop(key) for key in _CONNECTION_FIELDS if key in fields}
+            name = definition.provider_name or definition.provider.value
+            connection_id = name
+            suffix = 2
+            while connection_id in connections and connections[connection_id] != connection:
+                connection_id = f"{name}-{suffix}"
+                suffix += 1
+            connections[connection_id] = connection
+            models[model_id] = {"connection": connection_id, **fields}
+        return {**payload, "connections": connections, "models": models}
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,6 +268,10 @@ class UserModelRegistryStore:
     def read(self) -> RegistrySnapshot:
         return self._read_unlocked()
 
+    def compact(self, *, expected: FileVersion) -> RegistryMutationResult:
+        """Rewrite the registry with shared connections using its normal commit path."""
+        return self._mutate(expected=expected, apply=lambda models: models, compact=True)
+
     def preview_add(
         self,
         model_id: str,
@@ -297,6 +313,7 @@ class UserModelRegistryStore:
         definition: UserModelDefinition,
         *,
         expected: FileVersion,
+        make_default: bool = False,
     ) -> RegistryMutationResult:
         _validate_model_id(model_id)
 
@@ -308,7 +325,11 @@ class UserModelRegistryStore:
             models[model_id] = definition
             return models
 
-        return self._mutate(expected=expected, apply=apply)
+        return self._mutate(expected=expected, apply=apply, select_default=model_id if make_default else None)
+
+    def set_default(self, model_id: str, *, expected: FileVersion) -> RegistryMutationResult:
+        _validate_model_id(model_id)
+        return self._mutate(expected=expected, apply=lambda models: models, select_default=model_id)
 
     def update(
         self,
@@ -357,6 +378,8 @@ class UserModelRegistryStore:
         *,
         expected: FileVersion,
         apply: Callable[[dict[str, UserModelDefinition]], dict[str, UserModelDefinition]],
+        select_default: str | None = None,
+        compact: bool = False,
     ) -> RegistryMutationResult:
         self._reject_override_mode()
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -373,8 +396,19 @@ class UserModelRegistryStore:
             )
             models = validated.models
             self._validate_effective_model_ids(models)
-            unchanged = _normalized_models(models) == _normalized_models(current.document.models)
-            if unchanged:
+            available = self._built_in_model_ids | models.keys()
+            if select_default is not None and select_default not in available:
+                raise RegistryEntryNotFound(f"Model ID {select_default!r} does not exist")
+            default_model = select_default or current.document.default_model
+            if default_model not in available:
+                default_model = None
+            unchanged = (
+                default_model == current.document.default_model
+                and _normalized_models(models) == _normalized_models(current.document.models)
+            )
+            if unchanged and (
+                not compact or current.fingerprint == file_fingerprint(_serialize_document(current.document))
+            ):
                 receipt = MutationReceipt(
                     base_version=current.version,
                     intended_revision=current.document.revision,
@@ -385,6 +419,7 @@ class UserModelRegistryStore:
             document = UserModelRegistryDocument(
                 revision=current.document.revision + 1,
                 models=models,
+                default_model=default_model,
             )
             payload = _serialize_document(document)
             fingerprint = file_fingerprint(payload)
@@ -409,7 +444,7 @@ class UserModelRegistryStore:
                 fingerprint=file_fingerprint(b""),
             )
         parsed = _load_registry_yaml(payload)
-        document = UserModelRegistryDocument.model_validate(parsed)
+        document = UserModelRegistryDocument.model_validate(_expand_connections(parsed))
         return RegistrySnapshot(document=document, fingerprint=file_fingerprint(payload))
 
     def _validate_effective_model_ids(self, models: Mapping[str, UserModelDefinition]) -> None:
@@ -523,14 +558,39 @@ def _reject_none_changes(value: object, *, path: str = "changes") -> None:
 
 
 def _serialize_document(document: UserModelRegistryDocument) -> bytes:
-    text = str(
-        yaml.safe_dump(
-            document.to_persisted_mapping(),
-            allow_unicode=True,
-            sort_keys=True,
-        )
-    )
-    return text.encode("utf-8")
+    return str(yaml.safe_dump(document.to_persisted_mapping(), allow_unicode=True, sort_keys=False)).encode("utf-8")
+
+
+def _expand_connections(payload: object) -> object:
+    if not isinstance(payload, dict) or type(payload.get("version")) is not int or payload["version"] != 2:
+        return payload
+    connections = payload.get("connections")
+    models = payload.get("models")
+    if not isinstance(connections, dict) or not isinstance(models, dict):
+        raise RegistryConfigValidationError("version 2 registry requires connections and models mappings")
+    for name, connection in connections.items():
+        if not isinstance(name, str) or not name or name != name.strip():
+            raise RegistryConfigValidationError("connection names must be non-empty trimmed strings")
+        if not isinstance(connection, dict) or not connection.keys() <= set(_CONNECTION_FIELDS):
+            raise RegistryConfigValidationError(f"connection {name!r} contains invalid fields")
+    expanded = {}
+    used_connections = set()
+    for model_id, entry in models.items():
+        if not isinstance(entry, dict):
+            raise RegistryConfigValidationError(f"model {model_id!r} must declare a connection")
+        name = entry.get("connection")
+        if not isinstance(name, str) or name not in connections:
+            raise RegistryConfigValidationError(f"model {model_id!r} references an unknown connection")
+        if set(_CONNECTION_FIELDS).intersection(entry):
+            raise RegistryConfigValidationError(f"model {model_id!r} cannot override connection fields")
+        used_connections.add(name)
+        fields = {key: value for key, value in entry.items() if key != "connection"}
+        expanded[model_id] = {**connections[name], **fields}
+    if used_connections != connections.keys():
+        raise RegistryConfigValidationError("registry contains an unused connection")
+    result = dict(payload)
+    del result["connections"]
+    return {**result, "version": 1, "models": expanded}
 
 
 def _load_registry_yaml(payload: bytes) -> object:

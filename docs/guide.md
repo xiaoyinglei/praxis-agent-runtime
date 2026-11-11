@@ -23,8 +23,7 @@ curl -fsSL https://raw.githubusercontent.com/xiaoyinglei/praxis-agent-runtime/ma
 ```bash
 uv tool install --python 3.12 --link-mode copy praxis-agent
 cd /path/to/my-project
-agent setup
-agent chat
+agent
 ```
 
 后续示例中的 `uv run agent ...` 适用于源码安装；使用上面的 PyPI 安装方式时，直接运行 `agent ...`。
@@ -35,27 +34,22 @@ agent chat
 git clone https://github.com/xiaoyinglei/praxis-agent-runtime.git
 cd praxis-agent-runtime
 uv sync --locked --link-mode copy
-uv run agent setup
-uv run agent chat
+uv run agent
 ```
 
 使用复制方式安装依赖，避免工作区中的依赖文件与外部 uv 缓存形成硬链接，触发沙箱包含性检查。Linux 还需要 Bubblewrap 和 libseccomp，见 [Ubuntu 部署](../DEPLOY_UBUNTU.md)。
 
-公开版默认使用 DeepSeek（`deepseek-flash`），首次向导直接进入默认模型的 API Key 输入。内置目录也提供已核验声明的其他服务商型号；安装包不包含开发者的凭据、个人模型注册表或 MLX 模型权重。向导验证失败不会改变当前模型选择，也不会保存本次输入的新 Key。模型验证会调用真实服务，产生实际用量。
+公开版默认使用 DeepSeek（`deepseek-flash`）。交互启动时缺少当前模型的凭据，会打开模型配置向导。选择已有模型，或输入 `new` 添加 OpenAI 兼容连接。验证会发送一条流式测试消息，产生实际用量。验证失败时保留原有选择和凭据。
 
-模型连接验证后，向导直接提供联网搜索设置，无需另记搜索命令。使用官方 DeepSeek 模型时，可以明确选择复用当前账号 Key；其他模型用户单独隐藏输入 DeepSeek 搜索 Key。已有搜索配置不会被覆盖；选择跳过会保存选择，后续不反复询问。自动化或只配置模型时使用 `agent setup --no-web`，不会更改已有搜索设置。搜索配置步骤不发真实搜索请求，不据此声明账号或服务已验证。
-
-使用目录已有型号时，运行 `agent setup --model MODEL_ID` 隐藏输入对应 Key，不需要手填上下文容量。目录外的服务商或本地模型按下文的 `agent model add` 接入；本地模型服务必须已经启动。
-
-```bash
-uv run agent setup --model MODEL_ID --no-mcp
-```
+添加连接或更换 API Key 时运行 `uv run agent model`。联网搜索可在聊天中用 `/web` 配置，外部服务可用 `/connections` 管理。
 
 macOS 将新 Key 保存到 Keychain；其他 POSIX 系统使用个人配置目录下的 `credentials` 私有目录和文件，权限分别为 `0700`、`0600`。Linux 使用受文件权限保护的本地明文存储。Agent 文件工具与子进程沙箱不能读取该凭据目录。
 
 环境变量优先于保存的个人凭据。凭据绑定变量名和准确服务地址，切换地址不会自动使用旧地址保存的 Key。项目 `.env` 只提供已校验模型定义声明的 `api_key_env`，不会用来改变权限、MCP 或宿主配置；`PRAXIS_DISABLE_DOTENV=1` 可禁用自动加载。
 
-个人配置默认位于 `~/.config/praxis`，可通过宿主环境变量 `PRAXIS_CONFIG_DIR` 指定。项目的模型选择和聊天记录默认位于 `.praxis/`，不应提交到 Git。
+个人模型及新会话默认值保存在 `~/.config/praxis/models.yaml`。`PRAXIS_CONFIG_DIR` 可更改个人目录，显式设置的 `PRAXIS_MODEL_REGISTRY_PATH` 优先。会话与历史仍在各项目的 `.praxis/`。旧版保存在项目里的模型选择，在尚未设置个人默认值时继续用于启动。
+
+个人注册表把共享地址、协议和凭据引用写在 `connections` 中。各模型在 `models` 中引用连接，并保存各自的服务端 ID 和容量。旧版平铺注册表可直接读取，下一次修改会写为共享连接格式。需要立即整理时可运行 `uv run agent model compact`。
 
 ### 选择其他项目
 
@@ -63,8 +57,7 @@ CLI 以当前工作目录作为项目。Praxis 的源码和依赖可以放在一
 
 ```bash
 cd /path/to/my-project
-uv run --project /path/to/praxis-agent-runtime agent setup
-uv run --project /path/to/praxis-agent-runtime agent chat
+uv run --project /path/to/praxis-agent-runtime agent
 ```
 
 上面的 `--project` 选择 uv 使用的安装项目，当前目录仍然是 Agent 的工作区。后续示例省略这部分前缀，默认在 Praxis 源码目录执行。
@@ -75,16 +68,13 @@ uv run --project /path/to/praxis-agent-runtime agent chat
 
 快照覆盖 OpenAI、Anthropic、Google、DeepSeek、Kimi、Qwen、智谱、MiniMax，并核对项目已有 Groq 型号。`chat_completions` 表示声明与当前接口匹配，不等于账号已授权或真实任务通过；`catalog_only` 保留官方容量与协议限制，不进入可运行列表。尚无明确整数的容量保留原始单位，不从 `1M` 猜数值。当前多模态消息协议未接通，目录中的厂商视觉能力不等于 Agent 已能读取图片。
 
-例如使用已内置的 Kimi：
-
-```bash
-uv run agent setup --model kimi-k3 --no-mcp
-uv run agent chat --model kimi-k3
-```
-
 ## 接入模型
 
-模型服务需要提供 OpenAI-compatible 接口，并满足配置中声明的能力：真实流式文本增量与权威完成状态、合法工具调用，以及启用时的结构化输出。模型 ID 必须与服务实际提供的 ID 一致。
+运行 `uv run agent model`，输入 `new`，再输入服务端模型 ID、OpenAI 兼容 Base URL 和 API Key。地址填到 API 的基础路径，例如 `https://models.example.com/v1`。当服务端 ID 已存在时，向导会让你给新连接起名，并把它登记为 `模型ID@连接名`。请求仍携带原始服务端模型 ID。新建连接默认使用 32,768 tokens 的上下文预算，可通过 `agent model update` 按服务规格调整。
+
+向导验证流式聊天。需要验证服务端模型列表、工具调用或结构化输出时，运行 `agent model probe MODEL_ID --level full`。自动化和高级配置可使用下列命令。
+
+`agent model list --source` 显示生效的目录模式和文件路径，`agent model show MODEL_ID` 显示单个模型的来源。通过宿主环境启用 `RAG_AGENT_MODELS_PATH` 或 `RAG_AGENT_MODELS` 时，部署目录会替换整份模型列表，个人注册表在该模式下不参与加载。
 
 已有个人注册表若与新版内置型号重名，启动会明确拒绝冲突，不会覆盖用户定义；升级前需保留个人文件并解决同名条目。内置模型定义只读；目录外的用户模型通过 CLI 登记，不需要修改源码配置：
 
@@ -109,7 +99,9 @@ uv run agent model remove MODEL_ID
 
 `add`、`update` 在完整验证成功后才提交注册表。首次使用会自动初始化本地绑定信任信息，无需手工初始化；已有历史绑定时若信任密钥丢失，需要恢复原密钥。
 
-聊天内输入 `/model` 选择模型，或输入 `/model MODEL_ID`。切换影响下一条消息，保留聊天历史；已经暂停的 Turn 继续使用原冻结绑定，不会改用新模型。
+聊天内输入 `/model` 或 `/model MODEL_ID`，下一条消息使用新模型，并记作新会话的默认值。`/model session MODEL_ID` 仅切换当前聊天。已经暂停的 Turn 继续使用原冻结绑定。
+
+Python SDK 使用同一份注册表。宿主可以调用 `await Agent().configure_openai_model(model, base_url=..., api_key=...)` 登记连接，随后新建的 `Agent()` 会使用保存的默认模型。传入 `model_id` 可指定独立的本地选择标识。
 
 ### 本地 MLX
 
