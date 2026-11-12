@@ -16,8 +16,9 @@ Session 是 turn 循环之上的会话门面:它不执行任何东西,只负责"
 
 resume 的处理序(与代码一一对应):守卫 → transition(RUNNING,真实 reason) →
 reconcile 写结果(先) → approval 写决策(摘要从 approval_request item 取,绑定
-digest)→ classify_pending 分类(有 matching decision 的调用进重放队列——审批
-重入靠管道内的 digest 绑定裁决,其余才走中断矩阵)→ 若有 outcome_unknown 则
+digest)→ classify_pending 分类(**先 started 后 decision**:未 started 且有
+matching decision 的调用进重放队列承接审批重入;已 started 的决策一律失效于
+安全矩阵——非幂等 outcome_unknown,见 _classify_and_prepare)→ 若有 outcome_unknown 则
 transition(PAUSED) 直接返回 → 否则带 resume_calls 重入 run_turn。
 
 已知边界(Phase 1,如实):
@@ -368,9 +369,13 @@ class Session:
     def _classify_and_prepare(self, turn_id: str) -> tuple[list[ModelToolCall], list[str]]:
         """classify_pending 决策矩阵 → (重放队列, outcome_unknown 清单)。
 
-        matching approval_decision(allow/deny)的待决调用直接进重放队列——审批
-        重入由管道内的 digest 绑定裁决落地(Task 12/13 交接语义);其余才按中断
-        矩阵写 not_executed / 自动重放幂等 / 标记 outcome_unknown。
+        优先级(R12 评审修复):**先 started,后 decision**。未 started 且持
+        matching approval_decision 的调用进重放队列——正常"ask→批准→重入"里
+        调用从未 dispatch(request 先于 tool_call),审批重入由管道内 digest 绑定
+        落地(Task 12/13 交接语义)。而 approve→dispatch→crash 的调用一旦
+        started,决策就绝不能再开自动重放的安全通道:非幂等一律 outcome_unknown
+        (未知副作用只能人工对账),幂等照常自动重试。其余按中断矩阵:
+        not_started→not_executed / started+幂等→重放 / started+非幂等→unknown。
         """
         items = self._store.read_turn_items(turn_id)
         decided = set(_latest_payloads(items, ItemKind.APPROVAL_DECISION))
@@ -379,14 +384,15 @@ class Session:
         entries: list[ItemEntry] = []
         for pending in classify_pending(items, self._tools):
             call = pending.call
-            if call.call_id in decided:
-                resume_calls.append(call)
-            elif not pending.started:
-                entries.append(
-                    _text_result_entry(
-                        call.call_id, call.name, ResultStatus.NOT_EXECUTED, _NOT_EXECUTED_TEXT, {}
+            if not pending.started:
+                if call.call_id in decided:
+                    resume_calls.append(call)  # 审批重入:未 dispatch,无未知副作用
+                else:
+                    entries.append(
+                        _text_result_entry(
+                            call.call_id, call.name, ResultStatus.NOT_EXECUTED, _NOT_EXECUTED_TEXT, {}
+                        )
                     )
-                )
             elif pending.idempotent:
                 resume_calls.append(call)
             else:

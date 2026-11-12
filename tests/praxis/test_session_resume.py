@@ -293,6 +293,66 @@ def test_resume_reconcile_with_ok_outcome(workspace: Path, open_ws: Callable[...
     assert results[-1]["is_error"] is False
 
 
+def test_resume_approved_started_non_idempotent_marks_unknown_not_replay(
+    workspace: Path, open_ws: Callable[..., Any]
+) -> None:
+    """R12 安全不变式回归:approve→dispatch→crash 后 started+非幂等仍走 outcome_unknown。
+
+    审批决策(decision item + matching digest 在场)不得成为未知副作用的自动重放
+    通道:确认续跑必须暂停等对账,reconcile 后才收尾,期间 bash 绝不重新执行。
+    """
+    session = open_ws(ScriptedAdapter([_resp("reconciled after crash")]))
+    args = {"command": "touch replay_marker.txt"}
+    call = ("c1", "bash", args)
+    digest = args_digest(args)
+    turn_id = _dead_turn(
+        workspace,
+        session.thread_id,
+        [
+            _model_response_entry("running bash", (call,)),
+            ItemEntry(
+                kind=ItemKind.APPROVAL_REQUEST,
+                payload={
+                    "call_id": "c1",
+                    "tool_name": "bash",
+                    "arguments": args,
+                    "effects": ("execute_process",),
+                    "targets": (),
+                    "args_digest": digest,
+                    "policy_revision": "0" * 64,
+                },
+            ),
+            ItemEntry(
+                kind=ItemKind.APPROVAL_DECISION,
+                payload={"call_id": "c1", "verdict": "allow", "args_digest": digest, "destination": "once"},
+            ),
+            _tool_call_entry(*call),  # 崩溃点在 dispatch 之后:tool_call 已落库、无 result
+        ],
+    )
+
+    paused = asyncio.run(session.resume(turn_id, confirm=True))
+    assert paused.status is TurnStatus.PAUSED
+    assert paused.reason == "outcome_unknown"
+    assert paused.unknown_calls == ("c1",)
+    assert not (workspace / "replay_marker.txt").exists()  # 确认续跑绝不重跑 bash
+
+    def _counts(other: Store) -> tuple[int, list[Any]]:
+        items = other.read_turn_items(turn_id)
+        calls = sum(1 for i in items if i.kind == ItemKind.TOOL_CALL)
+        results = [i.payload for i in items if i.kind == ItemKind.TOOL_RESULT]
+        return calls, results
+
+    call_count, results = _with_other_store(workspace, _counts)
+    assert call_count == 1  # 重放没有经管道二次 dispatch
+    assert results[-1]["status"] == "outcome_unknown"
+    assert results[-1]["tool_name"] == "bash"
+
+    done = asyncio.run(session.resume(turn_id, reconcile={"c1": "ok"}))
+    assert done.status is TurnStatus.COMPLETED and done.output == "reconciled after crash"
+    assert not (workspace / "replay_marker.txt").exists()  # reconcile 同样不执行
+    assert session.result(turn_id).unknown_calls == ()
+
+
 # ---------------------------------------------------------------------------
 # brief 草图 5:幂等 started → 自动重跑
 # ---------------------------------------------------------------------------
