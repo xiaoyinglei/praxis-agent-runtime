@@ -11,7 +11,6 @@ from praxis.protocol.items import ItemKind
 from praxis.store.log import ItemEntry, Store
 from praxis.store.verify import verify_store
 
-
 # ---------------------------------------------------------------------------
 # Step 2 brief test 1: seq gap detection
 # ---------------------------------------------------------------------------

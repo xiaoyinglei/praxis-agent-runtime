@@ -274,7 +274,11 @@ def test_classify_mixed_statuses_preserve_order() -> None:
 
 def test_classify_accepts_frozen_shapes() -> None:
     """Store 读出的 payload 是冻结形态:tool_calls=tuple,条目=mappingproxy。"""
-    frozen_calls = (MappingProxyType({"call_id": "c1", "name": "read_file", "arguments": MappingProxyType({"path": "x"})}),)
+    frozen_calls = (
+        MappingProxyType(
+            {"call_id": "c1", "name": "read_file", "arguments": MappingProxyType({"path": "x"})}
+        ),
+    )
     items = [_item(1, ItemKind.MODEL_RESPONSE.value, {"content": "", "tool_calls": frozen_calls})]
     pending = classify_pending(items, _TOOLS)
     assert len(pending) == 1

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from praxis.core.events import EventBus
 from praxis.protocol.events import ToolStarted
 

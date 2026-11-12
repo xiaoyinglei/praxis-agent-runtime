@@ -9,9 +9,9 @@ B11 回归 = FAILED 的 reason 携带真实异常文本而非笼统标签。
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import pytest
 
@@ -152,7 +152,13 @@ def test_multitool_turn_completes(store: Store, bus: Any, workspace: Path) -> No
             _resp("完成"),
         ]
     )
-    deps = _deps(store, bus, workspace, adapter, {"write": create_write_tool(workspace), "read": create_read_tool(workspace)})
+    deps = _deps(
+        store,
+        bus,
+        workspace,
+        adapter,
+        {"write": create_write_tool(workspace), "read": create_read_tool(workspace)},
+    )
 
     result = asyncio.run(run_turn(deps, TurnState(TURN, THREAD)))
 

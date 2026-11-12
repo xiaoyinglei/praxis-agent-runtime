@@ -15,7 +15,7 @@ import pytest
 
 from praxis.adapters.models.base import to_openai_messages, to_openai_tools
 from praxis.adapters.models.openai_compat import OpenAICompatAdapter
-from praxis.adapters.models.scripted import ScriptExhausted, ScriptedAdapter
+from praxis.adapters.models.scripted import ScriptedAdapter, ScriptExhausted
 from praxis.protocol.models import (
     ModelAdapter,
     ModelMessage,

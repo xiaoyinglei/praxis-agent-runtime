@@ -8,13 +8,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from hypothesis import HealthCheck, given, settings, strategies as st
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 
 from praxis.core.context import build_context, to_messages
 from praxis.protocol.items import Item
 from praxis.protocol.models import ModelMessage, ModelToolCall
 from praxis.protocol.tools import ToolContentBlock, ToolResult
-
 
 _UNPAIRED_NOTE = "[tool result unavailable: turn ended before execution]"
 
@@ -341,7 +341,10 @@ def test_all_calls_unpaired_get_synthetic_results() -> None:
         ModelMessage(
             role="assistant",
             content="calling",
-            tool_calls=(ModelToolCall(call_id="c1", name="t", arguments={}), ModelToolCall(call_id="c2", name="t", arguments={})),
+            tool_calls=(
+                ModelToolCall(call_id="c1", name="t", arguments={}),
+                ModelToolCall(call_id="c2", name="t", arguments={}),
+            ),
         ),
         ModelMessage(role="tool", content=_UNPAIRED_NOTE, tool_call_id="c1"),
         ModelMessage(role="tool", content=_UNPAIRED_NOTE, tool_call_id="c2"),
@@ -367,7 +370,11 @@ def test_denied_or_not_executed_result_counts_as_paired() -> None:
     for status in ("denied", "not_executed", "outcome_unknown", "error"):
         items = [
             mk(1, "model_response", {"content": "", "tool_calls": [{"call_id": "c1", "name": "t", "arguments": {}}]}),
-            mk(2, "tool_result", {"call_id": "c1", "status": status, "content": [{"type": "text", "data": {"text": "x"}}]}),
+            mk(
+                2,
+                "tool_result",
+                {"call_id": "c1", "status": status, "content": [{"type": "text", "data": {"text": "x"}}]},
+            ),
         ]
         msgs = to_messages(items)
         assert [m.role for m in msgs] == ["assistant", "tool"], status
@@ -396,7 +403,9 @@ def pairing_items(draw: st.SearchStrategy) -> list[Item]:  # type: ignore[misc]
         for c in calls:
             if draw(st.booleans()):
                 seq += 1
-                items.append(mk(seq, "tool_result", {"call_id": c, "content": [{"type": "text", "data": {"text": "ok"}}]}))
+                items.append(
+                    mk(seq, "tool_result", {"call_id": c, "content": [{"type": "text", "data": {"text": "ok"}}]})
+                )
         if draw(st.booleans()):
             seq += 1
             items.append(mk(seq, "user_message", {"text": "next"}))
@@ -416,7 +425,11 @@ def test_pairing_invariant_holds_for_every_assistant(items: list[Item]) -> None:
                 next_assistant = j
                 break
         for call in m.tool_calls:
-            following = [k for k in range(idx + 1, next_assistant) if msgs[k].role == "tool" and msgs[k].tool_call_id == call.call_id]
+            following = [
+                k
+                for k in range(idx + 1, next_assistant)
+                if msgs[k].role == "tool" and msgs[k].tool_call_id == call.call_id
+            ]
             assert len(following) == 1, call.call_id
 
 
