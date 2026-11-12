@@ -280,17 +280,9 @@ async def test_filesystem_tools_list_read_patch_and_expose_changes_immediately(
     assert "before_sha256" not in patched.result.metadata
     assert "after_sha256" not in patched.result.metadata
     assert patched.result.metadata["runtime_workspace_write"] is True
-    assert patched.result.metadata["workspace_tree_changed"] is True
-    assert len(
-        str(patched.result.metadata["workspace_tree_before_sha256"])
-    ) == 64
-    assert len(
-        str(patched.result.metadata["workspace_tree_after_sha256"])
-    ) == 64
-    assert (
-        patched.result.metadata["workspace_tree_before_sha256"]
-        != patched.result.metadata["workspace_tree_after_sha256"]
-    )
+    assert patched.result.metadata["runtime_workspace_changed"] is True
+    assert "workspace_tree_before_sha256" not in patched.result.metadata
+    assert "workspace_tree_after_sha256" not in patched.result.metadata
     [(changed_path, before_sha256, after_sha256)] = (
         runtime_workspace_file_changes(patched.result)
     )
@@ -1554,3 +1546,52 @@ def test_utf8_line_page_at_eof_does_not_offer_an_empty_continuation(tmp_path):
     result = _read_file(workspace, ReadFileInput(path='unicode', max_lines=1, max_bytes=1))
     assert result.content == '甲'
     assert result.truncated is False and result.next_offset is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        ("run_command", {"command": "if read -r line; then exit 91; fi; printf eof", "working_dir": "."}),
+        ("execute_python", {"code": "import sys\nassert sys.stdin.read() == ''\nprint('eof')", "working_dir": "."}),
+    ],
+)
+async def test_local_noninteractive_tools_explicitly_close_stdin(tmp_path, monkeypatch, tool_name, arguments):
+    import asyncio
+
+    original = asyncio.create_subprocess_exec
+    stdin_modes = []
+
+    async def spawn(*argv, **kwargs):
+        stdin_modes.append(kwargs.get("stdin"))
+        return await original(*argv, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    workspace = open_workspace(tmp_path, create=True)
+    result = await _execute(_tools_by_name(workspace)[tool_name], arguments, workspace=workspace)
+    assert not result.result.is_error, result.result
+    assert result.result.structured_content["stdout"].strip() == "eof"
+    assert stdin_modes == [asyncio.subprocess.DEVNULL]
+
+
+@pytest.mark.anyio
+async def test_patch_noop_attests_no_change_without_tree_observation(tmp_path, monkeypatch):
+    from agent_runtime.tools import executor as executor_module
+
+    workspace = open_workspace(tmp_path, create=True)
+    path = tmp_path / "value.txt"
+    path.write_text("same")
+
+    def unexpected_scan(root):
+        pytest.fail(f"precise patch scanned the workspace: {root}")
+
+    monkeypatch.setattr(executor_module, "workspace_tree_sha256", unexpected_scan)
+    execution = await _execute(
+        _tools_by_name(workspace)["apply_patch"],
+        {"file_path": "value.txt", "old_string": "same", "new_string": "same"},
+        workspace=workspace,
+    )
+    assert execution.result.is_error
+    assert execution.result.metadata["runtime_workspace_changed"] is False
+    assert runtime_workspace_file_changes(execution.result) == ()
+    assert path.read_text() == "same"

@@ -1313,6 +1313,7 @@ class ToolContinuation:
     key: str
     phase: Literal["start", "observe"]
     terminal: bool
+    observe_workspace: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -1335,6 +1336,9 @@ class Tool:
     stream: StreamingToolRunner | None = None
     continuation: Callable[[Mapping[str, JsonValue], JsonValue | None], ToolContinuation | None] | None = None
     after_commit: Callable[[Mapping[str, JsonValue], JsonValue | None, str], Awaitable[None]] | None = None
+    # A trusted file adapter can report its committed before/after bytes without a tree scan.
+    # An empty tuple attests no commit, and None means the outcome is unavailable.
+    committed_file_changes: Callable[[object], tuple[tuple[str, str, str], ...] | None] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.definition, ToolDefinition):
@@ -1346,6 +1350,8 @@ class Tool:
             raise TypeError("stream must be callable when provided")
         if self.continuation is not None and not callable(self.continuation):
             raise TypeError("continuation must be callable when provided")
+        if self.committed_file_changes is not None and not callable(self.committed_file_changes):
+            raise TypeError("committed_file_changes must be callable when provided")
         if self.after_commit is not None and not callable(self.after_commit):
             raise TypeError("after_commit must be callable when provided")
 

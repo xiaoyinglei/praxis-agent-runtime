@@ -53,6 +53,7 @@ from agent_runtime.setup_cli import configure_model, setup
 from agent_runtime.terminal_input import CHAT_COMMANDS, TerminalComposer, resolve_pause_choice
 from agent_runtime.terminal_render import (
     TerminalToolEventDisplay,
+    format_delivery_outcome,
     format_model_failure,
     format_usage_summary,
     safe_terminal_text,
@@ -550,16 +551,8 @@ def _display_agent_result(
     if result.answer and not answer_streamed:
         print(f"\n{safe_terminal_text(result.answer)}")
 
-    if show_outcome and result.delivery:
-        print(f"\n交付: {result.delivery.get('status', 'unverified')}")
-        if result.delivery.get("delivery_id"):
-            print(f"  证据: {result.delivery['delivery_id']}")
-        scopes = result.delivery.get("verified_scope", ())
-        actions = result.delivery.get("next_actions", ())
-        for scope in scopes if isinstance(scopes, tuple) else ():
-            print(f"  已验证范围: {safe_terminal_text(str(scope))}")
-        for action in actions if isinstance(actions, tuple) else ():
-            print(f"  续跑: {safe_terminal_text(str(action))}")
+    if show_outcome and (delivery := format_delivery_outcome(result)):
+        print("\n" + delivery)
 
     if result.status == "paused" and result.pause is None and result.needs_user_input:
         print(f"\n暂停原因: {result.needs_user_input}")
@@ -1279,6 +1272,29 @@ async def _chat_facade_loop(
             refresh_request_status(opened)
             return opened
 
+        async def submit_current(
+            query: str, saved_result: AgentResult | None, saved_action: str | None, saved_input: str | None,
+        ) -> AgentResult:
+            if saved_result is None:
+                opened = await open_session()
+                if pending_files:
+                    return await opened.submit(query, event_sink=event_display, files=list(pending_files))
+                return await opened.submit(query, event_sink=event_display)
+            assert saved_action is not None
+            if saved_action != "abort" and (_ui is not None or pending_files):
+                await open_session(frozen_turn_id=saved_result.turn_id)
+            driver = session if session is not None else facade
+            resume_options: _ResumeOptions = (
+                {"files": list(pending_files)} if pending_files and saved_action != "abort" else {}
+            )
+            return await driver.resume(
+                saved_result.turn_id,
+                saved_action,
+                user_input=saved_input,
+                event_sink=event_display,
+                **resume_options,
+            )
+
         async def change_request_settings(query: str) -> None:
             query = query.strip()
             control = session or facade
@@ -1342,9 +1358,9 @@ async def _chat_facade_loop(
                 if text.split(maxsplit=1)[0] in {"/effort", "/output"}:
                     await change_request_settings(text)
                     return None
-                turn_id = _ui.display.turn_id
+                turn_id = await _ui.wait_for_turn_id()
                 if turn_id is None:
-                    raise RuntimeError("当前 Turn 尚未启动，请保留输入稍后发送")
+                    raise RuntimeError("当前操作未启动 Turn")
                 receiver = session if session is not None else facade
                 guidance, files = parse_file_input(text, base=Path(default_chat_workspace))
                 if files:
@@ -1357,8 +1373,12 @@ async def _chat_facade_loop(
                     receipt = await receiver.steer(text, expected_turn_id=turn_id)
                 return receipt.item_id
 
+            def read_input_status(identity: str) -> str:
+                receiver = session if session is not None else facade
+                return receiver.input_status(identity)
+
             _ui.on_input = receive_input
-            _ui.input_status = lambda identity: facade.input_status(identity)
+            _ui.input_status = read_input_status
 
         if resume_thread_id is not None and not await reopen(resume_thread_id):
             return
@@ -1950,34 +1970,14 @@ async def _chat_facade_loop(
                             saved_result.turn_id,
                         )
                         facade.knowledge = metadata.runtime.knowledge
-            if saved_result is None:
-                session = await open_session()
-            elif saved_action != "abort" and (_ui is not None or pending_files):
-                session = await open_session(frozen_turn_id=saved_result.turn_id)
-            resume_driver = session if session is not None else facade
-            event_display.begin_turn()
+            if _ui is not None:
+                _ui.display.begin_turn(resume_turn_id=saved_result.turn_id if saved_result is not None else None)
+            else:
+                event_display.begin_turn()
             if saved_result is not None:
                 event_display.update_usage(saved_result.usage)
             try:
-                if saved_result is not None:
-                    assert saved_action is not None
-                    resume_options: _ResumeOptions = (
-                        {"files": list(pending_files)} if pending_files and saved_action != "abort" else {}
-                    )
-                    submission = resume_driver.resume(
-                        saved_result.turn_id,
-                        saved_action,
-                        user_input=saved_input,
-                        event_sink=event_display,
-                        **resume_options,
-                    )
-                else:
-                    assert session is not None
-                    submission = (
-                        session.submit(query, event_sink=event_display, files=list(pending_files))
-                        if pending_files
-                        else session.submit(query, event_sink=event_display)
-                    )
+                submission = submit_current(query, saved_result, saved_action, saved_input)
                 result = await _ui.operation(submission) if _ui else await submission
                 event_display.update_usage(result.usage)
                 if saved_result is None or saved_action != "abort":
@@ -1985,14 +1985,15 @@ async def _chat_facade_loop(
             except (OSError, ValueError, ConversationBusyError) as error:
                 print("发送失败：" + safe_terminal_text(str(error)))
                 if _ui:
-                    _ui.editor.text = query
+                    _ui.editor.text = query + ("\n" + _ui.editor.text if _ui.editor.text else "")
                     _ui.invalidate()
                 continue
             except asyncio.CancelledError:
                 if _ui is None or ((task := asyncio.current_task()) is not None and task.cancelling()):
                     raise
-                await _cancel_ui_execution(resume_driver, _ui, _ui.display.turn_id)
+                await _cancel_ui_execution(session if session is not None else facade, _ui, _ui.display.turn_id)
                 continue
+            resume_driver = session if session is not None else facade
             current_turn_id = result.turn_id
             while result.status == "paused":
                 event_display.finish()
@@ -2010,7 +2011,7 @@ async def _chat_facade_loop(
                     and result.pause.kind == "tool_approval"
                     and any(
                         [
-                            await asyncio.to_thread(facade.input_status, identity) == "pending"
+                            await asyncio.to_thread(read_input_status, identity) == "pending"
                             for identity in _ui._input_receipts
                         ]
                     )

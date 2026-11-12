@@ -451,7 +451,7 @@ class RuntimeStore:
     @read_operation
     def context_source_revision(self, turn_id: str) -> str:
         """Version every source Thread, including non-message state transitions."""
-        thread_ids = {item.thread_id for item in self.list_context_items(turn_id)}
+        thread_ids = {thread_id for thread_id, _ in self._conversation_segments(turn_id)}
         thread_ids.add(self.read_turn(turn_id).thread_id)
         versions = [
             (thread_id, self.read_thread(thread_id).applied_thread_sequence) for thread_id in sorted(thread_ids)
@@ -735,8 +735,19 @@ class RuntimeStore:
         return tuple(_turn_snapshot(row) for row in rows)
 
     @read_operation
-    def list_items(self, turn_id: str) -> tuple[ItemSnapshot, ...]:
-        rows = self.persistence.rows("items", where={"turn_id": turn_id}, order_by="sequence")
+    def list_items(
+        self,
+        turn_id: str,
+        *,
+        kind: str | tuple[str, ...] | None = None,
+        payload_fields: Mapping[str, Any] | None = None,
+    ) -> tuple[ItemSnapshot, ...]:
+        rows = self.persistence.rows(
+            "items",
+            where={"turn_id": turn_id, **({"kind": kind} if kind is not None else {})},
+            payload_fields=payload_fields,
+            order_by="sequence",
+        )
         return tuple(_item_snapshot(row) for row in rows)
 
     def _latest_item(self, turn_id: str) -> ItemSnapshot:
@@ -753,29 +764,32 @@ class RuntimeStore:
         return _item_snapshot(row)
 
     @read_operation
-    def list_context_items(self, turn_id: str) -> tuple[ItemSnapshot, ...]:
+    def list_context_items(self, turn_id: str, *, tool_name: str | None = None) -> tuple[ItemSnapshot, ...]:
         """Visible model/recall window; the complete ledger remains separately readable."""
         from agent_runtime.harness import artifact_ops
 
         artifact_ops._assert_artifact_integrity(self, turn_id)
-        items = self.list_conversation_items(turn_id)
-        start = 0
-        seen = set()
-        for index, item in enumerate(items):
-            if item.turn_id not in seen:
-                seen.add(item.turn_id)
-                reset = self.read_turn(item.turn_id).binding_manifest.get("context_reset")
-                if (
-                    isinstance(reset, Mapping)
-                    and reset.get("revision") == "v1"
-                    and reset.get("reason") == "memory_revoked"
-                ):
-                    start = index
-        return items[start:]
+        return tuple(
+            _item_snapshot(row)
+            for thread_id, start, cutoff in self._context_segments(turn_id)
+            for row in self.persistence.conversation_rows(
+                thread_id,
+                cutoff,
+                from_turn_index=start,
+                tool_name=tool_name,
+            )
+        )
 
     @read_operation
     def list_conversation_items(self, turn_id: str) -> tuple[ItemSnapshot, ...]:
         """Read original Items through the fork point; do not load or execute artifacts."""
+        rows: list[Mapping[str, Any]] = []
+        for ancestor_thread_id, cutoff in self._conversation_segments(turn_id):
+            rows.extend(self.persistence.conversation_rows(ancestor_thread_id, cutoff))
+        return tuple(_item_snapshot(row) for row in rows)
+
+    def _conversation_segments(self, turn_id: str) -> tuple[tuple[str, int], ...]:
+        """Resolve ancestry using metadata only, independently of history size."""
         turn = self.persistence.first("turns", where={"turn_id": turn_id})
         if turn is None:
             raise KeyError(f"unknown turn: {turn_id}")
@@ -798,10 +812,91 @@ class RuntimeStore:
                 raise RuntimeError("fork point does not belong to its parent Thread")
             segment_thread_id = str(parent_thread_id)
             segment_turn_index = int(fork_turn["turn_index"])
-        rows: list[Mapping[str, Any]] = []
-        for ancestor_thread_id, cutoff in reversed(segments):
-            rows.extend(self.persistence.conversation_rows(ancestor_thread_id, cutoff))
-        return tuple(_item_snapshot(row) for row in rows)
+        return tuple(reversed(segments))
+
+    def _context_segments(self, turn_id: str) -> tuple[tuple[str, int, int], ...]:
+        """Resolve context resets before loading any message bodies."""
+        segments = []
+        for thread_id, cutoff in self._conversation_segments(turn_id):
+            start = 0
+            for turn in self.persistence.rows("turns", where={"thread_id": thread_id}, order_by="turn_index"):
+                reset = turn["binding_manifest"].get("context_reset")
+                if (
+                    turn["turn_index"] <= cutoff
+                    and isinstance(reset, Mapping)
+                    and reset.get("revision") == "v1"
+                    and reset.get("reason") == "memory_revoked"
+                ):
+                    segments.clear()
+                    start = turn["turn_index"]
+            segments.append((thread_id, start, cutoff))
+        return tuple(segments)
+
+    @read_operation
+    def user_read_references(self, turn_id: str) -> tuple[dict[str, str], ...]:
+        references = {}
+        for thread_id, cutoff in self._conversation_segments(turn_id):
+            for reference in self.persistence.user_read_references(thread_id, cutoff):
+                references[reference["path"]] = reference
+        return tuple(references.values())
+
+    @read_operation
+    def conversation_artifact_ids(self, turn_id: str) -> set[str]:
+        return set().union(
+            *(
+                self.persistence.conversation_artifact_ids(thread_id, cutoff)
+                for thread_id, cutoff in self._conversation_segments(turn_id)
+            )
+        )
+
+    @read_operation
+    def list_model_context_items(self, turn_id: str) -> tuple[ItemSnapshot, ...]:
+        """Load a complete replacement and its suffix; old Rollouts use legacy replay.
+
+        Canonical Items stay available through list_context_items/read_item. Only
+        the small set explicitly retained by the checkpoint is fetched by ID.
+        """
+        segments = self._context_segments(turn_id)
+        for index in range(len(segments) - 1, -1, -1):
+            thread_id, start, cutoff = segments[index]
+            row = self.persistence.latest_context_checkpoint(thread_id, cutoff, from_turn_index=start)
+            if row is None:
+                continue
+            checkpoint = _item_snapshot(row)
+            identities = dict.fromkeys(
+                entry["item_id"] for entry in checkpoint.payload["replacement_history"] if entry["item_id"]
+            )
+            retained = tuple(self.read_item(identity) for identity in identities)
+            suffix = list(
+                self.persistence.conversation_rows(
+                    thread_id,
+                    cutoff,
+                    after_sequence=checkpoint.applied_thread_sequence,
+                )
+            )
+            for segment_thread, segment_start, segment_cutoff in segments[index + 1 :]:
+                suffix.extend(
+                    self.persistence.conversation_rows(
+                        segment_thread,
+                        segment_cutoff,
+                        from_turn_index=segment_start,
+                    )
+                )
+            items = (*retained, checkpoint, *(_item_snapshot(row) for row in suffix))
+            visible_ids = {item.item_id for item in items}
+            if any(
+                item.kind == "context_compaction"
+                and not set(item.payload.get("covered_item_ids", ())).issubset(visible_ids)
+                for item in items[len(retained) + 1 :]
+            ):
+                # Old elision records used whole-archive coverage. Replay them
+                # under that contract until the next complete checkpoint.
+                return self.list_context_items(turn_id)
+            from agent_runtime.harness.artifact_ops import _assert_artifact_integrity
+
+            _assert_artifact_integrity(self, turn_id, items=items)
+            return items
+        return self.list_context_items(turn_id)
 
     @read_operation
     def read_turn_answer(self, turn_id: str) -> ItemSnapshot:

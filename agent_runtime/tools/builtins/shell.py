@@ -81,7 +81,7 @@ class RunCommandInput(BaseModel):
     command: str = Field(
         min_length=1,
         max_length=8000,
-        description="Shell command to execute in an isolated process group.",
+        description="Non-interactive shell command. Standard input starts at EOF.",
     )
     working_dir: str = Field(
         default=".",
@@ -374,29 +374,18 @@ def create_run_command_tool(
         definition=ToolDefinition(
             name="run_command",
             description=(
-                "On macOS/Linux live Sessions, set yield_time_seconds to return a session_id while a command runs; "
-                "manage_command queries, waits or cancels it. timeout_seconds=null removes the execution "
-                "deadline only in this mode; closing the Session cancels its processes. One running command "
-                "per Session. macOS writes go directly to the workspace and remain after failure, timeout "
-                "or cancellation; publish_on_failure has no effect there. "
-                "On Linux, writes use a private candidate workspace with streaming copies and fingerprints. "
-                "Only exit 0 with all path, permission and host-change checks passing publishes changes by default; "
-                "publish_on_failure=true also publishes validated partial build files on failure or timeout. "
-                "Cancellation discards them. Internal relative symlinks are supported; external/absolute links "
-                "and protected targets are refused. File mtimes are preserved for incremental builds. "
-                "External writes are unsupported. "
-                "Linux network access requires libseccomp and blocks host Unix/local IPC; "
-                "anonymous stream socketpairs remain available for async event loops. "
-                "Run one shell command inside a restricted OS sandbox from a "
-                "workspace-relative directory. The workspace is read-only by default "
-                "and a private temporary directory is writable. Set "
-                "workspace_write=true to request destructive workspace write access; "
-                ".git, .agents, .codex, .aws, .venv, and node_modules remain read-only. Host environment "
-                "variables and network access are disabled. Set network=true to "
-                "request a separate network approval. Timeout or cancellation "
-                "terminates and reaps the complete process group. Commands fail "
-                "closed before execution when hardlinked workspace files could "
-                "bypass path containment. For implementation tasks, locate the "
+                "Run a non-interactive shell command in a restricted OS sandbox. Standard input is at EOF. "
+                "One live background command per Session. manage_command can inspect its output, wait or cancel. "
+                "Timeout or cancellation reaps the process group. Private temporary storage is writable. "
+                "Host environment variables are withheld. External writes are unsupported. "
+                "Metadata and toolchain directories (.git, .agents, .codex, .aws, .venv, node_modules) stay read-only. "
+                "Unsafe hardlinks and protected path aliases cause preflight refusal. "
+                "macOS writes apply directly, including on failure, timeout or cancellation. "
+                "Linux stages writes privately, validates paths and concurrent host changes before publication, "
+                "and discards on cancellation. Linux preserves file mtimes and supports internal relative symlinks. "
+                "Linux networking requires libseccomp. Host Unix/local IPC stays blocked, while anonymous stream "
+                "socketpairs are available for async event loops. "
+                "For implementation tasks, locate the "
                 "affected code before execution and prefer focused verification "
                 "over a full-repository test run. Use recognized read-only commands "
                 "to verify code behavior; do not execute a process solely to reconfirm "
@@ -477,7 +466,8 @@ def create_execute_python_tool(
                 "Linux network access requires libseccomp and blocks host Unix/local IPC; "
                 "anonymous stream socketpairs remain available for async event loops. "
                 "Run plain Python source with the managed Praxis interpreter in "
-                "a restricted OS sandbox. run_command uses the executable selected by its command "
+                "a restricted OS sandbox with standard input at EOF. run_command uses the executable "
+                "selected by its command "
                 "and may have different Python packages; a shell Python import failure does not "
                 "describe this managed interpreter. Unlike run_command, this works when the "
                 "task workspace has no .venv and does not use shell heredocs. Use "
@@ -751,6 +741,7 @@ async def _run_command(
             request.command,
             cwd=str(cwd),
             env=environment,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
@@ -967,6 +958,7 @@ async def _execute_managed_python(
             str(import_directory),
             cwd=str(cwd),
             env=environment,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,

@@ -148,6 +148,24 @@ def stable_prompt_cache_key(request: ModelRequest) -> str:
     })[:48]
 
 
+def openai_compatible_text(value: object) -> str:
+    """Normalize a Chat Completions string or a compatible typed text array."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, Sequence) or isinstance(value, (bytes, bytearray)):
+        raise ValueError("Chat Completions content must be a string or a sequence of text parts")
+    parts: list[str] = []
+    for part in value:
+        kind = _field(part, "type", default=None)
+        text = _field(part, "text", default=None)
+        if kind != "text" or not isinstance(text, str):
+            raise ValueError("Chat Completions response contains an unsupported content part")
+        parts.append(text)
+    return "".join(parts)
+
+
 def parse_openai_response(response: object) -> ToolUseResult:
     """Parse chat response data into the shared provider-neutral turn value."""
 
@@ -195,16 +213,10 @@ def parse_openai_response(response: object) -> ToolUseResult:
             call_id = f"call_{index}"
         calls.append(ModelToolCall(id=call_id, name=name, arguments=arguments, argument_error=argument_error))
 
-    content = _field(message, "content", default="")
-    if content is None:
-        content = ""
-    if not isinstance(content, str):
-        content = str(content)
-    reasoning_content = _field(message, "reasoning_content", default=None)
-    if not reasoning_content:
-        reasoning_content = _field(message, "reasoning", default=None)
-    if reasoning_content is not None and not isinstance(reasoning_content, str):
-        reasoning_content = str(reasoning_content)
+    content = openai_compatible_text(_field(message, "content", default=None))
+    reasoning_content = openai_compatible_text(
+        _field(message, "reasoning_content", default=None) or _field(message, "reasoning", default=None)
+    ) or None
     return ToolUseResult(
         tool_calls=calls,
         text=content,

@@ -205,7 +205,9 @@ class TerminalChatApp:
         self._opening_permissions = False
         self.input_status: Callable[[str], str] | None = None
         self._input_tasks: set[asyncio.Task[None]] = set()
+        self._starting_inputs: list[str] = []
         self._input_receipts: dict[str, Block] = {}
+        self._input_feedback = ""
         self._input_lock = asyncio.Lock()
         self._connection_server: ConnectionServer | None = None
         self._connection_thread: threading.Thread | None = None
@@ -374,15 +376,26 @@ class TerminalChatApp:
                     return
                 self.editor.buffer.append_to_history()
                 self.editor.text = ""
-                submission = self.app.create_background_task(self._send_input(value))
-                self._input_tasks.add(submission)
-                submission.add_done_callback(self._input_tasks.discard)
+                self._schedule_input(value)
+                return
+            if (
+                self.on_input is not None and self._pending is not None and self._pending.done()
+                and not self._pending.cancelled() and self._pending.result().strip()
+                and not self._pending.result().lstrip().startswith("/")
+                and not self.editor.text.lstrip().startswith("/")
+            ):
+                # The terminal can deliver two Enter presses before the prompt
+                # coroutine starts the operation for the first message.
+                self._starting_inputs.append(self.editor.text)
+                self.editor.buffer.append_to_history()
+                self.editor.text = ""
                 return
             if self._pending is not None and not self._pending.done():
                 value = self.editor.text
                 self.editor.buffer.append_to_history()
                 self.editor.text = ""
                 assert self._pending is not None
+                self._input_feedback = ""
                 self._pending.set_result(value)
                 self._show_history = False
                 self._follow = True
@@ -1181,6 +1194,8 @@ class TerminalChatApp:
             tab_hint = ("Tab切换到补充输入/详情" if self.on_input is not None
                         and self.app.output.get_size().rows >= 12 else "Tab详情")
             return entry + [("class:dim", f" · ↑↓ 选择 · Enter 确认 · Esc 取消 · {tab_hint}")]
+        if self._input_feedback:
+            entry.append(("class:dim", f" · {self._input_feedback}"))
         hint = "Ctrl+C 停止" if self._operation else "/help 帮助"
         hint += " · Ctrl+O 返回" if self.view.details else " · Ctrl+O 详情"
         return entry + [
@@ -1195,6 +1210,9 @@ class TerminalChatApp:
         if not approval:
             await self.flush_scrollback()
         self.status = "等待确认" if approval else "就绪"
+        if self._starting_inputs:
+            self.editor.text = "\n".join((*self._starting_inputs, self.editor.text)).rstrip("\n")
+            self._starting_inputs.clear()
         self._pending = asyncio.get_running_loop().create_future()
         self.app.layout.focus(self.model_menu if self._model_pending is not None else self.editor)
         self.invalidate()
@@ -1209,6 +1227,10 @@ class TerminalChatApp:
     async def operation(self, awaitable: Coroutine[Any, Any, Any]) -> Any:
         self._operation = asyncio.create_task(awaitable)
         self.status = "工作中"
+        for text in self._starting_inputs:
+            self._schedule_input(text)
+        self._starting_inputs.clear()
+
         async def refresh() -> None:
             next_inputs_refresh = 0.0
             loop = asyncio.get_running_loop()
@@ -1232,6 +1254,29 @@ class TerminalChatApp:
             self.status = "就绪"
             self.invalidate()
 
+    def _schedule_input(self, text: str) -> None:
+        submission = self.app.create_background_task(self._send_input(text))
+        self._input_tasks.add(submission)
+        submission.add_done_callback(self._input_tasks.discard)
+
+    async def wait_for_turn_id(self) -> str | None:
+        operation = self._operation
+        if self.display.input_turn_id is not None or operation is None:
+            return self.display.input_turn_id
+        ready = self.display.turn_ready
+
+        def wake_if_finished(_operation: asyncio.Task[Any]) -> None:
+            ready.set()
+
+        self._input_feedback = "补充已排队"
+        self.view.message("补充已排队 · 等待当前 Turn 启动\n", "notice")
+        operation.add_done_callback(wake_if_finished)
+        try:
+            await ready.wait()
+            return self.display.input_turn_id
+        finally:
+            operation.remove_done_callback(wake_if_finished)
+
     async def _send_input(self, text: str) -> None:
         async with self._input_lock:
             try:
@@ -1239,6 +1284,7 @@ class TerminalChatApp:
                 identity = await self.on_input(text)
             except Exception as exc:
                 self.editor.text = text + ("\n" + self.editor.text if self.editor.text else "")
+                self._input_feedback = "补充未接收，草稿已保留"
                 self.view.message(f"补充未接收，草稿已保留：{exc}\n", "notice")
                 self.invalidate()
                 return
@@ -1247,6 +1293,7 @@ class TerminalChatApp:
                 return
             self.view.message(text + "\n", "user")
             block = self.view._add(Block("notice"))
+            self._input_feedback = "补充已接收"
             block.append("补充已接收 · 等待应用\n")
             self._input_receipts[identity] = block
             await self._refresh_inputs()
@@ -1268,8 +1315,8 @@ class TerminalChatApp:
                 continue
             if status == "pending":
                 continue
-            label = "已应用（已进入模型请求）" if status == "applied" else "本次执行已结束，补充尚未应用"
-            text = f"补充{label}\n"
+            self._input_feedback = "补充已应用" if status == "applied" else "补充尚未应用"
+            text = "补充已应用（已进入模型请求）\n" if status == "applied" else "本次执行已结束，补充尚未应用\n"
             if block.in_scrollback:
                 self.view.message(text, "notice")
             else:

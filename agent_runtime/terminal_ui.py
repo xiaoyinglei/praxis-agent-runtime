@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import Callable, Mapping
@@ -13,6 +14,7 @@ from agent_runtime.terminal_render import (
     TerminalToolEventDisplay,
     bounded_result_lines,
     display_rows,
+    format_delivery_outcome,
     format_model_failure,
     format_usage_summary,
     safe_terminal_text,
@@ -205,6 +207,9 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
         self._receipt: Block | None = None
         self._context_detail: Block | None = None
         self.turn_id: str | None = None
+        self.input_turn_id: str | None = None
+        self._resume_turn_id: str | None = None
+        self.turn_ready = asyncio.Event()
         self.connection_required = False
         self.search_configuration_required = False
         self._new_answer = True
@@ -218,7 +223,7 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
         super().update_request_settings(snapshot)
         self.view.invalidate()
 
-    def begin_turn(self, *, reset: bool = True) -> None:
+    def begin_turn(self, *, reset: bool = True, resume_turn_id: str | None = None) -> None:
         super().begin_turn(reset=reset)
         self._activity_status = "等待模型响应"
         self._last_activity = self._clock()
@@ -234,6 +239,9 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
             self._tool_blocks.clear()
             self._projected.clear()
             self.turn_id = None
+            self.input_turn_id = None
+            self._resume_turn_id = resume_turn_id
+            self.turn_ready = asyncio.Event()
         self.view.invalidate()
 
     def activity_text(self) -> str:
@@ -279,6 +287,12 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
         self._last_activity = self._clock()
         if self.turn_id is None and event.turn_id:
             self.turn_id = event.turn_id
+        if self.input_turn_id is None and (
+            (self._resume_turn_id is None and event.type is EventType.TURN_STARTED)
+            or self._resume_turn_id == event.turn_id
+        ):
+            self.turn_id = self.input_turn_id = event.turn_id
+            self.turn_ready.set()
         identity = event.item_id or event.data.get("tool_id")
         is_tool = event.item_kind in {TurnItemKind.TOOL, TurnItemKind.COMMAND} or event.type in {
             EventType.TOOL_USE_START,
@@ -432,11 +446,11 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
                 if isinstance(output, str)
                 else process.get("stdout", process.get("content", process.get("text")))
             )
-            block.preview = (
-                "\n".join(safe_terminal_text(content).splitlines()[:2])[:400]
-                if isinstance(content, str) and content.strip()
-                else "操作完成"
-            )
+            lines = safe_terminal_text(content).splitlines() if isinstance(content, str) else []
+            stderr = process.get("stderr") if is_command else None
+            if isinstance(stderr, str) and (error_lines := safe_terminal_text(stderr).strip().splitlines()):
+                lines.insert(0, "stderr: " + error_lines[0][:200])
+            block.preview = "\n".join(lines[:2])[:400] if lines else "操作完成"
             self._activity_status = "等待模型响应"
         if block.session_id and state != "running":
             for previous in (child for group in self.view.blocks for child in group.children):
@@ -602,16 +616,9 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
         else:
             self._activity_status = "本轮已结束"
             text = ""
-        if result.delivery:
-            text += ("\n" if text else "") + "交付: " + str(result.delivery.get("status", "unverified"))
-            if result.delivery.get("delivery_id"):
-                text += "\n证据: " + str(result.delivery["delivery_id"])
-            scopes = result.delivery.get("verified_scope", ())
-            actions = result.delivery.get("next_actions", ())
-            for scope in scopes if isinstance(scopes, tuple) else ():
-                text += "\n已验证范围: " + safe_terminal_text(str(scope))
-            for action in actions if isinstance(actions, tuple) else ():
-                text += "\n续跑: " + safe_terminal_text(str(action))
+        delivery = format_delivery_outcome(result)
+        if delivery:
+            text = "\n".join(part for part in (text, delivery) if part)
         if result.files:
             text += (
                 ("\n" if text else "") + "文件引用：\n" + "\n".join(safe_terminal_text(path) for path in result.files)

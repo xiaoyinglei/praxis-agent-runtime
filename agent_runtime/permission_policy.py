@@ -279,6 +279,39 @@ class ResolvedPermissions(_FrozenModel):
                     rules.append(PathRule(path=str(path), access="read"))
         return self.model_copy(update={"filesystem": tuple(dict.fromkeys(rules))})
 
+    def with_read_references(
+        self, references: tuple[dict[str, str], ...], *, historical: bool = False,
+    ) -> ResolvedPermissions:
+        """Apply frozen user selections, preserving explicit denies and path identity.
+
+        Historical snapshots may predate a new user input. Reapply its selections
+        there too; callers still intersect with CURRENT managed/supplied ceilings.
+        """
+        rules = list(self.filesystem)
+        for reference in references:
+            path = Path(reference["path"])
+            target = Path(reference["resolved_path"])
+            try:
+                valid = path.resolve() == target and (
+                    target.is_file() if reference["kind"] == "file" else target.is_dir()
+                )
+            except (OSError, RuntimeError):
+                valid = False
+            if not valid:
+                continue
+            paths = tuple(dict.fromkeys((path, target)))
+            if any(rule.access == "deny" and _under_path(p, Path(rule.path))
+                   for p in paths for rule in self.filesystem):
+                continue
+            for p in paths:
+                if not self.path_access(p):
+                    rules.append(PathRule(path=str(p), access="read"))
+        return self.model_copy(update={
+            "filesystem": tuple(dict.fromkeys(rules)),
+            "ceilings": tuple(c.with_read_references(references, historical=True) for c in self.ceilings)
+            if historical else self.ceilings,
+        })
+
     @property
     def read_only(self) -> bool:
         return self.profile == "read-only" or any(ceiling.read_only for ceiling in self.ceilings)
@@ -413,6 +446,7 @@ def resolve_permission_sources(
     managed_permissions: PermissionPolicy | Path | str | None = None,
     *,
     read_files: tuple[str, ...] = (),
+    read_references: tuple[dict[str, str], ...] = (),
 ) -> ResolvedPermissions:
     """Resolve user defaults and independent administrator ceilings without services."""
     def resolve(value: PermissionPolicy | Path | str | None) -> ResolvedPermissions:
@@ -426,7 +460,7 @@ def resolve_permission_sources(
             if candidate.exists():
                 permissions = candidate
                 break
-    effective = resolve(permissions).with_read_files(read_files)
+    effective = resolve(permissions).with_read_files(read_files).with_read_references(read_references)
     if managed_permissions is None:
         for suffix in ("toml", "json"):
             candidate = Path("/etc/praxis") / f"permissions.{suffix}"

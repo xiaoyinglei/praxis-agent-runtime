@@ -81,6 +81,7 @@ def test_normal_result_shows_usage_and_cache_without_an_unrequested_acceptance_n
     display.begin_turn()
     value = result(
         status=status,
+        delivery={"status": "unverified", "next_actions": []},
         usage=AgentUsage(
             input_tokens=1000,
             output_tokens=200,
@@ -95,6 +96,7 @@ def test_normal_result_shows_usage_and_cache_without_an_unrequested_acceptance_n
     assert "缓存命中 800" in text and "80.0%" in text
     assert text.count("输入 1,000") == 1
     assert "未运行验收" not in text and "本轮已结束" not in text
+    assert "交付" not in text
 
 
 def test_missing_cache_usage_is_reported_as_unknown_instead_of_zero_or_hidden():

@@ -159,6 +159,9 @@ def test_semantic_source_restores_fact_hidden_by_old_elision(tmp_path):
         assert "GOLD_FACT_TTL_17" not in str(manager.build(turn.turn_id))
         source_hash, source = manager.semantic_source(turn.turn_id)
         assert "GOLD_FACT_TTL_17" in source
+        _, projected_source = manager.semantic_source(turn.turn_id, use_archived_projection=True)
+        assert "GOLD_FACT_TTL_17" not in projected_source
+        assert original.item_id in projected_source and "recent result" in projected_source
         assert store.read_item(original.item_id).payload["model_content"].endswith("GOLD_FACT_TTL_17")
         manager.commit_compaction(
             manager.semantic_candidate(turn.turn_id, source_hash=source_hash, summary="TTL=17 verified.")
@@ -251,19 +254,19 @@ def test_message_guard_with_1m_window_and_200k_budget_can_summarize(tmp_path):
         operations = store.list_model_operations(turn.turn_id)
         assert [op.request_ref["purpose"] for op in operations] == ["context_summary", "agent_step"]
         plan = operations[0].request_ref["compaction_plan"]
-        assert plan["continuation_input_limit"] < 40000
+        assert plan["continuation_token_reserve"] < 40000
         assert plan["planned_token_upper_bound"] < 200000
         assert len(model_gateway.requests) == 2
         assert store.verify().valid
 
 
-def test_auto_compaction_uses_summary_even_when_elision_would_fit(tmp_path):
+def test_auto_compaction_uses_summary_when_elision_cannot_reduce_message_count(tmp_path):
     import asyncio
 
     from agent_runtime.harness import RuntimeStore
     from tests.agent.harness.test_tool_result_elision import exchange
 
-    with RuntimeStore.open_sync(tmp_path / "semantic-first.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "message-guard.db") as store:
         runner, turn, _ = capacity_runner(store, tmp_path, messages=5)
         for index in range(3):
             exchange(store, turn.turn_id, str(index), "evidence " * 2000)
@@ -358,13 +361,13 @@ def test_retained_web_exchange_keeps_canonical_acquisition_references(tmp_path):
         ] == [[97, 296]]
 
 
-def test_small_window_summary_tree_measures_each_leaf_and_merge(tmp_path):
+def test_small_window_summarizes_complete_history_in_measured_units(tmp_path):
     import asyncio
 
     from agent_runtime.harness import RuntimeStore
     from tests.agent.harness.test_compaction_consistency import long_history
 
-    with RuntimeStore.open_sync(tmp_path / "tree.db") as store:
+    with RuntimeStore.open_sync(tmp_path / "suffix.db") as store:
         runner, turn, model_gateway = capacity_runner(store, tmp_path, window=8192)
         long_history(store, turn)
         result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
@@ -373,15 +376,17 @@ def test_small_window_summary_tree_measures_each_leaf_and_merge(tmp_path):
             op for op in store.list_model_operations(turn.turn_id) if op.request_ref["purpose"] == "context_summary"
         ]
         assert len(summaries) > 1
-        for op in summaries:
-            plan = op.request_ref["compaction_plan"]
-            assert op.request_ref["context_projection"]["input_tokens"] <= plan["summary_input_limit"]
-            assert plan["continuation_input_limit"] < 8192
+        for summary in summaries:
+            plan = summary.request_ref["compaction_plan"]
+            assert summary.request_ref["context_projection"]["input_tokens"] <= plan["summary_input_limit"]
+            assert "summary_history_start" not in plan and "summary_tree" in plan
+        sources = str([op.request_ref["step_snapshot"]["messages"] for op in summaries])
+        assert all(f"finding {index}" in sources for index in range(8))
         assert len(model_gateway.requests) == len(summaries) + 1
         assert store.verify().valid
 
 
-def test_large_window_summary_leaves_respect_frozen_materialization_guard(tmp_path):
+def test_complete_summary_units_respect_frozen_materialization_guard(tmp_path):
     import asyncio
 
     from agent_runtime.harness import RuntimeStore
@@ -398,30 +403,33 @@ def test_large_window_summary_leaves_respect_frozen_materialization_guard(tmp_pa
         summaries = [
             op for op in store.list_model_operations(turn.turn_id) if op.request_ref["purpose"] == "context_summary"
         ]
-        assert len(summaries) > 1  # capacity alone could admit the whole history
-        assert all(
-            len(message["body"].encode("utf-8")) <= 5000
-            for op in summaries
-            for message in op.request_ref["step_snapshot"]["messages"]
-        )
+        assert len(summaries) > 1
+        for summary in summaries:
+            [message] = summary.request_ref["step_snapshot"]["messages"]
+            assert len(message["body"].encode("utf-8")) <= 5000
+            assert "summary_history_start" not in summary.request_ref["compaction_plan"]
+        sources = str([op.request_ref["step_snapshot"]["messages"] for op in summaries])
+        assert all(f"finding {index}" in sources for index in range(8))
         assert len(model_gateway.requests) == len(summaries) + 1
         assert store.verify().valid
 
 
-def test_indivisible_summary_work_unit_over_byte_guard_never_dispatches(tmp_path):
+def test_indivisible_non_tool_input_over_byte_guard_never_dispatches(tmp_path):
     import asyncio
 
     from agent_runtime.harness import RuntimeStore
     from agent_runtime.modeling.contracts import ContextCapacityPolicy
+    from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
     from tests.agent.harness.test_compaction_consistency import long_history
-    from tests.agent.harness.test_tool_result_elision import exchange
 
     with RuntimeStore.open_sync(tmp_path / "indivisible.db") as store:
         runner, turn, model_gateway = capacity_runner(
             store, tmp_path, policy=ContextCapacityPolicy(max_item_bytes=5000)
         )
         long_history(store, turn)
-        original = exchange(store, turn.turn_id, "large", "canonical evidence " * 1000)
+        original = seed(
+            store, turn_id=turn.turn_id, kind="agent_message", payload={"text": "canonical evidence " * 1000}
+        )
         result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "failed"
         assert not model_gateway.requests and not store.list_model_operations(turn.turn_id)
@@ -429,18 +437,18 @@ def test_indivisible_summary_work_unit_over_byte_guard_never_dispatches(tmp_path
         assert store.verify().valid
 
 
-def test_merge_exceeding_reserved_node_limit_is_not_dispatched(tmp_path):
+def test_summary_that_exceeds_hard_continuation_limit_keeps_originals(tmp_path):
     import asyncio
 
     from agent_runtime.harness import RuntimeStore
     from tests.agent.harness.test_compaction_consistency import long_history
 
-    with RuntimeStore.open_sync(tmp_path / "merge-too-large.db") as store:
-        runner, turn, model_gateway = capacity_runner(store, tmp_path, window=8192, summary="x" * 3300)
+    with RuntimeStore.open_sync(tmp_path / "continuation-too-large.db") as store:
+        runner, turn, model_gateway = capacity_runner(store, tmp_path, window=8192, summary="x" * 9000)
         long_history(store, turn)
         result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "failed"
-        assert len(model_gateway.requests) == 2  # two leaves; no unreserved merge or continuation
+        assert len(model_gateway.requests) == 1  # summary only
         assert not any(item.kind == "context_compaction" for item in store.list_items(turn.turn_id))
         assert store.verify().valid
 

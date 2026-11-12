@@ -105,6 +105,23 @@ async def test_command_session_success_is_not_process_completion():
 
 
 @pytest.mark.anyio
+async def test_successful_shell_exit_surfaces_stderr():
+    view = Conversation()
+    display = ConversationEventDisplay(view)
+    display.begin_turn()
+    await complete(
+        display,
+        "compound",
+        name="run_command",
+        output={"status": "completed", "exit_code": 0, "stdout": "later result", "stderr": "earlier command failed"},
+    )
+    block = display.group.children[0]
+    assert block.operation_status == "success"
+    assert "stderr: earlier command failed" in view.plain_text()
+    assert "later result" in view.plain_text()
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("status,label", [(ItemStatus.CANCELLED, "已取消"), (ItemStatus.OUTCOME_UNKNOWN, "结果未确认")])
 async def test_cancelled_and_unknown_are_distinct(status, label):
     view = Conversation()

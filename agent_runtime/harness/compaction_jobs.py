@@ -37,6 +37,7 @@ class CompactionJob:
     plan: Mapping[str, Any]
     nodes: Mapping[str, Mapping[str, Any]]
     continuation: Mapping[str, Any] | None = None
+    failure: Mapping[str, str] | None = None
 
 
 def _payload(job: CompactionJob) -> dict[str, Any]:
@@ -47,6 +48,7 @@ def _payload(job: CompactionJob) -> dict[str, Any]:
         "plan": dict(job.plan),
         "nodes": dict(job.nodes),
         "continuation": job.continuation,
+        **({"failure": dict(job.failure)} if job.failure is not None else {}),
     }
 
 
@@ -73,7 +75,7 @@ def _record(store: RuntimeStore, job: CompactionJob) -> None:
 
 @owner_operation
 def read_job(store: RuntimeStore, *, turn_id: str, job_id: str) -> CompactionJob:
-    for item in reversed(store.list_items(turn_id)):
+    for item in reversed(store.list_items(turn_id, kind="compaction_job")):
         if item.kind == "compaction_job" and item.status == "completed" and item.payload.get("job_id") == job_id:
             value = item.payload
             return CompactionJob(
@@ -84,6 +86,7 @@ def read_job(store: RuntimeStore, *, turn_id: str, job_id: str) -> CompactionJob
                 value["plan"],
                 value["nodes"],
                 value.get("continuation"),
+                value.get("failure"),
             )
     raise KeyError(f"unknown compaction job: {job_id}")
 
@@ -139,6 +142,20 @@ def create_job(store: RuntimeStore, *, turn_id: str, plan: Mapping[str, Any], so
     """Admit all still-unspent nodes and one continuation atomically."""
     frozen = copy.deepcopy(dict(plan))
     with store.tx.transaction():
+        if source_revision != store.user_input_revision(turn_id):
+            raise ContextSourceChangedError("User input changed before compaction admission.")
+        failure_key = frozen.get("failure_key")
+        if failure_key is not None and any(
+            item.kind == "compaction_job"
+            and item.status == "completed"
+            and item.payload["status"] == "failed"
+            and item.payload["plan"].get("failure_key") == failure_key
+            for item in store.list_items(turn_id, kind="compaction_job")
+        ):
+            raise ContextBudgetExceededError(
+                "The same summary work already failed; the original context is still available.",
+                reason_code="context_summary_previously_failed",
+            )
         # An abandoned admission has no live allowance. Preserve its immutable
         # identity and admit a fresh generation instead of reusing empty holds.
         generation = 0
@@ -207,6 +224,22 @@ def _check_completed_call_allowances(store: RuntimeStore, *, turn_id: str, job_i
 
 
 @owner_operation
+def summary_usage(store: RuntimeStore, *, turn_id: str, job_id: str) -> ResourceUsage:
+    """Read settled summary usage from the job's attempts, including after reopen."""
+    operations = {
+        op.operation_id
+        for op in store.list_model_operations(turn_id)
+        if op.request_ref.get("purpose") == "context_summary"
+        and (op.request_ref.get("compaction_plan") or {}).get("job_id") == job_id
+    }
+    usage = ResourceUsage()
+    for row in store.tx.rows("budget_reservations", where={"turn_id": turn_id, "status": "settled"}):
+        if row["operation_id"] in operations:
+            usage += ResourceUsage.from_dict(row["actual"])
+    return usage
+
+
+@owner_operation
 def transfer_for_attempt(
     store: RuntimeStore, *, turn_id: str, job_id: str, amount: ResourceUsage, purpose: str
 ) -> None:
@@ -217,6 +250,8 @@ def transfer_for_attempt(
     """
     with store.tx.transaction():
         job = read_job(store, turn_id=turn_id, job_id=job_id)
+        if job.source_revision != store.user_input_revision(turn_id):
+            raise ContextSourceChangedError("User input changed before compaction dispatch.")
         _check_completed_call_allowances(store, turn_id=turn_id, job_id=job_id)
         if job.status not in {"planned", "running", "candidate_ready", "waiting_unknown"}:
             raise ContextBudgetExceededError("Compaction job allowance is no longer active.")
@@ -276,7 +311,14 @@ def record_node(
 
 
 @owner_operation
-def finish_job(store: RuntimeStore, *, turn_id: str, job_id: str, status: str) -> None:
+def finish_job(
+    store: RuntimeStore,
+    *,
+    turn_id: str,
+    job_id: str,
+    status: str,
+    failure: Mapping[str, str] | None = None,
+) -> None:
     if status not in {"installed", "cancelled", "failed", "superseded", "waiting_unknown"}:
         raise ValueError("unsupported compaction job status")
     with store.tx.transaction():
@@ -286,10 +328,7 @@ def finish_job(store: RuntimeStore, *, turn_id: str, job_id: str, status: str) -
         if status != "waiting_unknown":
             for row in _hold_rows(store, job_id):
                 _fact(store, turn_id, "budget_released", {"reservation_id": row["reservation_id"]})
-        _record(
-            store,
-            CompactionJob(job.job_id, turn_id, job.source_revision, status, job.plan, job.nodes, job.continuation),
-        )
+        _record(store, replace(job, status=status, failure=failure))
 
 
 @owner_operation
@@ -347,9 +386,9 @@ def allowance_tokens(store: RuntimeStore, *, job_id: str) -> int:
 
 
 @owner_operation
-def find_job(store: RuntimeStore, *, turn_id: str, source_hash: str) -> CompactionJob | None:
+def find_job(store: RuntimeStore, *, turn_id: str, source_hash: str | None = None) -> CompactionJob | None:
     seen: set[str] = set()
-    for item in reversed(store.list_items(turn_id)):
+    for item in reversed(store.list_items(turn_id, kind="compaction_job")):
         if item.kind != "compaction_job" or item.status != "completed":
             continue
         identity = item.payload["job_id"]
@@ -357,7 +396,7 @@ def find_job(store: RuntimeStore, *, turn_id: str, source_hash: str) -> Compacti
             continue
         seen.add(identity)
         if (
-            item.payload["plan"].get("source_hash") == source_hash
+            (source_hash is None or item.payload["plan"].get("source_hash") == source_hash)
             and item.payload["status"] in {"planned", "running", "candidate_ready", "waiting_unknown"}
             and item.payload["source_revision"] == store.user_input_revision(turn_id)
         ):
@@ -371,7 +410,7 @@ def retry_admission_count(store: RuntimeStore, *, turn_id: str, job_id: str) -> 
         item.kind == "compaction_retry_admission"
         and item.status == "completed"
         and item.payload.get("job_id") == job_id
-        for item in store.list_items(turn_id)
+        for item in store.list_items(turn_id, kind="compaction_retry_admission")
     )
 
 
@@ -407,7 +446,7 @@ def admit_retry(store: RuntimeStore, *, turn_id: str, operation_id: str, amount:
         if job.source_revision != store.user_input_revision(turn_id):
             raise ContextSourceChangedError("Compaction retry source changed.")
         generation = operation.generation + 1
-        for item in store.list_items(turn_id):
+        for item in store.list_items(turn_id, kind="compaction_retry_admission"):
             if (
                 item.kind == "compaction_retry_admission"
                 and item.status == "completed"
@@ -547,7 +586,7 @@ def finish_active_jobs(store: RuntimeStore, *, turn_id: str, status: str) -> Non
     """Release only unused holds when the owning Turn ends, never unknown attempts."""
     with store.tx.transaction():
         seen: set[str] = set()
-        for item in reversed(store.list_items(turn_id)):
+        for item in reversed(store.list_items(turn_id, kind="compaction_job")):
             if item.kind != "compaction_job" or item.status != "completed":
                 continue
             job_id = item.payload["job_id"]

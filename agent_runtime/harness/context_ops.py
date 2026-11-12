@@ -35,6 +35,7 @@ def record_context_compaction(
     algorithm_revision: str | None = None,
     tool_result_overrides: Mapping[str, str] | None = None,
     capacity_diagnostics: Mapping[str, Any] | None = None,
+    replacement_history: tuple[Mapping[str, Any], ...] | None = None,
 ) -> ItemSnapshot:
     """Append an auditable replacement for one committed context prefix."""
 
@@ -55,7 +56,15 @@ def record_context_compaction(
             raise KeyError(f"unknown turn: {turn_id}")
         if turn["status"] != "running":
             raise RuntimeError("context compaction requires a running Turn")
-        visible_items = tuple(item for item in store.list_context_items(turn_id) if item.status == "completed")
+        visible_items = tuple(
+            item
+            for item in (
+                store.list_model_context_items(turn_id)
+                if tool_result_overrides is not None
+                else store.list_context_items(turn_id)
+            )
+            if item.status == "completed"
+        )
         visible_ids = tuple(item.item_id for item in visible_items)
         if visible_ids[: len(covered_item_ids)] != covered_item_ids:
             raise ValueError("compaction must cover a contiguous context prefix in exact order")
@@ -93,8 +102,33 @@ def record_context_compaction(
                     for op in store.list_tool_operations(source_turn)
                 ):
                     raise ValueError("unsettled tool results cannot be archived in semantic replay")
-        elif any(item.kind != "user_message" for item in visible_items if item.item_id in preserved_item_ids):
+        elif algorithm_revision != "semantic-compaction-v7" and any(
+            item.kind != "user_message" for item in visible_items if item.item_id in preserved_item_ids
+        ):
             raise ValueError("only user Items can be preserved inside a covered prefix")
+
+        if algorithm_revision == "semantic-compaction-v7":
+            from agent_runtime.core.messages import restore_model_message
+            from agent_runtime.harness.context import _validate_tool_groups
+
+            if not replacement_history or sum(entry.get("item_id") is None for entry in replacement_history) != 1:
+                raise ValueError("replacement history must contain exactly one summary")
+            original_ids = {entry["item_id"] for entry in replacement_history if entry["item_id"] is not None}
+            if not original_ids.issubset(visible_ids):
+                raise ValueError("replacement history references a nonvisible Item")
+            if original_ids.intersection(covered_item_ids) != set(preserved_item_ids):
+                raise ValueError("replacement history must replay exactly the preserved Items inside its prefix")
+            restored = tuple(restore_model_message(entry["message"]) for entry in replacement_history)
+            summary_message = next(
+                message
+                for entry, message in zip(replacement_history, restored, strict=True)
+                if entry["item_id"] is None
+            )
+            if summary_message.role != "context" or summary_message.context_category != "continuation_summary":
+                raise ValueError("replacement history must identify its continuation summary")
+            _validate_tool_groups(restored)
+        elif replacement_history is not None:
+            raise ValueError("replacement history requires a checkpoint record")
 
         if tool_result_overrides is not None:
             covered_by_id = {item.item_id: item for item in visible_items[: len(covered_item_ids)]}
@@ -163,6 +197,8 @@ def record_context_compaction(
         }
         if tool_result_overrides is not None:
             payload["tool_result_overrides"] = dict(tool_result_overrides)
+        if replacement_history is not None:
+            payload["replacement_history"] = list(replacement_history)
         if capacity_diagnostics is not None:
             payload["capacity_diagnostics"] = _json_object(capacity_diagnostics, field="capacity diagnostics")
         if expected_source_revision is not None:

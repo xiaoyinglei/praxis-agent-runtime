@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 from stat import S_ISLNK
 from typing import Any, Literal
@@ -209,9 +210,10 @@ class ToolOrchestrator:
                 continue  # Terminal log inspection cannot attribute later host edits.
             metadata = item.payload.get("metadata", {})
             root = Path(sessions.workspace.root) if "write_workspace" in operation.effects else None
-            before = metadata.get("workspace_tree_after_sha256")
+            before = metadata.get("workspace_tree_after_sha256") or metadata.get("workspace_tree_before_sha256")
             self._executor.restore_continuation(
-                sessions, key, operation_id=operation.operation_id, workspace_root=root, before_sha256=before
+                sessions, key, operation_id=operation.operation_id, workspace_root=root, before_sha256=before,
+                permission_provider=lambda: sessions.workspace.permissions,
             )
 
     def __init__(
@@ -287,6 +289,9 @@ class ToolOrchestrator:
         continuation: ToolContinuation,
         result: Mapping[str, JsonValue],
     ) -> None:
+        output = result.get("structured_content")
+        if isinstance(output, Mapping) and output.get("sandbox_error") is not None:
+            continuation = replace(continuation, observe_workspace=False)
         metadata = await self._executor.observe_continuation(continuation)
         operation_id = metadata.get("runtime_workspace_origin_operation_id")
         if isinstance(operation_id, str):
@@ -849,8 +854,9 @@ class ToolOrchestrator:
                 ):
                     raise changed_scope()
 
-        checkpoint = self._checkpoints is not None and ToolEffect.WRITE_WORKSPACE.value in operation.effects
-        if not pre and not checkpoint:
+        workspace_write = ToolEffect.WRITE_WORKSPACE.value in operation.effects
+        checkpoint = self._checkpoints is not None and workspace_write
+        if not pre and not workspace_write:
             return
         await self._store.run_async(self._guard_input, turn_id, call, ceiling)
         if pre and hooks is not None:
@@ -876,6 +882,10 @@ class ToolOrchestrator:
             prepared_targets = self._instruction_targets[(turn_id, call.tool_call_id)]
             if current_scope != frozen_scope or resolved.targets != prepared_targets:
                 raise changed_scope()
+        if workspace_write:
+            from agent_runtime.harness.delivery import begin_before_write
+
+            await self._commit(partial(begin_before_write, self._store, turn_id))
 
     def _operation_for_call(self, turn_id: str, call_id: str) -> ToolOperationSnapshot | None:
         return next((op for op in self._store.list_tool_operations(turn_id) if op.tool_call_id == call_id), None)

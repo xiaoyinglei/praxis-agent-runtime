@@ -2,9 +2,53 @@
 
 from __future__ import annotations
 
+import re
 import shlex
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
+
+
+def user_path_references(text: str) -> tuple[dict[str, str], ...]:
+    """Freeze existing paths supplied directly by the user, without reading contents.
+
+    Mixed prose accepts absolute paths, ~/ paths and local file URIs. Quotes
+    or backticks delimit paths containing spaces; no shell expansion is run.
+    Never apply this parser to model output, attachments or tool results.
+    """
+    pattern = (
+        r'''[`"']([^`"'\n]+)[`"']|'''
+        r'''(?<![\w/:])((?:file://(?:localhost)?/|~/|/)(?:\\ |[^\s`"'<>，。；：！？、,;!?()\[\]{}])+)'''
+    )
+    candidates = []
+    for line in text.splitlines():
+        value = line.strip()
+        try:
+            direct = value.startswith(("/", "~/")) and Path(value).expanduser().exists()
+        except (OSError, ValueError):
+            direct = False
+        if direct:
+            candidates.append(value)
+        else:
+            candidates.extend(match.group(1) or match.group(2) for match in re.finditer(pattern, line))
+    references = {}
+    for value in candidates:
+        if not value.startswith(("/", "~/", "file://")):
+            continue
+        if value.startswith("file://"):
+            uri = urlsplit(value)
+            if uri.netloc not in {"", "localhost"} or uri.query or uri.fragment:
+                continue
+            value = unquote(uri.path)
+        value = value.replace("\\ ", " ")
+        try:
+            path = Path(value).expanduser().absolute()
+            resolved = path.resolve()
+            kind = "file" if resolved.is_file() else "directory" if resolved.is_dir() else None
+        except (OSError, ValueError, RuntimeError):
+            continue
+        if kind is not None:
+            references[str(path)] = {"path": str(path), "resolved_path": str(resolved), "kind": kind}
+    return tuple(references.values())
 
 
 def resolve_local_file(value: str, *, base: Path, resolve_symlinks: bool = True) -> Path:

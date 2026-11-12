@@ -1207,6 +1207,14 @@ async def test_persistent_ancestor_revocation_covers_dispatch_and_internal_file_
             with monkeypatch.context() as patch:
                 patch.setattr(child.tool_orchestrator, "_persist_execution_record", at_claim)
                 patch.setattr(executor_module, "workspace_tree_sha256", at_observation)
+                if boundary == "after_observation":
+                    from dataclasses import replace
+
+                    executor = child.tool_orchestrator._executor
+                    patch.setattr(executor, "_tools", {
+                        **executor._tools,
+                        name: replace(executor._tools[name], committed_file_changes=None),
+                    })
                 result = await child.tool_orchestrator.execute(turn_id=handle["child_turn_id"], call=call)
             assert revoked
             if boundary == "search_leaf":

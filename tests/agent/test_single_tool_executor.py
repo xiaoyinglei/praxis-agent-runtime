@@ -581,6 +581,7 @@ async def test_executor_strips_forged_workspace_attestation_from_read_tool() -> 
     forged = {
         "runtime_workspace_origin_operation_id": "unapproved-operation",
         "runtime_workspace_write": True,
+        "runtime_workspace_changed": True,
         "runtime_workspace_file_changes": (
             {
                 "path": "already-there.py",
@@ -1907,3 +1908,38 @@ async def test_finish_current_async_cancellation_is_reported_with_completed_resu
     execution = await task
     assert not execution.result.is_error
     assert execution.result.metadata['execution_cancellation_requested'] is True
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("policy_denies", [False, True])
+async def test_unavailable_tree_observation_is_not_a_noop(tmp_path, monkeypatch, policy_denies):
+    from agent_runtime.permission_policy import PathRule, PermissionPolicy
+    from agent_runtime.tools import executor as executor_module
+
+    path = tmp_path / "unrelated"
+    path.write_text("fixture")
+    permissions = None
+    if policy_denies:
+        permissions = PermissionPolicy(filesystem=(PathRule(path="unrelated", access="deny"),)).resolve(tmp_path)
+
+        def unauthorized_scan(root):
+            pytest.fail(f"tree observation crossed a read denial: {root}")
+
+        monkeypatch.setattr(executor_module, "workspace_tree_sha256", unauthorized_scan)
+    else:
+        path.chmod(0)
+
+    write = _tool(
+        name="opaque_write",
+        static_effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+        resolve_use=lambda _args: ResolvedToolUse(
+            effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+            targets=(ToolTarget(kind="workspace_path", value=str(tmp_path)),),
+        ),
+    )
+    result = await ToolExecutor({"opaque_write": write}).execute(
+        _call("opaque_write"),
+        context=replace(_context(workspace_root=tmp_path, allow_write=True), permissions=permissions),
+    )
+    assert not result.result.is_error
+    assert result.result.metadata["workspace_tree_changed"] is None

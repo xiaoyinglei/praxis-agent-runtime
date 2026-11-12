@@ -274,6 +274,10 @@ class Session:
                     ):
                         raise ValueError("invalid saved input file references")
                     agent._input_read_files = tuple(selected_files)
+                    source_turn = thread.active_turn_id or thread.head_turn_id or thread.fork_turn_id
+                    agent._input_read_references = (
+                        self.store.user_read_references(source_turn) if source_turn is not None else ()
+                    )
                 model, resource_options = await self._open_agent_resources(
                     agent,
                     allow_write_tools=service_options.pop("allow_write_tools", False),
@@ -669,6 +673,7 @@ class Session:
                 user_message=task,
                 binding_manifest=binding,
                 input_files=input_files,
+                reference_user_paths=True,
             )
             if (
                 self.memory_config.generate_memories
@@ -915,6 +920,7 @@ class Session:
     def permissions(self) -> ResolvedPermissions:
         """Return current effective authority, including administrator ceilings."""
         self._ensure_open()
+        self._refresh_user_read_references()
         context = self.tool_execution_context
         head = self.head_turn_id
         if head is not None:
@@ -924,6 +930,25 @@ class Session:
         effective = context.effective_permissions
         current = self._resource_permissions()
         return current if effective is None else current.intersection(effective)
+
+    def _refresh_user_read_references(self) -> None:
+        """Consume only committed user selections, including cross-process steering."""
+        if self._agent is None or not hasattr(self, "thread_id"):
+            return
+        thread = self.store.read_thread(self.thread_id)
+        source_turn = thread.active_turn_id or thread.head_turn_id or thread.fork_turn_id
+        references = self.store.user_read_references(source_turn) if source_turn is not None else ()
+        self._agent._input_read_references = references
+        previous = self.tool_execution_context
+        if previous.permissions is not None:
+            self.tool_execution_context = replace(
+                previous, permissions=previous.permissions.with_read_references(references, historical=True),
+            )
+            self._apply_tool_context()
+
+    def _snapshot_tool_policy(self) -> dict[str, object]:
+        self._refresh_user_read_references()
+        return _tool_execution_policy_snapshot(self.tool_execution_context)
 
     def update_permissions(self, policy: PermissionPolicy | Path | str) -> None:
         """Explicit user/host control; the model has no tool to widen authority."""

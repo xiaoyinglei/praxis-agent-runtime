@@ -129,6 +129,7 @@ def start_turn(
     input_files: tuple[Mapping[str, Any], ...] = (),
     turn_id: str | None = None,
     turn_producer: str = "runtime",
+    reference_user_paths: bool = False,
 ) -> TurnSnapshot:
     if not isinstance(user_message, str) or not user_message.strip():
         raise ValueError("user_message must be non-empty")
@@ -147,6 +148,9 @@ def start_turn(
         if thread["active_turn_id"] is not None:
             raise RuntimeError(f"thread already has an active turn: {thread_id}")
         turn_index = (store.tx.maximum("turns", "turn_index", where={"thread_id": thread_id}) + 1,)[0]
+        from agent_runtime.local_files import user_path_references
+
+        read_paths = user_path_references(user_message) if reference_user_paths else ()
         facts.append_fact(
             store,
             thread_id=thread_id,
@@ -174,7 +178,9 @@ def start_turn(
             turn_id=turn_id,
             record_type="item_completed",
             producer="user",
-            payload={"item_id": item_id, "payload": {"text": user_message}},
+            payload={"item_id": item_id, "payload": {
+                "text": user_message, **({"read_paths": list(read_paths)} if read_paths else {}),
+            }},
         )
         for input_file in frozen_input_files:
             input_item_id = f"item_{uuid4().hex}"
@@ -258,6 +264,9 @@ def receive_turn_input(
         if turn is None or turn.status not in {"running", "paused", "interrupted"}:
             raise RuntimeError("expected Turn is no longer active; input was not accepted")
         _assert_no_pending_cancellation(store, turn_id)
+        from agent_runtime.local_files import user_path_references
+
+        read_paths = user_path_references(text)
         revision = store.user_input_revision(turn_id) + 1
         facts.append_fact(
             store,
@@ -275,6 +284,7 @@ def receive_turn_input(
             producer="user",
             payload={"item_id": item_id, "payload": {
                 "text": text, "input_revision": revision,
+                **({"read_paths": list(read_paths)} if read_paths else {}),
                 **({"input_receipt_digest": digest} if input_id is not None else {}),
                 **({"input_request": request} if input_id is not None and request is not None else {}),
             }},

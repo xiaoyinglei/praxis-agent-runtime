@@ -241,6 +241,20 @@ def workspace_tree_sha256(root: Path | str) -> str | None:
     return digest.hexdigest()
 
 
+def workspace_tree_excludes(root: Path, path: Path) -> bool:
+    """Whether a path is outside the tree fingerprint's observation domain."""
+    if not path.is_relative_to(root):
+        return True
+    for relative in (path, *path.parents):
+        if relative == root:
+            return False
+        if relative.name == ".git" or (
+            relative.name in _SNAPSHOT_IGNORED_DIRECTORIES and relative.is_dir()
+        ):
+            return True
+    return False
+
+
 def _has_temporary_runtime_layout(root: Path) -> bool:
     return bool(
         (root / ".agent_memory").is_dir()
@@ -254,11 +268,15 @@ def _filesystem_workspace_paths(
     *,
     ignore_runtime_root: bool = False,
 ) -> tuple[Path, ...]:
+    def raise_walk_error(error: OSError) -> None:
+        raise error
+
     paths: list[Path] = []
     for directory, directory_names, file_names in os.walk(
         root,
         topdown=True,
         followlinks=False,
+        onerror=raise_walk_error,
     ):
         current = Path(directory)
         kept_directories: list[str] = []

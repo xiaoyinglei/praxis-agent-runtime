@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from rich.live import Live
 
 from agent_runtime.modeling.failures import ModelFailure
-from agent_runtime.result import AgentUsage
+from agent_runtime.result import AgentResult, AgentUsage
 from agent_runtime.streaming.events import (
     EventType,
     ItemDeltaKind,
@@ -31,6 +31,27 @@ DEFAULT_COMMAND_HEAD_ROWS = 6
 DEFAULT_COMMAND_TAIL_ROWS = 3
 DEFAULT_PARTIAL_ROW_BYTES = 16 * 1024
 DEFAULT_PROGRESS_MESSAGES = 8
+
+
+def format_delivery_outcome(result: AgentResult) -> str:
+    lines = []
+    plan = result.plan
+    if result.status == "done" and plan is not None and plan.status == "needs_replan":
+        remaining = sum(step.status not in {"completed", "skipped"} for step in plan.steps)
+        lines.append(f"回答已结束 · 计划仍有 {remaining} 项未结")
+    delivery = result.delivery
+    identity = delivery.get("delivery_id")
+    scopes = delivery.get("verified_scope")
+    actions = delivery.get("next_actions")
+    if identity or scopes or actions:
+        lines.append(f"交付: {delivery.get('status', 'unverified')}")
+        if identity:
+            lines.append(f"证据: {identity}")
+        if isinstance(scopes, tuple):
+            lines.extend(f"已验证范围: {scope}" for scope in scopes)
+        if isinstance(actions, tuple):
+            lines.extend(f"续跑: {action}" for action in actions)
+    return safe_terminal_text("\n".join(lines))
 
 
 def format_model_failure(failure: ModelFailure) -> str:

@@ -700,13 +700,24 @@ async def test_cancelling_permanently_blocked_sync_provider_returns_promptly() -
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("content_parts", [False, True])
 async def test_streaming_fallback_parses_sdk_text_completion(
-    chat_completion_factory: Callable[..., ChatCompletion],
+    chat_completion_factory: Callable[..., ChatCompletion], content_parts: bool,
 ) -> None:
     response = chat_completion_factory(
         content="provider answer that is deliberately longer than twenty bytes",
         tool_calls=None,
     )
+
+    if content_parts:
+        content = [
+            {"type": "text", "text": "provider answer that is "},
+            {"type": "text", "text": "deliberately longer than twenty bytes"},
+        ]
+        choice = response.choices[0]
+        response = response.model_copy(update={
+            "choices": [choice.model_copy(update={"message": choice.message.model_copy(update={"content": content})})]
+        })
 
     chunks = [
         chunk

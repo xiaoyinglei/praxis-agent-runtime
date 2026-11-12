@@ -134,7 +134,18 @@ def record_failure(
                 *(float(r.payload.get("dispatched_at", r.committed_at_ms / 1000)) for r in dispatches),
             ]
         )
-        policy = RetryPolicy.from_binding(turn.binding_manifest)
+        request_ref = operation["request_ref"]
+        plan = request_ref.get("compaction_plan")
+        standalone_summary = (
+            request_ref.get("purpose") == "context_summary"
+            and isinstance(plan, Mapping)
+            and plan.get("summary_request_mode") == "standalone"
+        )
+        policy = (
+            None
+            if standalone_summary and failure.billing_outcome == "unknown"
+            else RetryPolicy.from_binding(turn.binding_manifest)
+        )
         decision = (
             None
             if policy is None or observed_at < clock_floor
@@ -209,7 +220,11 @@ def _validate_source(store: RuntimeStore, operation: Mapping[str, Any]) -> None:
         from agent_runtime.harness.context import RolloutContextManager
         from agent_runtime.harness.protocol import ContextSourceChangedError
 
-        source_hash, _ = RolloutContextManager(store).semantic_source(turn_id)
+        source_hash, _ = RolloutContextManager(store).semantic_source(
+            turn_id,
+            use_archived_projection=plan.get("summary_request_mode") == "standalone",
+            checkpoint="checkpoint_revision" in plan or "summary_history_start" in plan,
+        )
         if source_hash != plan["source_hash"]:
             raise ContextSourceChangedError("Summary source changed before model retry dispatch.")
 

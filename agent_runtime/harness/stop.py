@@ -36,6 +36,7 @@ from agent_runtime.harness.protocol import (
 )
 from agent_runtime.harness.records import ItemSnapshot, ToolOperationSnapshot
 from agent_runtime.harness.runtime_store import RuntimeStore
+from agent_runtime.tools.evidence import workspace_changed
 
 _BOUNDED_STOP_FEEDBACK = frozenset({"stop_hook_blocked", "stop_evidence_changed", "delivery_evidence_stale"})
 
@@ -257,7 +258,7 @@ def _is_workspace_change(item: ItemSnapshot, operation: ToolOperationSnapshot) -
     return (
         has_write_claim
         and metadata.get("runtime_workspace_write") is True
-        and metadata.get("workspace_tree_changed") is True
+        and workspace_changed(metadata) is True
     )
 
 
@@ -593,12 +594,11 @@ class TurnStop:
                 status="failed",
             )
         try:
-            policy = self._store.read_turn(turn_id).binding_manifest.get("delivery_policy", {})
-            if policy.get("revision") == "delivery-v1":
-                from agent_runtime.harness import delivery
+            from agent_runtime.harness import delivery
 
-                if not any(i.kind == "delivery_record" for i in self._store.list_items(turn_id)):
-                    delivery.record(self._store, turn_id)
+            binding = self._store.read_turn(turn_id).binding_manifest
+            if delivery.should_record_on_stop(binding, items):
+                delivery.record(self._store, turn_id)
             completed = turn_ops.complete_turn(
                 self._store,
                 turn_id=turn_id,

@@ -406,6 +406,10 @@ def integrate(
         current.update(status="reviewed", reconciled=True)
         record(store, parent, current)
         return current
+    if changed:
+        from agent_runtime.harness.delivery import begin_before_write
+
+        begin_before_write(store, parent)
     current.update(status="applying", changed_paths=changed)
     record(store, parent, current)  # Durable write intent before first filesystem mutation.
     with tarfile.open(fileobj=io.BytesIO(store.read_artifact(current["result_archive_id"]))) as result_tar:

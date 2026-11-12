@@ -376,15 +376,69 @@ class RolloutStore:
         return _decoded_row(row) if row is not None else None
 
     @_store_operation
-    def conversation_rows(self, thread_id: str, through_turn_index: int) -> tuple[Mapping[str, Any], ...]:
+    def conversation_rows(
+        self,
+        thread_id: str,
+        through_turn_index: int,
+        *,
+        after_sequence: int = 0,
+        from_turn_index: int = 0,
+        tool_name: str | None = None,
+    ) -> tuple[Mapping[str, Any], ...]:
         return tuple(
             _decoded_row(row)
             for row in self._connection.execute(
                 "SELECT items.* FROM items JOIN turns USING(turn_id) "
-                "WHERE turns.thread_id = ? AND turns.turn_index <= ? ORDER BY turns.turn_index, items.sequence",
-                (thread_id, through_turn_index),
+                "WHERE turns.thread_id = ? AND turns.turn_index <= ? AND items.applied_thread_sequence > ? "
+                "AND turns.turn_index >= ? AND (? IS NULL OR EXISTS (SELECT 1 FROM tool_operations "
+                "WHERE tool_operations.result_item_id = items.item_id AND tool_operations.tool_name = ?)) "
+                "ORDER BY turns.turn_index, items.sequence",
+                (thread_id, through_turn_index, after_sequence, from_turn_index, tool_name, tool_name),
             )
         )
+
+    @_store_operation
+    def latest_context_checkpoint(
+        self, thread_id: str, through_turn_index: int, *, from_turn_index: int = 0
+    ) -> Mapping[str, Any] | None:
+        row = self._connection.execute(
+            "SELECT items.* FROM items JOIN turns USING(turn_id) "
+            "WHERE turns.thread_id = ? AND turns.turn_index <= ? AND turns.turn_index >= ? "
+            "AND items.kind = 'context_compaction' "
+            "AND items.status = 'completed' AND json_type(items.payload_json, '$.replacement_history') = 'array' "
+            "ORDER BY turns.turn_index DESC, items.sequence DESC LIMIT 1",
+            (thread_id, through_turn_index, from_turn_index),
+        ).fetchone()
+        return None if row is None else _decoded_row(row)
+
+    @_store_operation
+    def user_read_references(self, thread_id: str, through_turn_index: int) -> tuple[dict[str, str], ...]:
+        return tuple(
+            reference
+            for row in self._connection.execute(
+                "SELECT json_extract(payload_json, '$.read_paths') FROM items JOIN turns USING(turn_id) "
+                "WHERE turns.thread_id = ? AND turns.turn_index <= ? AND items.kind = 'user_message' "
+                "AND items.producer = 'user' AND items.status = 'completed' "
+                "AND json_type(payload_json, '$.read_paths') = 'array' ORDER BY turns.turn_index, items.sequence",
+                (thread_id, through_turn_index),
+            )
+            for reference in json.loads(row[0])
+        )
+
+    @_store_operation
+    def conversation_artifact_ids(self, thread_id: str, through_turn_index: int) -> set[str]:
+        """Read attachment identities without materializing tool/message bodies."""
+        return {
+            row[0]
+            for row in self._connection.execute(
+                "SELECT DISTINCT CASE WHEN attachment.type = 'object' THEN "
+                "json_extract(attachment.value, '$.artifact_id') END AS artifact_id "
+                "FROM items JOIN turns USING(turn_id), json_each(items.payload_json, '$.attachments') AS attachment "
+                "WHERE turns.thread_id = ? AND turns.turn_index <= ?",
+                (thread_id, through_turn_index),
+            )
+            if isinstance(row[0], str)
+        }
 
     @_store_operation
     def metadata(self, key: str) -> str | None:

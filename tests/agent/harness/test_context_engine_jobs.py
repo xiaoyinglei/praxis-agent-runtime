@@ -553,3 +553,243 @@ def test_new_job_generation_has_its_own_call_allowance_after_unsent_supersession
         )
         assert attempt.status == "dispatched"
         assert store.verify().valid
+
+
+def _compaction_runner(store, thread_id, dispatch, *, accounting=None):
+    from agent_runtime.harness import GatewayHarnessModel, RolloutContextManager, TurnRunner
+    from tests.agent.harness.test_compaction_consistency import Accept
+    from tests.agent.harness.test_model_adapter import BudgetAwareCapturingGateway, _resolved_model
+
+    gateway = BudgetAwareCapturingGateway(max_input_tokens=95000)
+    model = GatewayHarnessModel(
+        model_id="test-model",
+        resolved=_resolved_model(
+            gateway=gateway, token_accounting=accounting or gateway.token_accounting, context_window_tokens=100000
+        ),
+        instructions=("Follow the task.",),
+    )
+    model.dispatch = dispatch
+    return TurnRunner(
+        thread_id=thread_id,
+        store=store,
+        model=model,
+        context_manager=RolloutContextManager(store),
+        completion_gate=Accept(),
+    )
+
+
+def test_optional_compaction_stops_after_three_rejected_summaries_across_reopen(tmp_path):
+    import asyncio
+
+    from agent_runtime.harness.protocol import HarnessModelResponse
+    from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
+    from tests.agent.harness.test_compaction_consistency import long_history
+
+    summaries = []
+
+    async def dispatch(prepared, *, event_sink=None):
+        assert prepared.request_ref["purpose"] == "context_summary"
+        summaries.append(prepared.request_ref["request_id"])
+        text = "The task is still in progress." if len(summaries) == 4 else "x" * 34000
+        return HarnessModelResponse.from_parts(text=text, usage={"input_tokens": 100, "output_tokens": 100})
+
+    def prepare(store, step, *, required=False):
+        seed(store, turn_id=turn_id, kind="agent_message", payload={"text": f"New fact {step}"})
+        runner = _compaction_runner(store, thread_id, dispatch)
+        return asyncio.run(
+            runner._context_engine.prepare_or_resume(
+                runner.restore_turn_context(turn_id),
+                step=step,
+                pressure_reason="provider_overflow" if required else None,
+            )
+        )
+
+    database = tmp_path / "compaction-breaker.db"
+    with RuntimeStore.open_sync(database) as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(
+            store,
+            thread_id=thread.thread_id,
+            user_message="Continue the task",
+            binding_manifest={
+                "context_capacity_policy": {"revision": "context-capacity-v2"},
+                "auto_compact_token_limit": 12000,
+            },
+        )
+        thread_id, turn_id = thread.thread_id, turn.turn_id
+        long_history(store, turn)
+        prepare(store, 1)
+        prepare(store, 2)
+        assert len(summaries) == 2
+
+    with RuntimeStore.open_sync(database) as store:
+        prepare(store, 3)
+        prepare(store, 4)
+        assert len(summaries) == 3
+        jobs = [
+            item.payload
+            for item in store.list_items(turn_id)
+            if item.kind == "compaction_job" and item.payload["status"] == "failed"
+        ]
+        assert len(jobs) == 3
+        assert {job["failure"]["reason_code"] for job in jobs} == {"byte_guard"}
+        assert store.read_budget_state(turn_id).reserved.total_tokens == 0
+        assert not any(item.kind == "context_compaction" for item in store.list_items(turn_id))
+        assert "finding 0" in str(_compaction_runner(store, thread_id, dispatch)._context_manager.build(turn_id))
+
+        prepare(store, 5, required=True)
+        assert len(summaries) == 4
+        assert any(item.kind == "context_compaction" for item in store.list_items(turn_id))
+        assert _compaction_runner(store, thread_id, dispatch)._context_engine._proactive_compaction_available(turn_id)
+        assert store.verify().valid
+
+
+@pytest.mark.parametrize("provider_rejects", [False, True], ids=["unfit-response", "provider-overflow"])
+def test_same_failed_summary_plan_is_not_readmitted_on_reopen(tmp_path, provider_rejects):
+    import asyncio
+
+    from agent_runtime.harness.protocol import HarnessModelResponse, ModelContextOverflowError
+    from tests.agent.harness.test_compaction_consistency import long_history
+
+    calls = []
+
+    async def dispatch(prepared, *, event_sink=None):
+        calls.append(prepared.request_ref["request_id"])
+        if provider_rejects:
+            raise ModelContextOverflowError("Summary rejected by the provider window.")
+        return HarnessModelResponse.from_parts(text="x" * 34000, usage={"input_tokens": 100, "output_tokens": 100})
+
+    database = tmp_path / "failed-summary.db"
+    with RuntimeStore.open_sync(database) as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(
+            store,
+            thread_id=thread.thread_id,
+            user_message="Continue the task",
+            binding_manifest={
+                "context_capacity_policy": {"revision": "context-capacity-v2"},
+                "auto_compact_token_limit": 12000,
+            },
+        )
+        long_history(store, turn)
+
+    for _ in range(2):
+        with RuntimeStore.open_sync(database) as store:
+            runner = _compaction_runner(store, thread.thread_id, dispatch)
+            _, continuation = asyncio.run(
+                runner._context_engine.prepare_or_resume(runner.restore_turn_context(turn.turn_id), step=1)
+            )
+            assert continuation.request_ref["purpose"] == "agent_step"
+            assert not any(item.kind == "context_compaction" for item in store.list_items(turn.turn_id))
+            failed = {
+                item.payload["failure"]["reason_code"]
+                for item in store.list_items(turn.turn_id)
+                if item.kind == "compaction_job" and item.payload["status"] == "failed"
+            }
+            assert failed == ({"summary_context_overflow"} if provider_rejects else {"byte_guard"})
+            assert store.read_budget_state(turn.turn_id).reserved.total_tokens == 0
+    assert len(calls) == 1
+
+
+def test_utf8_summary_can_cross_soft_target_and_fit_actual_model_window(tmp_path):
+    import asyncio
+
+    from agent_runtime.harness.protocol import HarnessModelResponse
+    from agent_runtime.modeling.tokenization import TokenAccountingService, TokenizerContract
+    from tests.agent.harness.test_compaction_consistency import long_history
+
+    summaries = []
+
+    async def dispatch(prepared, *, event_sink=None):
+        assert prepared.request_ref["purpose"] == "context_summary"
+        snapshot = prepared.request_ref["step_snapshot"]
+        assert not snapshot["tools"]
+        assert "Available space for the summary" in snapshot["messages"][-1]["body"]
+        assert prepared.request_ref["compaction_plan"]["summary_byte_limit"] >= 4806
+        summaries.append(prepared.request_ref["request_id"])
+        return HarnessModelResponse.from_parts(text="事实" * 800, usage={"input_tokens": 100, "output_tokens": 100})
+
+    with RuntimeStore.open_sync(tmp_path / "summary-slot.db") as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(
+            store,
+            thread_id=thread.thread_id,
+            user_message="Review these requirements: " + "requirement " * 280,
+            binding_manifest={
+                "context_capacity_policy": {"revision": "context-capacity-v2"},
+                "auto_compact_token_limit": 9000,
+            },
+        )
+        long_history(store, turn)
+        accounting = TokenAccountingService(
+            TokenizerContract("fixture", "fixture", "fixture", tokenizer_backend="simple")
+        )
+        runner = _compaction_runner(store, thread.thread_id, dispatch, accounting=accounting)
+        _, prepared = asyncio.run(
+            runner._context_engine.prepare_or_resume(runner.restore_turn_context(turn.turn_id), step=1)
+        )
+        assert len(summaries) == 1
+        [compaction] = [item for item in store.list_items(turn.turn_id) if item.kind == "context_compaction"]
+        projection = prepared.request_ref["context_projection"]
+        assert projection["count_source"] == "utf8_bytes_conservative"
+        measured = compaction.payload["capacity_diagnostics"]
+        assert projection["post_compact_target"] < measured["after_input_tokens"] < measured["before_input_tokens"]
+        assert measured["after_input_tokens"] <= projection["max_input_tokens"]
+        assert "事实" * 800 in str(compaction.payload["replacement_history"])
+
+
+def test_completed_checkpoint_summary_is_installed_after_reopen(tmp_path, monkeypatch):
+    import asyncio
+
+    from agent_runtime.harness import compaction_jobs
+    from agent_runtime.harness.protocol import HarnessModelResponse
+    from tests.agent.harness.test_compaction_consistency import long_history
+
+    calls = []
+
+    async def dispatch(prepared, *, event_sink=None):
+        purpose = prepared.request_ref["purpose"]
+        calls.append(purpose)
+        return HarnessModelResponse.from_parts(
+            text="Previous work is recorded; continue verification." if purpose == "context_summary" else "done",
+            usage={"input_tokens": 10, "output_tokens": 10},
+        )
+
+    database = tmp_path / "checkpoint-reopen.db"
+    with RuntimeStore.open_sync(database) as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(
+            store,
+            thread_id=thread.thread_id,
+            user_message="Finish verification.",
+            binding_manifest={
+                "model_token_budget_total": 38000,
+                "context_capacity_policy": {"revision": "context-capacity-v2", "max_messages": 5},
+            },
+        )
+        long_history(store, turn)
+        runner = _compaction_runner(store, thread.thread_id, dispatch)
+
+        def lose_process(*args, **kwargs):
+            raise InterruptedError("before checkpoint installation")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(compaction_jobs, "install_candidate", lose_process)
+            with pytest.raises(InterruptedError, match="before checkpoint installation"):
+                asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
+
+        [summary] = store.list_model_operations(turn.turn_id)
+        assert summary.status == "completed"
+        assert not any(item.kind == "context_compaction" for item in store.list_items(turn.turn_id))
+        assert store.read_budget_state(turn.turn_id).reserved.total_tokens > 0
+
+    with RuntimeStore.open_sync(database) as store:
+        runner = _compaction_runner(store, thread.thread_id, dispatch)
+        result = asyncio.run(runner.drive(turn_id=turn.turn_id, action="continue"))
+        assert result.status == "completed"
+        assert calls == ["context_summary", "agent_step"]
+        [boundary] = [item for item in store.list_items(turn.turn_id) if item.kind == "context_compaction"]
+        assert boundary.payload["capacity_diagnostics"]["summary_calls"] == 1
+        assert boundary.payload["capacity_diagnostics"]["summary_tokens"] == 20
+        assert store.read_budget_state(turn.turn_id).reserved.total_tokens == 0
+        assert store.verify().valid

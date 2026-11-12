@@ -51,6 +51,7 @@ from agent_runtime.harness.tool_orchestrator import (
     ToolOrchestrator,
 )
 from agent_runtime.streaming.sink import TurnEventDispatcher
+from agent_runtime.tools.evidence import workspace_changed
 
 
 class TurnRunner:
@@ -165,6 +166,7 @@ class TurnRunner:
         user_message: str,
         binding_manifest: Mapping[str, Any],
         input_files: tuple[Mapping[str, Any], ...] = (),
+        reference_user_paths: bool = False,
     ) -> TurnResult:
         binding_manifest = dict(binding_manifest)
         binding_manifest.setdefault("model_step_budget", self._max_steps)
@@ -176,6 +178,7 @@ class TurnRunner:
                 return turn_ops.start_turn(
                     self._store, thread_id=self.thread_id, turn_id=turn_id,
                     user_message=user_message, binding_manifest=binding_manifest, input_files=input_files,
+                    reference_user_paths=reference_user_paths,
                 )
 
         turn = await self._commit(admit)
@@ -499,12 +502,6 @@ class TurnRunner:
             else:
                 turn_context = await self._store.run_async(self.restore_turn_context, turn_id)
         turn_id = turn_context.turn_id
-        if turn_context.binding_manifest.get("delivery_policy", {}).get("revision") == "delivery-v1":
-            from agent_runtime.harness.delivery import begin
-
-            current = await self._store.run_async(self._store.read_turn, turn_id)
-            if current.status == "running":
-                await self._commit(partial(begin, self._store, turn_id))
         thread_id = turn_context.thread_id
         if thread_id != self.thread_id:
             raise RuntimeError("Turn belongs to a different Session")
@@ -712,12 +709,18 @@ class TurnRunner:
             step = count + 1 if first_step is None else first_step
             if decision.kind in {ContinuationKind.CONTEXT_OVERFLOW, ContinuationKind.RESUME_COMPACTION}:
                 models = await self._store.run_async(self._store.list_model_operations, turn_id)
-                if models:
+                if models and (
+                    decision.kind == ContinuationKind.CONTEXT_OVERFLOW
+                    or models[-1].request_ref.get("purpose") == "context_summary"
+                ):
                     step = models[-1].request_ref.get("step_snapshot", {}).get("step", max(1, count))
             remaining_tokens = await self._store.run_async(
                 lambda: self._store.read_budget_state(turn_id).remaining("tokens")
             )
-            if remaining_tokens is not None and remaining_tokens < 1:
+            if (
+                remaining_tokens is not None and remaining_tokens < 1
+                and decision.kind not in {ContinuationKind.RESUME_COMPACTION, ContinuationKind.CONTEXT_OVERFLOW}
+            ):
                 return await self._fail_turn(
                     thread_id=thread_id,
                     turn_id=turn_id,
@@ -734,6 +737,8 @@ class TurnRunner:
                     message=await self._store.run_async(self._step_budget_receipt, turn_id, step_budget),
                 )
             reactive = decision.kind == ContinuationKind.CONTEXT_OVERFLOW
+            rejected = None
+            rejections = 0
             self._capacity_recovery_root = await self._store.run_async(active_capacity_root, self._store, turn_id)
             if reactive:
                 operations = await self._store.run_async(self._store.list_model_operations, turn_id)
@@ -756,19 +761,27 @@ class TurnRunner:
                     )
 
                 rejections = await self._store.run_async(count_rejections)
-                if rejections > 1:
+                if rejections > 2:
                     return await self._fail_turn(
                         thread_id=thread_id,
                         turn_id=turn_id,
                         reason_code="model_context_window_exceeded",
-                        message="Context overflow persisted after one recovery.",
+                        message="Context overflow persisted after both recovery paths.",
                     )
                 self._capacity_recovery_root = root_id
             observation = await self._store.run_async(self._context_engine.observation_revision, turn_id)
             try:
-                context, prepared = await self._context_engine.prepare_or_resume(
-                    turn_context, step=step, pressure_reason="provider_overflow" if reactive else None
-                )
+                if rejected is not None and rejections == 2:
+                    context, prepared = await self._context_engine.retry_overflow_with_archived_results(
+                        turn_context, step=step, rejected=rejected,
+                    )
+                else:
+                    context, prepared = await self._context_engine.prepare_or_resume(
+                        turn_context, step=step, pressure_reason="provider_overflow" if reactive else None,
+                        rejected_request_bytes=(
+                            rejected.request_ref.get("serialized_input_bytes") if rejected is not None else None
+                        ),
+                    )
             except ModelRetryScheduledError:
                 continue
             except SummaryStoppedError as stopped:
@@ -838,7 +851,7 @@ class TurnRunner:
             if item.kind == "tool_result" and item.status == "completed"
         ]
         failed = sum(item.payload.get("is_error") is True for item in results)
-        changed = any(item.payload.get("metadata", {}).get("workspace_tree_changed") is True for item in results)
+        changed = any(workspace_changed(item.payload.get("metadata", {})) is True for item in results)
         return (
             f"本轮已达到 {limit} 步执行上限，尚未完成收尾。\n"
             f"已记录 {len(results)} 个工具结果，其中 {failed} 个报错。"
