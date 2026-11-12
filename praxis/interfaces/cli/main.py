@@ -410,9 +410,13 @@ def _chat_loop(session: Session) -> None:
         if not text:
             continue
         if text.startswith("/"):
-            command = REGISTRY.get(text[1:].split(maxsplit=1)[0].lower())
+            # Fix Round 2:名字提取必须对裸 "/"(及 "/ " 经 strip 后)安全——
+            # split 结果为空时 name="",与未知命令同路:提示后继续循环,绝不抛。
+            parts = text[1:].split(maxsplit=1)
+            name = parts[0].lower() if parts else ""
+            command = REGISTRY.get(name)
             if command is None:
-                typer.echo(f"unknown command: /{text[1:].split(maxsplit=1)[0]} (try /help)")
+                typer.echo(f"unknown command: /{name} (try /help)")
                 continue
             try:
                 output = command.run(session)

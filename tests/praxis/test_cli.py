@@ -576,6 +576,26 @@ def test_chat_slash_commands(workspace: Path, tmp_path: Path) -> None:
     assert "unknown command" in result.output.lower()
 
 
+def test_chat_bare_slash_never_kills_session(workspace: Path, tmp_path: Path) -> None:
+    """C1 回归(Fix Round 2):裸 "/" 与 "/ " 必须走 unknown-command 提示并继续循环。
+
+    审查发现:text[1:].split(maxsplit=1)[0] 对恰好 "/" 的输入抛 IndexError,
+    逸出所有错误边界 → traceback → 会话终止。此测试钉死修复。
+    """
+    script = _write_script(tmp_path, "slash.json", [{"content": "normal reply"}])
+    result = runner.invoke(
+        app,
+        ["chat", "--workspace", str(workspace), "--scripted", str(script)],
+        input="/\n/ \n/nosuch\nhello\n/exit\n",
+        env=_CLEAN_ENV,
+    )
+    assert result.exception is None, repr(result.exception)
+    assert result.exit_code == 0, result.output
+    assert "unknown command" in result.output.lower()
+    assert "normal reply" in result.output  # 裸斜杠后普通 turn 照常执行
+    assert "Traceback" not in result.output
+
+
 def test_chat_paused_approve_y_n(workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(permission, "decide", lambda *a: Decision.ask("test"))
     script = _write_script(tmp_path, "chat-ask.json", [_write_call_entry("chat-approved"), {"content": "chat done"}])
