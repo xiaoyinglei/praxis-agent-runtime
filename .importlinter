@@ -1,6 +1,7 @@
 [importlinter]
 root_packages =
     agent_runtime
+    praxis
     rag
 
 [importlinter:contract:runtime_rag_boundary]
@@ -109,4 +110,61 @@ forbidden_modules =
     agent_runtime.approval
     agent_runtime.planning
     agent_runtime.modeling
+allow_indirect_imports = true
+
+[importlinter:contract:praxis_layers]
+name = Praxis layers point downward only
+type = layers
+layers =
+    praxis.interfaces
+    praxis.core
+    praxis.store
+    praxis.protocol
+
+[importlinter:contract:praxis_tools_adapters_boundary]
+name = Praxis tools and adapters never reach core/store/interfaces
+type = forbidden
+source_modules =
+    praxis.tools
+    praxis.adapters
+forbidden_modules =
+    praxis.core
+    praxis.store
+    praxis.interfaces
+
+[importlinter:contract:praxis_core_purity]
+name = Praxis core receives tools/adapters via protocol interfaces only
+type = forbidden
+source_modules =
+    praxis.core
+forbidden_modules =
+    praxis.tools
+    praxis.adapters
+    praxis.interfaces
+
+[importlinter:contract:praxis_no_legacy]
+name = Praxis never imports the legacy runtime
+type = forbidden
+source_modules =
+    praxis
+forbidden_modules =
+    agent_runtime
+
+[importlinter:contract:praxis_verify_offline]
+name = Praxis write path never calls verify
+type = forbidden
+source_modules =
+    praxis.store.log
+    praxis.store.turns
+forbidden_modules =
+    praxis.store.verify
+
+[importlinter:contract:praxis_cli_via_sdk]
+name = Praxis CLI talks to core only through the SDK
+type = forbidden
+source_modules =
+    praxis.interfaces.cli
+forbidden_modules =
+    praxis.core
+    praxis.store
 allow_indirect_imports = true

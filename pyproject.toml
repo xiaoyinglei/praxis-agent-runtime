@@ -72,6 +72,7 @@ local-mlx = [
 
 [dependency-groups]
 dev = [
+  "hypothesis>=6.100",
   "import-linter>=2.11",
   "mypy>=1.15.0",
   "pytest>=8.3.5",
@@ -82,12 +83,13 @@ dev = [
 [project.scripts]
 agent = "agent_runtime.cli:agent_app"
 rag = "rag.cli:app"
+praxis = "praxis.interfaces.cli:app"
 
 [tool.hatch.build.targets.sdist]
 exclude = ["/.agents", "/.claude", "/.vscode", "/.import_linter_cache"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["agent_runtime", "rag"]
+packages = ["agent_runtime", "rag", "praxis"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "configs/agent-models.yaml" = "agent_runtime/_data/models.yaml"
@@ -103,7 +105,7 @@ line-length = 120
 target-version = "py312"
 # Immutable evaluation outputs, including model-generated code and failed samples.
 # Keep checking the maintained evaluation runners in the parent directory.
-extend-exclude = ["evals/context_management/deepseek-*"]
+extend-exclude = ["evals/context_management/deepseek-*", "praxis"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "N"]
@@ -113,7 +115,7 @@ python_version = "3.12"
 mypy_path = ["."]
 strict = true
 warn_unused_configs = true
-packages = ["agent_runtime", "rag"]
+packages = ["agent_runtime", "rag", "praxis"]
 
 [[tool.mypy.overrides]]
 module = [

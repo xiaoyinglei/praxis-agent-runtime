@@ -60,6 +60,10 @@ jobs:
           sudo /usr/bin/python3 -I scripts/ubuntu/smoke-model-service.py --wheel-dir "$smoke_wheels"
       - name: Import contracts
         run: uv run --all-extras lint-imports
+      - name: Praxis hard rules
+        run: |
+          uv run --all-extras ruff check praxis --config praxis/ruff.toml
+          uv run --all-extras python scripts/check_anti_patterns.py
       - name: CLI projection smoke
         run: uv run --all-extras python scripts/agent_cli_smoke.py
       - name: Delivery smoke
