@@ -63,7 +63,7 @@ jobs:
       - name: Praxis hard rules
         run: |
           uv run --all-extras ruff check praxis --config praxis/ruff.toml
-          uv run --all-extras python scripts/check_anti_patterns.py
+          uv run --all-extras python scripts/check_anti_patterns.py --praxis-only
       - name: CLI projection smoke
         run: uv run --all-extras python scripts/agent_cli_smoke.py
       - name: Delivery smoke

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import scripts.check_anti_patterns as capi
 from scripts.check_anti_patterns import scan_praxis_file
 
 
@@ -67,7 +68,13 @@ def test_update_turns_sql_outside_store_turns(tmp_path):
 
 
 def test_update_turns_allowed_in_store_turns(tmp_path):
-    f = _write(tmp_path, "store/turns.py", 'sql = "UPDATE turns SET status = ?"\n')
+    f = _write(tmp_path, "praxis/store/turns.py", 'sql = "UPDATE turns SET status = ?"\n')
+    assert scan_praxis_file(f) == []
+
+
+def test_update_turns_in_comment_not_flagged(tmp_path):
+    # 规则只针对字符串字面量;注释里提到 UPDATE turns 不触发
+    f = _write(tmp_path, "other.py", "# UPDATE turns 这种注释不应触发\nx = 1\n")
     assert scan_praxis_file(f) == []
 
 
@@ -79,7 +86,7 @@ def test_write_status_outside_statemachine(tmp_path):
 
 
 def test_write_status_allowed_in_core_statemachine(tmp_path):
-    f = _write(tmp_path, "core/statemachine.py", "write_status(sid, status)\n")
+    f = _write(tmp_path, "praxis/core/statemachine.py", "write_status(sid, status)\n")
     assert scan_praxis_file(f) == []
 
 
@@ -91,7 +98,7 @@ def test_interrupted_transition_outside_recovery(tmp_path):
 
 
 def test_interrupted_transition_allowed_in_core_recovery(tmp_path):
-    f = _write(tmp_path, "core/recovery.py", "transition(sid, TurnStatus.INTERRUPTED)\n")
+    f = _write(tmp_path, "praxis/core/recovery.py", "transition(sid, TurnStatus.INTERRUPTED)\n")
     assert scan_praxis_file(f) == []
 
 
@@ -103,8 +110,14 @@ def test_session_construction_outside_composition(tmp_path):
 
 
 def test_session_allowed_in_composition(tmp_path):
-    f = _write(tmp_path, "composition.py", "sess = Session(store=store)\n")
+    f = _write(tmp_path, "praxis/composition.py", "sess = Session(store=store)\n")
     assert scan_praxis_file(f) == []
+
+
+def test_nested_composition_is_not_exempt(tmp_path):
+    # 白名单严格等于"相对 praxis 根的路径":praxis/flow/composition.py 不豁免
+    f = _write(tmp_path, "praxis/flow/composition.py", "sess = Session(store=store)\n")
+    assert any("Session" in v for v in scan_praxis_file(f))
 
 
 # --- 干净文件不报任何违规 ---
@@ -112,3 +125,23 @@ def test_session_allowed_in_composition(tmp_path):
 def test_clean_file_has_no_violations(tmp_path):
     f = _write(tmp_path, "clean.py", "import os\n\n\ndef g():\n    return os.name\n")
     assert scan_praxis_file(f) == []
+
+
+# --- CLI:--praxis-only 只扫 praxis 树,跳过 rag 存量 ---
+
+def test_praxis_only_flag_skips_rag(tmp_path, monkeypatch, capsys):
+    rag_dir = tmp_path / "rag"
+    rag_dir.mkdir()
+    (rag_dir / "svc.py").write_text('URL = "https://api.deepseek.com/v1"\n', encoding="utf-8")
+    praxis_dir = tmp_path / "praxis"
+    praxis_dir.mkdir()
+    (praxis_dir / "ok.py").write_text("import os\n\n\ndef g():\n    return os.name\n", encoding="utf-8")
+    monkeypatch.setattr(capi, "_PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(capi, "_RAG_DIR", rag_dir)
+    monkeypatch.setattr(capi, "_PRAXIS_DIR", praxis_dir)
+
+    assert capi.main([]) == 1  # 默认两棵树:rag 存量违规被计入
+    assert "rag/svc.py" in capsys.readouterr().out
+
+    assert capi.main(["--praxis-only"]) == 0  # 只扫 praxis:同一 rag 违规被跳过
+    assert "praxis hard-rule scan clean" in capsys.readouterr().out

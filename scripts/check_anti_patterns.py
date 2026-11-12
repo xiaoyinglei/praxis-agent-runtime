@@ -14,14 +14,18 @@ Also scans praxis/ for architecture hard-rule violations (阶段1 CI 硬规则):
   6. 禁止 import agent_runtime(旧 runtime)
   7. Session(...) 构造只允许 composition.py(设计 §4.1)
 
+``--praxis-only``:只扫 praxis 硬规则、跳过 rag 存量扫描(CI 门 R5:阶段1 只强制 praxis 规则)。
+
 Exit code 0: no anti-patterns found.
 Exit code 1: anti-patterns detected.
 """
 
 from __future__ import annotations
 
+import argparse
 import ast
 import re
+from collections.abc import Sequence
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -96,8 +100,10 @@ def _scan_file(path: Path) -> list[str]:
 # ---------------------------------------------------------------------------
 # Praxis 硬规则扫描(阶段1)
 #
-# 唯一写入点白名单按"相对 praxis 根的后缀路径"匹配,这样 scan_praxis_file
-# 是纯函数、可接受任意路径(tmp fixture 也能模拟 store/turns.py 等允许位置)。
+# 唯一写入点白名单严格等于"相对 praxis 根的路径":praxis/composition.py 豁免,
+# praxis/flow/composition.py 不豁免。scan_praxis_file 仍为纯函数、可接受任意路径:
+# 优先用显式 praxis_root,否则在路径中定位名为 praxis 的目录段,再否则视为"父目录即根"
+# (仅 basename 参与比较,便于 tmp fixture)。
 # ---------------------------------------------------------------------------
 
 _PRAXIS_TURN_SQL_FILE = ("store", "turns.py")
@@ -106,9 +112,26 @@ _PRAXIS_INTERRUPTED_FILE = ("core", "recovery.py")
 _PRAXIS_SESSION_FILE = ("composition.py",)
 
 
-def _has_suffix(path: Path, suffix: tuple[str, ...]) -> bool:
+def _rel_to_praxis_parts(path: Path, praxis_root: Path | None) -> tuple[str, ...]:
+    if praxis_root is not None:
+        try:
+            return path.relative_to(praxis_root).parts
+        except ValueError:
+            pass
     parts = path.parts
-    return len(parts) >= len(suffix) and parts[-len(suffix) :] == suffix
+    for i in range(len(parts) - 1, -1, -1):
+        if parts[i] == "praxis":
+            return parts[i + 1 :]
+    return parts[-1:]
+
+
+def _has_update_turns_literal(tree: ast.Module) -> bool:
+    # 只看字符串字面量(AST Constant str),注释/文档外的文本不触发
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if re.search(r"UPDATE\s+turns", node.value):
+                return True
+    return False
 
 
 def _is_private(name: str) -> bool:
@@ -143,14 +166,15 @@ def _enclosing_function(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
     return False
 
 
-def scan_praxis_file(path: Path) -> list[str]:
+def scan_praxis_file(path: Path, praxis_root: Path | None = None) -> list[str]:
     """扫描单个 praxis 文件,返回违规描述列表(纯函数,可接受任意路径)。"""
     violations: list[str] = []
-    content = path.read_text(encoding="utf-8")
     try:
-        tree = ast.parse(content, filename=str(path))
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     except SyntaxError as exc:
         return [f"line {exc.lineno or 0}: syntax error: {exc.msg}"]
+
+    rel_parts = _rel_to_praxis_parts(path, praxis_root)
 
     parents: dict[ast.AST, ast.AST] = {}
     for node in ast.walk(tree):
@@ -207,25 +231,25 @@ def scan_praxis_file(path: Path) -> list[str]:
                     f"line {node.lineno}: cross-module private access ({'.'.join(chain)}) — 只走公开接口"
                 )
 
-    # 规则 3:UPDATE turns 只允许 store/turns.py
-    if re.search(r"UPDATE\s+turns", content) and not _has_suffix(path, _PRAXIS_TURN_SQL_FILE):
+    # 规则 3:UPDATE turns 只允许 store/turns.py(仅字符串字面量)
+    if rel_parts != _PRAXIS_TURN_SQL_FILE and _has_update_turns_literal(tree):
         violations.append("UPDATE turns SQL outside store/turns.py — turn 状态写入只允许 store 层唯一入口")
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         # 规则 4:write_status() 只允许 core/statemachine.py
-        if _call_is(node, "write_status") and not _has_suffix(path, _PRAXIS_WRITE_STATUS_FILE):
+        if _call_is(node, "write_status") and rel_parts != _PRAXIS_WRITE_STATUS_FILE:
             violations.append(
                 f"line {node.lineno}: write_status() called outside core/statemachine.py — 权限决策/状态转换唯一入口"
             )
-        # 规则 7:Session() 构造只允许 composition.py
-        if _call_is(node, "Session") and not _has_suffix(path, _PRAXIS_SESSION_FILE):
+        # 规则 7:Session() 构造只允许 praxis/composition.py
+        if _call_is(node, "Session") and rel_parts != _PRAXIS_SESSION_FILE:
             violations.append(
                 f"line {node.lineno}: Session(...) constructed outside composition.py — 组合根唯一(设计 §4.1)"
             )
         # 规则 5:transition(..., TurnStatus.INTERRUPTED) 只允许 core/recovery.py
-        if _call_is(node, "transition") and not _has_suffix(path, _PRAXIS_INTERRUPTED_FILE):
+        if _call_is(node, "transition") and rel_parts != _PRAXIS_INTERRUPTED_FILE:
             args = list(node.args) + [kw.value for kw in node.keywords]
             for arg in args:
                 if _dotted_chain(arg) == ["TurnStatus", "INTERRUPTED"]:
@@ -250,20 +274,29 @@ def scan_praxis_tree(root: Path) -> list[str]:
             rel = str(py_file.relative_to(_PROJECT_ROOT))
         except ValueError:
             rel = str(py_file)
-        violations.extend(f"{rel}: {v}" for v in scan_praxis_file(py_file))
+        violations.extend(f"{rel}: {v}" for v in scan_praxis_file(py_file, praxis_root=root))
     return violations
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument(
+        "--praxis-only",
+        action="store_true",
+        help="只扫描 praxis 硬规则,跳过 rag 存量扫描(CI 门只强制 praxis 规则)",
+    )
+    args = parser.parse_args(argv)
+
     violations: list[str] = []
 
-    for py_file in sorted(_RAG_DIR.rglob("*.py")):
-        rel = str(py_file.relative_to(_RAG_DIR))
-        parts = Path(rel).parts
-        if any(part in _EXCLUDED_DIRS for part in parts):
-            continue
+    if not args.praxis_only:
+        for py_file in sorted(_RAG_DIR.rglob("*.py")):
+            rel = str(py_file.relative_to(_RAG_DIR))
+            parts = Path(rel).parts
+            if any(part in _EXCLUDED_DIRS for part in parts):
+                continue
 
-        violations.extend(_scan_file(py_file))
+            violations.extend(_scan_file(py_file))
 
     violations.extend(scan_praxis_tree(_PRAXIS_DIR))
 
@@ -278,7 +311,8 @@ def main() -> int:
         )
         return 1
 
-    print("✓ no hardcoded model names found in business code")
+    if not args.praxis_only:
+        print("✓ no hardcoded model names found in business code")
     print("✓ praxis hard-rule scan clean")
     return 0
 
