@@ -153,3 +153,49 @@ def test_verify_tool_call_with_matching_result(store: Store) -> None:
     report = verify_store(store)
     assert report.ok
     assert report.problems == ()
+
+
+# ---------------------------------------------------------------------------
+# Fix Round 1: Finding 1 — non-dict JSON payload must not raise AttributeError
+# ---------------------------------------------------------------------------
+
+
+def test_verify_non_dict_payload_no_crash(store: Store) -> None:
+    """A tool_call with payload=[1,2] (valid JSON but not object) must NOT crash.
+
+    Previously: json.loads succeeds, then payload.get('call_id') → AttributeError escapes.
+    Expected: problem entry for corrupt payload type, ok=False.
+    """
+    # Insert a valid item so checked_items ≥ 1, plus the bad tool_call at seq=3
+    store.append_items("t", "turn-1", [ItemEntry(ItemKind.USER_MESSAGE, {"text": "ok"})])
+    store.transact(
+        lambda c: c.execute(
+            "INSERT INTO items VALUES ("
+            "'bad', 't', 'turn-1', 3, 'tool_call', "
+            "'[1, 2]', 0.0)",
+        ),
+    )
+    report = verify_store(store)
+    assert not report.ok
+    assert any("bad" in p or "corrupt" in p or "payload" in p for p in report.problems)
+
+
+# ---------------------------------------------------------------------------
+# Fix Round 1: Finding 2 — NULL-turn orphan tool_call must be reported
+# ---------------------------------------------------------------------------
+
+
+def test_verify_null_turn_orphan_tool_call(store: Store) -> None:
+    """A tool_call with turn_id=NULL (no result can match) must be flagged as orphan."""
+    # Build an empty thread first, then inject a naked tool_call via raw SQL
+    store.create_thread()
+    store.transact(
+        lambda c: c.execute(
+            "INSERT INTO items VALUES ("
+            "'orphan-n', 't', NULL, 1, 'tool_call', "
+            "'{\"call_id\":\"naked\",\"name\":\"x\",\"input\":{}}', 0.0)",
+        ),
+    )
+    report = verify_store(store)
+    assert not report.ok
+    assert any("naked" in p for p in report.problems)

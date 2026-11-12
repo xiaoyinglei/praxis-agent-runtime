@@ -29,49 +29,53 @@ class VerifyReport:
 
 
 def _check_thread_rows(rows: list[Row]) -> list[str]:
-    """Check seq contiguity + raw-payload JSON + orphan tool_call for one thread."""
+    """Check seq contiguity + raw-payload JSON/type + orphan tool_call for one thread."""
     problems: list[str] = []
     expected_seq = 1
     tid = rows[0]["thread_id"] if rows else "?"
 
+    # -- seq contiguous ---------------------------------------------------------
     for row in rows:
-        # -- seq contiguous --------------------------------------------------
         if row["seq"] != expected_seq:
             problems.append(
                 f"seq gap in thread {tid}: expected {expected_seq}, got {row['seq']}"
             )
         expected_seq = row["seq"] + 1
 
-    # -- payload JSON parse check (on raw DB text) --------------------------
+    # -- Single-pass: JSON parse/type-check + collect call_ids ------------------
+    call_ids: dict[str, str] = {}   # call_id -> turn_id
+    result_ids: dict[str, str] = {}  # call_id -> turn_id
     for row in rows:
         raw = str(row["payload"])
         try:
-            json.loads(raw)
+            parsed = json.loads(raw)
         except json.JSONDecodeError:
             problems.append(
                 f"corrupt payload at {tid}/seq={row['seq']} "
                 f"(item_id={row['item_id']}): JSON parse failure"
             )
+            continue
 
-    # -- orphan tool_call ---------------------------------------------------
-    call_ids: dict[str, str] = {}   # call_id -> turn_id
-    result_ids: dict[str, str] = {}  # call_id -> turn_id
-    for row in rows:
-        try:
-            payload = json.loads(row["payload"])
-        except json.JSONDecodeError:
-            continue  # already reported above; skip further analysis
+        # Finding 1: valid JSON but non-object type — not usable as tool metadata
+        if not isinstance(parsed, dict):
+            problems.append(
+                f"non-object payload at {tid}/seq={row['seq']} "
+                f"(item_id={row['item_id']}): expected dict, got {type(parsed).__name__}"
+            )
+            continue
+
         if row["kind"] == "tool_call":
-            cid = payload.get("call_id")
+            cid = parsed.get("call_id")
             if isinstance(cid, str):
                 call_ids[cid] = row["turn_id"]
         elif row["kind"] == "tool_result":
-            cid = payload.get("call_id")
+            cid = parsed.get("call_id")
             if isinstance(cid, str):
                 result_ids[cid] = row["turn_id"]
 
+    # -- orphan tool_call detection ---------------------------------------------
     for cid, t_id in call_ids.items():
-        if result_ids.get(cid) != t_id:
+        if cid not in result_ids or result_ids[cid] != t_id:
             problems.append(
                 f"orphan tool_call {cid!r} in thread {tid}, "
                 f"turn {t_id}: no matching tool_result"
