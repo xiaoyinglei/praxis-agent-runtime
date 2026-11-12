@@ -177,7 +177,10 @@ class NonStreamingProvider:
             value={
                 "choices": [
                     {
-                        "message": {"content": "one complete response"},
+                        "message": {"content": [
+                            {"type": "text", "text": "one complete "},
+                            {"type": "text", "text": "response"},
+                        ]},
                         "finish_reason": "stop",
                     }
                 ]

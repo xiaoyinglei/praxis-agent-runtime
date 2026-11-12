@@ -73,6 +73,16 @@ def test_public_macos_command_lifecycle_approval_and_completion(tmp_path, monkey
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "run.db"
+    from agent_runtime.tools import executor
+
+    observed = []
+    snapshot = executor.workspace_tree_sha256
+
+    def count_snapshot(root):
+        observed.append(root)
+        return snapshot(root)
+
+    monkeypatch.setattr(executor, "workspace_tree_sha256", count_snapshot)
     # Write only after the initial response, exercising final mutation evidence.
     command = "sleep 0.2; " + ("printf delayed > artifact" if write else "printf verified")
     models = []
@@ -152,6 +162,13 @@ def test_public_macos_command_lifecycle_approval_and_completion(tmp_path, monkey
         assert outputs[1]["structured_content"]["exit_code"] == 0
         assert outputs[0]["structured_content"]["session_id"] == outputs[1]["structured_content"]["session_id"]
         assert all(not r["is_error"] for r in outputs)
+        if write:
+            assert outputs[0]["metadata"]["workspace_tree_changed"] is None
+            assert outputs[0]["metadata"]["workspace_tree_after_sha256"] is None
+            assert outputs[1]["metadata"]["workspace_tree_changed"] is True
+            assert observed == [workspace, workspace]
+        else:
+            assert observed == []
         assert any(i.kind == "completion_feedback" for i in store.list_items(turn.turn_id))
         assert store.verify().valid
     assert not list((workspace / ".praxis/runtime/scratch").glob("run-command-*"))

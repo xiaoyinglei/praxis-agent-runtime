@@ -203,7 +203,7 @@ class AgentResult:
 
         turn = store.read_turn(result.turn_id)
         thread = store.read_thread(result.thread_id)
-        records = tuple(record for record in store.list_records(thread.thread_id) if record.turn_id == turn.turn_id)
+        records = store.list_turn_records(turn.turn_id)
         model_failures = tuple(
             (record.payload.get("operation_id"), ModelFailure.from_payload(failure))
             for record in records
@@ -395,9 +395,8 @@ class AgentResult:
                 )
         unknown_model_diagnostics = tuple(
             record
-            for record in store.list_records(thread.thread_id)
-            if record.turn_id == turn.turn_id
-            and record.record_type == "model_attempt_unknown"
+            for record in records
+            if record.record_type == "model_attempt_unknown"
             and isinstance(record.payload.get("error_type"), str)
             and isinstance(record.payload.get("error_message"), str)
         )
@@ -410,9 +409,8 @@ class AgentResult:
         )
         rejected_model_diagnostics = tuple(
             record
-            for record in store.list_records(thread.thread_id)
-            if record.turn_id == turn.turn_id
-            and record.record_type == "model_attempt_rejected"
+            for record in records
+            if record.record_type == "model_attempt_rejected"
             and isinstance(record.payload.get("error_type"), str)
             and isinstance(record.payload.get("error_message"), str)
         )

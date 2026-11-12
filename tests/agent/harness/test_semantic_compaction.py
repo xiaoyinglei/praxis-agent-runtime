@@ -4,41 +4,61 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
+
 from agent_runtime.core.messages import ModelToolCall
-from agent_runtime.harness import HarnessModelResponse, RolloutContextManager, RuntimeStore, TurnRunner
+from agent_runtime.harness import HarnessModelResponse, RolloutContextManager, RuntimeStore, TurnRunner, turn_ops
 from agent_runtime.harness.protocol import model_response_payload
 from tests.agent.harness.test_compaction_consistency import Accept, long_history, model_for, start
 
 
-def test_recompaction_uses_committed_memory_and_new_history_not_raw_archive(tmp_path: Path):
+def test_checkpoint_recompacts_a_legacy_boundary_and_reopens_without_raw_replay(tmp_path: Path):
     from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
 
-    with RuntimeStore.open_sync(tmp_path / "r.db") as store:
+    database = tmp_path / "r.db"
+    with RuntimeStore.open_sync(database) as store:
         _, turn = start(store, tmp_path)
         long_history(store, turn)
         manager = RolloutContextManager(store)
         original_hash, original = manager.semantic_source(turn.turn_id)
-        manager.commit_compaction(
+        legacy = manager.commit_compaction(
             manager.semantic_candidate(
                 turn.turn_id, source_hash=original_hash, summary="Decision A, reason B; pending C."
             )
         )
+        assert "replacement_history" not in legacy.payload
+
+    with RuntimeStore.open_sync(database) as store:
+        manager = RolloutContextManager(store)
         seed(store, turn_id=turn.turn_id, kind="agent_message", payload={"text": "New evidence supersedes A with D."})
-        _, current = manager.semantic_source(turn.turn_id)
+        source_hash, current = manager.semantic_source(turn.turn_id, checkpoint=True)
         assert "Decision A, reason B; pending C." in current
         assert "New evidence supersedes A with D." in current
         assert "x" * 3000 not in current
         assert len(current) < len(original) / 2
-        # Compaction is a projection: the complete original remains recoverable.
+        manager.commit_compaction(
+            manager.semantic_candidate(
+                turn.turn_id, source_hash=source_hash, summary="Decision D; verification pending.", checkpoint=True
+            )
+        )
+        seed(store, turn_id=turn.turn_id, kind="agent_message", payload={"text": "Verification has started."})
+        expected = manager.build(turn.turn_id)
+
+    with RuntimeStore.open_sync(database) as store:
+        manager = RolloutContextManager(store)
+        assert manager.build(turn.turn_id) == expected
+        assert expected[-1].content == "Verification has started."
+        assert "Decision D; verification pending." in expected[-2].content
         assert any("x" * 3000 in str(item.payload) for item in store.list_context_items(turn.turn_id))
+        assert store.verify().valid
 
 
-def test_full_history_is_chunked_and_internal_summaries_are_durable(tmp_path: Path):
+def test_summary_reduction_covers_all_history_and_keeps_archived_items(tmp_path: Path):
     with RuntimeStore.open_sync(tmp_path / "r.db") as store:
         thread, turn = start(store, tmp_path)
         long_history(store, turn)
         manager = RolloutContextManager(store)
-        source_hash, source = manager.semantic_source(turn.turn_id)
+        _, source = manager.semantic_source(turn.turn_id, checkpoint=True)
         model, gateway = model_for()
         runner = TurnRunner(
             thread_id=thread.thread_id, store=store, model=model, context_manager=manager, completion_gate=Accept()
@@ -48,19 +68,21 @@ def test_full_history_is_chunked_and_internal_summaries_are_durable(tmp_path: Pa
         operations = store.list_model_operations(turn.turn_id)
         internal = [op for op in operations if op.request_ref.get("purpose") == "context_summary"]
         assert len(internal) > 1
-        fragments = [
-            op.request_ref["step_snapshot"]["messages"][0]["body"].split("HISTORY:\n", 1)[1] for op in internal
-        ]
+        prompts = [op.request_ref["step_snapshot"]["messages"][0]["body"] for op in internal]
+        histories = [json.loads(prompt.split("HISTORY:\n", 1)[1])["history"] for prompt in prompts]
+        originals = [entry for history in histories for entry in history if "item_id" in entry]
         original_history = json.loads(source)["history"]
-        actual_history = [
-            entry for text in fragments for entry in json.loads(text)["history"] if "history_index" in entry
-        ]
-        assert actual_history == original_history
+        assert originals == original_history
+        assert all("summary_history_start" not in op.request_ref["compaction_plan"] for op in internal)
+        assert store.read_item(original_history[0]["item_id"]).payload["text"].startswith("finding 0")
         assert runner.agent_step_count(turn.turn_id) == 1
         assert all(store.read_item(op.response_item_id).kind == "context_summary_response" for op in internal)
         compactions = [i for i in store.list_items(turn.turn_id) if i.kind == "context_compaction"]
         assert len(compactions) == 1
-        assert compactions[0].payload["algorithm_revision"] == "semantic-compaction-v4"
+        assert compactions[0].payload["algorithm_revision"] == "semantic-compaction-v7"
+        projected = manager.build(turn.turn_id)
+        store.rebuild_projections()
+        assert manager.build(turn.turn_id) == projected
         assert store.read_budget_state(turn.turn_id).used.total_tokens > 0
         from agent_runtime.harness.events import RolloutEventReader
 
@@ -328,11 +350,21 @@ def test_crash_after_summary_prepare_recovers_same_operation(tmp_path: Path):
         assert store.verify().valid
 
 
-def test_old_tool_outputs_are_archived_before_spending_a_summary_call(tmp_path: Path):
+@pytest.mark.parametrize("capacity", [False, True])
+def test_old_tool_outputs_are_archived_before_spending_a_summary_call(tmp_path: Path, capacity: bool):
     from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
 
     with RuntimeStore.open_sync(tmp_path / "r.db") as store:
-        thread, turn = start(store, tmp_path)
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(
+            store,
+            thread_id=thread.thread_id,
+            user_message="Fix the package; preserve public API.",
+            binding_manifest={
+                "model_id": "test-model",
+                **({"context_capacity_policy": {"revision": "context-capacity-v2"}} if capacity else {}),
+            },
+        )
         for index in range(5):
             seed(
                 store,
@@ -464,3 +496,83 @@ def test_summary_disables_explicit_thinking_without_changing_agent_settings():
     normal = model.prepare(request)
     assert summary.dispatch_payload.request.settings.provider_options["thinking"]["type"] == "disabled"
     assert normal.dispatch_payload.request.settings.provider_options["thinking"]["type"] == "enabled"
+
+
+@pytest.mark.parametrize("reopen", [False, True])
+def test_second_overflow_can_archive_a_remaining_large_tool_result(tmp_path, monkeypatch, reopen):
+    from agent_runtime.harness.protocol import ModelContextOverflowError
+    from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
+
+    class ProcessStopped(BaseException):
+        pass
+
+    original_commit = RolloutContextManager.commit_compaction
+
+    def commit(self, candidate):
+        item = original_commit(self, candidate)
+        if reopen and item.payload.get("capacity_diagnostics", {}).get("rejected_operation_id"):
+            raise ProcessStopped()
+        return item
+
+    monkeypatch.setattr(RolloutContextManager, "commit_compaction", commit)
+    database = tmp_path / "r.db"
+    with RuntimeStore.open_sync(database) as store:
+        thread, turn = start(store, tmp_path)
+        long_history(store, turn)
+        seed(
+            store,
+            turn_id=turn.turn_id,
+            kind="model_response",
+            payload=model_response_payload(
+                HarnessModelResponse.from_parts(
+                    text="",
+                    tool_calls=(ModelToolCall(id="read-a", name="read_context", arguments={}),),
+                )
+            ),
+        )
+        evidence = "original fixture line\n" * 270
+        seed(
+            store,
+            turn_id=turn.turn_id,
+            kind="tool_result",
+            payload={"tool_call_id": "read-a", "model_content": evidence},
+        )
+        model, _gateway = model_for(100000)
+        original_dispatch = model.dispatch
+        requests = []
+
+        async def dispatch(prepared, *, event_sink=None):
+            if prepared.request_ref.get("purpose") != "context_summary":
+                requests.append(prepared)
+                if len(requests) < 3:
+                    raise ModelContextOverflowError("fixture provider window exceeded")
+            return await original_dispatch(prepared, event_sink=event_sink)
+
+        model.dispatch = dispatch
+
+        def runner_for(current_store):
+            return TurnRunner(
+                thread_id=thread.thread_id,
+                store=current_store,
+                model=model,
+                context_manager=RolloutContextManager(current_store),
+                completion_gate=Accept(),
+            )
+
+        runner = runner_for(store)
+        if reopen:
+            with pytest.raises(ProcessStopped):
+                asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
+        else:
+            result = asyncio.run(runner.drive(runner.restore_turn_context(turn.turn_id), start_step=1))
+    with RuntimeStore.open_sync(database) as store:
+        if reopen:
+            result = asyncio.run(runner_for(store).drive(turn_id=turn.turn_id, action="continue"))
+        assert result.status == "completed"
+        first, second, third = [p.request_ref["serialized_input_bytes"] for p in requests]
+        assert first > second > third
+        root = requests[1].request_ref["capacity_recovery_root_id"]
+        assert requests[2].request_ref["capacity_recovery_root_id"] == root
+        assert requests[2].tool_hash == requests[1].tool_hash
+        assert any(item.payload.get("model_content") == evidence for item in store.list_context_items(turn.turn_id))
+        assert store.verify().valid

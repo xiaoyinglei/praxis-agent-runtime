@@ -60,7 +60,7 @@ class DurableToolRouter:
         messages: tuple[ModelMessage, ...],
     ) -> tuple[Tool, ...]:
         del messages
-        items = self._store.list_context_items(turn_id)
+        items = self._store.list_context_items(turn_id, tool_name="find_tools")
         operations = {
             operation.result_item_id: operation
             for source_turn_id in dict.fromkeys(item.turn_id for item in items)

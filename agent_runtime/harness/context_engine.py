@@ -21,14 +21,18 @@ from agent_runtime.harness.protocol import (
     ContextCompactionCandidate,
     ContextManager,
     ContextSourceChangedError,
+    ModelContextOverflowError,
     ModelMessage,
     PreparedModelCall,
     TurnResult,
     restore_model_response,
 )
+from agent_runtime.harness.records import ModelOperationSnapshot
 from agent_runtime.harness.runtime_store import RuntimeStore
-from agent_runtime.modeling.contracts import context_capacity_policy, context_working_limit
+from agent_runtime.modeling.contracts import ContextCapacityPolicy, context_capacity_policy, context_working_limit
 from agent_runtime.tools.tool import Tool, json_schema_output
+
+MAX_CONSECUTIVE_PROACTIVE_COMPACTION_FAILURES = 3
 
 
 class SummaryStoppedError(Exception):
@@ -97,7 +101,11 @@ class ContextEngine:
             plan = operation.request_ref.get("compaction_plan", {})
             if not stale and isinstance(self._context_manager, RolloutContextManager) and plan.get("source_hash"):
                 try:
-                    current_hash, _ = self._context_manager.semantic_source(operation.turn_id)
+                    current_hash, _ = self._context_manager.semantic_source(
+                        operation.turn_id,
+                        use_archived_projection=plan.get("summary_request_mode") == "standalone",
+                        checkpoint=_is_checkpoint_plan(plan),
+                    )
                 except ContextBudgetExceededError as exc:
                     if exc.reason_code != "no_compactable_context":
                         raise
@@ -110,11 +118,35 @@ class ContextEngine:
             return True
 
     async def prepare_or_resume(
-        self, turn: TurnContext, *, step: int, pressure_reason: str | None = None
+        self,
+        turn: TurnContext,
+        *,
+        step: int,
+        pressure_reason: str | None = None,
+        rejected_request_bytes: int | None = None,
     ) -> tuple[StepContext, PreparedModelCall]:
         """Prepare one Step, or resume its admitted compaction before dispatch."""
         if pressure_reason is not None:
-            return await self._prepare_compacted_step(turn, step=step, trigger_reason=pressure_reason)
+            return await self._prepare_compacted_step(
+                turn,
+                step=step,
+                trigger_reason=pressure_reason,
+                rejected_request_bytes=rejected_request_bytes,
+            )
+        existing_job = await self._store.run_async(compaction_jobs.find_job, self._store, turn_id=turn.turn_id)
+        if existing_job is not None:
+            try:
+                return await self._prepare_compacted_step(
+                    turn,
+                    step=step,
+                    trigger_reason=existing_job.plan.get("trigger_reason", "resume_compaction"),
+                    optional=existing_job.plan.get("optional", False),
+                )
+            except (ContextBudgetExceededError, BudgetLimitExceededError, PricingUnavailableError):
+                if not existing_job.plan.get("optional"):
+                    raise
+                context = await self._store.run_async(self.capture_step_context, turn, step=step)
+                return context, await self._prepare_step(context)
         try:
             context = await self._store.run_async(self.capture_step_context, turn, step=step)
             prepared = await self._prepare_step(context)
@@ -154,9 +186,7 @@ class ContextEngine:
             if pressure:
                 context = await self._store.run_async(self.capture_step_context, turn, step=step, budget_pressure=True)
                 prepared = await self._prepare_step(context)
-            if isinstance(self._context_manager, RolloutContextManager) and await self._store.run_async(
-                self._proactive_compaction_available, turn.turn_id
-            ):
+            if isinstance(self._context_manager, RolloutContextManager):
                 try:
                     return await self._prepare_compacted_step(
                         turn,
@@ -164,6 +194,7 @@ class ContextEngine:
                         trigger_reason=decision.reason,
                         before_input_tokens=prepared.resource_request.input_tokens,
                         target_input_tokens=decision.target_input_tokens,
+                        optional=True,
                     )
                 except (
                     ContextBudgetExceededError,
@@ -178,6 +209,83 @@ class ContextEngine:
                     prepared = await self._prepare_step(context)
         return context, prepared
 
+    async def retry_overflow_with_archived_results(
+        self,
+        turn: TurnContext,
+        *,
+        step: int,
+        rejected: ModelOperationSnapshot,
+    ) -> tuple[StepContext, PreparedModelCall]:
+        """Retry a rejected compacted request only after a measured reduction."""
+        from agent_runtime.harness.context import RolloutContextManager
+
+        manager = self._context_manager
+        reason = ContextBudgetExceededError(
+            "Provider rejected the compacted request; no smaller tool-result projection fits.",
+            reason_code="model_context_window_exceeded",
+        )
+        rejected_bytes = rejected.request_ref.get("serialized_input_bytes")
+        if not isinstance(manager, RolloutContextManager) or type(rejected_bytes) is not int:
+            raise reason
+        request_id = f"{turn.turn_id}:step:{step}:recovery:{rejected.operation_id}"
+        rejected_tokens = rejected.request_ref.get("context_projection", {}).get("input_tokens")
+
+        def smaller(prepared: PreparedModelCall) -> bool:
+            size = prepared.request_ref.get("serialized_input_bytes")
+            return (
+                prepared.tool_hash == rejected.tool_hash
+                and type(size) is int
+                and size < rejected_bytes
+                and (type(rejected_tokens) is not int or prepared.resource_request.input_tokens < rejected_tokens)
+            )
+
+        # A process can stop after recording the projection and before preparing
+        # the model operation. Re-measure that projection on reopen.
+        installed = await self._store.run_async(
+            lambda: any(
+                item.kind == "context_compaction"
+                and item.payload.get("capacity_diagnostics", {}).get("rejected_operation_id") == rejected.operation_id
+                for item in self._store.list_items(turn.turn_id, kind="context_compaction")
+            )
+        )
+        if installed:
+            context = await self._store.run_async(self.capture_step_context, turn, step=step)
+            context = replace(context, request_id=request_id)
+            prepared = await self._prepare_step(context)
+            if smaller(prepared):
+                return context, prepared
+            raise reason
+
+        async with aclosing(
+            self._store.iterate(
+                await self._store.run_async(manager.cheap_candidates, turn.turn_id, include_recent=True)
+            )
+        ) as candidates:
+            async for candidate in candidates:
+                try:
+                    context = await self._store.run_async(
+                        self.capture_step_context, turn, step=step, messages=candidate.messages
+                    )
+                    context = replace(context, request_id=request_id)
+                    prepared = await self._prepare_step(context)
+                except ContextBudgetExceededError:
+                    continue
+                if not smaller(prepared):
+                    continue
+                payload = json.loads(candidate.payload_json)
+                payload["capacity_diagnostics"] = {
+                    "trigger_reason": "provider_overflow",
+                    "rejected_operation_id": rejected.operation_id,
+                    "before_serialized_bytes": rejected_bytes,
+                    "after_serialized_bytes": prepared.request_ref["serialized_input_bytes"],
+                }
+                candidate = replace(candidate, payload_json=json.dumps(payload, sort_keys=True))
+                await self._commit(partial(manager.commit_compaction, candidate))
+                if (await self._store.run_async(manager.build, turn.turn_id)) != candidate.messages:
+                    raise ContextSourceChangedError("Context changed after installing the reduced request.")
+                return context, prepared
+        raise reason
+
     def _summary_step(
         self,
         turn: TurnContext,
@@ -186,7 +294,7 @@ class ContextEngine:
         source: str,
         plan: Mapping[str, Any] | None = None,
     ) -> StepContext:
-        byte_limit = None if plan is None else plan.get("summary_byte_limit")
+        byte_limit = None if plan is None or "summary_history_start" in plan else plan.get("summary_byte_limit")
         output_limit = None if plan is None else plan["summary_output_limit"]
         prompt = (
             "Create a concise context checkpoint for another LLM that will resume this task. Include: "
@@ -212,6 +320,9 @@ class ContextEngine:
         identity = prompt + str(output_limit)
         if plan is not None and plan.get("policy_revision") == "context-capacity-v2":
             identity += f":context-capacity-v2:{plan['summary_input_limit']}"
+        standalone = plan is not None and plan.get("summary_request_mode") == "standalone"
+        if standalone:
+            identity += ":standalone"
         digest = hashlib.sha256(identity.encode()).hexdigest()
         binding = turn.binding_manifest
         messages: tuple[ModelMessage, ...] = (ModelMessage(role="user", body=prompt),)
@@ -220,7 +331,8 @@ class ContextEngine:
         # Only a complete source can fork the parent. Tree fragments and merges
         # retain the existing bounded, tool-free summarization protocol.
         if (
-            turn.binding_manifest.get("execution_context_policy", {}).get("cache_continuity") == "append-v1"
+            not standalone
+            and turn.binding_manifest.get("execution_context_policy", {}).get("cache_continuity") == "append-v1"
             and plan is not None
             and plan.get("source_hash") == hashlib.sha256(source.encode()).hexdigest()
         ):
@@ -308,6 +420,8 @@ class ContextEngine:
                     right = await summarize(right_source, node=node["children"][1])
                     text = _merge_summary_history(left, right)
                     merged_input = True
+                elif "input_source" in node:
+                    text = node["input_source"]
                 active_plan = {**plan, "summary_input_limit": node["input_limit"]}
 
             def validate(answer: str) -> str:
@@ -375,10 +489,16 @@ class ContextEngine:
                     )
                 return answer
             if existing is not None:
+                if existing.status == "failed":
+                    raise ContextBudgetExceededError(
+                        "The saved summary request already failed.", reason_code="context_summary_previously_failed"
+                    )
                 context = await self._store.run_async(self.restore_step_context, turn, existing)
             try:
                 prepared = await self._prepare_step(context)
             except ContextBudgetExceededError as exc:
+                if plan is not None and "summary_history_start" in plan:
+                    raise
                 if node is not None:
                     raise ContextBudgetExceededError(
                         "Summary exceeds its frozen node input limit.", reason_code=exc.reason_code
@@ -417,12 +537,15 @@ class ContextEngine:
                 )
             )
             assert operation is not None
-            response = await self._dispatch_prepared(
-                thread_id=turn.thread_id,
-                turn_id=turn.turn_id,
-                operation=operation,
-                prepared=prepared,
-            )
+            try:
+                response = await self._dispatch_prepared(
+                    thread_id=turn.thread_id,
+                    turn_id=turn.turn_id,
+                    operation=operation,
+                    prepared=prepared,
+                )
+            except ModelContextOverflowError as exc:
+                raise ContextBudgetExceededError(str(exc), reason_code="summary_context_overflow") from exc
             if isinstance(response, TurnResult):
                 raise SummaryStoppedError(response)
             if response.status == "incomplete":
@@ -450,119 +573,12 @@ class ContextEngine:
                 )
             return answer
 
+        if plan is not None and "summary_history_start" in plan:
+            source = _checkpoint_history_suffix(source, plan["summary_history_start"])
+            return await summarize(source)
         return await summarize(source, node=None if plan is None else plan.get("summary_tree"))
 
-    async def _plan_capacity_compaction(
-        self,
-        turn: TurnContext,
-        *,
-        step: int,
-        source_hash: str,
-        source: str,
-        retained: int,
-        base: PreparedModelCall,
-        byte_allowance: int,
-        target_input_tokens: int | None = None,
-    ) -> dict[str, Any]:
-        """Reserve actual leaves and bounded summary slots, never model capacity."""
-        policy = context_capacity_policy(turn.binding_manifest)
-        assert policy is not None
-        target = base.request_ref["context_projection"]["post_compact_target"]
-        if target_input_tokens is not None:
-            target = min(target, target_input_tokens)
-        byte_limit = min(policy.summary_serialized_bytes, byte_allowance)
-        if byte_limit < _summary_serialized_bytes(""):
-            raise ContextBudgetExceededError("No serialized summary slot remains.", reason_code="byte_guard")
-        continuation_limit = min(
-            target, base.request_ref["serialized_input_bytes"] + byte_limit - _summary_serialized_bytes("")
-        )
-        if base.resource_request.input_tokens > continuation_limit:
-            raise ContextBudgetExceededError("Fixed continuation exceeds its frozen input limit.")
-        probe = await self._prepare_step(await self._store.run_async(self._summary_step, turn, step=step, source="{}"))
-        plan: dict[str, Any] = {
-            "policy_revision": policy.revision,
-            "source_hash": source_hash,
-            "retained_tail_messages": retained,
-            "summary_byte_limit": byte_limit,
-            "summary_output_limit": probe.resource_request.output_tokens,
-            "summary_input_limit": probe.request_ref["context_projection"]["max_input_tokens"],
-            "continuation_input_limit": continuation_limit,
-            "continuation_output_limit": base.resource_request.output_tokens,
-            "continuation_token_reserve": continuation_limit + base.resource_request.output_tokens,
-            "max_summary_calls": None,
-        }
-        # Empty child slots measure the fixed merge wrapper in the real native
-        # or local serializer; B includes escaping in both enclosing formats.
-        merge_floor = await self._prepare_step(
-            await self._store.run_async(
-                self._summary_step, turn, step=step, source=_merge_summary_history("", ""), plan=plan
-            )
-        )
-        merge_limit = min(
-            plan["summary_input_limit"],
-            merge_floor.request_ref["serialized_input_bytes"] + 2 * (byte_limit - _summary_serialized_bytes("")),
-        )
-        nodes: list[tuple[int, int | None]] = []
-
-        async def measure(text: str) -> dict[str, Any]:
-            digest = hashlib.sha256(text.encode()).hexdigest()
-            try:
-                leaf = await self._prepare_step(
-                    await self._store.run_async(self._summary_step, turn, step=step, source=text, plan=plan)
-                )
-            except ContextBudgetExceededError:
-                left, right = _split_summary_history(text)
-                children = [await measure(left), await measure(right)]
-                rates = base.request_ref.get("pricing_micros_per_1m", {})
-                cost = estimated_model_cost_micros(
-                    input_tokens=merge_limit,
-                    max_output_tokens=plan["summary_output_limit"],
-                    pricing=rates,
-                )
-                nodes.append((merge_limit, cost))
-                return {"source_hash": digest, "input_limit": merge_limit, "children": children}
-            nodes.append(
-                (
-                    leaf.resource_request.input_tokens,
-                    leaf.resource_request.cost_micros if leaf.request_ref.get("pricing_known") else None,
-                )
-            )
-            return {"source_hash": digest, "input_limit": leaf.resource_request.input_tokens}
-
-        plan["summary_tree"] = await measure(source)
-        required = (
-            sum(tokens + plan["summary_output_limit"] for tokens, _ in nodes) + plan["continuation_token_reserve"]
-        )
-        remaining = normal_token_remaining(await self._store.run_async(self._store.read_budget_state, turn.turn_id))
-        if remaining is not None and required > remaining:
-            raise ContextBudgetExceededError(
-                f"Turn cumulative token budget cannot fit summary tree plus one continuation request: "
-                f"required={required}, remaining={remaining}.",
-                reason_code="model_token_budget_exhausted",
-            )
-        plan.update(planned_summary_calls=len(nodes), planned_token_upper_bound=required)
-        if turn.binding_manifest.get("model_cost_budget_total_micros") is not None:
-            continuation_cost = estimated_model_cost_micros(
-                input_tokens=continuation_limit,
-                max_output_tokens=base.resource_request.output_tokens,
-                pricing=base.request_ref.get("pricing_micros_per_1m", {}),
-            )
-            if continuation_cost is None or any(cost is None for _, cost in nodes):
-                raise PricingUnavailableError("Summary continuation plan requires frozen model pricing.")
-            required_cost = continuation_cost + sum(cost for _, cost in nodes if cost is not None)
-            remaining_cost = await self._store.run_async(
-                lambda: self._store.read_budget_state(turn.turn_id).remaining("cost_micros")
-            )
-            if remaining_cost is not None and required_cost > remaining_cost:
-                raise ContextBudgetExceededError(
-                    "Insufficient monetary budget for summary and continuation.",
-                    reason_code="model_cost_budget_exhausted",
-                )
-            plan.update(continuation_cost_reserve=continuation_cost, planned_cost_upper_bound=required_cost)
-        plan["plan_id"] = hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
-        return plan
-
-    async def _plan_legacy_compaction(
+    async def _plan_checkpoint(
         self,
         turn: TurnContext,
         *,
@@ -573,127 +589,170 @@ class ContextEngine:
         base: PreparedModelCall,
         byte_limit: int,
     ) -> dict[str, Any]:
-        """Measure the frozen legacy summary budget without dispatch or commit."""
+        """Admit complete work units, bounded outputs and a continuation before I/O.
+
+        Every input participates in reduction. Oversized tool exchanges keep
+        their calls, result IDs and archive references; only bodies are bounded.
+        """
+        policy = context_capacity_policy(turn.binding_manifest) or ContextCapacityPolicy()
         probe = await self._prepare_step(await self._store.run_async(self._summary_step, turn, step=step, source="{}"))
-        projection = base.request_ref.get("context_projection", {})
-        max_input = projection.get("max_input_tokens")
-        if not isinstance(max_input, int):
-            raise ContextBudgetExceededError("Summary planning requires a measured model input budget.")
-        base_tokens = base.resource_request.input_tokens
-        output = base.resource_request.output_tokens
-        cap = probe.resource_request.output_tokens
-        if byte_limit < 1 or max_input - base_tokens < cap:
-            raise ContextBudgetExceededError("No capacity remains for a continuation summary.")
-        # Output tokens and escaped UTF-8 bytes are different units.
-        # Reserve the bounded serialized summary space on the input
-        # side; an output token cap is not an input-size guarantee.
-        continuation_input_limit = min(max_input, base_tokens + byte_limit)
-        plan = {
+        summary_input = probe.request_ref.get("context_projection", {}).get("max_input_tokens")
+        max_input = base.request_ref.get("context_projection", {}).get("max_input_tokens")
+        if type(summary_input) is not int or type(max_input) is not int:
+            raise ContextBudgetExceededError("Checkpoint admission requires measured model input limits.")
+        base_input = base.resource_request.input_tokens
+        byte_limit = min(policy.summary_serialized_bytes, byte_limit, max_input - base_input)
+        if byte_limit < 1:
+            raise ContextBudgetExceededError("The protected continuation has no room for a summary.")
+        plan: dict[str, Any] = {
+            "checkpoint_revision": "complete-v1",
+            "policy_revision": policy.revision,
+            "summary_request_mode": "standalone",
             "source_hash": source_hash,
             "retained_tail_messages": retained,
-            "summary_output_limit": cap,
-            "summary_input_limit": probe.request_ref["context_projection"]["max_input_tokens"],
             "summary_byte_limit": byte_limit,
-            "continuation_input_limit": continuation_input_limit,
-            "continuation_output_limit": output,
-            "continuation_token_reserve": continuation_input_limit + output,
+            "summary_output_limit": min(probe.resource_request.output_tokens, byte_limit),
+            "summary_input_limit": summary_input,
+            "continuation_output_limit": base.resource_request.output_tokens,
             "max_summary_calls": None,
         }
 
-        async def measure_leaves(text: str, active_plan: Mapping[str, Any]) -> list[PreparedModelCall]:
-            try:
-                return [
-                    await self._prepare_step(
-                        await self._store.run_async(self._summary_step, turn, step=step, source=text, plan=active_plan)
-                    )
-                ]
-            except ContextBudgetExceededError:
-                left, right = _split_summary_history(text)
-                return [*await measure_leaves(left, active_plan), *await measure_leaves(right, active_plan)]
-
-        leaves = await measure_leaves(source, plan)
-        count = 2 * len(leaves) - 1
-        summary_input_limit = probe.request_ref["context_projection"]["max_input_tokens"]
-        fixed = (
-            sum(leaf.resource_request.input_tokens for leaf in leaves)
-            + (len(leaves) - 1) * summary_input_limit
-            + continuation_input_limit
-            + output
-        )
-        remaining = normal_token_remaining(await self._store.run_async(self._store.read_budget_state, turn.turn_id))
-        if remaining is not None and fixed + count * cap > remaining:
-            raise ContextBudgetExceededError(
-                f"Turn cumulative token budget cannot fit summary allowance plus one continuation request: "
-                f"required={fixed + count * cap}, remaining={remaining}.",
-                reason_code="model_token_budget_exhausted",
-            )
-        plan.update(
-            summary_output_limit=cap,
-            continuation_input_limit=continuation_input_limit,
-            continuation_token_reserve=continuation_input_limit + output,
-            planned_summary_calls=count,
-        )
-        # Re-measure after changing limits; no request has been dispatched.
-        leaves = await measure_leaves(source, plan)
-        required = (
-            sum(leaf.resource_request.total_tokens for leaf in leaves)
-            + (len(leaves) - 1) * (summary_input_limit + cap)
-            + plan["continuation_token_reserve"]
-        )
-        if remaining is not None and required > remaining:
-            raise ContextBudgetExceededError(
-                f"Measured summary plan exceeds Turn cumulative token budget: "
-                f"required={required}, remaining={remaining}.",
-                reason_code="model_token_budget_exhausted",
-            )
-        plan["planned_token_upper_bound"] = required
-        if turn.binding_manifest.get("model_cost_budget_total_micros") is not None:
-            rates = base.request_ref.get("pricing_micros_per_1m", {})
-            continuation_cost = estimated_model_cost_micros(
-                input_tokens=plan["continuation_input_limit"],
-                max_output_tokens=output,
-                pricing=rates,
-            )
-            merge_cost = estimated_model_cost_micros(
-                input_tokens=summary_input_limit,
-                max_output_tokens=cap,
-                pricing=rates,
-            )
-            if continuation_cost is None or merge_cost is None:
-                raise PricingUnavailableError("Summary continuation plan requires frozen model pricing.")
-            required_cost = (
-                sum(leaf.resource_request.cost_micros for leaf in leaves)
-                + (len(leaves) - 1) * merge_cost
-                + continuation_cost
-            )
-            available_cost = await self._store.run_async(
-                lambda: self._store.read_budget_state(turn.turn_id).remaining("cost_micros")
-            )
-            if available_cost is not None and required_cost > available_cost:
-                raise ContextBudgetExceededError(
-                    "Insufficient monetary budget for summary and continuation.",
-                    reason_code="model_cost_budget_exhausted",
+        async def prepare(text: str):
+            return await self._prepare_step(
+                await self._store.run_async(
+                    self._summary_step,
+                    turn,
+                    step=step,
+                    source=text,
+                    plan=plan,
                 )
-            plan["continuation_cost_reserve"] = continuation_cost
-            plan["planned_cost_upper_bound"] = required_cost
+            )
 
-        async def freeze_tree(text: str) -> dict[str, Any]:
+        # A merge holds two bounded summaries. Reserve escaped bytes as input
+        # tokens conservatively; output tokens are not a serialized-size bound.
+        merge_source = _merge_summary_history("", "")
+        merge_probe = await prepare(merge_source)
+        merge_context = await self._store.run_async(self._summary_step, turn, step=step, source=merge_source, plan=plan)
+        merge_room = min(
+            summary_input - merge_probe.resource_request.input_tokens,
+            policy.max_total_bytes - merge_probe.request_ref.get("serialized_input_bytes", 0),
+            policy.max_item_bytes - len(merge_context.messages[0].content.encode()),
+        )
+        byte_limit = min(byte_limit, merge_room // 2)
+        if byte_limit < 1:
+            raise ContextBudgetExceededError("No capacity for complete summary reduction.")
+        plan.update(summary_byte_limit=byte_limit, summary_output_limit=min(plan["summary_output_limit"], byte_limit))
+        merge_probe = await prepare(merge_source)
+        merge_input = merge_probe.resource_request.input_tokens + 2 * byte_limit
+        nodes: list[tuple[int, int | None]] = []
+
+        async def freeze(text: str) -> dict[str, Any]:
             digest = hashlib.sha256(text.encode()).hexdigest()
             try:
-                leaf = await self._prepare_step(
-                    await self._store.run_async(self._summary_step, turn, step=step, source=text, plan=plan)
-                )
+                measured = await prepare(text)
             except ContextBudgetExceededError:
-                left, right = _split_summary_history(text)
-                return {
-                    "source_hash": digest,
-                    "input_limit": summary_input_limit,
-                    "children": [await freeze_tree(left), await freeze_tree(right)],
-                }
-            return {"source_hash": digest, "input_limit": leaf.resource_request.input_tokens}
+                try:
+                    left, right = _split_summary_history(text)
+                except ContextBudgetExceededError:
+                    history = json.loads(text)["history"]
+                    high = max(
+                        (len(entry.get("body", "").encode()) for entry in history if entry["role"] == "tool"), default=0
+                    )
+                    low, best = 0, None
+                    while low <= high:
+                        limit = (low + high) // 2
+                        bounded = _bound_summary_tool_results(text, limit)
+                        try:
+                            candidate = await prepare(bounded)
+                        except ContextBudgetExceededError:
+                            high = limit - 1
+                        else:
+                            best = bounded, candidate
+                            low = limit + 1
+                    if best is None:
+                        raise ContextBudgetExceededError(
+                            "An indivisible non-tool input exceeds summary capacity; originals retained.",
+                            reason_code="summary_unit_exceeds_context",
+                        ) from None
+                    bounded, measured = best
+                    node = {"source_hash": digest, "input_source": bounded}
+                else:
+                    children = [await freeze(left), await freeze(right)]
+                    nodes.append(
+                        (
+                            merge_input + plan["summary_output_limit"],
+                            estimated_model_cost_micros(
+                                input_tokens=merge_input,
+                                max_output_tokens=plan["summary_output_limit"],
+                                pricing=merge_probe.request_ref.get("pricing_micros_per_1m", {}),
+                            ),
+                        )
+                    )
+                    return {"source_hash": digest, "input_limit": merge_input, "children": children}
+            else:
+                node = {"source_hash": digest}
+            nodes.append(
+                (
+                    measured.resource_request.total_tokens,
+                    measured.resource_request.cost_micros if measured.request_ref.get("pricing_known") else None,
+                )
+            )
+            return {**node, "input_limit": measured.resource_request.input_tokens}
 
-        plan["summary_tree"] = await freeze_tree(source)
-        plan["plan_id"] = hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
+        remaining = normal_token_remaining(await self._store.run_async(self._store.read_budget_state, turn.turn_id))
+        low, high, admitted = 1, byte_limit, None
+        while low <= high:
+            size = high if admitted is None and high == byte_limit else (low + high) // 2
+            plan.update(summary_byte_limit=size, summary_output_limit=min(probe.resource_request.output_tokens, size))
+            merge_probe = await prepare(merge_source)
+            merge_input = merge_probe.resource_request.input_tokens + 2 * size
+            nodes.clear()
+            tree = await freeze(source)
+            reserve = base_input + size + base.resource_request.output_tokens
+            required = sum(tokens for tokens, _ in nodes) + reserve
+            if remaining is None or required <= remaining:
+                admitted = size, tree, list(nodes), reserve, required
+                low = size + 1
+            else:
+                high = size - 1
+        if admitted is None:
+            raise ContextBudgetExceededError(
+                "Complete summary and continuation exceed the remaining Turn budget.",
+                reason_code="model_token_budget_exhausted",
+            )
+        byte_limit, tree, nodes, reserve, required = admitted
+        continuation_input = base_input + byte_limit
+        plan.update(
+            summary_tree=tree,
+            summary_byte_limit=byte_limit,
+            summary_output_limit=min(probe.resource_request.output_tokens, byte_limit),
+        )
+        plan.update(
+            continuation_token_reserve=reserve,
+            planned_summary_calls=len(nodes),
+            planned_token_upper_bound=required,
+            failure_key=hashlib.sha256(
+                json.dumps(
+                    [
+                        source_hash,
+                        "complete-v1",
+                    ],
+                    sort_keys=True,
+                ).encode()
+            ).hexdigest(),
+        )
+        if turn.binding_manifest.get("model_cost_budget_total_micros") is not None:
+            continuation_cost = estimated_model_cost_micros(
+                input_tokens=continuation_input,
+                max_output_tokens=base.resource_request.output_tokens,
+                pricing=base.request_ref.get("pricing_micros_per_1m", {}),
+            )
+            if continuation_cost is None or any(cost is None for _, cost in nodes):
+                raise PricingUnavailableError("Compaction requires frozen summary and continuation pricing.")
+            plan.update(
+                continuation_cost_reserve=continuation_cost,
+                planned_cost_upper_bound=continuation_cost + sum(cost for _, cost in nodes),
+            )
         return plan
 
     async def _prepare_compacted_step(
@@ -703,7 +762,9 @@ class ContextEngine:
         step: int,
         trigger_reason: str = "explicit_compaction",
         before_input_tokens: int | None = None,
+        rejected_request_bytes: int | None = None,
         target_input_tokens: int | None = None,
+        optional: bool = False,
     ) -> tuple[StepContext, PreparedModelCall]:
         """Measure/commit identical projections; plan summary and continuation together."""
         from agent_runtime.harness.context import RolloutContextManager
@@ -722,7 +783,7 @@ class ContextEngine:
             if plan is not None:
                 context = replace(
                     context,
-                    input_token_limit=plan["continuation_input_limit"],
+                    input_token_limit=plan.get("continuation_input_limit"),
                     output_token_limit=plan["continuation_output_limit"],
                     compaction_plan=plan,
                     request_id=context.request_id or f"{turn.turn_id}:step:{step}",
@@ -736,10 +797,6 @@ class ContextEngine:
                         ),
                     )
             prepared = await self._prepare_step(context)
-            if plan is not None and plan.get("job_id"):
-                prepared = replace(prepared, request_ref={**prepared.request_ref, "compaction_job_id": plan["job_id"]})
-            if target_input_tokens is not None and prepared.resource_request.input_tokens > target_input_tokens:
-                raise ContextBudgetExceededError("Compacted context exceeds its working target.")
             remaining = normal_token_remaining(await self._store.run_async(self._store.read_budget_state, turn.turn_id))
             if (
                 not context.budget_pressure
@@ -748,18 +805,52 @@ class ContextEngine:
             ):
                 context = replace(context, budget_pressure=True)
                 prepared = await self._prepare_step(context)
+            if plan is not None and plan.get("job_id"):
+                prepared = replace(prepared, request_ref={**prepared.request_ref, "compaction_job_id": plan["job_id"]})
+            if plan is not None and before_input_tokens is not None:
+                if prepared.resource_request.input_tokens >= before_input_tokens:
+                    raise ContextBudgetExceededError(
+                        "Compaction did not reduce the measured request.", reason_code="context_compaction_no_reduction"
+                    )
+            if rejected_request_bytes is not None:
+                candidate_bytes = prepared.request_ref.get("serialized_input_bytes")
+                if type(candidate_bytes) is not int or candidate_bytes >= rejected_request_bytes:
+                    raise ContextBudgetExceededError(
+                        "Compaction did not reduce the rejected request.",
+                        reason_code="model_context_window_exceeded",
+                    )
             return context, prepared
 
         manager = self._context_manager
 
-        async def commit_candidate(candidate: ContextCompactionCandidate, context: StepContext) -> None:
-            await self._commit(partial(manager.commit_compaction, candidate))
-            if context.input_revision != (await self._store.run_async(self._store.user_input_revision, turn.turn_id)):
+        def install_projection(candidate: ContextCompactionCandidate, context: StepContext) -> None:
+            if context.input_revision != self._store.user_input_revision(turn.turn_id):
                 raise ContextSourceChangedError("New user input arrived during compaction commit.")
-            if (await self._store.run_async(manager.build, turn.turn_id)) != candidate.messages:
+            manager.commit_compaction(candidate)
+            if manager.build(turn.turn_id) != candidate.messages:
                 raise RuntimeError("Committed context differs from the measured candidate.")
 
-        before_state = await self._store.run_async(self._store.read_budget_state, turn.turn_id)
+        async def commit_candidate(
+            candidate: ContextCompactionCandidate,
+            context: StepContext,
+            continuation: PreparedModelCall | None = None,
+        ) -> None:
+            def install() -> None:
+                with self._store.tx.transaction():
+                    install_projection(candidate, context)
+                    if continuation is not None:
+                        model_ops.prepare_model_operation(
+                            self._store,
+                            turn_id=turn.turn_id,
+                            request_hash=continuation.request_hash,
+                            context_hash=continuation.context_hash,
+                            tool_hash=continuation.tool_hash,
+                            wire_hash=continuation.wire_hash,
+                            request_ref=continuation.request_ref,
+                        )
+
+            await self._commit(install)
+
         if (
             isinstance(manager, RolloutContextManager)
             and (await self._store.run_async(manager.capacity_policy, turn.turn_id)) is not None
@@ -795,7 +886,61 @@ class ContextEngine:
                     raise last_failure
                 raise ContextBudgetExceededError("No legal compaction candidate fits; original history retained.")
             capacity_policy = await self._store.run_async(manager.capacity_policy, turn.turn_id)
-            if capacity_policy is None:
+            existing_job = await self._store.run_async(compaction_jobs.find_job, self._store, turn_id=turn.turn_id)
+            if capacity_policy is not None and existing_job is None:
+                # Keep the latest exchange and all user messages. Use the
+                # smallest eligible archival prefix that reaches the target,
+                # or the largest measured reduction that still permits work.
+                best = None
+                async with aclosing(
+                    self._store.iterate(await self._store.run_async(manager.cheap_candidates, turn.turn_id))
+                ) as candidates:
+                    async for candidate in candidates:
+                        try:
+                            context, prepared = await accept(candidate)
+                        except ContextBudgetExceededError:
+                            continue
+                        measured = prepared.resource_request.input_tokens
+                        if before_input_tokens is not None and measured >= before_input_tokens:
+                            continue
+                        if best is None or measured < best[2].resource_request.input_tokens:
+                            best = candidate, context, prepared
+                        working_target = target_input_tokens or prepared.request_ref["context_projection"].get(
+                            "post_compact_target"
+                        )
+                        if working_target is None or measured <= working_target:
+                            break
+                if best is not None:
+                    candidate, context, prepared = best
+                    diagnostics = {
+                        **prepared.request_ref["context_projection"],
+                        "compacted": True,
+                        "trigger_reason": trigger_reason,
+                        "before_input_tokens": before_input_tokens,
+                        "after_input_tokens": prepared.resource_request.input_tokens,
+                        "summary_calls": 0,
+                        "summary_tokens": 0,
+                        "summary_cost_micros": 0,
+                        "budget_status": (await self._store.run_async(self._budget_status, turn)),
+                    }
+                    payload = {**json.loads(candidate.payload_json), "capacity_diagnostics": diagnostics}
+                    prepared = replace(
+                        prepared, request_ref={**prepared.request_ref, "context_projection": diagnostics}
+                    )
+                    await commit_candidate(
+                        replace(candidate, payload_json=json.dumps(payload, sort_keys=True)), context, prepared
+                    )
+                    return context, prepared
+            if (
+                optional
+                and existing_job is None
+                and not await self._store.run_async(self._proactive_compaction_available, turn.turn_id)
+            ):
+                raise ContextBudgetExceededError(
+                    "Optional semantic compaction is paused after failed checkpoints.",
+                    reason_code="context_summary_previously_failed",
+                )
+            if capacity_policy is None and existing_job is None:
                 # Bound the whole batch against the actual serialized request.
                 # Search only local projections; these prepare calls do no I/O.
                 # Keep all call/result roles and canonical originals unchanged.
@@ -845,135 +990,125 @@ class ContextEngine:
                     candidate, context, prepared = best
                     await commit_candidate(candidate, context)
                     return context, prepared
-            retained = await self._store.run_async(manager.semantic_retained_tail, turn.turn_id)
-            try:
-                floor = await self._store.run_async(
-                    manager.semantic_floor, turn.turn_id, retained_tail_messages=retained
-                )
-                floor_context, base = await accept(floor)
-            except ContextBudgetExceededError:
-                retained = 0
-                floor = await self._store.run_async(manager.semantic_floor, turn.turn_id)
-                floor_context, base = await accept(floor)
-            source_hash, source = await self._store.run_async(
-                manager.semantic_source, turn.turn_id, retained_tail_messages=retained
-            )
-            # Legacy operations predate durable budget plans. Reconstruct only
-            # fully committed summary trees; never spend tokens on this path.
-            legacy = await self._store.run_async(
-                lambda: any(
-                    op.request_ref.get("purpose") == "context_summary" and (not op.request_ref.get("compaction_plan"))
-                    for op in self._store.list_model_operations(turn.turn_id)
-                )
-            )
-            if legacy:
-                try:
-                    summary = await self._semantic_summary(turn, step=step, source=source, cached_only=True)
-                    candidate = await self._store.run_async(
-                        manager.semantic_candidate,
-                        turn.turn_id,
-                        source_hash=source_hash,
-                        summary=summary,
-                        retained_tail_messages=retained,
-                    )
-                    context, prepared = await accept(candidate)
-                except ContextBudgetExceededError:
-                    pass
-                else:
-                    await commit_candidate(candidate, context)
-                    return context, prepared
-            operations = await self._store.run_async(self._store.list_model_operations, turn.turn_id)
-            saved = next(
-                (
-                    op.request_ref["compaction_plan"]
-                    for op in operations
-                    if op.request_ref.get("compaction_plan", {}).get("source_hash") == source_hash
-                ),
-                None,
-            )
-            durable_job = await self._store.run_async(
-                compaction_jobs.find_job, self._store, turn_id=turn.turn_id, source_hash=source_hash
-            )
-            if durable_job is not None:
-                saved = durable_job.plan
-            if saved is not None:
-                plan = dict(saved)
-                retained = plan["retained_tail_messages"]
-            elif capacity_policy is not None:
-                try:
-                    plan = await self._plan_capacity_compaction(
-                        turn,
-                        step=step,
-                        source_hash=source_hash,
-                        source=source,
-                        retained=retained,
-                        base=base,
-                        byte_allowance=(
-                            await self._store.run_async(
-                                manager.summary_byte_allowance, floor, messages=floor_context.messages
-                            )
-                        ),
-                        target_input_tokens=target_input_tokens,
-                    )
-                except (ContextBudgetExceededError, PricingUnavailableError):
-                    if not retained:
-                        raise
-                    retained = 0
-                    floor = await self._store.run_async(manager.semantic_floor, turn.turn_id)
-                    floor_context, base = await accept(floor)
-                    plan = await self._plan_capacity_compaction(
-                        turn,
-                        step=step,
-                        source_hash=source_hash,
-                        source=source,
-                        retained=0,
-                        base=base,
-                        byte_allowance=(
-                            await self._store.run_async(
-                                manager.summary_byte_allowance, floor, messages=floor_context.messages
-                            )
-                        ),
-                        target_input_tokens=target_input_tokens,
-                    )
-            else:
-                plan = await self._plan_legacy_compaction(
-                    turn,
-                    step=step,
-                    source_hash=source_hash,
-                    source=source,
-                    retained=retained,
-                    base=base,
-                    byte_limit=(
-                        await self._store.run_async(
-                            manager.summary_byte_allowance, floor, messages=floor_context.messages
-                        )
+            active_job = existing_job
+            checkpoint = existing_job is None or _is_checkpoint_plan(existing_job.plan)
+            use_archived_projection = checkpoint or existing_job.plan.get("summary_request_mode") == "standalone"
+            source_revision, (source_hash, source) = await self._store.run_async(
+                self._store.read_snapshot,
+                lambda: (
+                    self._store.user_input_revision(turn.turn_id),
+                    manager.semantic_source(
+                        turn.turn_id, use_archived_projection=use_archived_projection, checkpoint=checkpoint
                     ),
-                )
-            if saved is None:
-                covered = json.loads(floor.payload_json)
-                plan.update(
-                    context_source_revision=floor.source_revision,
-                    covered_item_ids=covered["covered_item_ids"],
-                    preserved_item_ids=covered.get("preserved_item_ids", []),
-                    binding_manifest=dict(turn.binding_manifest),
-                    max_summary_retries=None,
-                    continuation_measurement={
-                        "resource_request": base.resource_request.to_dict(),
-                        "context_projection": dict(base.request_ref.get("context_projection", {})),
-                        "serialized_input_bytes": base.request_ref.get("serialized_input_bytes"),
-                    },
-                )
-                plan["plan_id"] = hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
-            job = await self._commit(
-                partial(
-                    compaction_jobs.create_job,
-                    self._store,
-                    turn_id=turn.turn_id,
-                    plan=plan,
-                    source_revision=await self._store.run_async(self._store.user_input_revision, turn.turn_id),
-                )
+                ),
             )
-            active_job = job
+            if existing_job is not None:
+                # Budget already belongs to this job. Resume its measured
+                # request instead of trying to admit a new floor against it.
+                if existing_job.plan["source_hash"] != source_hash:
+                    raise ContextSourceChangedError("The saved compaction source changed.")
+                job = existing_job
+                retained = job.plan["retained_tail_messages"]
+            else:
+                retained = await self._store.run_async(manager.semantic_retained_tail, turn.turn_id)
+                operations = await self._store.run_async(self._store.list_model_operations, turn.turn_id)
+                legacy = [
+                    op
+                    for op in operations
+                    if op.request_ref.get("purpose") == "context_summary"
+                    and not (op.request_ref.get("compaction_plan") or {}).get("job_id")
+                ]
+                saved = None
+                if legacy:
+                    legacy_hash, legacy_source = await self._store.run_async(
+                        manager.semantic_source, turn.turn_id, use_archived_projection=use_archived_projection
+                    )
+                    saved = next(
+                        (
+                            plan
+                            for op in reversed(legacy)
+                            if (plan := op.request_ref.get("compaction_plan"))
+                            and plan.get("source_hash") == legacy_hash
+                        ),
+                        None,
+                    )
+                    if saved is not None:
+                        source_hash, source = legacy_hash, legacy_source
+                        retained = saved["retained_tail_messages"]
+                        use_archived_projection = saved.get("summary_request_mode") == "standalone"
+                    elif any(not op.request_ref.get("compaction_plan") for op in legacy):
+                        # Records from before durable plans can still supply
+                        # a fully committed result, with no new provider I/O.
+                        try:
+                            summary = await self._semantic_summary(
+                                turn, step=step, source=legacy_source, cached_only=True
+                            )
+                            candidate = await self._store.run_async(
+                                manager.semantic_candidate,
+                                turn.turn_id,
+                                source_hash=legacy_hash,
+                                summary=summary,
+                                retained_tail_messages=retained,
+                                use_archived_projection=use_archived_projection,
+                            )
+                            context, prepared = await accept(candidate)
+                        except ContextBudgetExceededError:
+                            pass
+                        else:
+                            await commit_candidate(candidate, context)
+                            return context, prepared
+                if saved is None:
+                    for tail in dict.fromkeys((retained, 0)):
+                        try:
+                            floor = await self._store.run_async(
+                                manager.semantic_floor, turn.turn_id, retained_tail_messages=tail, checkpoint=True
+                            )
+                            floor_context, base = await accept(floor)
+                            plan = await self._plan_checkpoint(
+                                turn,
+                                step=step,
+                                source_hash=source_hash,
+                                source=source,
+                                retained=tail,
+                                base=base,
+                                byte_limit=await self._store.run_async(
+                                    manager.summary_byte_allowance, floor, messages=floor_context.messages
+                                ),
+                            )
+                        except (ContextBudgetExceededError, PricingUnavailableError):
+                            if tail == 0:
+                                raise
+                        else:
+                            retained = tail
+                            break
+                    covered = json.loads(floor.payload_json)
+                    plan.update(
+                        trigger_reason=trigger_reason,
+                        optional=optional,
+                        context_source_revision=floor.source_revision,
+                        covered_item_ids=covered["covered_item_ids"],
+                        preserved_item_ids=covered.get("preserved_item_ids", []),
+                        binding_manifest=dict(turn.binding_manifest),
+                        max_summary_retries=None,
+                        continuation_measurement={
+                            "resource_request": base.resource_request.to_dict(),
+                            "context_projection": dict(base.request_ref.get("context_projection", {})),
+                            "serialized_input_bytes": base.request_ref.get("serialized_input_bytes"),
+                        },
+                    )
+                    plan["plan_id"] = hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
+                else:
+                    plan = dict(saved)
+                job = await self._commit(
+                    partial(
+                        compaction_jobs.create_job,
+                        self._store,
+                        turn_id=turn.turn_id,
+                        plan=plan,
+                        source_revision=source_revision,
+                    )
+                )
+                active_job = job
             plan = dict(job.plan)
             summary = await self._semantic_summary(turn, step=step, source=source, plan=plan)
             try:
@@ -983,6 +1118,8 @@ class ContextEngine:
                     source_hash=source_hash,
                     summary=summary,
                     retained_tail_messages=retained,
+                    use_archived_projection=use_archived_projection,
+                    checkpoint=_is_checkpoint_plan(plan),
                 )
                 context, prepared = await accept(candidate, plan)
             except ContextBudgetExceededError:
@@ -991,20 +1128,27 @@ class ContextEngine:
                 # The frozen source includes this exchange. Reuse the SAME
                 # summary, dropping only its redundant verbatim replay.
                 candidate = await self._store.run_async(
-                    manager.semantic_candidate, turn.turn_id, source_hash=source_hash, summary=summary
+                    manager.semantic_candidate,
+                    turn.turn_id,
+                    source_hash=source_hash,
+                    summary=summary,
+                    use_archived_projection=use_archived_projection,
+                    checkpoint=_is_checkpoint_plan(plan),
                 )
                 context, prepared = await accept(candidate, plan)
-            if capacity_policy is not None:
-                state = await self._store.run_async(self._store.read_budget_state, turn.turn_id)
+            if capacity_policy is not None or _is_checkpoint_plan(plan):
+                usage = await self._store.run_async(
+                    compaction_jobs.summary_usage, self._store, turn_id=turn.turn_id, job_id=job.job_id
+                )
                 diagnostics = {
                     **prepared.request_ref["context_projection"],
                     "compacted": True,
                     "trigger_reason": trigger_reason,
                     "before_input_tokens": before_input_tokens,
                     "after_input_tokens": prepared.resource_request.input_tokens,
-                    "summary_calls": state.used.model_calls - before_state.used.model_calls,
-                    "summary_tokens": state.used.total_tokens - before_state.used.total_tokens,
-                    "summary_cost_micros": state.used.cost_micros - before_state.used.cost_micros
+                    "summary_calls": usage.model_calls,
+                    "summary_tokens": usage.total_tokens,
+                    "summary_cost_micros": usage.cost_micros
                     if prepared.request_ref.get("pricing_known")
                     else "unknown",
                     "budget_status": (await self._store.run_async(self._budget_status, turn)),
@@ -1030,26 +1174,13 @@ class ContextEngine:
                         },
                     },
                 )
-            if before_input_tokens is not None and prepared.resource_request.input_tokens >= before_input_tokens:
-                await self._commit(
-                    partial(
-                        compaction_jobs.finish_job,
-                        self._store,
-                        turn_id=turn.turn_id,
-                        job_id=job.job_id,
-                        status="failed",
-                    )
-                )
-                raise ContextBudgetExceededError(
-                    "Compaction did not reduce the measured request.", reason_code="context_compaction_no_reduction"
-                )
             await self._commit(
                 partial(
                     compaction_jobs.install_candidate,
                     self._store,
                     turn_id=turn.turn_id,
                     job_id=job.job_id,
-                    install=partial(manager.commit_compaction, candidate),
+                    install=partial(install_projection, candidate, context),
                     prepared=prepared,
                 )
             )
@@ -1074,6 +1205,21 @@ class ContextEngine:
                     status = "superseded"
                 else:
                     status = "failed"
+                details = None
+                if status == "failed":
+                    if isinstance(failure, SummaryStoppedError):
+                        outcome = await self._store.run_async(self._store.read_turn, turn.turn_id)
+                        details = {
+                            "reason_code": outcome.terminal_reason_code or "context_summary_stopped",
+                            "message": outcome.terminal_message or failure.result.status,
+                        }
+                    else:
+                        reason_code = (
+                            "pricing_unavailable"
+                            if isinstance(failure, PricingUnavailableError)
+                            else "model_budget_limit_exceeded"
+                        )
+                        details = {"reason_code": getattr(failure, "reason_code", reason_code), "message": str(failure)}
                 await self._commit(
                     partial(
                         compaction_jobs.finish_job,
@@ -1081,6 +1227,7 @@ class ContextEngine:
                         turn_id=turn.turn_id,
                         job_id=active_job.job_id,
                         status=status,
+                        failure=details,
                     )
                 )
             raise
@@ -1088,15 +1235,38 @@ class ContextEngine:
         # the last committed job/node/allowance ready for deterministic recovery.
 
     def _proactive_compaction_available(self, turn_id: str) -> bool:
-        """A failed checkpoint leaves this window intact; required compaction may still run."""
-        items = self._store.list_items(turn_id)
-        window_start = max((i.applied_thread_sequence for i in items if i.kind == "context_compaction"), default=0)
-        return not any(
-            i.kind == "context_summary_response"
-            and i.applied_thread_sequence > window_start
-            and i.payload.get("response_status") == "incomplete"
-            for i in items
-        )
+        """Count failed jobs in the current Turn and reset at a committed checkpoint."""
+        failures = 0
+        seen_jobs = set()
+        for item in reversed(
+            self._store.list_items(turn_id, kind=("context_compaction", "context_summary_response", "compaction_job"))
+        ):
+            if item.kind == "context_compaction":
+                break
+            if item.status != "completed":
+                continue
+            if item.kind == "context_summary_response" and item.payload.get("response_status") == "incomplete":
+                return False
+            if item.kind != "compaction_job":
+                continue
+            job_id = item.payload["job_id"]
+            if job_id in seen_jobs:
+                continue
+            seen_jobs.add(job_id)
+            if item.payload["status"] == "failed":
+                failures += 1
+                if failures >= MAX_CONSECUTIVE_PROACTIVE_COMPACTION_FAILURES:
+                    return False
+        return True
+
+
+def _checkpoint_history_suffix(source: str, offset: int) -> str:
+    if offset == 0:
+        return source
+    payload = json.loads(source)
+    payload["history"] = payload["history"][offset:]
+    payload["history_scope"] = "Earlier history remains in the archive. Only this recent suffix is shown."
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _split_summary_history(text: str) -> tuple[str, str]:
@@ -1144,3 +1314,25 @@ def _merge_summary_history(left: str, right: str) -> str:
         },
         ensure_ascii=False,
     )
+
+
+def _is_checkpoint_plan(plan: Mapping[str, Any]) -> bool:
+    return "checkpoint_revision" in plan or "summary_history_start" in plan
+
+
+def _bound_summary_tool_results(source: str, limit: int) -> str:
+    payload = json.loads(source)
+    for entry in payload["history"]:
+        if entry["role"] != "tool":
+            continue
+        body = entry.get("body", "")
+        if len(body.encode()) <= limit:
+            continue
+        identity = entry.get("item_id")
+        if not identity:
+            continue
+        entry["body"] = (
+            body.encode()[:limit].decode("utf-8", errors="ignore")
+            + f"\n[Partial tool result. Original evidence: read_context(item_id={identity!r}).]"
+        )
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

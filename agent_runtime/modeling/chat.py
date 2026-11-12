@@ -10,7 +10,7 @@ from typing import Any, TypeVar, cast
 
 from agent_runtime.modeling.contracts import LLMProviderResult, LLMUsage
 from agent_runtime.modeling.failures import ModelCallFailed, ModelFailure, classify_model_failure
-from agent_runtime.modeling.openai_wire import parse_openai_usage
+from agent_runtime.modeling.openai_wire import openai_compatible_text, parse_openai_usage
 
 T = TypeVar("T")
 _JSON_CODE_FENCE_RE = re.compile(r"^\s*```\s*(?:[A-Za-z0-9_-]+)?\s*(?P<body>.*?)\s*```\s*$", re.DOTALL)
@@ -69,7 +69,7 @@ class OpenAICompatibleChatGenerator:
         response = self._client.chat.completions.create(model=self.chat_model_name, messages=messages, **kwargs)  # type: ignore[call-overload]
         content = response.choices[0].message.content
         return LLMProviderResult(
-            value=str(content) if content is not None else "", usage=_openai_response_usage(response)
+            value=openai_compatible_text(content), usage=_openai_response_usage(response)
         )
 
     def generate_structured(
@@ -163,16 +163,18 @@ class OpenAICompatibleChatGenerator:
                     continue
                 choice = choices[0]
                 delta = choice.delta
-                content = getattr(delta, "content", None)
+                content = openai_compatible_text(getattr(delta, "content", None))
                 if content:
                     output_started = True
-                    yield {"type": "text_delta", "content": str(content), "provider_response_id": provider_response_id}
-                reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                    yield {"type": "text_delta", "content": content, "provider_response_id": provider_response_id}
+                reasoning = openai_compatible_text(
+                    getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                )
                 if reasoning:
                     output_started = True
                     yield {
                         "type": "thinking_delta",
-                        "content": str(reasoning),
+                        "content": reasoning,
                         "provider_response_id": provider_response_id,
                     }
                 plan = getattr(delta, "plan", None)
@@ -303,12 +305,14 @@ def _complete_response_chunks(response: object) -> Iterator[dict[str, object]]:
     provider_response_id = getattr(response, "id", None)
     choice = response.choices[0]  # type: ignore[attr-defined]
     message = choice.message
-    reasoning = getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None)
+    reasoning = openai_compatible_text(
+        getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None)
+    )
     if reasoning:
-        yield {"type": "thinking_delta", "content": str(reasoning), "provider_response_id": provider_response_id}
-    content = getattr(message, "content", None)
+        yield {"type": "thinking_delta", "content": reasoning, "provider_response_id": provider_response_id}
+    content = openai_compatible_text(getattr(message, "content", None))
     if content:
-        yield {"type": "text_delta", "content": str(content), "provider_response_id": provider_response_id}
+        yield {"type": "text_delta", "content": content, "provider_response_id": provider_response_id}
     refusal = getattr(message, "refusal", None)
     if refusal:
         yield {"type": "refusal_delta", "content": str(refusal), "provider_response_id": provider_response_id}

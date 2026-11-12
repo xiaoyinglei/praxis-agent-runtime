@@ -397,11 +397,14 @@ def configure_services(
         snapshot_ref: dict[str, Mapping[str, Tool]] = {}
 
         def search_hidden_tools(query: str, limit: int) -> object:
+            snapshot = snapshot_ref["tools"]
+            denied_names = session.tool_execution_context.denied_tool_names
             return find_tools(
-                snapshot_ref["tools"],
+                snapshot,
                 query=query,
                 discoverable_names=discoverable_names,
                 resident_names=("find_tools", *resident_names),
+                disabled_names=tuple(sorted(denied_names & snapshot.keys())),
                 limit=limit,
             )
 
@@ -480,7 +483,7 @@ def configure_services(
         tools=tool_snapshot,
         knowledge_revision=knowledge_revision,
         knowledge_config=knowledge_config,
-        tool_execution_policy=lambda: _tool_execution_policy_snapshot(session.tool_execution_context),
+        tool_execution_policy=session._snapshot_tool_policy,
         workspace_mcp_enabled=workspace_mcp_enabled,
         mcp_config_trust=mcp_config_trust,
         require_workspace_change=require_workspace_change,

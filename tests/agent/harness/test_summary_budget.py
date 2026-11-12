@@ -56,30 +56,18 @@ def test_summary_output_limit_controls_reservation_and_wire():
     assert prepared.dispatch_payload.request.settings.max_output_tokens == 37
 
 
-def test_summary_is_not_dispatched_with_leftover_output_allowance(tmp_path, monkeypatch):
-    """Budget can buy the input, but cannot buy configured output plus continuation."""
+def test_summary_is_not_dispatched_without_continuation_headroom(tmp_path):
+    """A bounded Turn cannot buy even the shortest complete work unit and its continuation."""
     with RuntimeStore.open_sync(tmp_path / "insufficient-summary.db") as store:
-        thread, turn = start(store, tmp_path)
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(
+            store,
+            thread_id=thread.thread_id,
+            user_message="Finish the task",
+            binding_manifest={"model_token_budget_total": 2600},
+        )
         long_history(store, turn)
         model, gateway = model_for(100000)
-        prepared_calls = []
-        original_prepare = model.prepare
-
-        def prepare(request):
-            prepared = original_prepare(request)
-            prepared_calls.append(prepared)
-            return prepared
-
-        def remaining(_state):
-            summaries = [p for p in prepared_calls if p.request_ref["purpose"] == "context_summary"]
-            floors = [p for p in prepared_calls if p.request_ref["purpose"] == "agent_step"]
-            if len(summaries) < 2 or not floors:
-                return None
-            summary = summaries[-1].resource_request
-            return summary.input_tokens + floors[-1].resource_request.total_tokens + summary.output_tokens
-
-        model.prepare = prepare
-        monkeypatch.setattr("agent_runtime.harness.context_engine.normal_token_remaining", remaining)
         runner = TurnRunner(
             thread_id=thread.thread_id,
             store=store,

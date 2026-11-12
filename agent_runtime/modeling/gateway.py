@@ -51,6 +51,7 @@ from agent_runtime.modeling.local_agent_wire import (
 )
 from agent_runtime.modeling.openai_wire import (
     OpenAIWireRequest,
+    openai_compatible_text,
     parse_openai_response,
     parse_openai_usage,
     serialize_openai_request,
@@ -470,11 +471,11 @@ class LLMGateway:
             if effective_ledger is not None:
                 await effective_ledger.refund(effective_lease_id)
             raise
-        turn = parse_openai_response(provider_result.value)
-        usage = (
-            provider_result.usage
-            or parse_openai_usage(provider_result.value)
-            or normalize_llm_usage(
+        reported = provider_result.usage
+        try:
+            reported = reported or parse_openai_usage(provider_result.value)
+            turn = parse_openai_response(provider_result.value)
+            usage = reported or normalize_llm_usage(
                 input_tokens=input_tokens,
                 output_tokens=sum(
                     self._token_accounting.count(part) for part in _openai_output_parts(provider_result.value)
@@ -482,7 +483,10 @@ class LLMGateway:
                 input_tokens_include_cache=True,
                 usage_source="tokenizer_estimate",
             )
-        )
+        except (ValueError, TypeError):
+            if effective_ledger is not None:
+                await effective_ledger.commit(effective_lease_id, reported.total_tokens if reported else reservation)
+            raise
         if effective_ledger is not None:
             await effective_ledger.commit(effective_lease_id, usage.total_tokens)
         return AgentModelResponse(
@@ -1029,7 +1033,11 @@ def _openai_output_parts(response: object) -> tuple[str, ...]:
     if not choices:
         return ()
     message = field(choices[0], "message")
-    parts = [field(message, "content", ""), field(message, "reasoning_content") or field(message, "reasoning", "")]
+    parts = [
+        openai_compatible_text(field(message, "content")),
+        openai_compatible_text(field(message, "reasoning_content") or field(message, "reasoning")),
+        field(message, "refusal", ""),
+    ]
     for call in field(message, "tool_calls", ()) or ():
         function = field(call, "function")
         parts.extend((field(function, "name", ""), field(function, "arguments", "")))

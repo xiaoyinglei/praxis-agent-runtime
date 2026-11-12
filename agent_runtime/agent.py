@@ -113,6 +113,7 @@ class Agent:
         self.permissions = permissions
         self.managed_permissions = managed_permissions
         self._input_read_files: tuple[str, ...] = ()
+        self._input_read_references: tuple[dict[str, str], ...] = ()
         self.effective_permissions()  # Reject invalid configuration before model/provider setup.
         self.model_session_path = model_session_path
         self.knowledge = knowledge
@@ -981,7 +982,8 @@ class Agent:
     def effective_permissions(self) -> ResolvedPermissions:
         """Reload trusted sources; saved conversation grants cannot widen them."""
         return resolve_permission_sources(
-            self.workspace_path, self.permissions, self.managed_permissions, read_files=self._input_read_files
+            self.workspace_path, self.permissions, self.managed_permissions, read_files=self._input_read_files,
+            read_references=self._input_read_references,
         )
 
     def _reference_harness_files(

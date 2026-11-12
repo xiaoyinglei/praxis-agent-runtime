@@ -10,6 +10,7 @@ from uuid import uuid4
 from agent_runtime.harness import facts, turn_ops
 from agent_runtime.harness.records import (
     ArtifactSnapshot,
+    ItemSnapshot,
 )
 from agent_runtime.harness.runtime_store import RuntimeStore, owner_operation
 
@@ -69,16 +70,22 @@ def commit_artifact(
     return store.read_artifact_metadata(artifact_id)
 
 
-def _assert_artifact_integrity(store: RuntimeStore, turn_id: str) -> None:
+def _assert_artifact_integrity(
+    store: RuntimeStore, turn_id: str, *, items: tuple[ItemSnapshot, ...] | None = None
+) -> None:
     # Dispatch validates its actual conversation references. A damaged blob
     # in another Thread is still diagnosed by verify(), without disabling
     # unrelated work throughout the whole store.
-    artifact_ids = {
-        str(attachment["artifact_id"])
-        for item in store.list_conversation_items(turn_id)
-        for attachment in item.payload.get("attachments", ())
-        if isinstance(attachment, Mapping) and isinstance(attachment.get("artifact_id"), str)
-    }
+    artifact_ids = (
+        store.conversation_artifact_ids(turn_id)
+        if items is None
+        else {
+            str(attachment["artifact_id"])
+            for item in items
+            for attachment in item.payload.get("attachments", ())
+            if isinstance(attachment, Mapping) and isinstance(attachment.get("artifact_id"), str)
+        }
+    )
     errors = store.tx.artifact_integrity_errors(artifact_ids=artifact_ids)
     if errors:
         raise RuntimeError(f"artifact integrity check failed: {errors[0]}")

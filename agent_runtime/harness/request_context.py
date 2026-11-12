@@ -75,7 +75,9 @@ class RequestContext:
 
         project_instructions = restored_instructions(
             turn_context.binding_manifest,
-            self._store.list_items(turn_context.turn_id),
+            self._store.list_items(
+                turn_context.turn_id, kind="tool_result", payload_fields={"error_code": "project_instructions_required"}
+            ),
         )
         context_updates: tuple[ModelMessage, ...] = ()
         clock = capture_runtime_clock()
@@ -104,6 +106,10 @@ class RequestContext:
             if self._binding_provider is None
             else self._binding_provider.snapshot(thread_id=self.thread_id, turn_id=turn_context.turn_id)
         )
+        tool_policy = binding.get("tool_execution_policy", {})
+        denied_names = tool_policy.get("denied_tool_names") if isinstance(tool_policy, Mapping) else None
+        if isinstance(denied_names, (tuple, list)):
+            tools = tuple(tool for tool in tools if tool.definition.name not in denied_names)
         # Old Turns do not acquire recovery by reopening with new defaults.
         binding.pop("model_response_recovery", None)
         binding.pop("lifecycle_hooks", None)
@@ -221,7 +227,7 @@ class RequestContext:
         state["acceptance_contract"] = dict(completion) if completion.get("acceptance_command") else None
         delivery_policy = turn.binding_manifest.get("delivery_policy", {})
         if delivery_policy.get("revision") == "delivery-v1" and delivery_policy.get("model_tools", True):
-            plans = [i for i in self._store.list_items(turn.turn_id) if i.kind == "delivery_plan"]
+            plans = self._store.list_items(turn.turn_id, kind="delivery_plan")
             state["Delivery evidence contract"] = {
                 "plan": dict(plans[-1].payload) if plans else None,
                 "next_action": (

@@ -119,8 +119,8 @@ class ModelRunner:
 
         if policy is not None and step.purpose == "context_summary":
             # A large token window does not authorize an unbounded history
-            # envelope. The planner splits complete work units before provider
-            # serialization; an indivisible unit fails with originals intact.
+            # envelope. Checkpoint planning measures whole work units before
+            # provider dispatch; the original history remains in Rollout.
             sizes = [len(message.content.encode("utf-8")) for message in step.messages]
             if max(sizes, default=0) > policy.max_item_bytes or sum(sizes) > policy.max_total_bytes:
                 if step.binding_manifest.get("summary_cache_fork"):
@@ -332,9 +332,11 @@ class ModelRunner:
             # The rejected claim transaction rolled back. Persist revocation
             # separately so recovery observes cancellation instead of retrying
             # the same denied admission forever.
-            await self._commit(lambda: turn_ops.request_turn_cancellation(
-                self._store, turn_id=turn_id, reason="Execution admission revoked before model dispatch"
-            ))
+            await self._commit(
+                lambda: turn_ops.request_turn_cancellation(
+                    self._store, turn_id=turn_id, reason="Execution admission revoked before model dispatch"
+                )
+            )
             raise
         except BudgetLimitExceededError as exc:
             return await self._fail_turn(
@@ -515,7 +517,10 @@ class ModelRunner:
                     ),
                 )
             )
-            if operation.request_ref.get("purpose") == "context_summary":
+            if operation.request_ref.get("purpose") == "context_summary" and not any(
+                key in (operation.request_ref.get("compaction_plan") or {})
+                for key in ("checkpoint_revision", "summary_history_start")
+            ):
                 return await self._fail_turn(
                     thread_id=thread_id, turn_id=turn_id, reason_code="summary_context_overflow", message=str(exc)
                 )

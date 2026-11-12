@@ -59,13 +59,20 @@ class RecoveryDecision:
         again afterwards, before an unknown result can become a retry.
         """
         return not self.requires_input and self.kind in {
-            ContinuationKind.TERMINAL, ContinuationKind.APPROVAL_RESOLVED,
-            ContinuationKind.RECOVER_OWNER, ContinuationKind.CANCEL,
-            ContinuationKind.CHILD_WAIT, ContinuationKind.WAIT_RETRY,
-            ContinuationKind.APPROVED_READY, ContinuationKind.COMMITTED_RESPONSE,
-            ContinuationKind.PREPARED_MODEL, ContinuationKind.CONTEXT_OVERFLOW,
-            ContinuationKind.RESUME_COMPACTION, ContinuationKind.INPUT_SUPERSEDED,
-            ContinuationKind.FIRST_DISPATCH, ContinuationKind.NEXT_STEP,
+            ContinuationKind.TERMINAL,
+            ContinuationKind.APPROVAL_RESOLVED,
+            ContinuationKind.RECOVER_OWNER,
+            ContinuationKind.CANCEL,
+            ContinuationKind.CHILD_WAIT,
+            ContinuationKind.WAIT_RETRY,
+            ContinuationKind.APPROVED_READY,
+            ContinuationKind.COMMITTED_RESPONSE,
+            ContinuationKind.PREPARED_MODEL,
+            ContinuationKind.CONTEXT_OVERFLOW,
+            ContinuationKind.RESUME_COMPACTION,
+            ContinuationKind.INPUT_SUPERSEDED,
+            ContinuationKind.FIRST_DISPATCH,
+            ContinuationKind.NEXT_STEP,
         }
 
     def accepts(self, action: str) -> bool:
@@ -286,7 +293,9 @@ def _recovery_decision(store: RuntimeStore, turn_id: str) -> RecoveryDecision:
         return plan("unavailable", (), "cancellation_pending", *(item.request_id for item in pending))
     pause = next((r for r in reversed(records) if r.record_type == "turn_paused"), None)
     if (
-        turn.status == "paused" and revoked is None and pause is not None
+        turn.status == "paused"
+        and revoked is None
+        and pause is not None
         and pause.payload.get("reason_code") == "attached_children"
     ):
         children = store.tx.rows("child_budget_allocations", where={"parent_turn_id": turn_id, "status": "active"})
@@ -380,9 +389,17 @@ def _recovery_decision(store: RuntimeStore, turn_id: str) -> RecoveryDecision:
     if (
         turn.status == "running"
         and models
-        and models[-1].status == "completed"
         and models[-1].request_ref.get("purpose") == "context_summary"
-        and models[-1].response_item_id is not None
+        and (
+            (models[-1].status == "completed" and models[-1].response_item_id is not None)
+            or (
+                models[-1].status == "failed"
+                and any(
+                    key in (models[-1].request_ref.get("compaction_plan") or {})
+                    for key in ("checkpoint_revision", "summary_history_start")
+                )
+            )
+        )
     ):
         return plan(
             "resume_compaction",
@@ -391,6 +408,12 @@ def _recovery_decision(store: RuntimeStore, turn_id: str) -> RecoveryDecision:
             models[-1].operation_id,
             models[-1].response_item_id,
         )
+    if turn.status == "running":
+        from agent_runtime.harness import compaction_jobs
+
+        job = compaction_jobs.find_job(store, turn_id=turn_id)
+        if job is not None:
+            return plan("resume_compaction", ("continue",), "compaction_admitted", job.job_id)
     if turn.status == "running" and pending_input_supersession(store, turn_id):
         return plan("input_superseded", ("continue",), "request_superseded", models[-1].operation_id)
     if (

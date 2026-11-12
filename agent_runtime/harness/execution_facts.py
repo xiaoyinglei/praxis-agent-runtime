@@ -8,6 +8,7 @@ from typing import Any
 from agent_runtime.harness import tool_ops
 from agent_runtime.harness.facts import append_fact
 from agent_runtime.harness.runtime_store import RuntimeStore, owner_operation
+from agent_runtime.tools.evidence import workspace_changed
 from agent_runtime.tools.tool import ToolCall, _thaw_json
 
 EXECUTION_PROTOCOL = "durable-turn-v1"
@@ -171,7 +172,7 @@ def repeated_tool_failure(store: RuntimeStore, turn_id: str) -> bool:
             break
         metadata = result.get("metadata")
         metadata = metadata if isinstance(metadata, Mapping) else {}
-        if metadata.get("workspace_tree_changed") is True:
+        if workspace_changed(metadata) is True:
             break
         if result.get("is_error") is not True:
             operation = operations.get(result_items.get(result.get("tool_call_id")))
@@ -181,7 +182,7 @@ def repeated_tool_failure(store: RuntimeStore, turn_id: str) -> bool:
                 break
             effects = set(operation.effects)
             readonly = effects <= {"read_workspace"}
-            noop = metadata.get("workspace_tree_changed") is False and effects <= {
+            noop = workspace_changed(metadata) is False and effects <= {
                 "read_workspace",
                 "write_workspace",
                 "execute_process",

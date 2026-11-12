@@ -14,6 +14,8 @@ from types import MappingProxyType
 from uuid import uuid4
 
 from agent_runtime.core.runtime_diagnostics import exception_diagnostic, redact_sensitive_text
+from agent_runtime.permission_policy import ResolvedPermissions
+from agent_runtime.tools.evidence import MISSING_FILE_SHA256
 from agent_runtime.tools.permissions import (
     CanUseToolResult,
     ToolExecutionContext,
@@ -41,7 +43,7 @@ from agent_runtime.tools.tool import (
     ToolValidationError,
     json_schema_output,
 )
-from agent_runtime.workspace import workspace_tree_sha256
+from agent_runtime.workspace import workspace_tree_excludes, workspace_tree_sha256
 
 _NETWORK_APPROVAL_SUFFIX = "::network"
 _MAX_PRECISE_WORKSPACE_FILE_TARGETS = 8
@@ -50,6 +52,7 @@ _PROTECTED_WORKSPACE_METADATA_KEYS = frozenset(
         "after_sha256",
         "before_sha256",
         "runtime_workspace_write",
+        "runtime_workspace_changed",
         "runtime_workspace_file_changes",
         "workspace_changed",
         "workspace_tree_after_sha256",
@@ -58,7 +61,6 @@ _PROTECTED_WORKSPACE_METADATA_KEYS = frozenset(
         "runtime_workspace_origin_operation_id",
     }
 )
-_MISSING_WORKSPACE_FILE_SHA256 = hashlib.sha256(b"praxis-workspace-file-missing-v1").hexdigest()
 
 
 class ExecutionBoundary(StrEnum):
@@ -193,7 +195,9 @@ class _PreparedExecution:
     record_sink: RecordSink | None
     started_at: float
     workspace_root: Path | None
+    workspace_observation_started: bool
     workspace_tree_before_sha256: str | None
+    committed_file_changes: tuple[tuple[str, str, str], ...] | None
     workspace_file_before_sha256: tuple[tuple[str, str], ...]
     permissions_revision: str | None
     context: ToolExecutionContext
@@ -223,6 +227,7 @@ class _LiveContinuation:
     operation_id: str
     workspace_root: Path | None
     before_sha256: str | None
+    permission_provider: Callable[[], ResolvedPermissions | None] | None
 
 
 class ToolExecutor:
@@ -266,9 +271,12 @@ class ToolExecutor:
         self._continuations: dict[tuple[object, str], _LiveContinuation] = {}
 
     def restore_continuation(self, owner: object, key: str, *, operation_id: str,
-                             workspace_root: Path | None, before_sha256: str | None) -> None:
+                             workspace_root: Path | None, before_sha256: str | None,
+                             permission_provider: Callable[[], ResolvedPermissions | None] | None = None) -> None:
         """Harness restores only ledger-validated launch receipts, never model claims."""
-        self._continuations[(owner, key)] = _LiveContinuation(operation_id, workspace_root, before_sha256)
+        self._continuations[(owner, key)] = _LiveContinuation(
+            operation_id, workspace_root, before_sha256, permission_provider
+        )
 
     async def observe_continuation(
         self, continuation: ToolContinuation,
@@ -280,14 +288,12 @@ class ToolExecutor:
             return {}
         metadata: dict[str, JsonValue] = {"runtime_workspace_origin_operation_id": live.operation_id}
         if live.workspace_root is not None:
-            after = await asyncio.to_thread(workspace_tree_sha256, live.workspace_root)
-            metadata.update({
-                "runtime_workspace_write": True,
-                "workspace_tree_before_sha256": live.before_sha256,
-                "workspace_tree_after_sha256": after,
-                "workspace_tree_changed": live.before_sha256 is not None and after is not None
-                and live.before_sha256 != after,
-            })
+            after = None
+            if continuation.observe_workspace and _workspace_observation_allowed(
+                live.workspace_root, live.permission_provider,
+            ):
+                after = await asyncio.to_thread(workspace_tree_sha256, live.workspace_root)
+            metadata.update(_tree_observation(live.before_sha256, after))
             if after is not None:
                 live.before_sha256 = after
         if continuation.terminal:
@@ -744,7 +750,9 @@ class ToolExecutor:
             record_sink=record_sink,
             started_at=started_at,
             workspace_root=workspace_root,
+            workspace_observation_started=False,
             workspace_tree_before_sha256=None,
+            committed_file_changes=None,
             workspace_file_before_sha256=(),
             permissions_revision=(
                 None if context.effective_permissions is None else context.effective_permissions.revision
@@ -914,11 +922,16 @@ class ToolExecutor:
             raise
         if isinstance(checked, ToolExecution):
             return checked
+        permissions = checked.effective_permissions
         try:
             # Preparation may be far ahead of invocation. Observe changes only
             # after admission, so earlier conflicting calls are not attributed
             # to this runner. Workspace observers are exclusive in a batch.
-            if prepared.workspace_root is not None:
+            if (
+                prepared.workspace_root is not None
+                and prepared.tool.committed_file_changes is None
+                and _workspace_observation_allowed(prepared.workspace_root, lambda: permissions)
+            ):
                 before = await asyncio.to_thread(workspace_tree_sha256, prepared.workspace_root)
                 files = await asyncio.to_thread(
                     _workspace_file_target_snapshots, prepared.workspace_root, prepared.resolved,
@@ -928,6 +941,7 @@ class ToolExecutor:
             checked = await self._check_live_invocation(prepared, cancellation_sink)
             if isinstance(checked, ToolExecution):
                 return checked
+            prepared = replace(prepared, workspace_observation_started=True)
             with execution_context_scope(checked):
                 raw = await _run_with_timeout(
                     prepared.tool,
@@ -1039,6 +1053,8 @@ class ToolExecutor:
             }
             raw = raw.value
         try:
+            if prepared.tool.committed_file_changes is not None:
+                prepared = replace(prepared, committed_file_changes=prepared.tool.committed_file_changes(raw))
             output = prepared.tool.normalize_output(raw)
             if not isinstance(output, NormalizedToolOutput):
                 raise TypeError("normalize_output must return NormalizedToolOutput")
@@ -1231,38 +1247,33 @@ class ToolExecutor:
                 "permission_reason": prepared.decision.reason,
                 "permissions_revision": prepared.permissions_revision,
             })
-            if prepared.workspace_root is not None:
-                after_sha256 = await asyncio.to_thread(
-                    workspace_tree_sha256,
-                    prepared.workspace_root,
-                )
-                file_changes = await asyncio.to_thread(
-                    _changed_workspace_file_snapshots,
-                    prepared.workspace_root,
-                    prepared.workspace_file_before_sha256,
-                )
-                before_sha256 = prepared.workspace_tree_before_sha256
-                metadata.update(
-                    {
+            continuation = (
+                prepared.tool.continuation(prepared.arguments, result.structured_content)
+                if prepared.tool.continuation is not None
+                else None
+            )
+            root = prepared.workspace_root
+            if root is not None and prepared.workspace_observation_started and continuation is None:
+                if prepared.tool.committed_file_changes is not None:
+                    committed = prepared.committed_file_changes
+                    metadata.update({
                         "runtime_workspace_write": True,
-                        "runtime_workspace_file_changes": file_changes,
-                        "workspace_tree_before_sha256": before_sha256,
-                        "workspace_tree_after_sha256": after_sha256,
-                        "workspace_tree_changed": bool(
-                            before_sha256 is not None and after_sha256 is not None and before_sha256 != after_sha256
+                        "runtime_workspace_changed": None if committed is None else bool(committed),
+                        "runtime_workspace_file_changes": tuple(
+                            {"path": path, "before_sha256": before, "after_sha256": after}
+                            for path, before, after in committed or ()
                         ),
-                    }
-                )
-            if prepared.tool.continuation is not None:
-                continuation = prepared.tool.continuation(prepared.arguments, result.structured_content)
-                if continuation is not None:
-                    key = (continuation.owner, continuation.key)
-                    if continuation.phase == "start":
-                        self._continuations[key] = _LiveContinuation(
-                            prepared.record.operation_id, prepared.workspace_root,
-                            prepared.workspace_tree_before_sha256,
-                        )
-                    metadata.update(await self.observe_continuation(continuation))
+                    })
+                else:
+                    metadata.update(await _observe_workspace_write(prepared))
+            if continuation is not None:
+                key = (continuation.owner, continuation.key)
+                if continuation.phase == "start":
+                    self._continuations[key] = _LiveContinuation(
+                        prepared.record.operation_id, root, prepared.workspace_tree_before_sha256,
+                        lambda: prepared.context.refreshed().effective_permissions,
+                    )
+                metadata.update(await self.observe_continuation(continuation))
             if record is not None:
                 metadata["operation_id"] = record.operation_id
                 diagnostic = metadata.get("diagnostic")
@@ -1284,6 +1295,49 @@ class ToolExecutor:
         )
         self._traces.append(trace)
         return ToolExecution(result=result, record=record, trace=trace)
+
+
+def _tree_observation(before: str | None, after: str | None) -> dict[str, JsonValue]:
+    return {
+        "runtime_workspace_write": True,
+        "workspace_tree_before_sha256": before,
+        "workspace_tree_after_sha256": after,
+        "workspace_tree_changed": None if before is None or after is None else before != after,
+    }
+
+
+def _workspace_observation_allowed(
+    root: Path, permission_provider: Callable[[], ResolvedPermissions | None] | None,
+) -> bool:
+    """A whole-tree observation requires read authority over the tree."""
+    if permission_provider is None:
+        return True
+    try:
+        permissions = permission_provider()
+        return permissions is None or (
+            permissions.path_access(root)
+            and not any(
+                rule.access == "deny" and not workspace_tree_excludes(root, Path(rule.path))
+                for rule in permissions.sandbox_filesystem
+            )
+        )
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+async def _observe_workspace_write(prepared: _PreparedExecution) -> dict[str, JsonValue]:
+    root = prepared.workspace_root
+    assert root is not None
+    if not _workspace_observation_allowed(root, lambda: prepared.context.refreshed().effective_permissions):
+        return _tree_observation(prepared.workspace_tree_before_sha256, None)
+    after = await asyncio.to_thread(workspace_tree_sha256, root)
+    file_changes = await asyncio.to_thread(
+        _changed_workspace_file_snapshots, root, prepared.workspace_file_before_sha256
+    )
+    return {
+        **_tree_observation(prepared.workspace_tree_before_sha256, after),
+        "runtime_workspace_file_changes": file_changes,
+    }
 
 
 def _workspace_file_target_snapshots(
@@ -1316,7 +1370,7 @@ def _workspace_file_target_snapshots(
         return tuple(
             (
                 relative,
-                _file_sha256(path) if path.is_file() else _MISSING_WORKSPACE_FILE_SHA256,
+                _file_sha256(path) if path.is_file() else MISSING_FILE_SHA256,
             )
             for relative, path in targets.items()
         )
@@ -1335,7 +1389,7 @@ def _changed_workspace_file_snapshots(
         changes: list[Mapping[str, JsonValue]] = []
         for relative, before_sha256 in before_snapshots:
             path = _resolve_workspace_file_target(root, str(root / relative))
-            after_sha256 = _file_sha256(path) if path.is_file() else _MISSING_WORKSPACE_FILE_SHA256
+            after_sha256 = _file_sha256(path) if path.is_file() else MISSING_FILE_SHA256
             if after_sha256 == before_sha256:
                 continue
             changes.append(

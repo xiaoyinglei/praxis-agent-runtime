@@ -6,8 +6,9 @@ import sqlite3
 
 import pytest
 
-from agent_runtime.harness import RuntimeStore, facts, model_ops, turn_ops
+from agent_runtime.harness import RuntimeStore, facts, model_ops, model_retry_ops, turn_ops
 from agent_runtime.harness.events import RolloutEventReader
+from agent_runtime.harness.retry_policy import RetryPolicy
 from agent_runtime.modeling.failures import ModelFailure
 
 
@@ -84,6 +85,47 @@ def test_retry_schedule_is_replayable_and_public_runtime_event(tmp_path):
         assert store.verify().valid
     with RuntimeStore.open_sync(path, read_only=True) as store:
         assert store.list_model_operations(turn.turn_id)[0].status == "retry_wait"
+        assert store.verify().valid
+
+
+@pytest.mark.parametrize(("billing", "expected"), [("unknown", "failed"), ("released", "scheduled")])
+def test_standalone_summary_only_retries_when_billing_is_released(tmp_path, billing, expected):
+    with RuntimeStore.open_sync(tmp_path / "summary-retry.db") as store:
+        thread = turn_ops.create_thread(store, workspace=tmp_path)
+        turn = turn_ops.start_turn(
+            store,
+            thread_id=thread.thread_id,
+            user_message="work",
+            binding_manifest={"model_retry_policy": RetryPolicy().to_payload()},
+        )
+        operation = model_ops.prepare_model_operation(
+            store,
+            turn_id=turn.turn_id,
+            request_hash="r",
+            context_hash="c",
+            tool_hash="t",
+            wire_hash="w",
+            request_ref={
+                "request_id": "summary",
+                "input_revision": 1,
+                "purpose": "context_summary",
+                "compaction_plan": {"summary_request_mode": "standalone"},
+            },
+        )
+        attempt = model_ops.dispatch_model_attempt(store, operation.operation_id, now=100.0)
+        failure = ModelFailure(
+            kind="server_error", phase="response", provider_outcome="rejected", billing_outcome=billing, retryable=True
+        )
+        action = model_retry_ops.record_failure(
+            store,
+            operation_id=operation.operation_id,
+            attempt_id=attempt.attempt_id,
+            generation=attempt.generation,
+            failure=failure,
+            now=101.0,
+        )
+        assert action == expected
+        assert len(store.list_model_attempts(operation.operation_id)) == 1
         assert store.verify().valid
 
 

@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping, Sequence
 
 from agent_runtime.tools.tool import ToolResult
 
 _MAX_RUNTIME_WORKSPACE_FILE_CHANGES = 8
+MISSING_FILE_SHA256 = hashlib.sha256(b"praxis-workspace-file-missing-v1").hexdigest()
+
+
+def workspace_changed(metadata: Mapping[str, object]) -> bool | None:
+    """Read change evidence from current or historical executor results."""
+    if "runtime_workspace_changed" in metadata:
+        value = metadata["runtime_workspace_changed"]
+    else:
+        value = metadata.get("workspace_tree_changed")
+    return value if isinstance(value, bool) else None
 
 
 def runtime_workspace_snapshot(result: ToolResult) -> tuple[str, str] | None:
@@ -37,7 +48,7 @@ def runtime_workspace_file_changes(
 ) -> tuple[tuple[str, str, str], ...]:
     """Return executor-attested concrete file changes, failing closed."""
 
-    if runtime_workspace_snapshot(result) is None:
+    if result.metadata.get("runtime_workspace_write") is not True:
         return ()
     raw_changes = result.metadata.get("runtime_workspace_file_changes")
     if not isinstance(raw_changes, Sequence) or isinstance(raw_changes, (str, bytes)):

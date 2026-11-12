@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
+import sys
+from pathlib import Path
 
 import httpx
 import pytest
@@ -22,7 +26,9 @@ class SyntheticProvider:
     def __init__(self, task):
         self.task = task
         self.agent_calls = 0
+        self.agent_tools = []
         self.summary_sources = []
+        self.summary_tools = []
 
     def generate_with_tools(self, *, messages, **kwargs):
         turn = self._turn(messages=messages, **kwargs)
@@ -47,8 +53,7 @@ class SyntheticProvider:
             }
         )
 
-    def _turn(self, *, messages, **kwargs):
-        del kwargs
+    def _turn(self, *, messages, tools=None, **kwargs):
         text = json.dumps(messages, ensure_ascii=False)
         if (
             "Summarize the supplied execution history faithfully." in text
@@ -56,6 +61,7 @@ class SyntheticProvider:
             or "Return only a checkpoint; do not continue the task or call tools." in text
         ):
             self.summary_sources.append(text)
+            self.summary_tools.append(tools)
             facts = [fact for fact in ["GOLD_WEB_FACT=17", "GOLD_CODE_FACT=17", "GOLD_DIALOG_FACT=17"] if fact in text]
             return ToolUseResult(
                 raw_stop_reason="synthetic",
@@ -63,6 +69,7 @@ class SyntheticProvider:
                 stop_reason=StopReason.END_TURN,
             )
         self.agent_calls += 1
+        self.agent_tools.append(tools)
         if self.task == "web" and self.agent_calls <= 2:
             arguments = {
                 "url": "https://example.com/frozen",
@@ -221,8 +228,12 @@ def test_public_cli_controlled_context_replay(tmp_path, monkeypatch, task, mode)
     assert result.exit_code == 0, result.output + repr(result.exception)
     expected = f"GOLD_{task.upper()}_FACT=17"
     preserves_fact = mode == "capacity" or task == "dialog"
-    if preserves_fact:
+    expect_summary = preserves_fact and (mode, task) != ("capacity", "code")
+    if expect_summary:
         assert provider.summary_sources and expected in str(provider.summary_sources)
+        if mode == "capacity":
+            assert all(not tools for tools in provider.summary_tools)
+            assert any(tools for tools in provider.agent_tools)
     else:
         if provider.summary_sources:
             assert expected in str(provider.summary_sources)
@@ -234,7 +245,10 @@ def test_public_cli_controlled_context_replay(tmp_path, monkeypatch, task, mode)
         compactions = [item for item in items if item.kind == "context_compaction"]
         assert compactions
         if mode == "capacity":
-            assert all(item.payload["algorithm_revision"] == "semantic-compaction-v6" for item in compactions)
+            expected_algorithm = "semantic-compaction-v7" if expect_summary else "tool-output-elision-v5"
+            assert all(item.payload["algorithm_revision"] == expected_algorithm for item in compactions)
+            if not expect_summary:
+                assert not provider.summary_sources
         accepted = store.read_turn_answer(turn.turn_id)
         answer = item_text(accepted)
         assert accepted.kind == "model_response"
@@ -271,3 +285,213 @@ def test_public_cli_controlled_context_replay(tmp_path, monkeypatch, task, mode)
             "cli_output": result.output,
         }
         (tmp_path / "replay-report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2))
+
+
+def _continuity_cli():
+    """Subprocess fixture. Only the provider and the context threshold are synthetic."""
+    from agent_runtime import cli, harness
+    from agent_runtime.harness import services
+
+    recovering = sys.argv[1] == "recover"
+    semantic = os.environ.get("PRAXIS_TEST_SEMANTIC") == "1"
+
+    class ContinuityProvider(SyntheticProvider):
+        def _turn(self, *, messages, **kwargs):
+            text = json.dumps(messages)
+            assert "Keep API_NAME unchanged" in text
+            assert "Finish by verifying both edits" in text
+            if "Create a concise context checkpoint for another LLM" in text:
+                assert semantic and not kwargs.get("tools")
+                assert "ARCHIVED_FACT=42" in text
+                assert Path("sample.py").read_text().splitlines()[1] == "FIRST = 1"
+                return ToolUseResult(
+                    raw_stop_reason="stop",
+                    text="First edit committed. Apply the second edit and verify both. " + "进度已核实。" * 24,
+                    stop_reason=StopReason.END_TURN,
+                )
+            self.agent_calls += 1
+            if recovering:
+                assert "ARCHIVED_FACT=42" not in text or self.agent_calls > 1
+                if self.agent_calls == 1:
+                    assert "patch-after-compaction" in text
+                    if semantic:
+                        assert "First edit committed." in text
+                        return self._call(
+                            "read_context", {"item_id": "history", "query": "ARCHIVED_FACT", "max_chars": 250}
+                        )
+                    [archived] = [message["content"] for message in messages if message.get("tool_call_id") == "run-2"]
+                    item_id = re.search(r"read_context\(item_id='([^']+)'\)", archived).group(1)
+                    name, arguments = "read_context", {"item_id": item_id, "query": "ARCHIVED_FACT", "max_chars": 80}
+                elif self.agent_calls == 2:
+                    assert "ARCHIVED_FACT=42" in text
+                    name, arguments = "read_file", {"path": "sample.py"}
+                else:
+                    [verified] = [
+                        json.loads(message["content"])["structured_content"]["content"]
+                        for message in messages
+                        if message.get("tool_call_id") == "reopen-2"
+                    ]
+                    assert verified == 'API_NAME = "stable"\nFIRST = 1\nSECOND = 42\n'
+                    return ToolUseResult(
+                        raw_stop_reason="stop", text="Both edits verified.", stop_reason=StopReason.END_TURN
+                    )
+            else:
+                edit_step = 8 if semantic else 4
+                if self.agent_calls == 1:
+                    name = "apply_patch"
+                    arguments = {"file_path": "sample.py", "old_string": "FIRST = 0", "new_string": "FIRST = 1"}
+                elif self.agent_calls < edit_step:
+                    name = "read_file"
+                    path = {2: "archive.txt", edit_step - 1: "recent.txt"}.get(
+                        self.agent_calls, f"note{self.agent_calls}.txt"
+                    )
+                    arguments = {"path": path}
+                else:
+                    assert self.agent_calls == edit_step
+                    assert ("First edit committed." if semantic else "Tool output archived") in text
+                    assert "ARCHIVED_FACT=42" not in text
+                    assert "RECENT_FACT=42" in text
+                    assert Path("sample.py").read_text().startswith('API_NAME = "stable"\nFIRST = 1')
+                    name = "apply_patch"
+                    arguments = {"file_path": "sample.py", "old_string": "SECOND = 0", "new_string": "SECOND = 42"}
+            return self._call(name, arguments)
+
+        def _call(self, name, arguments):
+            call_id = f"{'reopen' if recovering else 'run'}-{self.agent_calls}"
+            return ToolUseResult(
+                raw_stop_reason="tool_calls",
+                text="patch-after-compaction"
+                if not recovering and name == "apply_patch" and self.agent_calls > 1
+                else "",
+                stop_reason=StopReason.TOOL_USE,
+                tool_calls=[ModelToolCall(id=call_id, name=name, arguments=arguments)],
+            )
+
+    class ContinuityModel(ReplayModel):
+        def prepare(self, request):
+            if not recovering and request.purpose == "agent_step" and "SECOND = 42" in Path("sample.py").read_text():
+                # The second write has committed. Exit before preparing the
+                # next operation so recover has to project the persisted boundary.
+                os._exit(73)
+            return super().prepare(request)
+
+    provider = ContinuityProvider("continuity")
+    accounting = CharacterAccounting()
+    gateway = LLMGateway(
+        generator=provider,
+        token_accounting=accounting,
+        model_context_tokens=1048576,
+        context_policy=ContextCapacityPolicy(),
+    )
+    model = ContinuityModel(
+        model_id="synthetic-local",
+        resolved=_resolved_model(
+            gateway=gateway, generator=provider, token_accounting=accounting, context_window_tokens=1048576
+        ),
+        instructions=("Use only actual execution evidence.",),
+    )
+    create_facade = cli._create_agent_facade
+
+    def local_facade(**options):
+        agent = create_facade(**options)
+        agent._model_factory = lambda: model
+        return agent
+
+    cli._create_agent_facade = local_facade
+    services.RolloutContextManager = lambda store: harness.RolloutContextManager(
+        store, max_total_bytes=17000 if not semantic else 48000, max_messages=16 if semantic else None
+    )
+    cli.agent_app()
+
+
+@pytest.mark.parametrize("semantic", [False, True], ids=["archive", "summary"])
+def test_cli_recovers_same_turn_after_work_on_both_sides_of_compaction(tmp_path, semantic):
+    (tmp_path / "sample.py").write_text('API_NAME = "stable"\nFIRST = 0\nSECOND = 0\n')
+    (tmp_path / "archive.txt").write_text("ARCHIVED_FACT=42\n" + "a" * 9800)
+    (tmp_path / "recent.txt").write_text("RECENT_FACT=42\n" + "b" * 7800)
+    (tmp_path / "note3.txt").write_text("Preserve the public interface.")
+    (tmp_path / "note4.txt").write_text("Check both lines after writing.")
+    (tmp_path / "note5.txt").write_text("Keep verification evidence.")
+    (tmp_path / "note6.txt").write_text("The second edit remains pending.")
+    database = tmp_path / "continuity.sqlite"
+    entry = [
+        sys.executable,
+        "-c",
+        f"import runpy; runpy.run_path({str(Path(__file__).resolve())!r})['_continuity_cli']()",
+    ]
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(Path(__file__).resolve().parents[3]),
+        "PRAXIS_TEST_SEMANTIC": str(int(semantic)),
+    }
+
+    def cli(*args):
+        result = subprocess.run(
+            [*entry, *args, "--checkpoint-db", str(database)],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        return result.returncode, result.stdout + result.stderr
+
+    code, output = cli(
+        "run",
+        "Keep API_NAME unchanged. Finish by verifying both edits.",
+        "--non-interactive",
+        "--disable-workspace-mcp",
+        "--allow-write-tools",
+        "--no-require-workspace-change",
+    )
+    assert code == 73, output
+    with RuntimeStore.open_sync(database) as store:
+        [turn] = store.list_turns()
+        items = store.list_items(turn.turn_id)
+        [boundary] = [item for item in items if item.kind == "context_compaction"]
+        assert boundary.payload["algorithm_revision"] == (
+            "semantic-compaction-v7" if semantic else "tool-output-elision-v5"
+        )
+        assert boundary.payload["capacity_diagnostics"]["summary_calls"] == int(semantic)
+        archived_result = next(
+            item for item in items if item.payload.get("tool_call_id") == "run-2" and item.kind == "tool_result"
+        )
+        assert "ARCHIVED_FACT=42" in str(archived_result.payload)
+        if semantic:
+            assert any(entry["item_id"] is None for entry in boundary.payload["replacement_history"])
+            assert archived_result.item_id not in {
+                entry["item_id"] for entry in boundary.payload["replacement_history"]
+            }
+        patch_results = [
+            item for item in items if item.kind == "tool_result" and item.payload["tool_name"] == "apply_patch"
+        ]
+        assert len(patch_results) == 2 and all(not item.payload["is_error"] for item in patch_results)
+        assert (
+            patch_results[0].applied_thread_sequence
+            < boundary.applied_thread_sequence
+            < patch_results[1].applied_thread_sequence
+        )
+
+    code, output = cli("recover", turn.turn_id, "--action", "continue")
+    assert code == 0, output
+    with RuntimeStore.open_sync(database) as store:
+        [recovered] = store.list_turns()
+        assert recovered.turn_id == turn.turn_id
+        assert recovered.status == "completed"
+        items = store.list_items(recovered.turn_id)
+        assert [item.item_id for item in items if item.kind == "context_compaction"] == [boundary.item_id]
+        [recall] = [
+            item for item in items if item.kind == "tool_result" and item.payload["tool_name"] == "read_context"
+        ]
+        assert not recall.payload["is_error"]
+        assert "ARCHIVED_FACT=42" in str(recall.payload)
+        if semantic:
+            assert archived_result.item_id in str(recall.payload)
+        assert store.read_item(archived_result.item_id).payload == archived_result.payload
+        [verification] = [
+            item for item in items if item.payload.get("tool_call_id") == "reopen-2" and item.kind == "tool_result"
+        ]
+        assert not verification.payload["is_error"]
+        assert verification.payload["structured_content"]["content"] == 'API_NAME = "stable"\nFIRST = 1\nSECOND = 42\n'
+        assert item_text(store.read_turn_answer(recovered.turn_id)) == "Both edits verified."
+        assert store.verify().valid

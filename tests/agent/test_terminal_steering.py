@@ -39,6 +39,7 @@ async def test_busy_enter_submits_ordered_messages_without_finishing_operation()
                 while "已应用" not in ui.view.plain_text():
                     await asyncio.sleep(.01)
             assert "已应用" in ui.view.plain_text()
+            assert "补充已应用" in "".join(fragment[1] for fragment in ui._footer())
         finally:
             release.set()
             await asyncio.wait_for(task, 3)
@@ -164,3 +165,58 @@ async def test_busy_settings_command_is_not_rendered_as_steering_receipt():
         await ui._send_input('/effort low')
         assert not ui._input_receipts
         assert '等待应用' not in ui.view.plain_text()
+
+
+@pytest.mark.anyio
+async def test_chat_queues_guidance_during_session_startup(tmp_path, monkeypatch):
+    from contextlib import asynccontextmanager
+
+    from agent_runtime import Agent
+    from agent_runtime.cli import _chat_facade_loop
+    from tests.agent.harness.test_steering import SteeringModel
+
+    model = SteeringModel()
+    agent = Agent(checkpoint_db=tmp_path / "run.db", workspace_path=tmp_path)
+    monkeypatch.setattr(agent, "_model_factory", lambda: model)
+    opening = asyncio.Event()
+    release_open = asyncio.Event()
+    open_session = agent.session
+
+    @asynccontextmanager
+    async def delayed_session(**kwargs):
+        opening.set()
+        await release_open.wait()
+        async with open_session(**kwargs) as session:
+            yield session
+
+    monkeypatch.setattr(agent, "session", delayed_session)
+    with create_pipe_input() as pipe:
+        ui = TerminalChatApp(model="test", workspace=str(tmp_path), input=pipe, output=DummyOutput())
+        task = asyncio.create_task(ui.run(lambda: _chat_facade_loop(agent, max_tokens_total=None, _ui=ui)))
+        try:
+            async with asyncio.timeout(5):
+                while not ui.waiting:
+                    await asyncio.sleep(.01)
+                pipe.send_text("initial task\r")
+                await opening.wait()
+                pipe.send_text("new requirement during startup\r")
+                while "补充已排队" not in ui.view.plain_text():
+                    await asyncio.sleep(.01)
+                release_open.set()
+                await model.started.wait()
+                while "补充已接收" not in ui.view.plain_text() and "已应用" not in ui.view.plain_text():
+                    await asyncio.sleep(.01)
+                model.release.set()
+                while not ui.waiting:
+                    await asyncio.sleep(.01)
+            assert [m.content for m in model.requests[-1].messages if m.role == "user"] == [
+                "initial task", "new requirement during startup",
+            ]
+            pipe.send_text("/exit\r")
+            await asyncio.wait_for(task, 5)
+        finally:
+            release_open.set()
+            model.release.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)

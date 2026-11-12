@@ -18,6 +18,7 @@ from uuid import uuid4
 from agent_runtime.harness import artifact_ops, facts, turn_ops
 from agent_runtime.harness.command_evidence import command_succeeded, trusted_command_results
 from agent_runtime.harness.protocol import item_text, restore_model_response
+from agent_runtime.harness.records import ItemSnapshot
 from agent_runtime.harness.runtime_store import RuntimeStore, owner_operation
 from agent_runtime.workspace_snapshot import (
     archive_tree,
@@ -147,6 +148,33 @@ def _restore_objects(store: RuntimeStore, version: Mapping[str, Any], repository
                 raise RuntimeError(f"archived input identity mismatch: {path}")
     if tree_from_entries(repository, dict(version["entries"])) != version["tree"]:
         raise RuntimeError("archived tree identity mismatch")
+
+
+def enabled(binding: Mapping[str, Any]) -> bool:
+    policy = binding.get("delivery_policy", {})
+    return isinstance(policy, Mapping) and policy.get("revision") == REVISION
+
+
+def _acceptance_requested(binding: Mapping[str, Any]) -> bool:
+    policy = binding.get("completion_policy", {})
+    return isinstance(policy, Mapping) and (
+        policy.get("require_workspace_change") is True or bool(policy.get("acceptance_command"))
+    )
+
+
+@owner_operation
+def begin_before_write(store: RuntimeStore, turn_id: str) -> None:
+    with store.tx.transaction():
+        if enabled(store.read_turn(turn_id).binding_manifest):
+            begin(store, turn_id)
+
+
+def should_record_on_stop(binding: Mapping[str, Any], items: Sequence[ItemSnapshot]) -> bool:
+    return (
+        enabled(binding)
+        and not any(item.kind == "delivery_record" for item in items)
+        and (_acceptance_requested(binding) or any(item.kind == "delivery_baseline" for item in items))
+    )
 
 
 @owner_operation
@@ -586,11 +614,14 @@ def inspect(store: RuntimeStore, turn_id: str, *, include_live_evidence: bool = 
             actions.append("Reconcile unknown operations: " + ", ".join(unknown))
         if pending:
             actions.append("Resolve pending interactions: " + ", ".join(pending))
+        binding = store.read_turn(turn_id).binding_manifest
+        if not actions and (_acceptance_requested(binding) or _latest(store, turn_id, "delivery_baseline")):
+            actions.append("Record delivery scope and evidence.")
         return {
             "status": "blocked" if unknown or pending else "unverified",
             "verified_scope": [],
             "unknown_operations": unknown,
-            "next_actions": actions or ["Record delivery scope and evidence."],
+            "next_actions": actions,
         }
     value["delivery_id"] = next(i.item_id for i in reversed(store.list_items(turn_id)) if i.kind == "delivery_record")
     return _assess(store, turn_id, value, include_live_evidence=include_live_evidence)

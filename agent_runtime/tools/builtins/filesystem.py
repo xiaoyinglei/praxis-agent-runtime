@@ -3,6 +3,7 @@ from __future__ import annotations
 import codecs
 import difflib
 import fnmatch
+import hashlib
 import os
 import stat
 from collections.abc import Mapping
@@ -12,6 +13,7 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agent_runtime.tools.builtins.file_access import atomic_bytes, file_version, open_binary, workspace_write_lock
+from agent_runtime.tools.evidence import MISSING_FILE_SHA256
 from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
@@ -225,6 +227,7 @@ class ApplyPatchOutput(BaseModel):
 @dataclass(frozen=True, slots=True)
 class _ApplyPatchRunResult:
     output: ApplyPatchOutput
+    committed_file_changes: tuple[tuple[str, str, str], ...] = ()
     diff: str = ""
     diff_truncated: bool = False
 
@@ -352,6 +355,7 @@ def create_apply_patch_tool(workspace: WorkspaceRuntime) -> Tool:
             ApplyPatchInput.model_validate(arguments),
         ),
         normalize_output=_normalize_apply_patch,
+        committed_file_changes=_committed_patch_changes,
         output_schema=_PATCH_OUTPUT_SCHEMA,
         static_effects=frozenset(
             {
@@ -682,7 +686,7 @@ def _apply_patch_locked(workspace: WorkspaceRuntime, request: ApplyPatchInput) -
             file_path=request.file_path,
         )
         try:
-            _atomic_create_text(target, request.new_string)
+            installed = _atomic_create_text(target, request.new_string)
         except FileExistsError:
             return _ApplyPatchRunResult(
                 ApplyPatchOutput(
@@ -700,6 +704,7 @@ def _apply_patch_locked(workspace: WorkspaceRuntime, request: ApplyPatchInput) -
                 occurrences=0,
                 message="file created",
             ),
+            committed_file_changes=((relative.as_posix(), MISSING_FILE_SHA256, installed),),
             diff=diff,
             diff_truncated=diff_truncated,
         )
@@ -774,7 +779,7 @@ def _apply_patch_locked(workspace: WorkspaceRuntime, request: ApplyPatchInput) -
         updated,
         file_path=request.file_path,
     )
-    _atomic_write_text(target, updated, expected=version)
+    installed = _atomic_write_text(target, updated, expected=version)
     return _ApplyPatchRunResult(
         ApplyPatchOutput(
             file_path=request.file_path,
@@ -782,6 +787,7 @@ def _apply_patch_locked(workspace: WorkspaceRuntime, request: ApplyPatchInput) -
             occurrences=occurrences if request.replace_all else 1,
             message="patch applied",
         ),
+        committed_file_changes=((relative.as_posix(), hashlib.sha256(raw).hexdigest(), installed),),
         diff=diff,
         diff_truncated=diff_truncated,
     )
@@ -810,13 +816,21 @@ def _patch_diff(
 
 
 def _atomic_write_text(path: Path, content: str, *,
-                       expected: tuple[int, int, int, int, int] | None = None) -> None:
+                       expected: tuple[int, int, int, int, int] | None = None) -> str:
     mode = stat.S_IMODE(path.stat().st_mode)
-    atomic_bytes(path, content.encode("utf-8"), mode=mode, expected=expected)
+    encoded = content.encode("utf-8")
+    atomic_bytes(path, encoded, mode=mode, expected=expected)
+    return hashlib.sha256(encoded).hexdigest()
 
 
-def _atomic_create_text(path: Path, content: str) -> None:
-    atomic_bytes(path, content.encode("utf-8"), create_only=True)
+def _atomic_create_text(path: Path, content: str) -> str:
+    encoded = content.encode("utf-8")
+    atomic_bytes(path, encoded, create_only=True)
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _committed_patch_changes(raw: object) -> tuple[tuple[str, str, str], ...] | None:
+    return raw.committed_file_changes if isinstance(raw, _ApplyPatchRunResult) else None
 
 
 def _workspace_use(

@@ -90,7 +90,7 @@ class RolloutContextManager:
         return next(
             (
                 item
-                for item in reversed(self._store.list_items(turn_id))
+                for item in reversed(self._store.list_items(turn_id, kind="plan_state"))
                 if item.kind == "plan_state" and item.status == "completed"
             ),
             None,
@@ -177,6 +177,7 @@ class RolloutContextManager:
         require_reduction: bool = True,
         summary_override: str | None = None,
         validate: bool = True,
+        checkpoint: bool = False,
     ) -> ContextCompactionCandidate:
         if isinstance(retained, bool) or not isinstance(retained, int) or retained < 0:
             raise ValueError("retained_tail_messages must be a non-negative integer")
@@ -228,7 +229,9 @@ class RolloutContextManager:
             raise ContextBudgetExceededError(
                 "No completed context is available for compaction.", reason_code="no_compactable_context"
             )
-        semantic_tail = summary_override is not None and self.capacity_policy(turn_id) is not None and retained > 0
+        semantic_tail = (
+            summary_override is not None and (checkpoint or self.capacity_policy(turn_id) is not None) and retained > 0
+        )
         if semantic_tail:
             # The source already summarizes this exchange. Preserve its raw
             # replay separately, so the next summary does not summarize it again.
@@ -281,6 +284,7 @@ class RolloutContextManager:
                         "semantic-compaction-v4",
                         "semantic-compaction-v5",
                         "semantic-compaction-v6",
+                        "semantic-compaction-v7",
                     }
                     previous = [
                         entry
@@ -339,8 +343,30 @@ class RolloutContextManager:
             if summary_override is None
             else ("semantic-compaction-v6" if self.capacity_policy(turn_id) is not None else "semantic-compaction-v4"),
         }
-        synthetic = replace(items[-1], item_id="candidate", kind="context_compaction", payload=payload)
-        result = tuple(m for _, m in self._project_items((*items, synthetic)))
+        if checkpoint:
+            payload["algorithm_revision"] = "semantic-compaction-v7"
+            covered_ids = set(payload["covered_item_ids"])
+            retained_prefix = [(item_id, message) for item_id, message in projected if item_id in protected]
+            # Put the summary after protected input and before any verbatim
+            # exchange it introduces. Keep the original projected exchange order.
+            anchor = next(
+                (index for index, (_, message) in enumerate(retained_prefix) if message.tool_calls),
+                len(retained_prefix),
+            )
+            replacement_history = [
+                *retained_prefix[:anchor],
+                (None, _compaction_message(payload)),
+                *retained_prefix[anchor:],
+                *((item_id, message) for item_id, message in projected if item_id not in covered_ids),
+            ]
+            payload["replacement_history"] = [
+                {"item_id": item_id, "message": model_message_payload(message)}
+                for item_id, message in replacement_history
+            ]
+            result = tuple(message for _, message in replacement_history)
+        else:
+            synthetic = replace(items[-1], item_id="candidate", kind="context_compaction", payload=payload)
+            result = tuple(m for _, m in self._project_items((*items, synthetic)))
         _validate_tool_groups(result)
         if validate:
             self._validate_budget(result, turn_id=turn_id)
@@ -367,13 +393,17 @@ class RolloutContextManager:
             return 0
         return len(tail)
 
-    def semantic_floor(self, turn_id: str, *, retained_tail_messages: int = 0) -> ContextCompactionCandidate:
+    def semantic_floor(
+        self, turn_id: str, *, retained_tail_messages: int = 0, checkpoint: bool = False
+    ) -> ContextCompactionCandidate:
         """Measure the irreducible continuation before spending on a summary.
 
         Empty summary candidates are planning-only; the store rejects committing
         them. Local limits and the normal model adapter still apply.
         """
-        return self._candidate(turn_id, retained_tail_messages, require_reduction=False, summary_override="")
+        return self._candidate(
+            turn_id, retained_tail_messages, require_reduction=False, summary_override="", checkpoint=checkpoint
+        )
 
     def summary_byte_allowance(
         self, floor: ContextCompactionCandidate, *, messages: tuple[ModelMessage, ...] | None = None
@@ -381,14 +411,21 @@ class RolloutContextManager:
         # Include live request facts when the caller has captured them. They
         # occupy the same byte envelope as the history and summary.
         messages = floor.messages if messages is None else messages
-        context_size = next(_message_size_bytes(m) for m in messages if m.role == "context")
+        context_size = next(_message_size_bytes(m) for m in messages if m.context_category == "continuation_summary")
         limits = self.limits(floor.turn_id)
         return min(
             limits["max_total_bytes"] - sum(map(_message_size_bytes, messages)), limits["max_item_bytes"] - context_size
         )
 
-    def semantic_source(self, turn_id: str, *, retained_tail_messages: int = 0) -> tuple[str, str]:
-        """Freeze the current continuation plus new history, without truncation.
+    def semantic_source(
+        self,
+        turn_id: str,
+        *,
+        retained_tail_messages: int = 0,
+        use_archived_projection: bool = False,
+        checkpoint: bool = False,
+    ) -> tuple[str, str]:
+        """Freeze the current continuation plus new history.
 
         Internal summary bookkeeping is excluded. Global revision CAS still guards
         the final commit; this fingerprint detects changes across summary calls.
@@ -405,6 +442,7 @@ class RolloutContextManager:
             require_reduction=False,
             summary_override="Pending semantic summary",
             validate=False,
+            checkpoint=checkpoint,
         )
         payload = json.loads(candidate.payload_json)
         covered = set(payload["covered_item_ids"])
@@ -413,9 +451,14 @@ class RolloutContextManager:
         # The projection includes prior committed summaries. Replaying their raw
         # covered items AND compaction payloads recursively duplicates history.
         # Originals remain in the archive for targeted recall.
+        projected = self._projected_messages(turn_id)
         sources: list[dict[str, Any]] = [
-            {"history_index": history_positions[item_id], **model_message_payload(message)}
-            for item_id, message in self._projected_messages(turn_id)
+            {
+                "history_index": history_positions[item_id],
+                **({"item_id": item_id} if checkpoint else {}),
+                **model_message_payload(message),
+            }
+            for item_id, message in projected
             if item_id in covered and (item_id not in protected or message.role != "user")
         ]
         items = self._store.list_context_items(turn_id)
@@ -429,9 +472,11 @@ class RolloutContextManager:
             )
             for item_id in item.payload.get("covered_item_ids", ())
         }
-        if self.capacity_policy(turn_id) is not None:
-            # Elision coverage proves archival, not semantic coverage. Recover
-            # canonical evidence only after the most recent semantic summary.
+        if not checkpoint and self.capacity_policy(turn_id) is not None:
+            # Elision coverage proves archival, not semantic coverage. New
+            # requests use its committed result references. Old jobs can still
+            # reconstruct the original summary source for frozen replay.
+            projected_results = {item_id: message for item_id, message in projected if message.role == "tool"}
             semantic = next(
                 (
                     item
@@ -460,6 +505,8 @@ class RolloutContextManager:
                 ):
                     continue
                 message = _item_message(item, answer_item_ids=answer_item_ids)
+                if use_archived_projection and item.kind == "tool_result":
+                    message = projected_results.get(item.item_id)
                 for entry in (*_request_context_messages(item), *((message,) if message is not None else ())):
                     if item.item_id not in protected or entry.role != "user":
                         sources.append(
@@ -485,7 +532,8 @@ class RolloutContextManager:
             and item.item_id in covered
             and item.item_id not in previously_summarized
         )
-        sources.sort(key=lambda entry: entry["history_index"])
+        if not checkpoint:
+            sources.sort(key=lambda entry: entry["history_index"])
         if not sources:
             raise ContextBudgetExceededError(
                 "No eligible history beyond the protected user task.", reason_code="no_compactable_context"
@@ -493,9 +541,18 @@ class RolloutContextManager:
         source = _json(
             {
                 "history": sources,
-                "current_task": next(
-                    m.content for _, m in reversed(self._projected_messages(turn_id)) if m.role == "user"
+                **(
+                    {
+                        "user_inputs": [
+                            message.content
+                            for item_id, message in projected
+                            if item_id in protected and message.role == "user"
+                        ]
+                    }
+                    if checkpoint
+                    else {}
                 ),
+                "current_task": next(m.content for _, m in reversed(projected) if m.role == "user"),
                 "history_order": "Oldest to newest; later explicit revisions supersede earlier decisions.",
                 "archive_lookup": "read_context(item_id='history', query=...) locates original evidence and its IDs.",
                 "protected_facts": payload["preserved_facts"],
@@ -505,19 +562,28 @@ class RolloutContextManager:
         return hashlib.sha256(source.encode()).hexdigest(), source
 
     def semantic_candidate(
-        self, turn_id: str, *, source_hash: str, summary: str, retained_tail_messages: int = 0
+        self,
+        turn_id: str,
+        *,
+        source_hash: str,
+        summary: str,
+        retained_tail_messages: int = 0,
+        use_archived_projection: bool = False,
+        checkpoint: bool = False,
     ) -> ContextCompactionCandidate:
         revision = self._store.context_source_revision(turn_id)
-        if self.semantic_source(turn_id, retained_tail_messages=retained_tail_messages)[0] != source_hash:
+        current_hash, _ = self.semantic_source(
+            turn_id,
+            retained_tail_messages=retained_tail_messages,
+            use_archived_projection=use_archived_projection,
+            checkpoint=checkpoint,
+        )
+        if current_hash != source_hash:
             raise ContextSourceChangedError("Context changed while generating its semantic summary.")
-        candidate = self._candidate(turn_id, retained_tail_messages, summary_override=summary)
+        candidate = self._candidate(turn_id, retained_tail_messages, summary_override=summary, checkpoint=checkpoint)
         if candidate.source_revision != revision:
             raise ContextSourceChangedError("Context changed while projecting its semantic summary.")
-        payload = json.loads(candidate.payload_json)
-        payload["algorithm_revision"] = (
-            "semantic-compaction-v6" if self.capacity_policy(turn_id) is not None else "semantic-compaction-v4"
-        )
-        return replace(candidate, payload_json=_json(payload))
+        return candidate
 
     def max_tool_result_bytes(self, turn_id: str) -> int:
         return max(
@@ -538,7 +604,7 @@ class RolloutContextManager:
         if max_result_bytes is not None and (type(max_result_bytes) is not int or max_result_bytes < 0):
             raise ValueError("max_result_bytes must be a non-negative integer")
         revision = self._store.context_source_revision(turn_id)
-        items = tuple(i for i in self._store.list_context_items(turn_id) if i.status == "completed")
+        items = tuple(i for i in self._store.list_model_context_items(turn_id) if i.status == "completed")
         projected = self._project_items(items)
         if not projected:
             return
@@ -629,10 +695,11 @@ class RolloutContextManager:
             algorithm_revision=payload["algorithm_revision"],
             tool_result_overrides=payload.get("tool_result_overrides"),
             capacity_diagnostics=payload.get("capacity_diagnostics"),
+            replacement_history=payload.get("replacement_history"),
         )
 
     def _projected_messages(self, turn_id: str) -> tuple[tuple[str, ModelMessage], ...]:
-        return self._project_items(self._store.list_context_items(turn_id))
+        return self._project_items(self._store.list_model_context_items(turn_id))
 
     def _accepted_answer_ids(self, items: tuple[ItemSnapshot, ...]) -> frozenset[str]:
         return frozenset(
@@ -647,7 +714,7 @@ class RolloutContextManager:
 
 def validate_tool_history(store: RuntimeStore, turn_id: str) -> None:
     """Check provider message structure without applying an old Turn's capacity limits."""
-    projected = RolloutContextManager(store)._project_items(store.list_context_items(turn_id))
+    projected = RolloutContextManager(store)._projected_messages(turn_id)
     _validate_tool_groups(tuple(message for _, message in projected))
 
 
@@ -664,7 +731,36 @@ def _project_items(
     *,
     answer_item_ids: frozenset[str] = frozenset(),
 ) -> tuple[tuple[str, ModelMessage], ...]:
-    replacements, suppressed = _compaction_projection(items, answer_item_ids=answer_item_ids)
+    checkpoint_index = next(
+        (
+            index
+            for index in range(len(items) - 1, -1, -1)
+            if items[index].status == "completed"
+            and items[index].kind == "context_compaction"
+            and (
+                "tool_result_overrides" not in items[index].payload
+                or items[index].payload.get("algorithm_revision") == "semantic-compaction-v5"
+            )
+        ),
+        None,
+    )
+    checkpoint = items[checkpoint_index] if checkpoint_index is not None else None
+    history: tuple[tuple[str, ModelMessage], ...] = ()
+    start = 0
+    if checkpoint is not None and "replacement_history" in checkpoint.payload:
+        start = checkpoint_index + 1
+        history = tuple(
+            (entry["item_id"] or checkpoint.item_id, restore_model_message(entry["message"]))
+            for entry in checkpoint.payload["replacement_history"]
+        )
+        _validate_tool_groups(tuple(message for _, message in history))
+    visible_history_ids = {item_id for item_id, _ in history}
+    replacements, suppressed = _compaction_projection(
+        items,
+        answer_item_ids=answer_item_ids,
+        start=start,
+        suppressed={item.item_id for item in items[:start]} - visible_history_ids,
+    )
     reconciled = {
         (item.turn_id, result.get("tool_call_id"))
         for item in items
@@ -678,8 +774,16 @@ def _project_items(
         for item in items
         if item.kind == "model_response" and item.payload.get("tool_result_order") == "call-v1"
     }
+    by_id = {item.item_id: item for item in items}
     projected = []
-    for item in items:
+    for item_id, message in history:
+        original = by_id[item_id]
+        if message.role == "tool" and (original.turn_id, message.tool_call_id) in reconciled:
+            continue
+        if message.role == "tool" and item_id in replacements:
+            message = replacements[item_id]
+        projected.append((item_id, message))
+    for item in items[start:]:
         if item.status != "completed":
             continue
         if (replacement := replacements.get(item.item_id)) is not None:
@@ -847,9 +951,8 @@ def _item_message(
     ):
         return ModelMessage(
             role="context",
-            body="Host hook observation (separate from the tool result): " + _json({
-                key: item.payload[key] for key in ("hook_name", "source_item_id", "feedback")
-            }),
+            body="Host hook observation (separate from the tool result): "
+            + _json({key: item.payload[key] for key in ("hook_name", "source_item_id", "feedback")}),
         )
     if item.kind in {"completion_feedback", "context_message"} and isinstance(text, str):
         return ModelMessage(role="context", body=text)
@@ -963,11 +1066,13 @@ def _compaction_projection(
     items: tuple[ItemSnapshot, ...],
     *,
     answer_item_ids: frozenset[str] = frozenset(),
+    start: int = 0,
+    suppressed: set[str] | None = None,
 ) -> tuple[dict[str, ModelMessage], set[str]]:
     replacements: dict[str, ModelMessage] = {}
-    suppressed: set[str] = set()
+    suppressed = set() if suppressed is None else suppressed
     visible_ids = {item.item_id for item in items}
-    for item in items:
+    for item in items[start:]:
         if item.status != "completed" or item.kind != "context_compaction":
             continue
         covered = item.payload.get("covered_item_ids")
@@ -1004,15 +1109,21 @@ def _compaction_projection(
                     suppressed.add(target)
             suppressed.add(item.item_id)
             continue
+        preserved = set(item.payload.get("preserved_item_ids", ()))
+        archived_results = {
+            target for target in preserved if target in replacements and replacements[target].role == "tool"
+        }
         for target in covered:
-            replacements.pop(target, None)
+            if target not in archived_results:
+                replacements.pop(target, None)
         anchor = covered[0]
         if item.payload.get("algorithm_revision") in {
             "semantic-compaction-v4",
             "semantic-compaction-v5",
             "semantic-compaction-v6",
+            "semantic-compaction-v7",
         }:
-            protected = set(item.payload.get("preserved_item_ids", ()))
+            protected = preserved
             anchor = next(
                 (
                     original.item_id
@@ -1038,7 +1149,7 @@ def _compaction_projection(
             )
         replacements[anchor] = _compaction_message(item.payload)
         suppressed.update(covered)
-        suppressed.difference_update(item.payload.get("preserved_item_ids", ()))
+        suppressed.difference_update(preserved - archived_results)
         if semantic_replay:
             originals = {original.item_id: original for original in items}
             for target, content in item.payload.get("tool_result_overrides", {}).items():

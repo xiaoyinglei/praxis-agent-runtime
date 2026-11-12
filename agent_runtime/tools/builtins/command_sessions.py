@@ -222,7 +222,14 @@ class CommandSessions:
         if not isinstance(session_id, str) or session_id not in self._sessions:
             return None
         phase: Literal["start", "observe"] = "observe" if arguments.get("session_id") == session_id else "start"
-        return ToolContinuation(self, session_id, phase, output.get("status") != "running")
+        terminal = output.get("status") != "running"
+        # A durable worker is released only after the launch result commits.
+        # Polls report job state; the terminal result observes workspace effects.
+        durable = self._sessions[session_id].state_path is not None
+        return ToolContinuation(
+            self, session_id, phase, terminal,
+            observe_workspace=(terminal or not durable) and output.get("sandbox_error") is None,
+        )
 
 
 def create_manage_command_tool(workspace: WorkspaceRuntime, sessions: CommandSessions | None) -> Tool:

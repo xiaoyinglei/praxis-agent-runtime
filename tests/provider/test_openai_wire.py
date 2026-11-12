@@ -513,3 +513,17 @@ def test_openai_wire_is_only_a_serializer_and_parser() -> None:
     assert "select_tools" not in source
     assert "can_use_tool" not in source
     assert "ToolExecutor" not in source
+
+
+@pytest.mark.parametrize("wrap", [dict, SimpleNamespace])
+def test_parse_compatible_text_parts(wrap):
+    message = wrap(content=[wrap(type="text", text="one"), wrap(type="text", text=" two")])
+    response = wrap(choices=[wrap(message=message, finish_reason="stop")])
+    assert parse_openai_response(response).text == "one two"
+
+
+def test_unsupported_response_content_is_a_protocol_error():
+    response = {"choices": [{"message": {"content": [{"type": "image_url", "image_url": {}}]},
+                             "finish_reason": "stop"}]}
+    with pytest.raises(ValueError, match="unsupported content part"):
+        parse_openai_response(response)
