@@ -69,17 +69,26 @@ def to_messages(items: Sequence[Item]) -> list[ModelMessage]:
     属于结果集合,原样投影)。真实结果 item 遇到时正常投影,不会重复。
     这样任何 provider 的 tool_use/tool_result 配对校验(OpenAI/Anthropic 会
     拒绝孤儿 tool_calls)都不会因中断轮次而失败。
+
+    结果覆盖(R10,同一第一遍的图完成):一个 call_id 出现多条 tool_result 时
+    只投影**最后**一条(最新 seq 胜;seq 相同取列表靠后者)。reconcile 会在
+    outcome_unknown 之后追加对账结果——被覆盖的旧结果仍留在 item 日志做审计,
+    但不再进入模型上下文,避免同一调用出现两个互相矛盾的工具消息。
     """
-    result_call_ids = _call_ids_with_results(items)
+    last_result_keys = _last_result_keys(items)
     messages: list[ModelMessage] = []
-    for item in items:
+    for position, item in enumerate(items):
+        if item.kind == ItemKind.TOOL_RESULT:
+            call_id = item.payload.get("call_id")
+            if isinstance(call_id, str) and last_result_keys.get(call_id) != (item.seq, position):
+                continue  # R10:非最新结果,留在日志不进投影
         message = _to_message(item)
         if message is None:
             continue
         messages.append(message)
         if message.role == "assistant" and message.tool_calls:
             for call in message.tool_calls:
-                if call.call_id not in result_call_ids:
+                if call.call_id not in last_result_keys:
                     messages.append(
                         ModelMessage(
                             role="tool",
@@ -90,16 +99,24 @@ def to_messages(items: Sequence[Item]) -> list[ModelMessage]:
     return messages
 
 
-def _call_ids_with_results(items: Sequence[Item]) -> set[str]:
-    """配对修复第一遍:凡 tool_result item(str call_id)即视为"该 call 已有结果"。"""
-    call_ids: set[str] = set()
-    for item in items:
+def _last_result_keys(items: Sequence[Item]) -> dict[str, tuple[int, int]]:
+    """两遍处理第一遍:call_id → 其最新 tool_result 的 (seq, 列表位置)。
+
+    键集合即"已有结果的 call_id"(R9 配对判据);值给出该 call 哪条结果进投影
+    (R10 覆盖判据)。存在性与覆盖判定都只看 kind+call_id,与 status 无关。
+    """
+    latest: dict[str, tuple[int, int]] = {}
+    for position, item in enumerate(items):
         if item.kind != ItemKind.TOOL_RESULT:
             continue
         call_id = item.payload.get("call_id")
-        if isinstance(call_id, str):
-            call_ids.add(call_id)
-    return call_ids
+        if not isinstance(call_id, str):
+            continue
+        key = (item.seq, position)
+        current = latest.get(call_id)
+        if current is None or key >= current:
+            latest[call_id] = key
+    return latest
 
 
 # ---------------------------------------------------------------------------

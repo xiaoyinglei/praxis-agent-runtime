@@ -425,3 +425,96 @@ def test_build_context_empty_and_no_boundaries() -> None:
     items = [mk(1, "user_message", {"text": "a"})]
     out = build_context(items)
     assert out == items and out is not items  # 返回新 list,不改输入
+
+
+# ---------------------------------------------------------------------------
+# R10:同一 call_id 只投影最后一条 tool_result(最新 seq 胜;旧结果留库审计)
+# ---------------------------------------------------------------------------
+
+
+def _result(seq: int, call_id: str, text: str, status: str) -> Item:
+    return mk(
+        seq,
+        "tool_result",
+        {
+            "call_id": call_id,
+            "status": status,
+            "content": [{"type": "text", "data": {"text": text}}],
+        },
+    )
+
+
+def test_r10_only_last_result_for_a_call_is_projected() -> None:
+    items = [
+        mk(1, "model_response", {"content": "", "tool_calls": [{"call_id": "c1", "name": "t", "arguments": {}}]}),
+        _result(2, "c1", "first answer", "ok"),
+        _result(3, "c1", "second answer", "ok"),
+    ]
+    msgs = to_messages(items)
+    assert [m.role for m in msgs] == ["assistant", "tool"]
+    assert msgs[1].content == "second answer"
+    assert msgs[1].tool_call_id == "c1"
+
+
+def test_r10_outcome_unknown_then_reconciled_projects_ok_only() -> None:
+    # reconcile 的真实序列:崩溃续跑写 outcome_unknown,人工对账再写 ok——只有最后一条进投影
+    items = [
+        mk(1, "model_response", {"content": "", "tool_calls": [{"call_id": "c1", "name": "t", "arguments": {}}]}),
+        _result(2, "c1", "[outcome unknown: process died during execution]", "outcome_unknown"),
+        _result(3, "c1", "reconciled by user: ok", "ok"),
+    ]
+    msgs = to_messages(items)
+    assert [m.role for m in msgs] == ["assistant", "tool"]
+    assert msgs[1].content == "reconciled by user: ok"
+    assert "outcome unknown" not in msgs[1].content
+    # failed 对账同理
+    items2 = [items[0], items[1], _result(3, "c1", "reconciled by user: failed", "error")]
+    msgs2 = to_messages(items2)
+    assert msgs2[1].content == "reconciled by user: failed"
+
+
+def test_r10_single_result_behavior_unchanged() -> None:
+    items = [
+        mk(1, "model_response", {"content": "", "tool_calls": [{"call_id": "c1", "name": "t", "arguments": {}}]}),
+        _result(2, "c1", "the only one", "ok"),
+        mk(3, "user_message", {"text": "next"}),
+    ]
+    msgs = to_messages(items)
+    assert [m.role for m in msgs] == ["assistant", "tool", "user"]
+    assert msgs[1].content == "the only one"
+
+
+def test_r10_pairing_invariant_holds_with_duplicate_results() -> None:
+    # 每 call_id 恰好一条 tool 消息(c1 双结果取最后,c2 走 R9 合成),且顺序不变
+    items = [
+        mk(
+            1,
+            "model_response",
+            {
+                "content": "",
+                "tool_calls": [
+                    {"call_id": "c1", "name": "t", "arguments": {}},
+                    {"call_id": "c2", "name": "t", "arguments": {}},
+                ],
+            },
+        ),
+        _result(2, "c1", "old", "outcome_unknown"),
+        _result(3, "c1", "new", "ok"),
+    ]
+    msgs = to_messages(items)
+    tool_msgs = [m for m in msgs if m.role == "tool"]
+    assert [m.tool_call_id for m in tool_msgs] == ["c2", "c1"]
+    assert tool_msgs[1].content == "new"
+    assert "old" not in "".join(m.content for m in msgs)
+
+
+def test_r10_last_by_seq_wins_even_if_list_order_differs() -> None:
+    # 判据是 seq(最新 seq 胜),不是列表位置——乱序输入仍投影 seq 最大的一条
+    items = [
+        mk(1, "model_response", {"content": "", "tool_calls": [{"call_id": "c1", "name": "t", "arguments": {}}]}),
+        _result(4, "c1", "later seq wins", "ok"),
+        _result(2, "c1", "earlier seq loses", "ok"),
+    ]
+    msgs = to_messages(items)
+    assert [m.role for m in msgs] == ["assistant", "tool"]
+    assert msgs[1].content == "later seq wins"
