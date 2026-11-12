@@ -6,6 +6,11 @@ asyncio.run 包装:仓库无 pytest-asyncio,与 test_model_adapters.py 同风格
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import gc
+import os
+import signal
+import time
 from pathlib import Path
 from typing import Any
 
@@ -66,11 +71,26 @@ def test_bash_exit_code_and_output(tmp_path: Path) -> None:
 
 
 def test_bash_timeout_kills_process_group(tmp_path: Path) -> None:
-    r = run(create_bash_tool(tmp_path), {"command": "sleep 30", "timeout_seconds": 1})
+    pidfile = tmp_path / "pid"
+    r = run(create_bash_tool(tmp_path), {"command": "echo $$ > pid; sleep 30", "timeout_seconds": 1})
     assert r.status is ResultStatus.TIMEOUT
     assert r.metadata["timed_out"]
     assert r.is_error
     assert r.error_code == "timeout"
+    assert_dead(pidfile)
+
+
+def assert_dead(pidfile: Path, budget: float = 6.0) -> None:
+    """pidfile 记录的进程必须已被回收:os.kill(pid, 0) → ProcessLookupError。"""
+    pid = int(pidfile.read_text().strip())
+    deadline = time.monotonic() + budget
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        assert time.monotonic() < deadline, f"process {pid} survived; expected group convergence"
+        time.sleep(0.1)
 
 
 def test_bash_background_child_does_not_hang(tmp_path: Path) -> None:
@@ -183,6 +203,95 @@ def test_resolve_use_targets(tmp_path: Path) -> None:
     bash = create_bash_tool(workspace)
     use = bash.resolve_use({"command": "true"})
     assert use.effects == frozenset({ToolEffect.EXECUTE_PROCESS})
+
+
+# ---------------------------------------------------------------------------
+# 评审修复轮 1:子进程生命周期三缺陷的回归
+# ---------------------------------------------------------------------------
+
+
+def test_bash_setsid_escaped_grandchild_does_not_hostage(tmp_path: Path, capfd: Any) -> None:
+    # Finding 1:逃逸出进程组的孙进程持有管道写端,不得绑架 run() 与 timeout_seconds
+    tool = create_bash_tool(tmp_path)
+    command = (
+        "python3 -c 'import os,time;"
+        'f=open("escape.pid","w");f.write(str(os.getpid()));f.close();'
+        "os.setsid();time.sleep(30)' & echo done"
+    )
+    started = time.monotonic()
+
+    async def drive() -> tuple[Any, float]:
+        r = await tool.run({"command": command, "timeout_seconds": 2})
+        elapsed = time.monotonic() - started
+        escaped_pid = int((tmp_path / "escape.pid").read_text().strip())
+        # Phase 1 不追杀 setsid 逃逸进程;测试自己收尾
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(escaped_pid, signal.SIGKILL)
+        # 逃逸者死亡 → 管道 EOF,abandoned transport 在循环存活时干净关闭
+        # (真实代理循环常驻;单次 asyncio.run 需留在循环内 settle,勿拖到 close 后 __del__)
+        await asyncio.sleep(0.3)
+        gc.collect()
+        await asyncio.sleep(0.3)
+        return r, elapsed
+
+    r, elapsed = asyncio.run(drive())
+    assert elapsed < 5
+    assert "done" in r.text
+    assert r.metadata["timed_out"] is False
+    assert r.metadata["exit_code"] == 0
+    assert "Event loop is closed" not in capfd.readouterr().err
+
+
+def test_bash_chatty_output_is_capped(tmp_path: Path) -> None:
+    # Finding 2:yes 全速刷管道,超时窗口内缓冲必须有硬上限,结果 ≤ max_model_output_bytes
+    tool = create_bash_tool(tmp_path)
+    r = run(tool, {"command": "yes", "timeout_seconds": 1})
+    assert r.status is ResultStatus.TIMEOUT
+    assert len(r.text) <= 30_000
+    assert r.truncated
+
+
+def test_bash_large_output_no_pipe_deadlock(tmp_path: Path) -> None:
+    # Finding 2 伴随面:边跑边读,200KB 正常退出命令不得因管道灌满而死锁
+    tool = create_bash_tool(tmp_path)
+    started = time.monotonic()
+    r = run(tool, {"command": 'python3 -c "import sys; sys.stdout.write(\'x\' * 200_000)"'})
+    assert time.monotonic() - started < 10
+    assert r.metadata["exit_code"] == 0
+    assert len(r.text) <= 30_000
+    assert r.truncated
+
+
+def test_bash_cancellation_cleans_up(tmp_path: Path, capfd: Any) -> None:
+    # Finding 3:执行中取消 → 进程组收敛、任务不悬空、无 Event-loop-closed 噪声
+    tool = create_bash_tool(tmp_path)
+    pidfile = tmp_path / "pid"
+
+    async def drive() -> None:
+        task = asyncio.create_task(tool.run({"command": "echo $$ > pid; sleep 60"}))
+        deadline = time.monotonic() + 5
+        while not pidfile.exists() and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        assert pidfile.exists()
+        await asyncio.sleep(0.1)  # 确保落在主等待阶段
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        else:
+            pytest.fail("cancelled bash run must raise CancelledError")
+        await asyncio.sleep(0.2)
+        leaked = [
+            t for t in asyncio.all_tasks()
+            if t is not asyncio.current_task() and not t.done()
+        ]
+        assert leaked == []
+
+    asyncio.run(drive())
+    assert_dead(pidfile)
+    captured = capfd.readouterr()
+    assert "Event loop is closed" not in captured.err
 
 
 def test_pending_tool_call_id_convention(tmp_path: Path) -> None:

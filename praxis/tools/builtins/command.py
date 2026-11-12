@@ -8,12 +8,20 @@
    CPython 的 ``wait()`` 把"进程退出"与"所有管道 EOF"混为一谈,后台孙进程持写端
    时 wait() 会拖到孙进程自然退出——这正是 B20 形态要修正的点;
 4. ``wait_for`` 主进程退出;超时 → SIGTERM 整组 → 5s 宽限 → SIGKILL 整组;
-5. 主进程退出后,每个管道只再给 0.5s 收尾读取(读到多少算多少);若 wait() 仍未完成
-   (孙进程持管道 fd),整组 SIGTERM/SIGKILL 收敛后收尸——后台孙进程不得绑架结果;
-6. 非零退出码不是 is_error(命令确实执行了),exit_code 放 metadata。
+5. 主进程退出后,每个管道只再给 0.5s 收尾读取(读到多少算多少);若 wait() 仍未完成,
+   整组 SIGTERM(组已空则跳过宽限)→ SIGKILL → 2s 短探;仍等不到 EOF
+   (setsid 逃逸到组外的孙进程持管道 fd)→ 取消挂起任务直接返回——逃逸进程
+   Phase 1 不追杀(manage_command 清理是 Phase 3),subprocess transport 由引用
+   消亡时(GC,循环尚存活)惰性关闭。
+6. 每路输出缓冲有硬上限(``_MAX_STREAM_BUFFER_BYTES``,对齐旧
+   ``_MAX_STREAM_BYTES=16_000``):超限字节继续读但丢弃——不能停止读取,否则管道
+   灌满反而阻塞子进程;超限计入 truncated。
+7. 非零退出码不是 is_error(命令确实执行了),exit_code 放 metadata。
 
-取消(MANAGED_PROCESS/CANCEL):外层 cancel 时向进程组发 SIGTERM,并用
-``call_later`` 挂一个宽限后的 SIGKILL,然后透传 CancelledError。
+取消(MANAGED_PROCESS/CANCEL):run() 的**所有** await 阶段共用一个
+CancelledError 出口——SIGTERM 整组 → 有界退出宽限 → SIGKILL 整组(宽限期间被
+二次 cancel 立即升级 KILL)→ 取消并回收三个任务 → 透传 CancelledError。
+不用 ``call_later`` 延迟致命信号:事件循环可能先于定时器关闭。
 
 ToolResult 占位符约定同 filesystem.py:``tool_call_id="pending"``,管道替换。
 """
@@ -26,7 +34,7 @@ import os
 import signal
 from collections.abc import Mapping
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 from praxis.protocol.json import JsonValue
 from praxis.protocol.tools import (
@@ -47,14 +55,24 @@ from praxis.tools.builtins.filesystem import PENDING_TOOL_CALL_ID
 _DEFAULT_TIMEOUT_SECONDS = 120.0
 _MAX_TIMEOUT_SECONDS = 600.0
 _TERM_GRACE_SECONDS = 5.0
+_POST_KILL_WAIT_SECONDS = 2.0
 _DRAIN_DEADLINE_SECONDS = 0.5
 _MAX_OUTPUT_BYTES = 30_000
+_MAX_STREAM_BUFFER_BYTES = 16_000
 
 
-def _signal_group(pgid: int, sig: signal.Signals) -> None:
-    """start_new_session=True ⇒ 子进程组 id == 主进程 pid;整组收发信号。"""
-    with contextlib.suppress(ProcessLookupError, PermissionError):
+def _signal_group(pgid: int, sig: signal.Signals) -> bool:
+    """start_new_session=True ⇒ 子进程组 id == 主进程 pid;整组收发信号。
+
+    返回"组内可能仍有活体":False 仅当 ESRCH(组已空,持管道者必在组外)。
+    """
+    try:
         os.killpg(pgid, sig)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
 
 
 async def _await_main_exit(proc: asyncio.subprocess.Process, timeout: float | None) -> int:
@@ -67,13 +85,26 @@ async def _await_main_exit(proc: asyncio.subprocess.Process, timeout: float | No
     return await asyncio.wait_for(poll(), timeout)
 
 
-async def _drain_to(stream: asyncio.StreamReader, buffer: list[bytes]) -> None:
-    """读到 EOF;已收字节留在 buffer,任务被取消也不丢。"""
+async def _drain_to(stream: asyncio.StreamReader, buffer: list[bytes], discarded: list[int]) -> None:
+    """读到 EOF;已收字节留在 buffer,任务被取消也不丢。
+
+    buffer 至多 ``_MAX_STREAM_BUFFER_BYTES``;超限字节仍继续读但只计入 discarded
+    ——停止读取会让管道灌满、阻塞子进程,那是另一种绑架。
+    """
+    buffered = 0
     while True:
         chunk = await stream.read(65536)
         if not chunk:
             return
-        buffer.append(chunk)
+        room = _MAX_STREAM_BUFFER_BYTES - buffered
+        if room >= len(chunk):
+            buffer.append(chunk)
+        elif room > 0:
+            buffer.append(chunk[:room])
+            discarded[0] += len(chunk) - room
+        else:
+            discarded[0] += len(chunk)
+        buffered += len(chunk)
 
 
 async def _finish_drain(task: asyncio.Task[None]) -> None:
@@ -99,6 +130,69 @@ async def _reap_main_exit(proc: asyncio.subprocess.Process) -> None:
     except TimeoutError:
         _signal_group(proc.pid, signal.SIGKILL)
         await _await_main_exit(proc, None)
+
+
+async def _abandon_wait(wait_task: asyncio.Task[int]) -> None:
+    """EOF 被组外逃逸进程绑架(Finding 1):run() 不陪孙进程寿命。
+
+    取消挂起的 wait 任务即返回;transport 在 proc 引用消亡时(GC)关闭——
+    此时事件循环仍在运行,关闭路径干净。setsid 逃逸的进程本身 Phase 1 不追杀。
+    """
+    wait_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await wait_task
+
+
+async def _converge_pipes(proc: asyncio.subprocess.Process, wait_task: asyncio.Task[int]) -> None:
+    """主进程已退出但 wait() 未完成:有进程还持着管道写端。
+
+    先 SIGTERM 整组(组内残留随信号退出、管道 EOF);组已空(ESRCH,持管道者
+    必为 setsid 逃逸的组外进程)则跳过 TERM 宽限,只做 2s 短探;短探落空
+    → 放弃等待(逃逸孙进程 Phase 1 不追杀)。
+    """
+    signaled = _signal_group(proc.pid, signal.SIGTERM)
+    killed = False
+    window = _TERM_GRACE_SECONDS if signaled else _POST_KILL_WAIT_SECONDS
+    while True:
+        try:
+            await asyncio.wait_for(asyncio.shield(wait_task), window)
+            return
+        except TimeoutError:
+            pass
+        if signaled and not killed:
+            killed = True
+            _signal_group(proc.pid, signal.SIGKILL)
+            window = _POST_KILL_WAIT_SECONDS
+            continue
+        await _abandon_wait(wait_task)
+        return
+
+
+async def _cancel_cleanup(proc: asyncio.subprocess.Process, tasks: tuple[asyncio.Task[Any], ...]) -> None:
+    """任何阶段被取消的统一收敛(Finding 3):不留悬空任务/孤儿进程组。"""
+    killed = False
+    try:
+        _signal_group(proc.pid, signal.SIGTERM)
+        try:
+            await _await_main_exit(proc, _TERM_GRACE_SECONDS)
+        except TimeoutError:
+            pass
+        _signal_group(proc.pid, signal.SIGKILL)
+        killed = True
+        try:
+            await _await_main_exit(proc, _POST_KILL_WAIT_SECONDS)
+        except TimeoutError:
+            pass
+    except asyncio.CancelledError:
+        if not killed:
+            _signal_group(proc.pid, signal.SIGKILL)
+        raise
+    finally:
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(BaseException):
+                await task
 
 
 def create_bash_tool(workspace: Path) -> Tool:
@@ -136,38 +230,31 @@ def create_bash_tool(workspace: Path) -> Tool:
             raise RuntimeError("bash process pipes were not created")
         out_buf: list[bytes] = []
         err_buf: list[bytes] = []
-        out_task = asyncio.create_task(_drain_to(proc.stdout, out_buf))
-        err_task = asyncio.create_task(_drain_to(proc.stderr, err_buf))
+        out_discarded: list[int] = [0]
+        err_discarded: list[int] = [0]
+        out_task = asyncio.create_task(_drain_to(proc.stdout, out_buf, out_discarded))
+        err_task = asyncio.create_task(_drain_to(proc.stderr, err_buf, err_discarded))
         wait_task = asyncio.create_task(proc.wait())
+        tasks = (out_task, err_task, wait_task)
         timed_out = False
         try:
-            await _await_main_exit(proc, timeout)
-        except TimeoutError:
-            timed_out = True
-            await _reap_main_exit(proc)
-        except asyncio.CancelledError:
-            _signal_group(proc.pid, signal.SIGTERM)
-            loop = asyncio.get_running_loop()
-            loop.call_later(_TERM_GRACE_SECONDS, _signal_group, proc.pid, signal.SIGKILL)
-            out_task.cancel()
-            err_task.cancel()
-            wait_task.cancel()
-            raise
-        await _finish_drain(out_task)
-        await _finish_drain(err_task)
-        if not wait_task.done():
-            # 孙进程仍持管道 fd:整组收敛后再收尸,确保 transport 干净关闭。
-            _signal_group(proc.pid, signal.SIGTERM)
             try:
-                await asyncio.wait_for(asyncio.shield(wait_task), _TERM_GRACE_SECONDS)
+                await _await_main_exit(proc, timeout)
             except TimeoutError:
-                _signal_group(proc.pid, signal.SIGKILL)
-                await asyncio.shield(wait_task)
+                timed_out = True
+                await _reap_main_exit(proc)
+            await _finish_drain(out_task)
+            await _finish_drain(err_task)
+            if not wait_task.done():
+                await _converge_pipes(proc, wait_task)
+        except asyncio.CancelledError:
+            await _cancel_cleanup(proc, tasks)
+            raise
 
         stdout = b"".join(out_buf).decode("utf-8", errors="replace")
         stderr = b"".join(err_buf).decode("utf-8", errors="replace")
         text = stdout if not stderr else (f"{stdout}\n{stderr}" if stdout else stderr)
-        truncated = False
+        truncated = out_discarded[0] > 0 or err_discarded[0] > 0
         encoded = text.encode("utf-8")
         if len(encoded) > _MAX_OUTPUT_BYTES:
             text = encoded[:_MAX_OUTPUT_BYTES].decode("utf-8", errors="ignore")
