@@ -252,6 +252,40 @@ def test_model_response_tool_calls_defaults() -> None:
     assert msgs[1].tool_calls == (ModelToolCall(call_id="c1", name="n", arguments={}),)
 
 
+def test_model_response_without_content_salvages_tool_calls() -> None:
+    # R7 读端 fail-open:tool-call-only 轮次(content 缺失/非 str)不丢 tool_calls
+    call = {"call_id": "c1", "name": "search", "arguments": {"q": "x"}}
+    expected = ModelMessage(
+        role="assistant",
+        content="",
+        tool_calls=(ModelToolCall(call_id="c1", name="search", arguments={"q": "x"}),),
+    )
+    for payload in ({"content": None, "tool_calls": [call]}, {"tool_calls": [call]}):
+        assert to_messages([mk(1, "model_response", payload)]) == [expected]
+
+
+def test_tool_call_only_turn_keeps_paired_tool_result() -> None:
+    # 回归钉死:assistant 消息不再消失,配对的 tool_result 不会在投影里成为孤儿
+    msgs = to_messages(
+        [
+            mk(1, "model_response", {"content": None, "tool_calls": [{"call_id": "c1", "name": "t", "arguments": {}}]}),
+            mk(2, "tool_result", {"call_id": "c1", "content": [{"type": "text", "data": {"text": "ok"}}]}),
+        ]
+    )
+    assert [m.role for m in msgs] == ["assistant", "tool"]
+    assert msgs[1].tool_call_id == msgs[0].tool_calls[0].call_id
+
+
+def test_model_response_no_content_and_no_valid_calls_skipped() -> None:
+    bad = [
+        mk(1, "model_response", {"content": None, "tool_calls": []}),  # 空 tool_calls → 无正文可投,跳过
+        mk(2, "model_response", {"content": 42}),  # 无 content 无 tool_calls → 跳过
+        mk(3, "model_response", {"content": None, "tool_calls": "nope"}),  # 不可重建 → 跳过
+        mk(4, "model_response", {"content": None, "tool_calls": [{"call_id": 1, "name": "n"}]}),  # 条目畸形 → 跳过
+    ]
+    assert to_messages(bad) == []
+
+
 def test_build_context_empty_and_no_boundaries() -> None:
     assert build_context([]) == []
     items = [mk(1, "user_message", {"text": "a"})]

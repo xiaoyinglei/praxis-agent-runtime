@@ -53,7 +53,8 @@ def to_messages(items: Sequence[Item]) -> list[ModelMessage]:
     """把(已折叠的)Item 序列投影为模型可见消息;未知 kind 与畸形 payload 跳过,永不抛。
 
     - user_message/steering → user(payload["text"])
-    - model_response → assistant(payload["content"] + tool_calls 重建)
+    - model_response → assistant(payload["content"] + tool_calls 重建);content 缺失/非 str
+      但 tool_calls 可重建时投 content=""(R7 读端 fail-open,保住配对 tool_result)
     - tool_result → tool(文本口径与 protocol.tools.ToolResult.text 一致,tool_call_id=payload["call_id"])
     - summary → user,前缀 "[conversation summary]\\n"
     - 其余 kind(turn_status/approval_*/tool_call/未知)→ 跳过
@@ -119,11 +120,26 @@ def _text_field(payload: Mapping[str, JsonValue], key: str) -> str | None:
 
 def _model_response_message(payload: Mapping[str, JsonValue]) -> ModelMessage | None:
     content = _text_field(payload, "content")
-    if content is None:
-        return None
     raw_calls = payload.get("tool_calls")
-    if raw_calls is None:
-        return ModelMessage(role="assistant", content=content)
+    calls: list[ModelToolCall] | None = None  # None=key 缺失;list=重建成功(可为空)
+    if raw_calls is not None:
+        calls = _reconstruct_tool_calls(raw_calls)
+        if calls is None:  # tool_calls 畸形/条目非法 → 整个 item 跳过(不部分抢救)
+            return None
+    if content is not None:
+        if calls is None:
+            return ModelMessage(role="assistant", content=content)
+        return ModelMessage(role="assistant", content=content, tool_calls=tuple(calls))
+    # R7 读端 fail-open:content 缺失/非 str 的 tool-call-only 轮次(许多模型 API 的
+    # 形状)不静默丢弃——只要有可重建的 tool_calls 就投 content="" 的 assistant 消息,
+    # 否则配对的 tool_result 会在投影里成为孤儿。两者皆无才跳过。
+    if calls:
+        return ModelMessage(role="assistant", content="", tool_calls=tuple(calls))
+    return None
+
+
+def _reconstruct_tool_calls(raw_calls: object) -> list[ModelToolCall] | None:
+    """严格重建:非序列或任一条目非法返回 None(= 不可重建)。"""
     if not isinstance(raw_calls, (list, tuple)):
         return None
     calls: list[ModelToolCall] = []
@@ -140,7 +156,7 @@ def _model_response_message(payload: Mapping[str, JsonValue]) -> ModelMessage | 
         if not isinstance(arguments, Mapping):
             return None
         calls.append(ModelToolCall(call_id=call_id, name=name, arguments=arguments))
-    return ModelMessage(role="assistant", content=content, tool_calls=tuple(calls))
+    return calls
 
 
 def _tool_result_message(payload: Mapping[str, JsonValue]) -> ModelMessage | None:
