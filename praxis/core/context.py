@@ -20,6 +20,7 @@ from praxis.protocol.models import ModelMessage, ModelToolCall
 
 _SUPPORTED_BOUNDARY_VERSION: Final = "v1"
 _SUMMARY_PREFIX: Final = "[conversation summary]\n"
+_UNPAIRED_TOOL_RESULT_NOTE: Final = "[tool result unavailable: turn ended before execution]"
 
 
 def build_context(items: Sequence[Item]) -> list[Item]:
@@ -58,13 +59,47 @@ def to_messages(items: Sequence[Item]) -> list[ModelMessage]:
     - tool_result → tool(文本口径与 protocol.tools.ToolResult.text 一致,tool_call_id=payload["call_id"])
     - summary → user,前缀 "[conversation summary]\\n"
     - 其余 kind(turn_status/approval_*/tool_call/未知)→ 跳过
+
+    配对修复(R9):只改投影,不改 store 事实。两遍处理——
+    第一遍收集"有 tool_result item 的 call_id 集合"(存在性按 kind+call_id 判定,
+    与 status/文本无关,denied/not_executed 也算存在);第二遍顺序投影,紧跟在
+    携带 tool_calls 的 assistant 消息之后,按其 tool_calls 顺序为集合中没有结果的
+    call_id 合成 tool 消息(覆盖 cancelled/failed/abandoned-paused 轮次;
+    INTERRUPTED 轮次由 recovery 写入真实 not_executed/outcome_unknown 结果,
+    属于结果集合,原样投影)。真实结果 item 遇到时正常投影,不会重复。
+    这样任何 provider 的 tool_use/tool_result 配对校验(OpenAI/Anthropic 会
+    拒绝孤儿 tool_calls)都不会因中断轮次而失败。
     """
+    result_call_ids = _call_ids_with_results(items)
     messages: list[ModelMessage] = []
     for item in items:
         message = _to_message(item)
-        if message is not None:
-            messages.append(message)
+        if message is None:
+            continue
+        messages.append(message)
+        if message.role == "assistant" and message.tool_calls:
+            for call in message.tool_calls:
+                if call.call_id not in result_call_ids:
+                    messages.append(
+                        ModelMessage(
+                            role="tool",
+                            content=_UNPAIRED_TOOL_RESULT_NOTE,
+                            tool_call_id=call.call_id,
+                        )
+                    )
     return messages
+
+
+def _call_ids_with_results(items: Sequence[Item]) -> set[str]:
+    """配对修复第一遍:凡 tool_result item(str call_id)即视为"该 call 已有结果"。"""
+    call_ids: set[str] = set()
+    for item in items:
+        if item.kind != ItemKind.TOOL_RESULT:
+            continue
+        call_id = item.payload.get("call_id")
+        if isinstance(call_id, str):
+            call_ids.add(call_id)
+    return call_ids
 
 
 # ---------------------------------------------------------------------------
@@ -78,9 +113,11 @@ def _is_int(value: object) -> TypeGuard[int]:
 
 
 def _boundary_range(payload: Mapping[str, JsonValue]) -> tuple[int, int] | None:
-    """解析 boundary payload;非已知版本或畸形区间返回 None(即:不折叠)。"""
-    if not isinstance(payload, Mapping):  # 防御:违反契约的 payload 也 fail-open
-        return None
+    """解析 boundary payload;非已知版本或畸形区间返回 None(即:不折叠)。
+
+    payload 为 Mapping 是 Item 契约(见 protocol/items.py),不再做运行时的
+    isinstance 防御(Item 是 frozen dataclass,store 读出的 payload 必为 Mapping)。
+    """
     if payload.get("algorithm_version") != _SUPPORTED_BOUNDARY_VERSION:
         return None
     low = payload.get("covered_from")
@@ -96,10 +133,9 @@ def _boundary_range(payload: Mapping[str, JsonValue]) -> tuple[int, int] | None:
 
 
 def _to_message(item: Item) -> ModelMessage | None:
+    # payload 为 Mapping 由 Item 契约保证,不做运行时 isinstance 防御
     kind = item.kind
     payload = item.payload
-    if not isinstance(payload, Mapping):  # 防御:违反契约的 payload 跳过(fail-open)
-        return None
     if kind == ItemKind.USER_MESSAGE or kind == ItemKind.STEERING:
         text = _text_field(payload, "text")
         return None if text is None else ModelMessage(role="user", content=text)

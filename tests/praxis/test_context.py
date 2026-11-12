@@ -16,6 +16,9 @@ from praxis.protocol.models import ModelMessage, ModelToolCall
 from praxis.protocol.tools import ToolContentBlock, ToolResult
 
 
+_UNPAIRED_NOTE = "[tool result unavailable: turn ended before execution]"
+
+
 def mk(seq: int, kind: str, payload: dict[str, Any]) -> Item:
     return Item(
         item_id=f"i{seq}",
@@ -261,7 +264,11 @@ def test_model_response_without_content_salvages_tool_calls() -> None:
         tool_calls=(ModelToolCall(call_id="c1", name="search", arguments={"q": "x"}),),
     )
     for payload in ({"content": None, "tool_calls": [call]}, {"tool_calls": [call]}):
-        assert to_messages([mk(1, "model_response", payload)]) == [expected]
+        # R9:救回的 assistant 同样享受配对修复——缺结果的 c1 补合成 tool 消息
+        assert to_messages([mk(1, "model_response", payload)]) == [
+            expected,
+            ModelMessage(role="tool", content=_UNPAIRED_NOTE, tool_call_id="c1"),
+        ]
 
 
 def test_tool_call_only_turn_keeps_paired_tool_result() -> None:
@@ -284,6 +291,133 @@ def test_model_response_no_content_and_no_valid_calls_skipped() -> None:
         mk(4, "model_response", {"content": None, "tool_calls": [{"call_id": 1, "name": "n"}]}),  # 条目畸形 → 跳过
     ]
     assert to_messages(bad) == []
+
+
+# ---------------------------------------------------------------------------
+# R9 配对修复:未配对的 assistant tool_calls 合成 tool 结果(真实 provider 配对规则)
+# ---------------------------------------------------------------------------
+
+
+def test_pairing_repair_synthesizes_missing_result_immediately_after_assistant() -> None:
+    # (a) assistant 两个 call,只有 c1 有真实结果:c2 的合成结果紧跟 assistant,先于后续 item
+    items = [
+        mk(
+            1,
+            "model_response",
+            {
+                "content": "",
+                "tool_calls": [
+                    {"call_id": "c1", "name": "t", "arguments": {}},
+                    {"call_id": "c2", "name": "t", "arguments": {}},
+                ],
+            },
+        ),
+        mk(2, "tool_result", {"call_id": "c1", "content": [{"type": "text", "data": {"text": "real"}}]}),
+        mk(3, "user_message", {"text": "next"}),
+    ]
+    msgs = to_messages(items)
+    assert [m.role for m in msgs] == ["assistant", "tool", "tool", "user"]
+    assert msgs[1] == ModelMessage(role="tool", content=_UNPAIRED_NOTE, tool_call_id="c2")
+    assert msgs[2].content == "real" and msgs[2].tool_call_id == "c1"
+
+
+def test_all_calls_unpaired_get_synthetic_results() -> None:
+    # (b) 零结果:全部合成,按 tool_calls 顺序
+    items = [
+        mk(
+            1,
+            "model_response",
+            {
+                "content": "calling",
+                "tool_calls": [
+                    {"call_id": "c1", "name": "t", "arguments": {}},
+                    {"call_id": "c2", "name": "t", "arguments": {}},
+                ],
+            },
+        )
+    ]
+    msgs = to_messages(items)
+    assert msgs == [
+        ModelMessage(
+            role="assistant",
+            content="calling",
+            tool_calls=(ModelToolCall(call_id="c1", name="t", arguments={}), ModelToolCall(call_id="c2", name="t", arguments={})),
+        ),
+        ModelMessage(role="tool", content=_UNPAIRED_NOTE, tool_call_id="c1"),
+        ModelMessage(role="tool", content=_UNPAIRED_NOTE, tool_call_id="c2"),
+    ]
+
+
+def test_fully_paired_history_has_no_synthesis() -> None:
+    # (c) 全配对:投影与旧行为逐字节一致——无任何合成消息
+    items = [
+        mk(1, "user_message", {"text": "go"}),
+        mk(2, "model_response", {"content": "", "tool_calls": [{"call_id": "c1", "name": "t", "arguments": {}}]}),
+        mk(3, "tool_result", {"call_id": "c1", "content": [{"type": "text", "data": {"text": "done"}}]}),
+        mk(4, "model_response", {"content": "fin"}),
+    ]
+    msgs = to_messages(items)
+    assert [m.role for m in msgs] == ["user", "assistant", "tool", "assistant"]
+    assert all(_UNPAIRED_NOTE not in m.content for m in msgs)
+    assert msgs[2].content == "done"
+
+
+def test_denied_or_not_executed_result_counts_as_paired() -> None:
+    # (d) 存在性按 kind+call_id 判定,与 status/文本无关:denied/not_executed 不触发合成
+    for status in ("denied", "not_executed", "outcome_unknown", "error"):
+        items = [
+            mk(1, "model_response", {"content": "", "tool_calls": [{"call_id": "c1", "name": "t", "arguments": {}}]}),
+            mk(2, "tool_result", {"call_id": "c1", "status": status, "content": [{"type": "text", "data": {"text": "x"}}]}),
+        ]
+        msgs = to_messages(items)
+        assert [m.role for m in msgs] == ["assistant", "tool"], status
+        assert len(msgs) == 2, status
+
+
+@st.composite
+def pairing_items(draw: st.SearchStrategy) -> list[Item]:  # type: ignore[misc]
+    # (e) 变体:每轮 1-3 个全局唯一 call id,每个 id 随机有/无真实结果
+    items: list[Item] = []
+    seq = 0
+    next_id = 0
+    for _ in range(draw(st.integers(1, 5))):
+        calls = []
+        for _ in range(draw(st.integers(1, 3))):
+            calls.append(f"tc{next_id}")
+            next_id += 1
+        seq += 1
+        items.append(
+            mk(
+                seq,
+                "model_response",
+                {"content": "resp", "tool_calls": [{"call_id": c, "name": "tool", "arguments": {}} for c in calls]},
+            )
+        )
+        for c in calls:
+            if draw(st.booleans()):
+                seq += 1
+                items.append(mk(seq, "tool_result", {"call_id": c, "content": [{"type": "text", "data": {"text": "ok"}}]}))
+        if draw(st.booleans()):
+            seq += 1
+            items.append(mk(seq, "user_message", {"text": "next"}))
+    return items
+
+
+@given(pairing_items())
+@settings(deadline=None, max_examples=200, suppress_health_check=[HealthCheck.too_slow])
+def test_pairing_invariant_holds_for_every_assistant(items: list[Item]) -> None:
+    msgs = to_messages(items)
+    for idx, m in enumerate(msgs):
+        if m.role != "assistant" or not m.tool_calls:
+            continue
+        next_assistant = len(msgs)
+        for j in range(idx + 1, len(msgs)):
+            if msgs[j].role == "assistant":
+                next_assistant = j
+                break
+        for call in m.tool_calls:
+            following = [k for k in range(idx + 1, next_assistant) if msgs[k].role == "tool" and msgs[k].tool_call_id == call.call_id]
+            assert len(following) == 1, call.call_id
 
 
 def test_build_context_empty_and_no_boundaries() -> None:
