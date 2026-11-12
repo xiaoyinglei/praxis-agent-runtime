@@ -689,6 +689,86 @@ def test_verify_command_reports(workspace: Path, tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# R15:稳定默认线程 "default"(跨命令可发现)+ run/resume 打印 turn id
+# ---------------------------------------------------------------------------
+
+
+def test_default_thread_persists_across_invocations(workspace: Path, tmp_path: Path) -> None:
+    """run 不传 --thread → 会话落 "default";log/status 不传 --thread 必须找到它。"""
+    script = _write_script(tmp_path, "done.json", [{"content": "hello default"}])
+    run_res = runner.invoke(
+        app, ["run", "hi", "--workspace", str(workspace), "--scripted", str(script)], env=_CLEAN_ENV
+    )
+    assert run_res.exit_code == 0, run_res.output
+    assert "hello default" in run_res.output
+
+    logged = runner.invoke(app, ["log", "--workspace", str(workspace)], env=_CLEAN_ENV)
+    assert logged.exit_code == 0, logged.output
+    assert "user: hi" in logged.output
+    assert "hello default" in logged.output
+
+    table = runner.invoke(app, ["status", "--workspace", str(workspace)], env=_CLEAN_ENV)
+    assert table.exit_code == 0, table.output
+    assert "completed" in table.output
+
+
+def test_run_and_resume_print_copyable_turn_id(
+    workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """run/resume 输出 "turn: <32hex> (thread: <id>)" 行,供复制到 praxis resume。"""
+    monkeypatch.setattr(permission, "decide", lambda *a: Decision.ask("test"))
+    script1 = _write_script(tmp_path, "ask.json", [_write_call_entry("r15")])
+    paused = runner.invoke(
+        app,
+        ["run", "write it", "--workspace", str(workspace), "--thread", "r15t", "--scripted", str(script1)],
+        env=_CLEAN_ENV,
+    )
+    assert paused.exit_code == 2, paused.output
+    id_match = re.search(r"turn: ([0-9a-f]{32}) \(thread: r15t\)", paused.output)
+    assert id_match is not None, paused.output
+    turn_id = id_match.group(1)
+
+    script2 = _write_script(tmp_path, "final.json", [{"content": "r15 done"}])
+    done = runner.invoke(
+        app,
+        [
+            "resume",
+            turn_id,
+            "--workspace",
+            str(workspace),
+            "--thread",
+            "r15t",
+            "--allow",
+            "c1",
+            "--scripted",
+            str(script2),
+        ],
+        env=_CLEAN_ENV,
+    )
+    assert done.exit_code == 0, done.output
+    assert re.search(rf"turn: {turn_id} \(thread: r15t\)", done.output)
+    assert "r15 done" in done.output
+
+
+def test_thread_override_still_isolates(workspace: Path, tmp_path: Path) -> None:
+    """--thread 覆盖仍生效:run --thread alpha 后,log --thread beta 为空、alpha 有内容。"""
+    script = _write_script(tmp_path, "done.json", [{"content": "isolated"}])
+    run_res = runner.invoke(
+        app,
+        ["run", "hi", "--workspace", str(workspace), "--thread", "alpha", "--scripted", str(script)],
+        env=_CLEAN_ENV,
+    )
+    assert run_res.exit_code == 0, run_res.output
+
+    other = runner.invoke(app, ["log", "--workspace", str(workspace), "--thread", "beta"], env=_CLEAN_ENV)
+    assert other.exit_code == 0, other.output
+    assert "(no items)" in other.output
+
+    same = runner.invoke(app, ["log", "--workspace", str(workspace), "--thread", "alpha"], env=_CLEAN_ENV)
+    assert "isolated" in same.output
+
+
+# ---------------------------------------------------------------------------
 # 入口点自检:pyproject 的 console script 目标存在且可调用
 # ---------------------------------------------------------------------------
 

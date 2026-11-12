@@ -47,11 +47,13 @@ EXIT_FAILED = 1
 EXIT_PAUSED = 2
 EXIT_USAGE = 3
 
+_DEFAULT_THREAD = "default"
+
 _WORKSPACE_OPT = typer.Option(None, "--workspace", help="Workspace directory (default: cwd).")
 _MODEL_OPT = typer.Option(None, "--model", help="Model id (else env PRAXIS_MODEL).")
 _BASE_URL_OPT = typer.Option(None, "--base-url", help="OpenAI-compatible base URL (else env PRAXIS_BASE_URL).")
 _SCRIPTED_OPT = typer.Option(None, "--scripted", help="Scripted responses JSON path (offline/acceptance).")
-_THREAD_OPT = typer.Option(None, "--thread", help="Thread id (default: fresh thread).")
+_THREAD_OPT = typer.Option(None, "--thread", help='Thread id (default: "default"; R15 stable across commands).')
 _CONFIRM_OPT = typer.Option(False, "--confirm", help="Resume an interrupted turn (human guard, §5.2).")
 _ALLOW_OPT = typer.Option([], "--allow", help="Approve this pending approval call id (repeatable).")
 _DENY_OPT = typer.Option([], "--deny", help="Deny this pending approval call id (repeatable).")
@@ -152,6 +154,12 @@ def _load_scripted(path: Path) -> list[ModelResponse]:
     return [_scripted_entry(index, entry) for index, entry in enumerate(raw)]
 
 
+def _resolve_thread(thread: str | None) -> str:
+    """R15:省略 --thread 一律落稳定线程 "default"——跨调用可发现(log/status 找得到),
+    也供阶段16 真实模型 smoke 检查;--thread 显式覆盖保持线程隔离语义。"""
+    return thread if thread is not None else _DEFAULT_THREAD
+
+
 def _open_from_options(
     workspace: Path | None,
     model: str | None,
@@ -161,7 +169,7 @@ def _open_from_options(
 ) -> Session:
     if scripted is not None:
         adapter: Any = ScriptedAdapter(_load_scripted(Path(scripted)))
-        return open_session(_resolve_workspace(workspace), adapter, thread_id=thread)
+        return open_session(_resolve_workspace(workspace), adapter, thread_id=_resolve_thread(thread))
     resolved_model = model or os.environ.get("PRAXIS_MODEL", "")
     if not resolved_model:
         raise typer.BadParameter("no model configured: pass --model, set PRAXIS_MODEL, or use --scripted")
@@ -170,16 +178,12 @@ def _open_from_options(
         raise typer.BadParameter("missing API key: set PRAXIS_API_KEY (or OPENAI_API_KEY), or use --scripted")
     resolved_base_url = base_url or os.environ.get("PRAXIS_BASE_URL") or None
     adapter = OpenAICompatAdapter(ModelSpec(model_id=resolved_model), api_key=api_key, base_url=resolved_base_url)
-    return open_session(_resolve_workspace(workspace), adapter, thread_id=thread)
+    return open_session(_resolve_workspace(workspace), adapter, thread_id=_resolve_thread(thread))
 
 
 def _open_read_only(workspace: Path | None, thread: str | None) -> Session:
     """log/status/steer/verify 不需要模型:空剧本 adapter 只是 open_session 的必填参数。"""
-    return open_session(
-        _resolve_workspace(workspace),
-        ScriptedAdapter([]),
-        thread_id=thread if thread is not None else "cli-readonly",
-    )
+    return open_session(_resolve_workspace(workspace), ScriptedAdapter([]), thread_id=_resolve_thread(thread))
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +227,11 @@ def _fmt_time(timestamp: float) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
 
 
+def _print_turn_ref(session: Session, result: TurnResult) -> None:
+    """R15:run/resume 打印可复制的 turn/thread 参照行(`praxis resume <turn_id>` 的入据)。"""
+    typer.echo(f"turn: {result.turn_id} (thread: {session.thread_id})")
+
+
 # ---------------------------------------------------------------------------
 # run / resume
 # ---------------------------------------------------------------------------
@@ -246,6 +255,7 @@ def run(
         raise typer.Exit(EXIT_FAILED) from None
     finally:
         session.close()
+    _print_turn_ref(session, result)
     raise typer.Exit(_report_turn(result))
 
 
@@ -306,6 +316,7 @@ def resume(
         raise typer.Exit(EXIT_FAILED) from None
     finally:
         session.close()
+    _print_turn_ref(session, result)
     raise typer.Exit(_report_turn(result))
 
 
