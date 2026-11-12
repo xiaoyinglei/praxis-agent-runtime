@@ -174,16 +174,22 @@ class Store:
     # -- 事务入口与写入 ----------------------------------------------------------
 
     def transact(self, fn: Callable[[sqlite3.Connection], T]) -> T:
-        """唯一事务入口:BEGIN IMMEDIATE → fn(conn) → COMMIT;异常 ROLLBACK 重抛。"""
+        """唯一事务入口:BEGIN IMMEDIATE → fn(conn) → COMMIT;异常(含 COMMIT 自身失败)ROLLBACK 重抛。"""
 
         def _run(conn: sqlite3.Connection) -> T:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 result = fn(conn)
+                conn.execute("COMMIT")
             except BaseException:
-                conn.execute("ROLLBACK")
+                # COMMIT 抛错时事务可能仍处于活动态(如 SQLITE_BUSY);若不回滚,
+                # 该连接后续每次 BEGIN 都会报 "within a transaction",整个 Store 报废。
+                # ROLLBACK 自身失败不能掩盖原始异常——吞掉它,继续重抛原始错误。
+                try:
+                    conn.execute("ROLLBACK")
+                except BaseException:
+                    pass
                 raise
-            conn.execute("COMMIT")
             return result
 
         return self._submit(_run)

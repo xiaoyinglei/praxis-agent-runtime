@@ -113,6 +113,89 @@ def test_append_batch_rolls_back_on_encode_failure(store: Store, monkeypatch: py
     assert after[0].seq == 1  # 回滚后 seq 从 0 重新分配
 
 
+class _FlakyCommitConnection(sqlite3.Connection):
+    """execute("COMMIT") 可被开关拦截:抛 SQLITE_BUSY 且**不执行真 COMMIT**,
+    事务保持 ACTIVE——忠实复现 busy_timeout 耗尽后的提交失败形态。"""
+
+    def execute(
+        self, sql: object, *args: object, **kwargs: object
+    ) -> object:
+        if _FLAKY_ARM["on"] and isinstance(sql, str) and sql.strip() == "COMMIT":
+            raise sqlite3.OperationalError("database is locked")
+        return super().execute(sql, *args, **kwargs)
+
+
+_FLAKY_ARM = {"on": False}
+
+
+def test_commit_failure_rolls_back_and_store_not_poisoned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fix round 1(review Important):COMMIT 自身失败时必须 ROLLBACK 并重抛原始异常。
+
+    未修复形态:COMMIT 在 try 之外抛出 → 事务残留 ACTIVE → 下一次 BEGIN IMMEDIATE
+    报 "cannot start a transaction within a transaction",Store 报废且钉住 WAL 快照。
+    """
+    real_connect = sqlite3.connect
+
+    def flaky_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        kwargs["factory"] = _FlakyCommitConnection
+        return real_connect(*args, **kwargs)  # type: ignore[call-arg]
+
+    _FLAKY_ARM["on"] = False
+    monkeypatch.setattr(sqlite3, "connect", flaky_connect)
+    store = Store(tmp_path / "commit-fail.db")  # _open 在建 Store 时一次性调用 connect
+    monkeypatch.undo()  # 只影响连接创建缝;实例已定型,之后全部走 flaky 子类
+
+    try:
+        first = store.append_items("t", None, [ItemEntry("user_message", {"n": 1})])  # 健全性
+
+        _FLAKY_ARM["on"] = True
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            store.append_items("t", None, [ItemEntry("user_message", {"n": 2})])
+        _FLAKY_ARM["on"] = False
+
+        second = store.append_items("t", None, [ItemEntry("user_message", {"n": 3})])  # 未被毒化
+        items = store.read_items("t")
+        assert [int(i.payload["n"]) for i in items] == [1, 3]  # 失败批整批回滚,无残行
+        assert [i.seq for i in items] == [1, 2]  # 失败批未消耗 seq
+        assert items[0].item_id == first[0].item_id
+        assert items[1].item_id == second[0].item_id
+    finally:
+        _FLAKY_ARM["on"] = False
+        store.close()
+
+
+def test_commit_failure_rollback_failure_does_not_mask_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ROLLBACK 自身也失败时,重抛的必须仍是原始 COMMIT 异常(不被掩盖)。"""
+    real_execute = _FlakyCommitConnection.execute
+
+    def execute_both_fail(self: _FlakyCommitConnection, sql: object, *args: object, **kwargs: object) -> object:
+        if isinstance(sql, str) and sql.strip() in {"COMMIT", "ROLLBACK"} and _FLAKY_ARM["on"]:
+            raise sqlite3.OperationalError("database is locked" if sql.strip() == "COMMIT" else "disk I/O error")
+        return real_execute(self, sql, *args, **kwargs)
+
+    real_connect = sqlite3.connect
+
+    def flaky_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        kwargs["factory"] = _FlakyCommitConnection
+        return real_connect(*args, **kwargs)  # type: ignore[call-arg]
+
+    monkeypatch.setattr(_FlakyCommitConnection, "execute", execute_both_fail)
+    monkeypatch.setattr(sqlite3, "connect", flaky_connect)
+    store = Store(tmp_path / "rollback-fail.db")
+    _FLAKY_ARM["on"] = True
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):  # 原始异常,而非 disk I/O error
+            store.append_items("t", None, [ItemEntry("user_message", {"n": 1})])
+    finally:
+        _FLAKY_ARM["on"] = False
+        monkeypatch.undo()
+        store.close()
+
+
 # ---------------------------------------------------------------------------
 # 读路径与线程助手
 # ---------------------------------------------------------------------------
