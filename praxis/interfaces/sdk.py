@@ -6,6 +6,8 @@ TurnStatus/ApprovalSummary)、事件订阅(Subscription)、并发与守卫异常
 (``open_session = build_session``),以及 CLI 构造模型所需的适配器与协议类型
 (OpenAICompatAdapter/ScriptedAdapter/ModelSpec/ModelResponse/ModelToolCall/
 Usage/PermissionPolicy)——providers 细节对 CLI 只经 sdk 暴露(R2)。
+R14 扩展:只读面 ``Session.items/turns/verify`` 配套 re-export
+Item/ItemKind/Turn/VerifyReport——CLI 的 log/status/verify 命令仍不直依 core/store。
 
 ``ConversationBusy``/``ResumeNotConfirmed`` 定义在 core.session 并由这里
 re-export:core 不得 import interfaces(import-linter praxis_core_purity),
@@ -22,14 +24,19 @@ from praxis.core.locks import ThreadBusy
 from praxis.core.session import ConversationBusy, ResumeNotConfirmed, Session
 from praxis.core.statemachine import TurnStatus
 from praxis.core.turn import ApprovalSummary, TurnResult
+from praxis.protocol.items import Item, ItemKind
 from praxis.protocol.models import ModelResponse, ModelSpec, ModelToolCall, Usage
 from praxis.protocol.policy import PermissionPolicy
+from praxis.store.turns import Turn
+from praxis.store.verify import VerifyReport
 
 open_session = build_session
 
 __all__ = [
     "ApprovalSummary",
     "ConversationBusy",
+    "Item",
+    "ItemKind",
     "ModelResponse",
     "ModelSpec",
     "ModelToolCall",
@@ -40,8 +47,10 @@ __all__ = [
     "Session",
     "Subscription",
     "ThreadBusy",
+    "Turn",
     "TurnResult",
     "TurnStatus",
     "Usage",
+    "VerifyReport",
     "open_session",
 ]

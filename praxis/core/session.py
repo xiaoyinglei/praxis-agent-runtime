@@ -52,7 +52,8 @@ from praxis.protocol.models import ModelAdapter, ModelSettings, ModelToolCall
 from praxis.protocol.permission import PermissionContext
 from praxis.protocol.tools import ResultStatus, Tool
 from praxis.store.log import ItemEntry, Store
-from praxis.store.turns import Turn, create_turn, get_turn
+from praxis.store.turns import Turn, create_turn, get_turn, list_turns
+from praxis.store.verify import VerifyReport, verify_store
 
 DEFAULT_SYSTEM_PROMPT_TEMPLATE = (
     "You are Praxis, a workspace coding agent. Workspace: {workspace}. "
@@ -435,6 +436,20 @@ class Session:
             pending_approvals=_pending_approvals(items),
             unknown_calls=_unresolved_unknown_calls(items),
         )
+
+    # -- 只读日志/turn 面(RULING R14:CLI 的 log/verify/status 经 sdk 触达)------
+
+    def items(self, *, after_seq: int = 0) -> list[Item]:
+        """本 thread 全量 item 日志(seq > after_seq,升序);纯读,不取任何锁。"""
+        return self._store.read_items(self._thread_id, after_seq=after_seq)
+
+    def turns(self) -> list[Turn]:
+        """本 thread 的 turn 快照列表(创建序);纯读。"""
+        return list_turns(self._store, thread_id=self._thread_id)
+
+    def verify(self) -> VerifyReport:
+        """对本会话所属 store 做只读校验扫描(offline verify,永不修复)。"""
+        return verify_store(self._store)
 
     # -- 内部执行入口 ----------------------------------------------------------
 
