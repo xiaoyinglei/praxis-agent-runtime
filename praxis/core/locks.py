@@ -24,15 +24,32 @@ class ThreadBusy(RuntimeError):  # noqa: N818 — 设计 §5.8/§5.1 钉死的�
     """该 thread 的执行锁正被另一进程持有(thread 正在被执行)。"""
 
 
+def _check_thread_id_filename(thread_id: str) -> None:
+    """thread_id 直接拼成 lockfile 名:路径语义的 id 必须在碰文件系统前整体拒绝。
+
+    生产 thread_id 是 uuid hex,但 SDK(Task 14)接受外部传入——"../x" 之类
+    会把 lockfile 写到 .praxis/locks/ 之外,破坏"锁目录 = 本库全部执行锁"的
+    不变量。规则:非空、不含 '/' 或 '\\'、不含 '..' 路径成分。
+    """
+    if not thread_id:
+        raise ValueError("thread_id must be non-empty")
+    if "/" in thread_id or "\\" in thread_id:
+        raise ValueError(f"thread_id must not contain path separators: {thread_id!r}")
+    if ".." in Path(thread_id).parts:
+        raise ValueError(f"thread_id must not contain '..' components: {thread_id!r}")
+
+
 @contextmanager
 def thread_execution_lock(workspace: Path, thread_id: str) -> Iterator[None]:
     """持有 thread 的独占执行锁;已被占用 → 立即 ``ThreadBusy``,不排队等待。
 
-    - 进入:创建 ``workspace/.praxis/locks/`` 并打开/创建 lockfile,
+    - 进入:先校验 thread_id 可安全作文件名(违规 → ValueError,不碰文件系统),
+      再创建 ``workspace/.praxis/locks/`` 并打开/创建 lockfile,
       ``flock(fd, LOCK_EX | LOCK_NB)``;``BlockingIOError``(EWOULDBLOCK)→ ThreadBusy。
     - 退出(含 with 体内异常):LOCK_UN + close,锁必然归还。
     - 进程死亡:内核关闭 fd 即自动释放——这就是 sweep 能安全"捡尸"的原因。
     """
+    _check_thread_id_filename(thread_id)
     lock_dir = workspace / ".praxis" / "locks"
     lock_dir.mkdir(parents=True, exist_ok=True)
     fd = os.open(lock_dir / f"{thread_id}.lock", os.O_CREAT | os.O_RDWR, 0o644)

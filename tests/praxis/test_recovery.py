@@ -15,9 +15,11 @@ from types import MappingProxyType
 
 import pytest
 
+from praxis.core import recovery
 from praxis.core.events import EventBus
 from praxis.core.locks import thread_execution_lock
 from praxis.core.recovery import PendingCall, classify_pending, sweep
+from praxis.core.statemachine import TurnStatus, transition
 from praxis.protocol.items import Item, ItemKind
 from praxis.protocol.models import ModelToolCall
 from praxis.protocol.tools import (
@@ -104,6 +106,35 @@ def test_sweep_lock_released_after_marking(store: Store, bus: EventBus, workspac
     assert sweep(store, bus, workspace) != []
     with thread_execution_lock(workspace, "t"):
         pass  # 不抛 ThreadBusy 即证明已释放
+
+
+def test_sweep_skips_raced_turn_and_continues(
+    store: Store, bus: EventBus, workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R6 竞态:snapshot 里 running,取锁前执行者已合法完成该 turn → 跳过,绝不中断清扫其余。
+
+    确定性注入:monkeypatch recovery 的 list_turns,快照返回的同一瞬间把 turn A
+    合法 transition 到 completed(终态)。sweep 对 A 的 INTERRUPTED 转换必然抛
+    IllegalTransition——修复前这会炸掉整次 sweep,B 永远不会被标记。
+    """
+    a = make_turn(store, status="running", thread_id="raced")
+    b = make_turn(store, status="running", thread_id="dead")
+    real_list_turns = recovery.list_turns
+
+    def stale_list_turns(s: Store, *, status: str | None = None) -> list[object]:
+        snapshot = list(real_list_turns(s, status=status))  # 此刻两条都还是 running
+        transition(store, bus, a.turn_id, TurnStatus.COMPLETED, reason="model_finished")  # 竞态发生
+        return snapshot
+
+    monkeypatch.setattr(recovery, "list_turns", stale_list_turns)
+
+    marked = sweep(store, bus, workspace)  # 不得抛 IllegalTransition
+
+    assert marked == [b.turn_id]  # 单条竞态不影响其余 dead turn 的清扫
+    ra = get_turn(store, a.turn_id)
+    rb = get_turn(store, b.turn_id)
+    assert ra is not None and ra.status == "completed"  # 执行者的合法结果不被回退
+    assert rb is not None and rb.status == "interrupted"
 
 
 # ---------------------------------------------------------------------------

@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from praxis.core.locks import ThreadBusy, thread_execution_lock
-from praxis.core.statemachine import TurnStatus, transition
+from praxis.core.statemachine import IllegalTransition, TurnStatus, transition
 from praxis.protocol.items import Item, ItemKind
 from praxis.protocol.json import JsonValue
 from praxis.protocol.models import ModelToolCall
@@ -43,6 +43,8 @@ def sweep(store: Store, bus: EventBus, workspace: Path) -> list[str]:
     """清扫:running 且执行锁空闲(原主已死)的 turn → interrupted。
 
     返回被标记的 turn_id 列表(按 list_turns 的 created_at 顺序)。
+    单条 turn 的任何失败绝不中断整次清扫:sweep 是 recovery 入口,
+    漏扫其余 dead turn 的代价远大于跳过一条。
     """
     marked: list[str] = []
     for turn in list_turns(store, status=TurnStatus.RUNNING.value):
@@ -56,6 +58,11 @@ def sweep(store: Store, bus: EventBus, workspace: Path) -> list[str]:
                     reason="executor_process_died",
                 )
         except ThreadBusy:
+            continue
+        except IllegalTransition:
+            # R6 竞态:快照与取锁之间,该 turn 已被活执行者合法改写(如 completed)
+            # ——不再是 dead,跳过并继续清扫其余。执行锁保证这不是"执行中":
+            # 活执行者改写状态全程持锁,能取到锁就说明它已经交还了该 thread。
             continue
         marked.append(turn.turn_id)
     return marked
