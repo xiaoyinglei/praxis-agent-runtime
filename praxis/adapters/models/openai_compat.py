@@ -66,13 +66,16 @@ class OpenAICompatAdapter:
         kwargs: dict[str, Any] = {
             "model": req.model,
             "messages": to_openai_messages(req.messages),
-            "max_tokens": req.max_output_tokens,
         }
         if req.tools:
             kwargs["tools"] = to_openai_tools(req.tools)
+        kwargs.update(req.provider_options)
+        # 标准字段最后落位:与 provider_options 冲突时 settings 显式值胜出
+        # (max_tokens 恒胜;temperature 仅在 settings 给了值时覆盖,
+        # 否则 provider_options 可继续提供默认值)。
+        kwargs["max_tokens"] = req.max_output_tokens
         if req.temperature is not None:
             kwargs["temperature"] = req.temperature
-        kwargs.update(req.provider_options)
         completion = await self._client.chat.completions.create(**kwargs)
         if not completion.choices:
             raise ValueError(f"provider returned no choices for model {req.model!r}")

@@ -191,6 +191,54 @@ def test_complete_passes_provider_options_to_sdk_once() -> None:
     ]
 
 
+def _text_payload() -> dict[str, Any]:
+    return _openai_payload(
+        choices=[
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "ok"},
+            }
+        ]
+    )
+
+
+def test_complete_settings_win_over_colliding_provider_options() -> None:
+    # 冲突键的优先级:settings 显式值覆盖 spec.provider_options 中的裸 SDK kwarg。
+    transport, seen = _mock_transport(_text_payload())
+    client = httpx.AsyncClient(transport=transport)
+    spec = ModelSpec(
+        model_id="m", provider_options={"temperature": 0.9, "max_tokens": 5}, max_output_tokens=50
+    )
+    adapter = OpenAICompatAdapter(
+        spec, api_key="k", base_url="https://unit.test/v1", http_client=client
+    )
+    req = adapter.build_request(
+        [ModelMessage(role="user", content="hi")],
+        [],
+        ModelSettings(temperature=0.2, max_output_tokens=100),
+    )
+    asyncio.run(adapter.complete(req))
+    body = json.loads(seen[0].content)
+    assert body["temperature"] == 0.2
+    assert body["max_tokens"] == 100
+
+
+def test_complete_provider_temperature_survives_when_settings_none() -> None:
+    # settings.temperature=None 时,provider_options 的 temperature 默认值仍生效。
+    transport, seen = _mock_transport(_text_payload())
+    client = httpx.AsyncClient(transport=transport)
+    spec = ModelSpec(model_id="m", provider_options={"temperature": 0.7}, max_output_tokens=400)
+    adapter = OpenAICompatAdapter(
+        spec, api_key="k", base_url="https://unit.test/v1", http_client=client
+    )
+    req = adapter.build_request([], [], ModelSettings())
+    asyncio.run(adapter.complete(req))
+    body = json.loads(seen[0].content)
+    assert body["temperature"] == 0.7
+    assert body["max_tokens"] == 400
+
+
 def test_complete_rejects_malformed_tool_call_arguments() -> None:
     payload = _openai_payload()
     payload["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] = "not-json{"
