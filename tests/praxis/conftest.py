@@ -1,69 +1,90 @@
 """Praxis 测试公共 fixture(Task 4 起):workspace 目录与独立 db 的 Store。
 
-Task 7 补充 make_turn 助手:创建 turn 然后通过合法转换链到达目标状态。
+Task 7: make_turn reaches requested status via transition() (the sole state-write
+entry point), eliminating duplicate write_status/event-emit boilerplate and the
+loop-body import that was hiding inside the for-loop.
 """
 
 from __future__ import annotations
 
+import tempfile
 from collections.abc import Iterator
 from pathlib import Path
+from typing import TYPE_CHECKING, Protocol
 from uuid import uuid4
 
 import pytest
 
-from praxis.core.events import EventBus
 from praxis.store.log import Store
-from praxis.store.turns import Turn, create_turn, get_turn, write_status
+from praxis.store.turns import Turn, create_turn, get_turn
 
+# Sentinel — default "no status given" becomes RUNNING inside the function.
+_UNSET: object = object()
 
-# Shortest legal chain(s) from "running" to each target status.
-# PAUSED needs two steps because we must go running→paused and then
-# pause→running before pausing again (a single run→pause gives
-# "running", not the desired paused-with-history).
-_CHAINS: dict[str, list[tuple[str, str]]] = {
-    "paused": [("running", "paused"), ("paused", "running"), ("running", "paused")],
-    "interrupted": [("running", "interrupted")],
-    "completed": [("running", "completed")],
-    "failed": [("running", "failed")],
-    "cancelled": [("running", "cancelled")],
-}
+if TYPE_CHECKING:
+    # Stubs for type-hints only; resolved at runtime inside functions.
+    class _EventBus(Protocol):
+        def emit(self, event: object) -> None: ...
+
+    class _TransitionFn(Protocol):
+        def __call__(
+            self,
+            store: Store,
+            bus: _EventBus,
+            turn_id: str,
+            to: str,  # noqa: PYI041 — str annotation avoids forward-reference pain
+            *,
+            reason: str,
+        ) -> Turn: ...
 
 
 def make_turn(
     store: Store,
-    bus: EventBus | None = None,
-    *,
+    status: str | None = None,  # type: ignore[assignment]
     thread_id: str = "t",
-    status: str = "running",
+    _bus: object | None = None,
+    *,
+    _transition: object | None = None,
 ) -> Turn:
-    """Create a new turn and reach the requested status via legal transitions."""
-    tid = f"turn-{uuid4().hex}"
-    turn = create_turn(store, turn_id=tid, thread_id=thread_id, binding={})
-    assert turn.status == "running"  # CREATE always starts at running
-    if status == "running":
-        return turn
-    chain = _CHAINS.get(status)
-    assert chain is not None, f"unknown target status: {status!r}"
-    prev = turn
-    for src, dst in chain:
-        old = get_turn(store, tid)
-        assert old is not None and old.status == src, f"expected {src}, got {old.status}"
-        prev = write_status(store, tid, dst, reason=f"reach_{dst}")
-        if bus is not None:
-            from praxis.protocol.events import TurnStatusChanged
+    """Create a new turn and (if needed) reach the requested status via transition().
 
-            bus.emit(
-                TurnStatusChanged(
-                    turn_id=tid,
-                    thread_id=thread_id,
-                    from_status=src,
-                    to_status=dst,
-                    reason=f"reach_{dst}",
-                )
-            )
+    By default (_transition=None) delegates to
+    ``praxis.core.statemachine.transition``.
+    Callers may inject ``_transition`` or ``_bus`` for testing without duplicating logic.
+    """
+    tid = f"turn-{uuid4().hex}"
+    # Lazy import — avoids any circular import dance at module load time.
+    from praxis.core.events import EventBus  # noqa: PLC0415
+    from praxis.core.statemachine import TurnStatus as TS  # noqa: PLC0415,N817
+    from praxis.core.statemachine import transition as _default_transition  # noqa: PLC0415
+
+    target: TS
+    if status is None:
+        target = TS.RUNNING
+    else:
+        target = TS(status)
+
+    transition_fn: _TransitionFn = _transition or _default_transition
+
+    turn = create_turn(store, turn_id=tid, thread_id=thread_id, binding={})
+    assert turn.status == "running"
+    if target != TS.RUNNING:
+        bus = _bus or EventBus()
+        transition_fn(store, bus, tid, target, reason=f"reach_{target.value}")
     result = get_turn(store, tid)
-    assert result is not None and result.status == status, f"expected {status}, got {result.status}"
+    assert result is not None and result.status == target.value, (
+        f"expected {target.value}, got {result.status}"
+    )
     return result
+
+
+# --- Helpers exposed for tests that need extra stores -----------------------
+
+
+def stub_store() -> Store:
+    """Create a temporary standalone store."""
+    s = Store(tempfile.mktemp(suffix=".db"))
+    return s
 
 
 @pytest.fixture
@@ -83,6 +104,8 @@ def store(workspace: Path) -> Iterator[Store]:
 
 
 @pytest.fixture
-def bus() -> Iterator[EventBus]:
+def bus() -> Iterator[_EventBus]:  # noqa: F821
+    from praxis.core.events import EventBus  # noqa: PLC0415
+
     eb = EventBus()
     yield eb

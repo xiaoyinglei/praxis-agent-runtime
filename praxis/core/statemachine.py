@@ -5,7 +5,7 @@
 public API
 ----------
 - TurnStatus(StrEnum) : running | paused | interrupted | completed | failed | cancelled
-- TRANSITIONS: dict[TurnStatus, frozenset[TurnStatus]]  (转义 §5.2)
+- TRANSITIONS: dict[TurnStatus, frozenset[TurnStatus]]  (逐字 §5.2)
 - IllegalTransition(RuntimeError): turn_id / from_status / to_status
 - transition(store, bus, turn_id, to, *, reason) -> Turn
     读当前 → 校验 TRANSITIONS → turns.write_status → 广播 TurnStatusChanged → 返回 Turn

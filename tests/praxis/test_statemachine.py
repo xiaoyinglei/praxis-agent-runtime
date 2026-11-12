@@ -5,20 +5,22 @@ TDD — Tests First: these tests must FAIL before statemachine.py is written.
 
 from __future__ import annotations
 
+import os
+import tempfile
+
 import pytest
 
 from praxis.core.events import EventBus
-from praxis.protocol.items import ItemKind
-from praxis.store.log import Store
-from praxis.store.turns import Turn
 from praxis.core.statemachine import (
-    IllegalTransition,
     TRANSITIONS,
+    IllegalTransition,
     TurnStatus,
     transition,
 )
+from praxis.protocol.items import ItemKind
+from praxis.store.log import Store
+from praxis.store.turns import Turn
 from tests.praxis.conftest import make_turn
-
 
 # ---------------------------------------------------------------------------
 # Phase 1: class existence — must fail when module is absent
@@ -39,15 +41,43 @@ def test_turn_status_has_all_members() -> None:
 @pytest.mark.parametrize("src", list(TurnStatus))
 @pytest.mark.parametrize("dst", list(TurnStatus))
 def test_transition_table_exhaustive(store: Store, bus: EventBus, src: TurnStatus, dst: TurnStatus) -> None:
-    """Legal → status updated; illegal → IllegalTransition raised."""
-    turn = make_turn(store, bus, status=src.value)
+    """Legal → status updated; illegal → IllegalTransition with full attributes."""
+    turn = make_turn(store, status=src.value, thread_id="t")
     if dst in TRANSITIONS[src]:
         out = transition(store, bus, turn.turn_id, dst, reason="test")
         assert isinstance(out, Turn)
         assert out.status == dst.value
     else:
-        with pytest.raises(IllegalTransition):
+        with pytest.raises(IllegalTransition) as err_ctx:
             transition(store, bus, turn.turn_id, dst, reason="test")
+        err = err_ctx.value
+        assert err.turn_id == turn.turn_id
+        assert err.from_status == src.value
+        assert err.to_status == dst.value
+
+
+# ---------------------------------------------------------------------------
+# Phase 2b: missing-turn branch (FINDING 1 fix)
+# ---------------------------------------------------------------------------
+
+
+def test_missing_turn_raises_illegal_transition() -> None:
+    """transition on a non-existent turn_id → IllegalTransition(from_status='', …)."""
+    s = Store(tempfile.mktemp(suffix=".db"))
+    try:
+        bus = EventBus()
+        with pytest.raises(IllegalTransition, match="nonexistent") as err:
+            transition(s, bus, "nonexistent", TurnStatus.COMPLETED, reason="ghost")
+        e = err.value
+        assert e.turn_id == "nonexistent"
+        assert e.from_status == ""
+        assert e.to_status == "completed"
+    finally:
+        s.close()
+        try:
+            os.unlink(s._db_path)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +88,7 @@ def test_transition_table_exhaustive(store: Store, bus: EventBus, src: TurnStatu
 def test_reason_persisted_and_emitted(store: Store, bus: EventBus) -> None:
     """reason flows to both write_status item AND TurnStatusChanged event."""
     sub = bus.subscribe()  # subscribe BEFORE the call so event lands in queue
-    turn = make_turn(store, bus=None, status=TurnStatus.RUNNING.value)
+    turn = make_turn(store, status=TurnStatus.RUNNING.value)
     transition(store, bus, turn.turn_id, TurnStatus.FAILED, reason="provider 503")
     # Check persisted item
     items = store.read_turn_items(turn.turn_id)
