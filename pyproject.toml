@@ -76,6 +76,7 @@ dev = [
   "import-linter>=2.11",
   "mypy>=1.15.0",
   "pytest>=8.3.5",
+  "pytest-timeout>=2.4.0",
   "ruff>=0.11.0",
   "types-regex>=2025.7.34",
 ]
@@ -99,6 +100,8 @@ packages = ["agent_runtime", "rag", "praxis"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+# 全局单测超时：挂起的测试必须中止，绝不允许变孤儿进程吃内存过夜（2026-11-13 事故教训）
+timeout = 60
 
 [tool.ruff]
 line-length = 120
