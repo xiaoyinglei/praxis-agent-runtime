@@ -61,34 +61,47 @@ def to_messages(items: Sequence[Item]) -> list[ModelMessage]:
     - 其余 kind(turn_status/approval_*/tool_call/未知)→ 跳过
 
     配对修复(R9):只改投影,不改 store 事实。两遍处理——
-    第一遍收集"有 tool_result item 的 call_id 集合"(存在性按 kind+call_id 判定,
-    与 status/文本无关,denied/not_executed 也算存在);第二遍顺序投影,紧跟在
-    携带 tool_calls 的 assistant 消息之后,按其 tool_calls 顺序为集合中没有结果的
-    call_id 合成 tool 消息(覆盖 cancelled/failed/abandoned-paused 轮次;
-    INTERRUPTED 轮次由 recovery 写入真实 not_executed/outcome_unknown 结果,
-    属于结果集合,原样投影)。真实结果 item 遇到时正常投影,不会重复。
+    第一遍收集"有 tool_result item 的 (turn_id, call_id) 集合"(存在性按
+    kind+turn_id+call_id 判定,与 status/文本无关,denied/not_executed 也算
+    存在);第二遍顺序投影,紧跟在携带 tool_calls 的 assistant 消息之后,按其
+    tool_calls 顺序为该 assistant 所属 turn 中没有结果的 call_id 合成 tool 消息
+    (覆盖 cancelled/failed/abandoned-paused 轮次;INTERRUPTED 轮次由 recovery
+    写入真实 not_executed/outcome_unknown 结果,属于结果集合,原样投影)。真实
+    结果 item 遇到时正常投影,不会重复。
     这样任何 provider 的 tool_use/tool_result 配对校验(OpenAI/Anthropic 会
     拒绝孤儿 tool_calls)都不会因中断轮次而失败。
 
-    结果覆盖(R10,同一第一遍的图完成):一个 call_id 出现多条 tool_result 时
-    只投影**最后**一条(最新 seq 胜;seq 相同取列表靠后者)。reconcile 会在
-    outcome_unknown 之后追加对账结果——被覆盖的旧结果仍留在 item 日志做审计,
-    但不再进入模型上下文,避免同一调用出现两个互相矛盾的工具消息。
+    结果覆盖(R10,同一第一遍的图完成):同一 turn 内一个 call_id 出现多条
+    tool_result 时只投影**最后**一条(最新 seq 胜;seq 相同取列表靠后者)。
+    reconcile 会在 outcome_unknown 之后追加对账结果——被覆盖的旧结果仍留在
+    item 日志做审计,但不再进入模型上下文,避免同一调用出现两个互相矛盾的
+    工具消息。
+
+    turn 作用域(整分支评审修复):存在性与覆盖判定都按 (turn_id, call_id)
+    分键——call_id 只在单个 turn 内是调用身份,跨 turn 不唯一(local provider
+    每轮从 call_0 重新起号、CLI 在 default 线程多轮累积)。全局按 call_id 分键
+    会把后一 turn 同 id 的真实结果判为"更新"而丢弃前一 turn 的结果、同时 R9
+    也不再为缺结果的 turn 合成 → 前一 turn 的 assistant 成为孤儿 tool_call,
+    真实 provider 拒收请求。turn_id 为 None 的 item 退化为 (None, call_id),
+    单线程行为不变。
     """
     last_result_keys = _last_result_keys(items)
     messages: list[ModelMessage] = []
     for position, item in enumerate(items):
         if item.kind == ItemKind.TOOL_RESULT:
             call_id = item.payload.get("call_id")
-            if isinstance(call_id, str) and last_result_keys.get(call_id) != (item.seq, position):
-                continue  # R10:非最新结果,留在日志不进投影
+            if isinstance(call_id, str) and last_result_keys.get((item.turn_id, call_id)) != (
+                item.seq,
+                position,
+            ):
+                continue  # R10:同 turn 内非最新结果,留在日志不进投影
         message = _to_message(item)
         if message is None:
             continue
         messages.append(message)
         if message.role == "assistant" and message.tool_calls:
             for call in message.tool_calls:
-                if call.call_id not in last_result_keys:
+                if (item.turn_id, call.call_id) not in last_result_keys:
                     messages.append(
                         ModelMessage(
                             role="tool",
@@ -99,13 +112,16 @@ def to_messages(items: Sequence[Item]) -> list[ModelMessage]:
     return messages
 
 
-def _last_result_keys(items: Sequence[Item]) -> dict[str, tuple[int, int]]:
-    """两遍处理第一遍:call_id → 其最新 tool_result 的 (seq, 列表位置)。
+def _last_result_keys(items: Sequence[Item]) -> dict[tuple[str | None, str], tuple[int, int]]:
+    """两遍处理第一遍:(turn_id, call_id) → 该 turn 该 call 最新 tool_result 的
+    (seq, 列表位置)。
 
-    键集合即"已有结果的 call_id"(R9 配对判据);值给出该 call 哪条结果进投影
-    (R10 覆盖判据)。存在性与覆盖判定都只看 kind+call_id,与 status 无关。
+    键集合即"已有结果的 (turn_id, call_id)"(R9 配对判据);值给出该 call 在本
+    turn 内哪条结果进投影(R10 覆盖判据)。call_id 跨 turn 不唯一,键必须带
+    turn_id(见 to_messages docstring);存在性与覆盖判定只看 kind+turn_id+
+    call_id,与 status 无关。
     """
-    latest: dict[str, tuple[int, int]] = {}
+    latest: dict[tuple[str | None, str], tuple[int, int]] = {}
     for position, item in enumerate(items):
         if item.kind != ItemKind.TOOL_RESULT:
             continue
@@ -113,9 +129,10 @@ def _last_result_keys(items: Sequence[Item]) -> dict[str, tuple[int, int]]:
         if not isinstance(call_id, str):
             continue
         key = (item.seq, position)
-        current = latest.get(call_id)
+        result_id = (item.turn_id, call_id)
+        current = latest.get(result_id)
         if current is None or key >= current:
-            latest[call_id] = key
+            latest[result_id] = key
     return latest
 
 

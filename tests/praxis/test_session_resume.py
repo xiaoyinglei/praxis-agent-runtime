@@ -497,6 +497,135 @@ def test_resume_and_result_guards(workspace: Path, open_ws: Callable[..., Any]) 
 
 
 # ---------------------------------------------------------------------------
+# 评审修复 #2:resume 的映射校验必须发生在 transition(RUNNING) 之前——
+# 非法 approval/reconcile 输入不得把 turn 留在无执行者的 RUNNING(下次
+# open_session 的 sweep 会把它误标 interrupted,伪造"进程死亡"现场)。
+# ---------------------------------------------------------------------------
+
+
+def _turn_item_counts(other: Store, turn_id: str) -> tuple[int, int, int, int]:
+    """(总条数, turn_status, approval_decision, tool_result)——失败 resume 须四项全不动。"""
+    items = other.read_turn_items(turn_id)
+    return (
+        len(items),
+        sum(1 for i in items if i.kind == ItemKind.TURN_STATUS),
+        sum(1 for i in items if i.kind == ItemKind.APPROVAL_DECISION),
+        sum(1 for i in items if i.kind == ItemKind.TOOL_RESULT),
+    )
+
+
+def _facts(workspace: Path, turn_id: str) -> tuple[int, int, int, int]:
+    return _with_other_store(workspace, lambda other: _turn_item_counts(other, turn_id))
+
+
+def test_resume_paused_unknown_approval_id_raises_before_transition(
+    workspace: Path, open_ws: Callable[..., Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(permission, "decide", lambda *a: Decision.ask("test"))
+    args = {"path": "f.txt", "content": "x"}
+    session = open_ws(ScriptedAdapter([_resp("", (("c1", "write", args),)), _resp("all done")]))
+    paused = asyncio.run(session.submit("write it"))
+    assert paused.status is TurnStatus.PAUSED and paused.reason == "approval_required"
+
+    before = _facts(workspace, paused.turn_id)
+
+    with pytest.raises(ValueError, match="no approval_request"):
+        asyncio.run(session.resume(paused.turn_id, approval={"nonexistent_call_id": "allow"}))
+    assert session.status(paused.turn_id).status == "paused"  # 绝不滞留 RUNNING
+    assert _facts(workspace, paused.turn_id) == before  # 零 transition、零写入
+
+    with pytest.raises(ValueError, match="allow/deny"):
+        asyncio.run(session.resume(paused.turn_id, approval={"c1": "maybe"}))  # type: ignore[dict-item]
+    assert session.status(paused.turn_id).status == "paused"
+    assert _facts(workspace, paused.turn_id) == before
+
+    # 失败输入不排队的合法续跑仍然工作
+    done = asyncio.run(session.resume(paused.turn_id, approval={"c1": "allow"}))
+    assert done.status is TurnStatus.COMPLETED and done.output == "all done"
+
+
+def test_resume_paused_bad_reconcile_raises_before_transition(
+    workspace: Path, open_ws: Callable[..., Any]
+) -> None:
+    session = open_ws(ScriptedAdapter([_resp("reconciled and done")]))
+    call = ("c1", "bash", {"command": "true"})
+    turn_id = _dead_turn(
+        workspace, session.thread_id, [_model_response_entry("running bash", (call,)), _tool_call_entry(*call)]
+    )
+    asyncio.run(session.resume(turn_id, confirm=True))  # → PAUSED/outcome_unknown
+    assert session.status(turn_id).status == "paused"
+
+    before = _facts(workspace, turn_id)
+
+    with pytest.raises(ValueError, match="not found in turn"):
+        asyncio.run(session.resume(turn_id, reconcile={"nonexistent_call_id": "ok"}))
+    assert session.status(turn_id).status == "paused"
+    assert _facts(workspace, turn_id) == before
+
+    with pytest.raises(ValueError, match="ok/failed"):
+        asyncio.run(session.resume(turn_id, reconcile={"c1": "bogus"}))  # type: ignore[dict-item]
+    assert session.status(turn_id).status == "paused"
+    assert _facts(workspace, turn_id) == before
+
+    done = asyncio.run(session.resume(turn_id, reconcile={"c1": "ok"}))
+    assert done.status is TurnStatus.COMPLETED and done.output == "reconciled and done"
+
+
+def test_resume_interrupted_bad_reconcile_stays_interrupted(
+    workspace: Path, open_ws: Callable[..., Any]
+) -> None:
+    """INTERRUPTED 路径同理:校验失败绝不先转 RUNNING(否则 sweep 场景失真)。"""
+    session = open_ws(ScriptedAdapter([_resp("never reached via bad input")]))
+    call = ("c1", "bash", {"command": "true"})
+    turn_id = _dead_turn(
+        workspace, session.thread_id, [_model_response_entry("running bash", (call,)), _tool_call_entry(*call)]
+    )
+    assert session.status(turn_id).status == "interrupted"
+    before = _facts(workspace, turn_id)
+
+    with pytest.raises(ValueError, match="not found in turn"):
+        asyncio.run(session.resume(turn_id, confirm=True, reconcile={"typo_id": "ok"}))
+    assert session.status(turn_id).status == "interrupted"
+    assert _facts(workspace, turn_id) == before
+
+    paused = asyncio.run(session.resume(turn_id, confirm=True))  # 合法确认仍走 outcome_unknown 矩阵
+    assert paused.status is TurnStatus.PAUSED and paused.unknown_calls == ("c1",)
+
+
+# ---------------------------------------------------------------------------
+# 评审修复 #3:PAUSED 守卫要求**非空**映射——approval={} 等空映射不是人工决策,
+# 放行会静默丢弃待决审批(transition RUNNING → classify 写 not_executed → 完成)。
+# ---------------------------------------------------------------------------
+
+
+def test_resume_paused_empty_maps_rejected(
+    workspace: Path, open_ws: Callable[..., Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(permission, "decide", lambda *a: Decision.ask("test"))
+    args = {"path": "f.txt", "content": "approved content"}
+    session = open_ws(ScriptedAdapter([_resp("", (("c1", "write", args),)), _resp("all done")]))
+    paused = asyncio.run(session.submit("write it"))
+    assert paused.status is TurnStatus.PAUSED
+
+    before = _facts(workspace, paused.turn_id)
+
+    with pytest.raises(ValueError, match="approval or reconcile"):
+        asyncio.run(session.resume(paused.turn_id, approval={}))
+    assert session.status(paused.turn_id).status == "paused"
+    assert _facts(workspace, paused.turn_id) == before
+
+    with pytest.raises(ValueError, match="approval or reconcile"):
+        asyncio.run(session.resume(paused.turn_id, reconcile={}))
+    assert session.status(paused.turn_id).status == "paused"
+    assert _facts(workspace, paused.turn_id) == before
+    assert not (workspace / "f.txt").exists()  # 审批未被静默丢弃,工具未执行
+
+    done = asyncio.run(session.resume(paused.turn_id, approval={"c1": "allow"}))  # 非空映射照常
+    assert done.status is TurnStatus.COMPLETED and done.output == "all done"
+    assert (workspace / "f.txt").read_text(encoding="utf-8") == "approved content"
+
+
+# ---------------------------------------------------------------------------
 # composition:thread_id 边界校验 + 打开即 sweep
 # ---------------------------------------------------------------------------
 

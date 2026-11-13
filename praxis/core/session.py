@@ -7,14 +7,17 @@ Session 是 turn 循环之上的会话门面:它不执行任何东西,只负责"
    锁被占(ThreadBusy)一律换成公开的 ``ConversationBusy``;steer/approval/
    reconcile/confirm 只是 append item,永不取锁(§5.8:它们不是执行者)。
 2. **人工确认守卫**(§5.2:interrupted 只能由人重启):INTERRUPTED turn 必须
-   ``confirm=True``,否则 ``ResumeNotConfirmed``;PAUSED turn 必须给 approval
-   (审批)或 reconcile(结果对账)之一;RUNNING 与终态 turn 不可 resume。
+   ``confirm=True``,否则 ``ResumeNotConfirmed``;PAUSED turn 必须给**非空**的
+   approval(审批)或 reconcile(结果对账)映射——空映射不是决策,同样拒绝;
+   RUNNING 与终态 turn 不可 resume。
 3. **classify_pending 决策矩阵**(§5.9,recovery 提供分类,本模块提供动作):
    未 started 的待决调用写 not_executed 结果(它确实没跑);started+幂等自动
    重跑(经唯一管道);started+非幂等写 outcome_unknown 并停在 PAUSED 等人对账
    ——续跑的代价不对称,绝不自动重放未知副作用。
 
-resume 的处理序(与代码一一对应):守卫 → transition(RUNNING,真实 reason) →
+resume 的处理序(与代码一一对应):守卫 → 映射校验(目标存在、verdict/outcome
+合法——在**任何** transition 之前,失败即零写入,绝不把 turn 留在无执行者的
+RUNNING 等 sweep 误标 interrupted)→ transition(RUNNING,真实 reason) →
 reconcile 写结果(先) → approval 写决策(摘要从 approval_request item 取,绑定
 digest)→ classify_pending 分类(**先 started 后 decision**:未 started 且有
 matching decision 的调用进重放队列承接审批重入;已 started 的决策一律失效于
@@ -190,6 +193,37 @@ def _text_result_entry(
 
 
 # ---------------------------------------------------------------------------
+# resume 映射校验(纯函数;在 transition(RUNNING) **之前**调用,见 Session.resume)
+# ---------------------------------------------------------------------------
+
+
+def _validate_reconcile(
+    turn_id: str, items: Sequence[Item], reconcile: Mapping[str, str]
+) -> Mapping[str, str]:
+    """reconcile:outcome 必须 ok/failed、目标必须出现在本 turn items;返回 call_id→工具名。"""
+    names = _call_names(items)
+    for call_id, outcome in reconcile.items():
+        if outcome not in _RECONCILE_OUTCOMES:
+            raise ValueError(f"reconcile outcome must be ok/failed, got {outcome!r}")
+        if call_id not in names:
+            raise ValueError(f"reconcile target {call_id!r} not found in turn {turn_id!r} items")
+    return names
+
+
+def _validate_approval(
+    turn_id: str, items: Sequence[Item], approval: Mapping[str, str]
+) -> Mapping[str, Mapping[str, JsonValue]]:
+    """approval:verdict 必须 allow/deny、目标必须有 matching approval_request;返回请求表。"""
+    requests = _latest_payloads(items, ItemKind.APPROVAL_REQUEST)
+    for call_id, verdict in approval.items():
+        if verdict not in _APPROVAL_VERDICTS:
+            raise ValueError(f"approval verdict must be allow/deny, got {verdict!r}")
+        if call_id not in requests:
+            raise ValueError(f"no approval_request for call {call_id!r} in turn {turn_id!r}")
+    return requests
+
+
+# ---------------------------------------------------------------------------
 # Session
 # ---------------------------------------------------------------------------
 
@@ -284,12 +318,22 @@ class Session:
                     f"turn {turn_id!r} is interrupted; resume requires confirm=True (design §5.2)"
                 )
         elif status is TurnStatus.PAUSED:
-            if approval is None and reconcile is None:
+            if not approval and not reconcile:  # 空映射不是决策:不得静默丢弃待决审批/对账
                 raise ValueError("paused turn needs approval or reconcile")
         elif status is TurnStatus.RUNNING:
             raise ValueError(f"turn {turn_id!r} is still running; not resumable")
         else:
             raise ValueError(f"turn {turn_id!r} is {status.value}; terminal turns are not resumable")
+
+        # 映射校验在 transition 之前:非法目标/verdict/outcome 绝不把 turn 转成
+        # 无执行者的 RUNNING——那会被下次 open_session 的 sweep 误标 interrupted,
+        # 伪造"进程死亡"的恢复现场。校验失败 = 零 transition、零 item 写入。
+        if reconcile or approval:
+            probe_items = self._store.read_turn_items(turn_id)
+            if reconcile:
+                _validate_reconcile(turn_id, probe_items, reconcile)
+            if approval:
+                _validate_approval(turn_id, probe_items, approval)
 
         transition(
             self._store,
@@ -333,31 +377,22 @@ class Session:
 
     def _write_reconcile(self, turn_id: str, reconcile: Mapping[str, Literal["ok", "failed"]]) -> None:
         items = self._store.read_turn_items(turn_id)
-        names = _call_names(items)
+        names = _validate_reconcile(turn_id, items, reconcile)  # resume 已前置校验;此处幂等复核
         entries: list[ItemEntry] = []
         for call_id, outcome in reconcile.items():
-            if outcome not in _RECONCILE_OUTCOMES:
-                raise ValueError(f"reconcile outcome must be ok/failed, got {outcome!r}")
-            tool_name = names.get(call_id)
-            if tool_name is None:
-                raise ValueError(f"reconcile target {call_id!r} not found in turn {turn_id!r} items")
             status = ResultStatus.OK if outcome == "ok" else ResultStatus.ERROR
             text = f"reconciled by user: {outcome}"
-            entries.append(_text_result_entry(call_id, tool_name, status, text, {"reconciled": True}))
+            entries.append(_text_result_entry(call_id, names[call_id], status, text, {"reconciled": True}))
         self._store.append_items(self._thread_id, turn_id, entries)
 
     def _write_approval_decisions(
         self, turn_id: str, approval: Mapping[str, Literal["allow", "deny"]]
     ) -> None:
         items = self._store.read_turn_items(turn_id)
-        requests = _latest_payloads(items, ItemKind.APPROVAL_REQUEST)
+        requests = _validate_approval(turn_id, items, approval)  # 同上:幂等复核
         entries: list[ItemEntry] = []
         for call_id, verdict in approval.items():
-            if verdict not in _APPROVAL_VERDICTS:
-                raise ValueError(f"approval verdict must be allow/deny, got {verdict!r}")
-            request = requests.get(call_id)
-            if request is None:
-                raise ValueError(f"no approval_request for call {call_id!r} in turn {turn_id!r}")
+            request = requests[call_id]
             payload: dict[str, JsonValue] = {
                 "call_id": call_id,
                 "verdict": verdict,

@@ -19,11 +19,11 @@ from praxis.protocol.tools import ToolContentBlock, ToolResult
 _UNPAIRED_NOTE = "[tool result unavailable: turn ended before execution]"
 
 
-def mk(seq: int, kind: str, payload: dict[str, Any]) -> Item:
+def mk(seq: int, kind: str, payload: dict[str, Any], turn_id: str | None = None) -> Item:
     return Item(
         item_id=f"i{seq}",
         thread_id="t",
-        turn_id=None,
+        turn_id=turn_id,
         seq=seq,
         kind=kind,
         payload=payload,
@@ -383,32 +383,37 @@ def test_denied_or_not_executed_result_counts_as_paired() -> None:
 
 @st.composite
 def pairing_items(draw: st.SearchStrategy) -> list[Item]:  # type: ignore[misc]
-    # (e) 变体:每轮 1-3 个全局唯一 call id,每个 id 随机有/无真实结果
+    # (e) 变体:每 turn 1-3 个 call id,从固定小池抽取——跨 turn 复用同一 id 是
+    # 真实形状(local provider 每轮从 call_0 重新起号;CLI 累积 default 线程);
+    # 单 turn 内 id 唯一,每个 id 随机有/无真实结果
     items: list[Item] = []
     seq = 0
-    next_id = 0
-    for _ in range(draw(st.integers(1, 5))):
-        calls = []
-        for _ in range(draw(st.integers(1, 3))):
-            calls.append(f"tc{next_id}")
-            next_id += 1
+    for turn_idx in range(1, draw(st.integers(1, 5)) + 1):
+        turn_id = f"turn-{turn_idx}"
+        calls = draw(st.lists(st.sampled_from(["tc0", "tc1", "tc2"]), min_size=1, max_size=3, unique=True))
         seq += 1
         items.append(
             mk(
                 seq,
                 "model_response",
                 {"content": "resp", "tool_calls": [{"call_id": c, "name": "tool", "arguments": {}} for c in calls]},
+                turn_id=turn_id,
             )
         )
         for c in calls:
             if draw(st.booleans()):
                 seq += 1
                 items.append(
-                    mk(seq, "tool_result", {"call_id": c, "content": [{"type": "text", "data": {"text": "ok"}}]})
+                    mk(
+                        seq,
+                        "tool_result",
+                        {"call_id": c, "content": [{"type": "text", "data": {"text": "ok"}}]},
+                        turn_id=turn_id,
+                    )
                 )
         if draw(st.booleans()):
             seq += 1
-            items.append(mk(seq, "user_message", {"text": "next"}))
+            items.append(mk(seq, "user_message", {"text": "next"}, turn_id=turn_id))
     return items
 
 
@@ -531,3 +536,87 @@ def test_r10_last_by_seq_wins_even_if_list_order_differs() -> None:
     msgs = to_messages(items)
     assert [m.role for m in msgs] == ["assistant", "tool"]
     assert msgs[1].content == "later seq wins"
+
+
+# ---------------------------------------------------------------------------
+# 跨 turn 复用 call_id 的回归(整分支评审 Important #1):R9/R10 的存在性与
+# 覆盖键必须按 (turn_id, call_id) 分键——call_id 只在单个 turn 内是调用身份,
+# local provider 每轮从 call_0 重新起号、CLI 在 default 线程上多轮累积都会复用。
+# 全局键会把前一 turn 的真实结果判为"非最新"丢弃、同时不再为它合成 → 孤儿
+# assistant tool_call → 真实 provider 直接拒收请求。
+# ---------------------------------------------------------------------------
+
+
+def _assistant_call(seq: int, turn_id: str, call_id: str) -> Item:
+    return mk(
+        seq,
+        "model_response",
+        {"content": "", "tool_calls": [{"call_id": call_id, "name": "t", "arguments": {}}]},
+        turn_id=turn_id,
+    )
+
+
+def _result_in(seq: int, turn_id: str, call_id: str, text: str, status: str = "ok") -> Item:
+    return mk(
+        seq,
+        "tool_result",
+        {"call_id": call_id, "status": status, "content": [{"type": "text", "data": {"text": text}}]},
+        turn_id=turn_id,
+    )
+
+
+def test_cross_turn_repeated_call_id_keeps_both_real_results() -> None:
+    # 两个 turn 都用 c1、各有真实结果:两个结果都必须投影——前一 turn 的结果
+    # 不得被跨 turn 的全局 R10 "最新 seq 胜" 判为旧结果而丢弃。
+    items = [
+        _assistant_call(1, "turn-A", "c1"),
+        _result_in(2, "turn-A", "c1", "from-turn-A"),
+        mk(3, "user_message", {"text": "next"}, turn_id="turn-B"),
+        _assistant_call(4, "turn-B", "c1"),
+        _result_in(5, "turn-B", "c1", "from-turn-B"),
+    ]
+    msgs = to_messages(items)
+    assert [m.role for m in msgs] == ["assistant", "tool", "user", "assistant", "tool"]
+    assert msgs[1].content == "from-turn-A" and msgs[1].tool_call_id == "c1"
+    assert msgs[4].content == "from-turn-B" and msgs[4].tool_call_id == "c1"
+    assert all(_UNPAIRED_NOTE not in m.content for m in msgs)  # 两边都是真实结果,无合成
+
+
+def test_cross_turn_reuse_missing_result_synthesizes_only_that_turn() -> None:
+    # turn-A 的 c1 有真实结果、turn-B 的 c1 无结果:B 必须合成配对结果——
+    # A 的存在不得让 B 的 R9 合成被抑制(B 的 assistant 成为孤儿)。
+    items = [
+        _assistant_call(1, "turn-A", "c1"),
+        _result_in(2, "turn-A", "c1", "real-A"),
+        _assistant_call(3, "turn-B", "c1"),
+    ]
+    msgs = to_messages(items)
+    assert [m.role for m in msgs] == ["assistant", "tool", "assistant", "tool"]
+    assert msgs[1].content == "real-A" and msgs[1].tool_call_id == "c1"
+    assert msgs[3] == ModelMessage(role="tool", content=_UNPAIRED_NOTE, tool_call_id="c1")
+
+
+def test_cross_turn_reuse_real_result_not_masked_by_later_turn_gap() -> None:
+    # 反向:turn-B 有结果不得掩盖 turn-A 缺结果——A 合成,B 投影真实结果。
+    items = [
+        _assistant_call(1, "turn-A", "c1"),
+        _assistant_call(2, "turn-B", "c1"),
+        _result_in(3, "turn-B", "c1", "real-B"),
+    ]
+    msgs = to_messages(items)
+    assert [m.role for m in msgs] == ["assistant", "tool", "assistant", "tool"]
+    assert msgs[1].content == _UNPAIRED_NOTE and msgs[1].tool_call_id == "c1"
+    assert msgs[3].content == "real-B"
+
+
+def test_within_turn_r10_last_wins_holds_with_real_turn_ids() -> None:
+    # turn_id 分键后,单 turn 内 reconcile 覆盖语义不变:outcome_unknown 之后
+    # 的对账结果仍"最后一条胜",旧结果只留审计不进投影。
+    items = [
+        _assistant_call(1, "turn-A", "c1"),
+        _result_in(2, "turn-A", "c1", "[outcome unknown: process died during execution]", "outcome_unknown"),
+        _result_in(3, "turn-A", "c1", "reconciled by user: ok"),
+    ]
+    msgs = to_messages(items)
+    assert [m.role for m in msgs] == ["assistant", "tool"]
+    assert msgs[1].content == "reconciled by user: ok"
