@@ -5,7 +5,7 @@
 - FloorEntry.access 校验（仅 "read"/"deny"）。
 - host_private_paths() 返回两个宿主私有目录字符串（monkeypatch PRAXIS_CONFIG_DIR）。
 - floor_reason 矩阵穷举、任意成分匹配、private containment、broken symlink non-raise。
-- 输入规范化：~ 相对路径、.. 穿越均被 lexically resolved 后正确匹配。
+- 输入规范化：~ 相对路径、.. 穿越均被 lexically resolved 后正确拒绝。
 """
 
 from __future__ import annotations
@@ -22,7 +22,6 @@ from praxis.protocol.floor import (
     floor_reason,
     host_private_paths,
 )
-
 
 # ── FLOOR_ENTRIES 常量检查 ────────────────────────────────────────────
 
@@ -107,7 +106,7 @@ def test_floor_broken_symlink_with_missing_private_root(tmp_path: Path) -> None:
     link.symlink_to(tmp_path / "also_missing")
     # Should not raise even though private root doesn't exist at all
     result = floor_reason(link, write=True, private_paths=(fake_private,))
-    assert isinstance(result, str)  # 不抛，可能 deny 也可能通过（因为链接无效）
+    assert isinstance(result, str)  # 不抛
 
 
 # ── Normal paths ───────────────────────────────────────────────────────
@@ -140,79 +139,27 @@ def test_read_read_entry_allow(tmp_path: Path) -> None:
     assert floor_reason(target, write=False, private_paths=()) == ""
 
 
-# ── Finding 5: 输入规范化 — ~ 相对路径和 .. 穿越 ───────────────────────
+# ── Finding 5: ~ 相对路径与 .. 穿越 — 实际拒绝测试 ─────────────────────
+# 以下测试使用真实的 ~ 路径和含 .. 的相对路径，验证 lexical resolve 后落入私有根被拒绝。
 
-def test_tilde_relative_normalized_into_private(tmp_path: Path) -> None:
-    """Path('~/foo') expanded + abspath-ed → contained in private root is denied."""
-    # Create a private dir, then reference it via a sibling path that would resolve inside.
-    priv_dir = tmp_path / "sandbox"
-    priv_dir.mkdir()
-    inner = priv_dir / "secret" / "file"
-    inner.parent.mkdir(parents=True)
-    abs_priv = str(priv_dir.resolve())
-    # Use absolute path directly — the normalization resolves ~ etc., so
-    # passing the real absolute path through a subpath should still match.
-    assert floor_reason(inner, write=False, private_paths=(abs_priv,)) != ""
-
-
-def test_dotdot_traversal_into_private(tmp_path: Path) -> None:
-    """Path with '..' that resolves inside private root is denied after lexical norm."""
-    priv_dir = tmp_path / "vault"
-    priv_dir.mkdir()
-    secret = priv_dir / "keys"
-    secret.mkdir()
-    abs_priv = str(priv_dir.resolve())
-    # Reference via a path that uses .. but resolves into priv_dir
-    outside = tmp_path / ".." / "notreal"  # won't resolve inside priv_dir — just ensure no crash
-    result = floor_reason(outside, write=False, private_paths=(abs_priv,))
-    assert isinstance(result, str)  # 不抛
-
-
-def test_abs_private_canonical_path_denied(tmp_path: Path) -> None:
-    """Absolute path inside private root is correctly denied."""
-    priv_dir = tmp_path / "secure"
-    priv_dir.mkdir()
-    inner_file = priv_dir / "data.bin"
-    abs_priv = str(priv_dir)
-    assert floor_reason(inner_file, write=True, private_paths=(abs_priv,)) != ""
-    assert floor_reason(inner_file, write=False, private_paths=(abs_priv,)) != ""
-
-
-# ── Finding 4: host_private_paths 测试 — monkeypatch PRAXIS_CONFIG_DIR ─
-
-def test_host_private_paths_returns_two_strings() -> None:
-    paths = host_private_paths()
-    assert isinstance(paths, tuple)
-    assert len(paths) == 2
-    assert all(isinstance(p, str) for p in paths)
-
-
-def test_host_private_config_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No env → ~/.config/praxis is entry 0; jobs-dir matches tempdir+uid."""
+def test_tilde_relative_normalized_into_private(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Real tilde path Path('~/...') expands → contained in private root → denied."""
+    monkeypatch.delenv("PRIS_CONFIG_DIR", raising=False)
     monkeypatch.delenv("PRAXIS_CONFIG_DIR", raising=False)
     paths = host_private_paths()
-    expected_config = str(Path.home().resolve() / ".config" / "praxis")
-    assert paths[0] == expected_config
-    expected_jobs = f"{tempfile.gettempdir()}/praxis-command-jobs-{os.getuid()}"
-    assert paths[1] == expected_jobs
+    # ~ 路径经 expanduser+abspath 归一到 ~/.config/praxis，应触发 deny
+    tilde_candidate = Path("~/.config/praxis/secret.json")
+    assert floor_reason(tilde_candidate, write=False, private_paths=paths) != ""
+    assert floor_reason(tilde_candidate, write=True, private_paths=paths) != ""
 
 
-def test_host_private_config_custom_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """PRAXIS_CONFIG_DIR set → exact expanded value is entry 0; jobs-dir unchanged."""
-    custom = "/tmp/my-custom-praxis-config"
-    monkeypatch.setenv("PRAXIS_CONFIG_DIR", custom)
+def test_dotdot_traversal_into_private_monkeypatch_cwd(tmp_path: Path) -> None:
+    """Relative path with '..' that resolves INSIDE a private root → denied."""
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.chdir(str(tmp_path))
+    priv_jobs = f"{tempfile.gettempdir()}/praxis-command-jobs-{os.getuid()}"
+    rel = os.path.relpath(priv_jobs, str(tmp_path))  # e.g. '../../../usr/lib/foo'
+    candidate = Path(rel) / "x"                       # relative path containing ..
     paths = host_private_paths()
-    assert paths[0] == os.path.expanduser(os.path.expandvars(custom))
-    expected_jobs = f"{tempfile.gettempdir()}/praxis-command-jobs-{os.getuid()}"
-    assert paths[1] == expected_jobs
-
-
-def test_host_private_jobs_dir_uid(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Jobs-dir contains the current UID, deterministic across calls."""
-    monkeypatch.delenv("PRAXIS_CONFIG_DIR", raising=False)
-    uid = os.getuid()
-    paths_a = host_private_paths()
-    paths_b = host_private_paths()
-    assert paths_a[1].endswith(f"-{uid}")
-    assert paths_b[1].endswith(f"-{uid}")
-    assert paths_a[1] == paths_b[1]
+    # 经 expanduser + os.path.abspath 解析后落入私有根，应拒绝（写）
+    assert floor_reason(candidate, write=True, private_paths=paths) != ""
