@@ -8,8 +8,8 @@
 
 步骤序冻结:deny_rules → ask_rules → tool_callback → safety_floor →
 mode_bypass → allow_rules → sandbox_auto → dontask_guard → fallback ask。
-两个由步骤序直接推出的边界行为在此钉死(见 report):
-- never 模式只转换 fallback ask;第 2 步的 ask 原样返回(步骤表无 mode 条件);
+边界行为钉死(见 report):
+- never 模式在合并器末端把任何 ask(含第 2/3 步早退)统一转 deny(design §5.3 第 8 步,R7);
 - bypass(第 5 步)先于沙箱裁决(第 7 步),但地板/规则/回调 deny 免疫。
 """
 
@@ -560,11 +560,38 @@ def test_fallback_ask_reason_and_suggestions(ws, web_tool):
     assert {u.destination for u in d.suggestions} == {"session", "always"}
 
 
-def test_never_mode_step2_ask_returns_ask(ws, bash_tool, bash_use):
-    # 步骤表钉死:dontask_guard 只转换 fallback ask;第 2 步 ask 无 mode 条件。
-    # never 下该 ask 会让回合停在审批(不可批准=不执行),fail-safe 但非 deny。
+def test_never_mode_converts_step2_ask_to_deny(ws, bash_tool, bash_use):
+    # design §5.3 第 8 步(R7):never 末端统一把 ask 转 deny——第 2 步早退 ask 同样转换。
     ctx = make_ctx(ws, policy=PermissionPolicy(tools=(ToolRule(pattern="bash", decision="ask"),)), mode="never")
-    assert decide(bash_tool, bash_use, ctx).is_ask
+    d = decide(bash_tool, bash_use, ctx)
+    assert d.is_deny and d.reason == NEVER_REASON and d.suggestions == ()
+
+
+def test_never_mode_matrix_all_ask_sources(ws, bash_tool, bash_use, web_tool):
+    # 每个 ask 来源 × never ⇒ deny(统一转换);× on-request ⇒ ask 不变;
+    # bypass 不受末端转换影响:早退 ask 源仍 ask(第 2/3 步先于第 5 步),fallback ⇒ allow。
+    callback_tool = make_minimal_tool(check_permission=lambda u, c: Decision.ask("tool"))
+    net_no_target = ResolvedUse(effects=frozenset({ToolEffect.NETWORK}), targets=())
+    cases = [
+        # (tool, use, ctx kwargs, bypass 期望)
+        (bash_tool, bash_use, {"policy": PermissionPolicy(tools=(ToolRule(pattern="bash", decision="ask"),))}, "ask"),
+        (
+            web_tool, url_use("https://ok.com/x"),
+            {"policy": PermissionPolicy(network=NetworkPolicy(decision="ask"))}, "ask",
+        ),
+        (bash_tool, bash_use, {}, "ask"),  # 命令网络 ask(默认 network ask,D9)
+        (
+            bash_tool, bash_use,
+            {"policy": NET_ALLOW, "hook_decisions": (HookDecision(source="h", verdict="ask"),)}, "ask",
+        ),
+        (callback_tool, path_use(ws, "f.txt"), {}, "ask"),  # 回调 ask(第 3 步)
+        (web_tool, net_no_target, {}, "allow"),  # fallback ask → bypass 第 5 步 allow
+    ]
+    for tool, use, kwargs, bypass_verdict in cases:
+        never = decide(tool, use, make_ctx(ws, mode="never", **kwargs))
+        assert never.is_deny and never.reason == NEVER_REASON and never.suggestions == ()
+        assert decide(tool, use, make_ctx(ws, mode="on-request", **kwargs)).is_ask
+        assert decide(tool, use, make_ctx(ws, mode="bypass", **kwargs)).verdict == bypass_verdict
 
 
 def test_bypass_precedes_sandbox(ws, bash_tool, bash_use):

@@ -12,7 +12,7 @@ decide() 的签名是冻结的接线契约:管道(T12 execute)只经模块属性
 5. mode_bypass   bypass 模式 allow
 6. allow_rules   ToolRule allow 或完整授权覆盖(D1);DESTRUCTIVE/EXECUTE_PROCESS 跳过
 7. sandbox_auto  EXECUTE_PROCESS 沙箱裁决,不可用 → deny(D2 fail-closed)
-8. dontask_guard never 模式把 fallback ask 转 deny
+8. dontask_guard never 模式把 fallback ask 转 deny(合并器末端再把任何早退 ask 统一转 deny)
 
 规则匹配一律消费 protocol/policy.py 代数,地板一律消费 protocol/floor.py——
 core 没有第二套匹配器/地板列表。ceiling 组合 = 逐一 resolve、决策时最严者胜
@@ -300,15 +300,22 @@ def decide(tool: Tool, use: ResolvedUse, ctx: PermissionContext) -> Decision:
 
     全函数(B10):任何输入不抛——意外异常 fail-closed 为 deny。
     八步皆无意见 → fallback ask(附建议规则)。
+    never 模式在合并器末端把**任何** ask 统一转 deny(design §5.3 第 8 步
+    "放最后防绕过":第 2/3 步的早退 ask 同样转换,不只 fallback)。
     """
     try:
+        decision: Decision | None = None
         for step in PIPELINE:
             decision = step(tool, use, ctx)
             if decision is not None:
-                return decision
+                break
+        if decision is None:
+            decision = _tool_ask(tool, "default")
     except Exception:  # 全函数围栏:敌意输入/回调异常一律 fail-closed,绝不炸穿管道
         return Decision.deny("rule: permission evaluation failed (fail closed)")
-    return _tool_ask(tool, "default")
+    if ctx.mode == "never" and decision.is_ask:
+        return Decision.deny("approval disabled (never mode)")
+    return decision
 
 
 def apply_update(ctx: PermissionContext, update: PermissionUpdate) -> PermissionContext:
