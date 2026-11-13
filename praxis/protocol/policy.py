@@ -73,6 +73,10 @@ class NetworkRule(FrozenPolicyModel):
         return NetworkPolicy.valid_domains((value,))[0]
 
 
+# 权限规则的联合类型:供 PermissionContext 规则层字段引用;解析代数在 core.permission(Task 2)。
+type PolicyRule = ToolRule | PathRule | NetworkRule
+
+
 class NetworkPolicy(FrozenPolicyModel):
     """Domain filters operate on exact hosts or '*.domain' subdomains only."""
 

@@ -16,7 +16,8 @@ execute 步骤序(与代码一一对应):
    transition(PAUSED) → emit ApprovalRequested → 返回 PAUSED;
 5. deny → tool_result(DENIED, error_code ``permission_denied``);
 6. allow → **先写 tool_call item** 再执行(崩溃后 recovery 才能判 pending);
-7. ``run_with_timeout``(移植旧 executor 超时/取消语义,任务全程被持有);
+7. ``run_with_timeout``(移植旧 executor 超时/取消语义,任务全程被持有;
+   透传 ``ToolExecContext``,阶段 2 Task 1 起工具为双参签名);
 8. 占位符替换 + 按 ``max_model_output_bytes`` 截断 → tool_result item →
    emit ToolFinished。
 
@@ -46,6 +47,7 @@ from praxis.protocol.events import ApprovalRequested, ToolFinished, ToolStarted
 from praxis.protocol.items import Item, ItemKind
 from praxis.protocol.json import JsonValue, thaw_json
 from praxis.protocol.permission import Decision, PermissionContext
+from praxis.protocol.sandbox import ToolExecContext
 from praxis.protocol.tools import (
     InterruptBehavior,
     ResolvedUse,
@@ -303,7 +305,9 @@ async def execute(call: ToolCall, ctx: ExecCtx) -> ToolResult:
         ToolStarted(turn_id=ctx.turn_id, call_id=call.tool_call_id, tool_name=tool.definition.name)
     )
 
-    raw = await run_with_timeout(tool, args)
+    # 阶段 2 Task 1:执行上下文先行落形——本任务恒传裸 ToolExecContext,
+    # sandbox 字段由 Task 7 依权限上下文编译后填充。
+    raw = await run_with_timeout(tool, args, ToolExecContext())
     result = _finalize(raw, call=call, tool=tool)
     _append_result_item(ctx, result)
     ctx.bus.emit(
@@ -346,14 +350,16 @@ async def _drain_task[T](task: asyncio.Task[T]) -> T:
                 raise
 
 
-async def _call_runner(tool: Tool, arguments: Mapping[str, JsonValue]) -> ToolResult:
+async def _call_runner(
+    tool: Tool, arguments: Mapping[str, JsonValue], exec_ctx: ToolExecContext
+) -> ToolResult:
     """调用 tool.run,把业务异常归一为 tool_error 结果(CancelledError 永远上抛)。"""
     try:
         if inspect.iscoroutinefunction(tool.run):
             # iscoroutinefunction 的 TypeGuard 把返回粗化为 Coroutine[..., Any],cast 归位。
-            return cast("ToolResult", await tool.run(arguments))
+            return cast("ToolResult", await tool.run(arguments, exec_ctx))
         # 同步工具:线程不可杀——worker task + shield,被取消时 drain 到线程真正结束。
-        worker = asyncio.create_task(asyncio.to_thread(tool.run, arguments))
+        worker = asyncio.create_task(asyncio.to_thread(tool.run, arguments, exec_ctx))
         try:
             raw = await asyncio.shield(worker)
         except asyncio.CancelledError:
@@ -367,7 +373,9 @@ async def _call_runner(tool: Tool, arguments: Mapping[str, JsonValue]) -> ToolRe
         return _synthetic_result(tool, status=ResultStatus.ERROR, error_code="tool_error", message=str(exc))
 
 
-async def run_with_timeout(tool: Tool, arguments: Mapping[str, JsonValue]) -> ToolResult:
+async def run_with_timeout(
+    tool: Tool, arguments: Mapping[str, JsonValue], exec_ctx: ToolExecContext
+) -> ToolResult:
     """执行工具并实施 timeout_seconds / interrupt_behavior(唯一实现,execute 专用)。
 
     语义(逐条对齐旧 executor):
@@ -378,7 +386,7 @@ async def run_with_timeout(tool: Tool, arguments: Mapping[str, JsonValue]) -> To
       tool_result 由谁写、回合转什么状态,是回合循环(Task 13)的决定;
     - tool.run 抛异常 → ERROR/tool_error(在 _call_runner 归一)。
     """
-    task = asyncio.create_task(_call_runner(tool, arguments))
+    task = asyncio.create_task(_call_runner(tool, arguments, exec_ctx))
     try:
         done, _pending = await asyncio.wait({task}, timeout=tool.timeout_seconds)
         if task in done:

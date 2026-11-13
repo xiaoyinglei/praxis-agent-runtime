@@ -147,7 +147,7 @@ def _tool(name: str, *, idempotent: bool) -> Tool:
     return Tool(
         definition=definition,
         validate_input=lambda arguments: arguments,
-        run=lambda arguments: ToolResult(tool_call_id="c", tool_name=name),
+        run=lambda arguments, exec_ctx: ToolResult(tool_call_id="c", tool_name=name),
         static_effects=frozenset({ToolEffect.READ_WORKSPACE}),
         resolve_use=lambda arguments: ResolvedUse(effects=frozenset({ToolEffect.READ_WORKSPACE}), targets=()),
         idempotent=idempotent,

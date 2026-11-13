@@ -47,6 +47,7 @@ from praxis.core.turn import execute as _real_execute  # noqa: E402
 from praxis.interfaces.sdk import open_session  # noqa: E402
 from praxis.protocol.json import JsonValue  # noqa: E402
 from praxis.protocol.models import ModelResponse, ModelToolCall, Usage  # noqa: E402
+from praxis.protocol.sandbox import ToolExecContext  # noqa: E402
 from praxis.protocol.tools import Tool  # noqa: E402
 from praxis.tools.builtins.command import create_bash_tool  # noqa: E402
 from praxis.tools.builtins.filesystem import create_read_tool, create_write_tool  # noqa: E402
@@ -95,9 +96,9 @@ def _slow_read_tools(workspace: Path) -> list[Tool]:
     read_tool = create_read_tool(workspace)
     real_run = read_tool.run
 
-    async def _slow_run(arguments: Mapping[str, JsonValue]) -> Any:
+    async def _slow_run(arguments: Mapping[str, JsonValue], exec_ctx: ToolExecContext) -> Any:
         await asyncio.sleep(_HOLD_SECONDS)
-        return await real_run(arguments)
+        return await real_run(arguments, exec_ctx)
 
     slow_read = dataclasses.replace(read_tool, run=_slow_run)
     return [slow_read, create_write_tool(workspace), create_bash_tool(workspace)]

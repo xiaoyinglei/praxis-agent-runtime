@@ -26,6 +26,7 @@ from praxis.protocol.json import JsonValue
 from praxis.protocol.models import ModelResponse, ModelToolCall, Usage, WireRequest
 from praxis.protocol.permission import Decision, PermissionContext
 from praxis.protocol.policy import PermissionPolicy
+from praxis.protocol.sandbox import ToolExecContext
 from praxis.protocol.tools import (
     CancellationMode,
     InterruptBehavior,
@@ -97,7 +98,9 @@ def _toy_tool(
 ) -> Tool:
     validate = json_schema_input(_EMPTY_SCHEMA)
 
-    async def run(arguments: Mapping[str, JsonValue]) -> ToolResult:
+    async def run(
+        arguments: Mapping[str, JsonValue], exec_ctx: ToolExecContext
+    ) -> ToolResult:
         if on_run is not None:
             on_run()
         if hang is not None:

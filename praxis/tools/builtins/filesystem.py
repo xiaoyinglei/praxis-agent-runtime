@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from praxis.protocol.json import JsonValue
+from praxis.protocol.sandbox import ToolExecContext
 from praxis.protocol.tools import (
     CancellationMode,
     InterruptBehavior,
@@ -101,7 +102,9 @@ def create_read_tool(workspace: Path) -> Tool:
         }
     )
 
-    async def run(arguments: Mapping[str, JsonValue]) -> ToolResult:
+    async def run(
+        arguments: Mapping[str, JsonValue], exec_ctx: ToolExecContext  # 阶段 2 沙箱接线(Task 7)前不消费
+    ) -> ToolResult:
         args = validate_input(arguments)
         path_value = cast("str", args["path"])
         offset = cast("int", args.get("offset", 0))
@@ -227,7 +230,9 @@ def create_write_tool(workspace: Path) -> Tool:
         }
     )
 
-    async def run(arguments: Mapping[str, JsonValue]) -> ToolResult:
+    async def run(
+        arguments: Mapping[str, JsonValue], exec_ctx: ToolExecContext  # 阶段 2 沙箱接线(Task 7)前不消费
+    ) -> ToolResult:
         args = validate_input(arguments)
         content = cast("str", args["content"])
         target = checked_path(workspace, cast("str", args["path"]), write=True)

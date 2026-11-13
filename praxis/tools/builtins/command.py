@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from praxis.protocol.json import JsonValue
+from praxis.protocol.sandbox import ToolExecContext
 from praxis.protocol.tools import (
     CancellationMode,
     InterruptBehavior,
@@ -212,7 +213,10 @@ def create_bash_tool(workspace: Path) -> Tool:
         }
     )
 
-    async def run(arguments: Mapping[str, JsonValue]) -> ToolResult:
+    async def run(
+        arguments: Mapping[str, JsonValue],
+        exec_ctx: ToolExecContext,  # 沙箱接线(Task 7)在此消费 exec_ctx.sandbox;本任务忽略
+    ) -> ToolResult:
         args = validate_input(arguments)
         command = cast("str", args["command"])
         timeout = cast("float", args.get("timeout_seconds", _DEFAULT_TIMEOUT_SECONDS))

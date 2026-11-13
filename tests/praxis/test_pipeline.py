@@ -19,6 +19,7 @@ from praxis.core.statemachine import TurnStatus, transition
 from praxis.protocol.items import ItemKind
 from praxis.protocol.permission import Decision, PermissionContext
 from praxis.protocol.policy import PermissionPolicy
+from praxis.protocol.sandbox import ToolExecContext
 from praxis.protocol.tools import (
     CancellationMode,
     InterruptBehavior,
@@ -204,7 +205,7 @@ def _echo_tool(max_bytes: int) -> Tool:
     schema = {"type": "object", "properties": {}, "additionalProperties": False}
     validate = json_schema_input(schema)
 
-    async def run(arguments: dict) -> ToolResult:
+    async def run(arguments: dict, exec_ctx: ToolExecContext) -> ToolResult:
         return ToolResult(
             tool_call_id="pending",  # documented convention:管道负责替换
             tool_name="echo",

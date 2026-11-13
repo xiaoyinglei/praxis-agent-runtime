@@ -25,6 +25,7 @@ from praxis.core.pipeline import ExecCtx, execute, run_with_timeout
 from praxis.protocol.items import ItemKind
 from praxis.protocol.permission import PermissionContext
 from praxis.protocol.policy import PermissionPolicy
+from praxis.protocol.sandbox import ToolExecContext
 from praxis.protocol.tools import (
     CancellationMode,
     InterruptBehavior,
@@ -52,7 +53,9 @@ def _ok(text: str) -> ToolResult:
     )
 
 
-def _toy_tool(run: Callable[[Mapping[str, Any]], Any], *, interrupt: InterruptBehavior, timeout: float) -> Tool:
+def _toy_tool(
+    run: Callable[[Mapping[str, Any], ToolExecContext], Any], *, interrupt: InterruptBehavior, timeout: float
+) -> Tool:
     return Tool(
         definition=ToolDefinition(name="toy", description="timeout toy", input_schema=_SCHEMA),
         validate_input=json_schema_input(_SCHEMA),
@@ -69,7 +72,7 @@ def _toy_tool(run: Callable[[Mapping[str, Any]], Any], *, interrupt: InterruptBe
 
 
 def sync_tool(delay: float, interrupt: InterruptBehavior, timeout: float) -> Tool:
-    def run(arguments: Mapping[str, Any]) -> ToolResult:
+    def run(arguments: Mapping[str, Any], exec_ctx: ToolExecContext) -> ToolResult:
         time.sleep(delay)
         return _ok("sync-done")
 
@@ -86,7 +89,7 @@ def async_tool(
 ) -> Tool:
     """cleanup>0:取消处理里再 await 一次——多步收尾让"未持有即上抛"的泄漏现形。"""
 
-    async def run(arguments: Mapping[str, Any]) -> ToolResult:
+    async def run(arguments: Mapping[str, Any], exec_ctx: ToolExecContext) -> ToolResult:
         state["started"] = state.get("started", 0) + 1
         try:
             await asyncio.sleep(delay)
@@ -112,7 +115,7 @@ def _live_tasks() -> list[asyncio.Task[Any]]:
 def test_sync_thread_timeout_drains_not_hangs() -> None:
     tool = sync_tool(0.3, InterruptBehavior.FINISH_CURRENT, timeout=0.05)
     started = time.monotonic()
-    r = asyncio.run(run_with_timeout(tool, {}))
+    r = asyncio.run(run_with_timeout(tool, {}, ToolExecContext()))
     elapsed = time.monotonic() - started
     assert r.status is ResultStatus.OK and r.text == "sync-done"  # 线程真实完成的真实结果
     assert elapsed >= 0.3  # 线程不可杀:等它跑完,这是如实的限制
@@ -123,7 +126,7 @@ def test_async_tool_timeout_cancels() -> None:
     state: dict[str, int] = {}
     tool = async_tool(10.0, InterruptBehavior.CANCEL, timeout=0.1, state=state)
     started = time.monotonic()
-    r = asyncio.run(run_with_timeout(tool, {}))
+    r = asyncio.run(run_with_timeout(tool, {}, ToolExecContext()))
     assert r.status is ResultStatus.TIMEOUT
     assert r.is_error and r.error_code == "timeout"
     assert r.tool_call_id == "pending"  # run_with_timeout 保持占位,execute 替换
@@ -208,7 +211,7 @@ def test_finish_current_repeated_cancellation() -> None:
     """
     state: dict[str, int] = {}
 
-    def run(arguments: Mapping[str, Any]) -> ToolResult:
+    def run(arguments: Mapping[str, Any], exec_ctx: ToolExecContext) -> ToolResult:
         state["enter"] = 1
         time.sleep(0.3)
         state["done"] = 1
@@ -217,7 +220,7 @@ def test_finish_current_repeated_cancellation() -> None:
     tool = _toy_tool(run, interrupt=InterruptBehavior.FINISH_CURRENT, timeout=30.0)
 
     async def main() -> tuple[float, list[asyncio.Task[Any]]]:
-        task = asyncio.create_task(run_with_timeout(tool, {}))
+        task = asyncio.create_task(run_with_timeout(tool, {}, ToolExecContext()))
         for _ in range(100):
             await asyncio.sleep(0.01)
             if state.get("enter"):

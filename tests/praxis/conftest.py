@@ -10,7 +10,7 @@ from __future__ import annotations
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 from uuid import uuid4
 
 import pytest
@@ -76,6 +76,43 @@ def make_turn(
         f"expected {target.value}, got {result.status}"
     )
     return result
+
+
+def make_minimal_tool(**overrides: object) -> Any:
+    """构造一个最小可用的合法 Tool(阶段 2 协议层测试助手,沿用 make_turn 的惰性导入风格)。
+
+    默认:只读玩具,run 为双参(签名 ToolRunner)返回 OK 结果,
+    check_permission 不设(None)。任意 Tool 字段可用关键字 overrides 替换。
+    """
+    from praxis.protocol.tools import (  # noqa: PLC0415
+        CancellationMode,
+        InterruptBehavior,
+        ResolvedUse,
+        Tool,
+        ToolDefinition,
+        ToolEffect,
+        ToolResult,
+    )
+
+    kwargs: dict[str, object] = dict(
+        definition=ToolDefinition(
+            name="minimal", description="minimal test tool", input_schema={"type": "object"}
+        ),
+        validate_input=lambda arguments: arguments,
+        run=lambda arguments, exec_ctx: ToolResult(tool_call_id="pending", tool_name="minimal"),
+        static_effects=frozenset({ToolEffect.READ_WORKSPACE}),
+        resolve_use=lambda arguments: ResolvedUse(
+            effects=frozenset({ToolEffect.READ_WORKSPACE}), targets=()
+        ),
+        idempotent=True,
+        concurrency_safe=True,
+        cancellation_mode=CancellationMode.COOPERATIVE,
+        interrupt_behavior=InterruptBehavior.CANCEL,
+        timeout_seconds=30.0,
+        max_model_output_bytes=4096,
+    )
+    kwargs.update(overrides)
+    return Tool(**kwargs)
 
 
 # --- Helpers exposed for tests that need extra stores -----------------------

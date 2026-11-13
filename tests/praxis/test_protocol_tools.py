@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 
 import pytest
@@ -9,6 +10,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from praxis.protocol.json import freeze_json, thaw_json
+from praxis.protocol.sandbox import SandboxRefusal, SandboxSpec, ToolExecContext
 from praxis.protocol.tools import (
     CancellationMode,
     InterruptBehavior,
@@ -25,6 +27,7 @@ from praxis.protocol.tools import (
     args_digest,
     json_schema_input,
 )
+from tests.praxis.conftest import make_minimal_tool
 
 # ---------------------------------------------------------------------------
 # protocol.json:freeze/thaw
@@ -220,7 +223,7 @@ def _make_tool(**overrides: object) -> Tool:
     kwargs: dict[str, object] = dict(
         definition=definition,
         validate_input=lambda arguments: arguments,
-        run=lambda arguments: ToolResult(tool_call_id="c", tool_name="demo"),
+        run=lambda arguments, exec_ctx: ToolResult(tool_call_id="c", tool_name="demo"),
         static_effects=frozenset({ToolEffect.READ_WORKSPACE}),
         resolve_use=lambda arguments: ResolvedUse(effects=frozenset({ToolEffect.READ_WORKSPACE}), targets=()),
         idempotent=True,
@@ -257,3 +260,45 @@ def test_tool_validates_basic_fields() -> None:
         _make_tool(max_model_output_bytes=0)
     with pytest.raises(TypeError):
         _make_tool(idempotent=1)
+
+
+# ---------------------------------------------------------------------------
+# 阶段 2 Task 1:ToolExecContext / check_permission / SandboxSpec / SandboxRefusal
+
+
+def test_tool_runner_receives_exec_context() -> None:
+    seen: list[ToolExecContext] = []
+
+    async def run(args, exec_ctx):
+        seen.append(exec_ctx)
+        return ToolResult(tool_call_id="pending", tool_name="t")
+
+    tool = make_minimal_tool(run=run)
+    spec = SandboxSpec(
+        backend="seatbelt",
+        argv_prefix=("/usr/bin/sandbox-exec", "-p", "x"),
+        scratch_dir="/tmp/s",
+    )
+    asyncio.run(tool.run({}, ToolExecContext(sandbox=spec)))
+    assert seen[0].sandbox is spec
+
+
+def test_check_permission_optional_and_validated() -> None:
+    assert make_minimal_tool().check_permission is None
+    with pytest.raises(TypeError):
+        make_minimal_tool(check_permission=42)
+
+
+def test_sandbox_refusal_bounded() -> None:
+    assert len(SandboxRefusal("x" * 2000).reason) <= 512
+
+
+def test_sandbox_spec_validates_fields() -> None:
+    with pytest.raises(ValueError):
+        SandboxSpec(backend="", argv_prefix=("/usr/bin/sandbox-exec",), scratch_dir="/tmp/s")
+    with pytest.raises(ValueError):
+        SandboxSpec(backend="seatbelt", argv_prefix=(), scratch_dir="/tmp/s")
+    with pytest.raises(ValueError):
+        SandboxSpec(backend="bwrap", argv_prefix=("/usr/bin/bwrap",), scratch_dir="relative/path")
+    spec = SandboxSpec(backend="bwrap", argv_prefix=("/usr/bin/bwrap", "--bind"), scratch_dir="/tmp/s")
+    assert spec.view_dir is None and spec.profile_text is None

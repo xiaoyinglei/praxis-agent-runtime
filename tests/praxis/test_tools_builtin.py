@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+from praxis.protocol.sandbox import ToolExecContext
 from praxis.protocol.tools import ResultStatus, ToolEffect, ToolValidationError
 from praxis.tools.builtins.command import create_bash_tool
 from praxis.tools.builtins.filesystem import create_read_tool, create_write_tool
@@ -23,7 +24,7 @@ from praxis.tools.builtins.paths import checked_path
 
 
 def run(tool: Any, arguments: dict[str, Any]) -> Any:
-    return asyncio.run(tool.run(arguments))
+    return asyncio.run(tool.run(arguments, ToolExecContext()))
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +98,7 @@ def test_bash_background_child_does_not_hang(tmp_path: Path) -> None:
     # B20 形态:后台子进程持有管道,主命令退出即返回,不得等到 EOF
     async def drive() -> Any:
         return await asyncio.wait_for(
-            create_bash_tool(tmp_path).run({"command": "sleep 30 & echo done"}),
+            create_bash_tool(tmp_path).run({"command": "sleep 30 & echo done"}, ToolExecContext()),
             timeout=5,
         )
 
@@ -221,7 +222,7 @@ def test_bash_setsid_escaped_grandchild_does_not_hostage(tmp_path: Path, capfd: 
     started = time.monotonic()
 
     async def drive() -> tuple[Any, float]:
-        r = await tool.run({"command": command, "timeout_seconds": 2})
+        r = await tool.run({"command": command, "timeout_seconds": 2}, ToolExecContext())
         elapsed = time.monotonic() - started
         escaped_pid = int((tmp_path / "escape.pid").read_text().strip())
         # Phase 1 不追杀 setsid 逃逸进程;测试自己收尾
@@ -268,7 +269,7 @@ def test_bash_cancellation_cleans_up(tmp_path: Path, capfd: Any) -> None:
     pidfile = tmp_path / "pid"
 
     async def drive() -> None:
-        task = asyncio.create_task(tool.run({"command": "echo $$ > pid; sleep 60"}))
+        task = asyncio.create_task(tool.run({"command": "echo $$ > pid; sleep 60"}, ToolExecContext()))
         deadline = time.monotonic() + 5
         while not pidfile.exists() and time.monotonic() < deadline:
             await asyncio.sleep(0.05)

@@ -27,6 +27,8 @@ from referencing import Registry
 from referencing.exceptions import Unresolvable
 
 from praxis.protocol.json import JsonValue, freeze_json, thaw_json
+from praxis.protocol.permission import Decision, PermissionContext
+from praxis.protocol.sandbox import ToolExecContext
 
 _MAX_VALIDATION_PATH_LENGTH = 256
 _MAX_VALIDATION_MESSAGE_LENGTH = 512
@@ -295,8 +297,14 @@ class ToolResult:
 
 
 type ValidateInput = Callable[[Mapping[str, JsonValue]], Mapping[str, JsonValue]]
-type ToolRunner = Callable[[Mapping[str, JsonValue]], ToolResult | Awaitable[ToolResult]]
+# 阶段 2 Task 1:双参签名——执行环境(沙箱等)经 ToolExecContext 传入(D3)。
+type ToolRunner = Callable[
+    [Mapping[str, JsonValue], ToolExecContext], ToolResult | Awaitable[ToolResult]
+]
 type ResolveUse = Callable[[Mapping[str, JsonValue]], ResolvedUse]
+# 工具自带的权限回调:返回 Decision 即表态,None=passthrough 交还判定管线
+# (decide 的步骤表在 Task 4/5 消费此字段;本任务只落形状)。
+type CheckPermission = Callable[[ResolvedUse, PermissionContext], Decision | None]
 
 
 def _json_path(parts: Iterable[str | int]) -> str:
@@ -406,7 +414,7 @@ def args_digest(arguments: Mapping[str, JsonValue]) -> str:
 
 @dataclass(frozen=True, slots=True)
 class Tool:
-    """工具契约:定义 + 校验 + 运行 + 副作用声明 + 执行策略(瘦身移植)。"""
+    """工具契约:定义 + 校验 + 运行 + 副作用声明 + 执行策略 + 可选权限回调(瘦身移植)。"""
 
     definition: ToolDefinition
     validate_input: ValidateInput
@@ -419,6 +427,7 @@ class Tool:
     interrupt_behavior: InterruptBehavior
     timeout_seconds: float
     max_model_output_bytes: int
+    check_permission: CheckPermission | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.definition, ToolDefinition):
@@ -426,6 +435,8 @@ class Tool:
         for name in ("validate_input", "run", "resolve_use"):
             if not callable(getattr(self, name)):
                 raise TypeError(f"{name} must be callable")
+        if self.check_permission is not None and not callable(self.check_permission):
+            raise TypeError("check_permission must be callable or None")
 
         static_effects = frozenset(self.static_effects)
         if any(not isinstance(effect, ToolEffect) for effect in static_effects):
