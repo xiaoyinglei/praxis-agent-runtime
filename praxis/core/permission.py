@@ -37,6 +37,7 @@ from praxis.protocol.policy import (
     NetworkRule,
     PathRule,
     PermissionPolicy,
+    PolicyRule,
     PolicyVerdict,
     ResolvedPolicy,
     ToolRule,
@@ -318,20 +319,50 @@ def decide(tool: Tool, use: ResolvedUse, ctx: PermissionContext) -> Decision:
     return decision
 
 
-def apply_update(ctx: PermissionContext, update: PermissionUpdate) -> PermissionContext:
-    """纯函数 update 代数(D10):once/session/always 追加对应规则层。
+def _extend_policy(policy: PermissionPolicy, rule: PolicyRule) -> PermissionPolicy:
+    """把 grant 规则追加进 policy 对应集合(model_copy 扩展;R6 代数)。
 
-    always 同时进 always_rules(调用方落盘)与 session_rules(立即生效);
-    返回新冻结上下文,原 ctx 不变;无磁盘 IO(落盘是 Task 8 调用方的事)。
+    PathRule→filesystem、ToolRule→tools、NetworkRule→network.rules。
+    边界注记:model_copy(update=...) 不重跑校验器——read-only profile 下扩展
+    write PathRule 会绕开声明期校验,但 resolve_policy 的 profile 检查继续
+    拒绝写操作(安全语义不变),且 Session 落盘重载时 strict 校验在边界拒绝。
     """
+    if isinstance(rule, PathRule):
+        return policy.model_copy(update={"filesystem": (*policy.filesystem, rule)})
+    if isinstance(rule, ToolRule):
+        return policy.model_copy(update={"tools": (*policy.tools, rule)})
+    if isinstance(rule, NetworkRule):
+        network = policy.network.model_copy(update={"rules": (*policy.network.rules, rule)})
+        return policy.model_copy(update={"network": network})
+    raise ValueError(f"unknown policy rule type: {rule!r}")
+
+
+def apply_update(ctx: PermissionContext, update: PermissionUpdate) -> PermissionContext:
+    """纯函数 update 代数(D10;Task 8 裁决 R6):session/always 的 grant 必须生效。
+
+    - once:只追加 once_rules——调用域,policy 不动(下一个执行批结束由
+      Session._execute 清除)。
+    - session/always:规则同时 a) 扩展进 ctx.policy 对应集合(生效通道:
+      policy 是第 6 步授权来源,decide/步骤表零改动;session/once 规则层
+      只收紧,承担不了 grant 生效)与 b) 追加记录层(session→session_rules;
+      always→always_rules+session_rules,供审计与调用方落盘)。
+    always 的持久化(原子写 .praxis/permissions.json)是 Session.update_permission
+    的事,本函数无磁盘 IO;返回新冻结上下文,原 ctx 不变。
+
+    D9 注记:session/always 的 NetworkRule 授权使 policy.network.rules 非空,
+    command_network_decision 对 EXECUTE_PROCESS(bash)一律 deny——放行的是
+    URL 级工具(web 类,阶段 3),bash 的命令网络保持 fail-closed。
+    """
+    rule = update.rule
     if update.destination == "once":
-        return replace(ctx, once_rules=(*ctx.once_rules, update.rule))
+        return replace(ctx, once_rules=(*ctx.once_rules, rule))
     if update.destination == "session":
-        return replace(ctx, session_rules=(*ctx.session_rules, update.rule))
+        return replace(ctx, policy=_extend_policy(ctx.policy, rule), session_rules=(*ctx.session_rules, rule))
     if update.destination == "always":
         return replace(
             ctx,
-            always_rules=(*ctx.always_rules, update.rule),
-            session_rules=(*ctx.session_rules, update.rule),
+            policy=_extend_policy(ctx.policy, rule),
+            always_rules=(*ctx.always_rules, rule),
+            session_rules=(*ctx.session_rules, rule),
         )
     raise ValueError(f"unknown update destination: {update.destination!r}")

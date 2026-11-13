@@ -40,13 +40,16 @@ Session 构造只允许 praxis/composition.py(CI 规则 7,设计 §4.1 唯一组
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
 from praxis.core.events import EventBus, Subscription
 from praxis.core.locks import ThreadBusy, thread_execution_lock
+from praxis.core.permission import apply_update
 from praxis.core.pipeline import SandboxCompiler, SandboxFinalizer
 from praxis.core.recovery import classify_pending
 from praxis.core.statemachine import TurnStatus, transition
@@ -54,7 +57,7 @@ from praxis.core.turn import ApprovalSummary, TurnDeps, TurnResult, TurnState, r
 from praxis.protocol.items import Item, ItemKind
 from praxis.protocol.json import JsonValue
 from praxis.protocol.models import ModelAdapter, ModelSettings, ModelToolCall
-from praxis.protocol.permission import PermissionContext
+from praxis.protocol.permission import PermissionContext, PermissionUpdate
 from praxis.protocol.tools import ResultStatus, Tool
 from praxis.store.log import ItemEntry, Store
 from praxis.store.turns import Turn, create_turn, get_turn, list_turns
@@ -226,6 +229,21 @@ def _validate_approval(
 
 
 # ---------------------------------------------------------------------------
+# 策略声明落盘(原子写:同目录 tmp + os.replace,与 filesystem 内置工具同语义;
+# 不跨层借 tools.builtins 的私有助手——ACI 各层自有实现,R6-4)
+# ---------------------------------------------------------------------------
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    tmp = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
 # Session
 # ---------------------------------------------------------------------------
 
@@ -276,6 +294,29 @@ class Session:
     def close(self) -> None:
         """关闭 store(写者线程收尾);EventBus 无持久资源,不另设关闭。"""
         self._store.close()
+
+    # -- 权限更新(Task 8:once/session/always;设计 §5.3/§5.12;裁决 R6)-----
+
+    def update_permission(self, update: PermissionUpdate) -> None:
+        """权限更新的会话级唯一入口:经 apply_update 纯代数落地,always 同批落盘。
+
+        once/session 只改内存(once 由 _execute 在下一批结束时清除;session
+        永不落盘)。always 额外把**已扩展规则**的 policy 原子写
+        ``.praxis/permissions.json``——该文件即策略声明,composition 下次打开
+        时按"显式参数 > 文件 > 默认"加载,规则跨重启生效。
+
+        D9 提醒:session/always 的 NetworkRule 授权只对 URL 级工具(web 类)
+        放行;bash(EXECUTE_PROCESS)的命令网络因规则在场而 fail-closed deny。
+        """
+        self._permissions = apply_update(self._permissions, update)
+        if update.destination == "always":
+            self._persist_policy()
+
+    def _persist_policy(self) -> None:
+        """策略声明落盘(原子写;mode 不进 policy,C5——approval 域只有 on-request/never)。"""
+        praxis_dir = self._workspace / ".praxis"
+        praxis_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(praxis_dir / "permissions.json", self._permissions.policy.model_dump_json(indent=2))
 
     # -- submit ---------------------------------------------------------------
 
@@ -519,6 +560,10 @@ class Session:
             raise ConversationBusy(
                 f"thread {self._thread_id!r} is executing elsewhere; try again later"
             ) from exc
+        finally:
+            # R6-4:once 授权是调用域——本执行批结束即清除,绝不下渗后续批。
+            if self._permissions.once_rules:
+                self._permissions = replace(self._permissions, once_rules=())
 
     def _model_id(self) -> str:
         """turn binding 的 model 标识:经公开 build_request 探针取 WireRequest.model

@@ -694,7 +694,7 @@ def test_apply_update_roundtrip_grants_session_allow(ws, web_tool):
 
 
 # ---------------------------------------------------------------------------
-# apply_update:三 destination 纯函数
+# apply_update:三 destination 纯函数(R6 裁决:session/always 同步扩展 policy)
 # ---------------------------------------------------------------------------
 
 
@@ -705,24 +705,34 @@ def test_apply_update_once(ws):
     assert out.once_rules == (rule,)
     assert out.session_rules == () and out.always_rules == ()
     assert ctx.once_rules == () and out is not ctx
+    assert out.policy is ctx.policy  # R6:once 调用域,policy 不扩展、revision 不变
 
 
 def test_apply_update_session(ws):
     ctx = make_ctx(ws)
     rule = PathRule(path="sub", access="write")
     out = apply_update(ctx, PermissionUpdate(rule=rule, destination="session"))
-    assert out.session_rules == (rule,)
+    assert out.session_rules == (rule,)  # 记录层(只收紧语义不变)
     assert out.once_rules == () and out.always_rules == ()
     assert ctx.session_rules == ()
+    # R6(Task 8 裁决):授权生效通道 = policy 扩展,经既有第 6 步,decide 零改动
+    assert out.policy.filesystem == (rule,)
+    assert out.policy.revision != ctx.policy.revision
+    assert ctx.policy.filesystem == ()  # 纯函数:原 ctx 不变
 
 
 def test_apply_update_always_hits_both(ws):
     ctx = make_ctx(ws)
     rule = NetworkRule(domain="ok.com", decision="allow")
     out = apply_update(ctx, PermissionUpdate(rule=rule, destination="always"))
-    assert out.always_rules == (rule,) and out.session_rules == (rule,)
+    assert out.always_rules == (rule,) and out.session_rules == (rule,)  # 审计/落盘记录
     assert out.once_rules == ()
     assert ctx.always_rules == () and ctx.session_rules == ()
+    # R6:NetworkRule → policy.network.rules 扩展(URL 级工具放行;
+    # D9:bash(EXECUTE_PROCESS)命令网络由此 fail-closed deny,见 Task 8 钉死测试)
+    assert out.policy.network.rules == (rule,)
+    assert out.policy.revision != ctx.policy.revision
+    assert ctx.policy.network.rules == ()
 
 
 def test_apply_update_appends_and_preserves_other_fields(ws):
@@ -731,7 +741,11 @@ def test_apply_update_appends_and_preserves_other_fields(ws):
     rule = ToolRule(pattern="write", decision="allow")
     out = apply_update(ctx, PermissionUpdate(rule=rule, destination="session"))
     assert out.session_rules == (existing, rule)
-    assert out.mode == "bypass" and out.workspace == ctx.workspace and out.policy is ctx.policy
+    assert out.mode == "bypass" and out.workspace == ctx.workspace
+    # R6 变更(裁决要求,非削弱):session 更新现在扩展 policy.tools——
+    # 生效通道是第 6 步 policy 授权;其余字段(模式/工作区/记录层)保持不变。
+    assert out.policy.tools == (rule,)
+    assert out.policy.approval == ctx.policy.approval
 
 
 def test_apply_update_unknown_destination_raises(ws):

@@ -25,12 +25,14 @@ from praxis.core.events import EventBus
 from praxis.core.recovery import sweep
 from praxis.core.session import Session
 from praxis.protocol.models import ModelAdapter
-from praxis.protocol.permission import PermissionContext
+from praxis.protocol.permission import PermissionContext, PermissionMode
 from praxis.protocol.policy import PermissionPolicy
 from praxis.protocol.tools import Tool
 from praxis.store.log import Store
 from praxis.tools.builtins.command import create_bash_tool
 from praxis.tools.builtins.filesystem import create_read_tool, create_write_tool
+
+_VALID_MODES: tuple[PermissionMode, ...] = ("on-request", "never", "bypass")
 
 
 def _validate_thread_id(thread_id: str) -> None:
@@ -44,18 +46,44 @@ def _validate_thread_id(thread_id: str) -> None:
         raise ValueError(f"thread_id must not contain '..' components: {thread_id!r}")
 
 
+def _resolve_policy(root: Path, explicit: PermissionPolicy | None) -> PermissionPolicy:
+    """policy 来源序(Task 8):显式参数 > ``.praxis/permissions.json`` > 默认。
+
+    文件是策略**声明**(always 授权由 Session 原子写合并于此);坏文件/坏 JSON
+    一律 ValueError 边界拒绝,绝不静默回退默认(fail early at the boundary;
+    pydantic strict 的 ValidationError 就是 ValueError 的子类)。
+    """
+    if explicit is not None:
+        return explicit
+    path = root / ".praxis" / "permissions.json"
+    if not path.exists():
+        return PermissionPolicy()
+    try:
+        return PermissionPolicy.model_validate_json(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot load policy file {path}: {exc}") from exc
+
+
 def build_session(
     workspace: Path,
     adapter: ModelAdapter,
     *,
     policy: PermissionPolicy | None = None,
+    mode: PermissionMode | None = None,
     thread_id: str | None = None,
     tools: Sequence[Tool] | None = None,
     max_steps: int = 50,
 ) -> Session:
-    """装配一个 Session:唯一组合根。CLI/TUI/host 一律经 sdk.open_session 走到这里。"""
+    """装配一个 Session:唯一组合根。CLI/TUI/host 一律经 sdk.open_session 走到这里。
+
+    Task 8 入口:policy 见 _resolve_policy 来源序;mode 来源序 = 显式参数 >
+    policy.approval,正交于策略(C5:bypass 只活在运行上下文,永不进 policy、
+    永不落盘;切换 mode 不触碰任何策略规则),非法值边界拒绝。
+    """
     if thread_id is not None:
         _validate_thread_id(thread_id)
+    if mode is not None and mode not in _VALID_MODES:
+        raise ValueError(f"unknown permission mode: {mode!r} (expected on-request/never/bypass)")
     root = Path(workspace)
     praxis_dir = root / ".praxis"
     praxis_dir.mkdir(parents=True, exist_ok=True)
@@ -69,11 +97,12 @@ def build_session(
             else (create_read_tool(root), create_write_tool(root), create_bash_tool(root))
         )
         tool_map: dict[str, Tool] = {tool.definition.name: tool for tool in tool_seq}
-        effective_policy = policy if policy is not None else PermissionPolicy()
+        effective_policy = _resolve_policy(root, policy)
+        effective_mode: PermissionMode = mode if mode is not None else effective_policy.approval
         permissions = PermissionContext(
             workspace=str(root),
             policy=effective_policy,
-            mode=effective_policy.approval,
+            mode=effective_mode,
             # 真实探测:darwin seatbelt;其他平台不可用 → decide 第 7 步对
             # EXECUTE_PROCESS fail-closed deny(bwrap 延后,D2/D7)。
             sandbox=probe_backend(),

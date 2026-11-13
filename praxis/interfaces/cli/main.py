@@ -33,6 +33,8 @@ from praxis.interfaces.sdk import (
     ModelSpec,
     ModelToolCall,
     OpenAICompatAdapter,
+    PermissionMode,
+    PermissionPolicy,
     ResumeNotConfirmed,
     ScriptedAdapter,
     Session,
@@ -60,6 +62,17 @@ _DENY_OPT = typer.Option([], "--deny", help="Deny this pending approval call id 
 _RECONCILE_OPT = typer.Option([], "--reconcile", help="Reconcile outcome-unknown call: CALL_ID=ok|failed.")
 _AFTER_SEQ_OPT = typer.Option(0, "--after-seq", help="Only render items with seq greater than this.")
 _TURN_ARG = typer.Argument(None, help="Turn id (omit: list the thread's turns).")
+# Task 8 策略入口(R6-6):--policy 覆盖 .praxis/permissions.json 声明;
+# --mode 正交于策略(C5:bypass 永不进策略、永不落盘)。
+_POLICY_OPT = typer.Option(
+    None, "--policy", help="PermissionPolicy JSON file (overrides .praxis/permissions.json)."
+)
+_MODE_OPT = typer.Option(
+    None,
+    "--mode",
+    click_type=click.Choice(["on-request", "never", "bypass"]),
+    help="Approval mode override; orthogonal to policy rules, never persisted.",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -160,16 +173,42 @@ def _resolve_thread(thread: str | None) -> str:
     return thread if thread is not None else _DEFAULT_THREAD
 
 
+def _load_policy_file(path: Path) -> PermissionPolicy:
+    """--policy JSON → PermissionPolicy;坏文件/坏 JSON → BadParameter(退出码 3,边界拒绝)。"""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise typer.BadParameter(f"--policy file not found: {path}") from None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise typer.BadParameter(f"cannot read policy file {path}: {exc}") from None
+    try:
+        return PermissionPolicy.model_validate_json(raw)
+    except ValueError as exc:  # pydantic strict 冻结模型:ValidationError ⊂ ValueError
+        raise typer.BadParameter(f"invalid PermissionPolicy JSON {path}: {exc}") from None
+
+
 def _open_from_options(
     workspace: Path | None,
     model: str | None,
     base_url: str | None,
     scripted: Path | None,
     thread: str | None,
+    policy: Path | None = None,
+    mode: str | None = None,
 ) -> Session:
+    # Task 8:policy/mode 经 sdk 透传给 composition(来源序在 composition 执行;
+    # mode 与 policy 正交,C5——这里不折叠、不改写)。
+    resolved_policy = _load_policy_file(Path(policy)) if policy is not None else None
+    resolved_mode = cast("PermissionMode | None", mode)
     if scripted is not None:
         adapter: Any = ScriptedAdapter(_load_scripted(Path(scripted)))
-        return open_session(_resolve_workspace(workspace), adapter, thread_id=_resolve_thread(thread))
+        return open_session(
+            _resolve_workspace(workspace),
+            adapter,
+            policy=resolved_policy,
+            mode=resolved_mode,
+            thread_id=_resolve_thread(thread),
+        )
     resolved_model = model or os.environ.get("PRAXIS_MODEL", "")
     if not resolved_model:
         raise typer.BadParameter("no model configured: pass --model, set PRAXIS_MODEL, or use --scripted")
@@ -178,7 +217,13 @@ def _open_from_options(
         raise typer.BadParameter("missing API key: set PRAXIS_API_KEY (or OPENAI_API_KEY), or use --scripted")
     resolved_base_url = base_url or os.environ.get("PRAXIS_BASE_URL") or None
     adapter = OpenAICompatAdapter(ModelSpec(model_id=resolved_model), api_key=api_key, base_url=resolved_base_url)
-    return open_session(_resolve_workspace(workspace), adapter, thread_id=_resolve_thread(thread))
+    return open_session(
+        _resolve_workspace(workspace),
+        adapter,
+        policy=resolved_policy,
+        mode=resolved_mode,
+        thread_id=_resolve_thread(thread),
+    )
 
 
 def _open_read_only(workspace: Path | None, thread: str | None) -> Session:
@@ -245,9 +290,11 @@ def run(
     base_url: str | None = _BASE_URL_OPT,
     scripted: Path | None = _SCRIPTED_OPT,
     thread: str | None = _THREAD_OPT,
+    policy: Path | None = _POLICY_OPT,
+    mode: str | None = _MODE_OPT,
 ) -> None:
     """一次性 turn:提交 prompt,打印结果,按 turn 终态决定退出码。"""
-    session = _open_from_options(workspace, model, base_url, scripted, thread)
+    session = _open_from_options(workspace, model, base_url, scripted, thread, policy, mode)
     try:
         result = asyncio.run(session.submit(prompt))
     except ConversationBusy as exc:
@@ -290,6 +337,8 @@ def resume(
     base_url: str | None = _BASE_URL_OPT,
     scripted: Path | None = _SCRIPTED_OPT,
     thread: str | None = _THREAD_OPT,
+    policy: Path | None = _POLICY_OPT,
+    mode: str | None = _MODE_OPT,
     confirm: bool = _CONFIRM_OPT,
     allow: list[str] = _ALLOW_OPT,
     deny: list[str] = _DENY_OPT,
@@ -298,7 +347,7 @@ def resume(
     """续跑 paused/interrupted turn:--confirm 人工确认,--allow/--deny 审批,--reconcile 对账。"""
     approval_map = _parse_approval(allow, deny)
     reconcile_map = _parse_reconcile(reconcile)
-    session = _open_from_options(workspace, model, base_url, scripted, thread)
+    session = _open_from_options(workspace, model, base_url, scripted, thread, policy, mode)
     try:
         result = asyncio.run(
             session.resume(
@@ -438,9 +487,11 @@ def chat(
     base_url: str | None = _BASE_URL_OPT,
     scripted: Path | None = _SCRIPTED_OPT,
     thread: str | None = _THREAD_OPT,
+    policy: Path | None = _POLICY_OPT,
+    mode: str | None = _MODE_OPT,
 ) -> None:
     """交互式 REPL:每 turn 错误边界(C1);/help /status /exit 查表分派。"""
-    session = _open_from_options(workspace, model, base_url, scripted, thread)
+    session = _open_from_options(workspace, model, base_url, scripted, thread, policy, mode)
     typer.echo(f"praxis chat — thread {session.thread_id} — /help for commands, /exit to leave")
     try:
         _chat_loop(session)

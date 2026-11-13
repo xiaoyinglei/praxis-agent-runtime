@@ -797,3 +797,133 @@ def test_console_entry_object() -> None:
     """pyproject 入口 praxis = praxis.interfaces.cli:app:包必须直接暴露 app。"""
     assert cli_pkg.app is app
     assert callable(app)
+
+
+# ---------------------------------------------------------------------------
+# Task 8: --policy / --mode(策略入口,C5 正交;坏输入 → 退出码 3)
+# ---------------------------------------------------------------------------
+
+
+def _write_policy(tmp_path: Path, name: str, text: str) -> Path:
+    path = tmp_path / name
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _bash_call_entry() -> dict[str, Any]:
+    return {
+        "content": "",
+        "tool_calls": [{"call_id": "c1", "name": "bash", "arguments": {"command": "echo hi"}}],
+    }
+
+
+_POLICY_BASH_DENY = json.dumps({"tools": [{"pattern": "bash", "decision": "deny"}]})
+
+
+def test_cli_policy_denies_bash_visible_in_log(workspace: Path, tmp_path: Path) -> None:
+    policy = _write_policy(tmp_path, "pol.json", _POLICY_BASH_DENY)
+    script = _write_script(tmp_path, "bash.json", [_bash_call_entry(), {"content": "done"}])
+    run_res = runner.invoke(
+        app,
+        [
+            "run", "run bash", "--workspace", str(workspace), "--thread", "pol1",
+            "--scripted", str(script), "--policy", str(policy),
+        ],
+        env=_CLEAN_ENV,
+    )
+    assert run_res.exit_code == 0, run_res.output
+    logged = runner.invoke(app, ["log", "--workspace", str(workspace), "--thread", "pol1"], env=_CLEAN_ENV)
+    assert "[denied]" in logged.output  # 规则 deny 落到 tool_result,经日志可查
+
+
+def test_cli_mode_never_denies_bash_default_ask(workspace: Path, tmp_path: Path) -> None:
+    """默认策略 bash 是 ask(命令网络);--mode never 把 ask 统一转 deny(R7 代数)。"""
+    script = _write_script(tmp_path, "bash.json", [_bash_call_entry(), {"content": "done"}])
+    run_res = runner.invoke(
+        app,
+        ["run", "run bash", "--workspace", str(workspace), "--thread", "mode1", "--scripted", str(script),
+         "--mode", "never"],
+        env=_CLEAN_ENV,
+    )
+    assert run_res.exit_code == 0, run_res.output
+    logged = runner.invoke(app, ["log", "--workspace", str(workspace), "--thread", "mode1"], env=_CLEAN_ENV)
+    assert "[denied]" in logged.output
+    assert not (workspace / ".praxis" / "permissions.json").exists()  # mode 永不落盘(C5)
+
+
+def test_cli_policy_bad_json_exit_3(workspace: Path, tmp_path: Path) -> None:
+    bad = _write_policy(tmp_path, "bad.json", "{ not json")
+    script = _write_script(tmp_path, "done.json", [{"content": "x"}])
+    result = runner.invoke(
+        app,
+        ["run", "hi", "--workspace", str(workspace), "--scripted", str(script), "--policy", str(bad)],
+        env=_CLEAN_ENV,
+    )
+    assert result.exit_code == 3, result.output
+    assert "policy" in result.output.lower()
+
+
+@pytest.mark.parametrize("bad_text", ['{"nope": 1}', '{"profile": "turbo"}', "[]"])
+def test_cli_policy_invalid_shape_exit_3(workspace: Path, tmp_path: Path, bad_text: str) -> None:
+    bad = _write_policy(tmp_path, "bad.json", bad_text)
+    script = _write_script(tmp_path, "done.json", [{"content": "x"}])
+    result = runner.invoke(
+        app,
+        ["run", "hi", "--workspace", str(workspace), "--scripted", str(script), "--policy", str(bad)],
+        env=_CLEAN_ENV,
+    )
+    assert result.exit_code == 3, result.output
+
+
+def test_cli_policy_missing_file_exit_3(workspace: Path, tmp_path: Path) -> None:
+    script = _write_script(tmp_path, "done.json", [{"content": "x"}])
+    result = runner.invoke(
+        app,
+        [
+            "run", "hi", "--workspace", str(workspace), "--scripted", str(script),
+            "--policy", str(tmp_path / "absent.json"),
+        ],
+        env=_CLEAN_ENV,
+    )
+    assert result.exit_code == 3, result.output
+
+
+def test_cli_mode_bad_choice_exit_3(workspace: Path, tmp_path: Path) -> None:
+    script = _write_script(tmp_path, "done.json", [{"content": "x"}])
+    result = runner.invoke(
+        app,
+        ["run", "hi", "--workspace", str(workspace), "--scripted", str(script), "--mode", "turbo"],
+        env=_CLEAN_ENV,
+    )
+    assert result.exit_code == 3, result.output
+
+
+def test_cli_policy_and_mode_forwarded_orthogonally(workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """C5 透传契约:--policy 解析为 PermissionPolicy、--mode 原样传 open_session,互不折叠。"""
+    from praxis.interfaces.sdk import PermissionPolicy
+
+    captured: dict[str, Any] = {}
+
+    def fake_open(root: Any, adapter: Any, **kwargs: Any) -> Any:
+        captured["workspace"] = root
+        captured.update(kwargs)
+        return _FlakySession([], ["ok"])
+
+    monkeypatch.setattr(cli_main, "open_session", fake_open)
+    policy = _write_policy(
+        tmp_path, "pol.json", json.dumps({"approval": "never", "tools": [{"pattern": "bash", "decision": "deny"}]})
+    )
+    script = _write_script(tmp_path, "done.json", [{"content": "x"}])
+    result = runner.invoke(
+        app,
+        [
+            "run", "hi", "--workspace", str(workspace), "--scripted", str(script),
+            "--policy", str(policy), "--mode", "bypass",
+        ],
+        env=_CLEAN_ENV,
+    )
+    assert result.exit_code == 0, result.output
+    assert isinstance(captured["policy"], PermissionPolicy)
+    assert captured["policy"].approval == "never"  # mode 不进 policy(正交)
+    assert captured["mode"] == "bypass"
+    assert captured["thread_id"] == "default"
