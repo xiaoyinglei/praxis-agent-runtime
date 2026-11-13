@@ -198,6 +198,53 @@ def test_r6_network_session_grant_allows_url_tool_but_bash_stays_denied(ws: Path
 
 
 # ---------------------------------------------------------------------------
+# R11:policy 扩展后再完整重验——非法 grant 在 UPDATE 时刻抛,内存/磁盘双双不动
+# ---------------------------------------------------------------------------
+
+
+def test_r11_readonly_write_grant_raises_at_update_level(ws: Path) -> None:
+    # (b) read-only + session write PathRule → apply_update 即抛(ValidationError ⊂ ValueError);
+    # 纯函数:原 ctx 的 policy 与记录层均不变。
+    ctx = PermissionContext(
+        workspace=str(ws),
+        policy=PermissionPolicy(profile="read-only"),
+        mode="on-request",
+        sandbox=SandboxAvailability(backend=None, available=False),
+    )
+    bad = PathRule(path=str(ws / "sub"), access="write")
+    with pytest.raises(ValueError, match="read-only"):
+        apply_update(ctx, PermissionUpdate(rule=bad, destination="session"))
+    assert ctx.policy.filesystem == () and ctx.session_rules == ()
+    with pytest.raises(ValueError, match="read-only"):
+        apply_update(ctx, PermissionUpdate(rule=bad, destination="always"))
+    assert ctx.always_rules == ()
+
+
+def test_r11_valid_extensions_still_work(ws: Path) -> None:
+    # (c) 合法扩展不因重验而改变行为:workspace profile + write PathRule;
+    # read-only + READ PathRule(read 授权不放宽写)。
+    ctx = base_ctx(ws)
+    rule = PathRule(path=str(ws / "sub"), access="write")
+    out = apply_update(ctx, PermissionUpdate(rule=rule, destination="session"))
+    assert out.policy.filesystem == (rule,) and out.session_rules == (rule,)
+
+    ro_ctx = PermissionContext(
+        workspace=str(ws),
+        policy=PermissionPolicy(profile="read-only"),
+        mode="on-request",
+        sandbox=SandboxAvailability(backend=None, available=False),
+    )
+    (ws / "sub").mkdir(exist_ok=True)
+    read_rule = PathRule(path=str(ws / "sub"), access="read")
+    ro_out = apply_update(ro_ctx, PermissionUpdate(rule=read_rule, destination="always"))
+    assert ro_out.policy.filesystem == (read_rule,)
+    assert ro_out.policy.profile == "read-only" and ro_out.policy.revision != ro_ctx.policy.revision
+    wt = make_named_tool("write", frozenset({ToolEffect.WRITE_WORKSPACE}), ())
+    assert decide(wt, write_use(str(ws / "sub" / "f.txt")), ro_out).is_deny  # 写仍被 profile 拒绝
+    assert decide(wt, write_use(str(ws / "sub" / "f.txt")), ro_ctx).is_deny
+
+
+# ---------------------------------------------------------------------------
 # Session.update_permission 行为层(经真实 submit)
 # ---------------------------------------------------------------------------
 
@@ -263,6 +310,38 @@ def test_session_update_not_persisted(ws: Path) -> None:
     finally:
         session.close()
     assert not permissions_file(ws).exists()  # session 授权永不落盘
+
+
+def test_r11_readonly_always_write_grant_no_file_session_still_usable(ws: Path) -> None:
+    # (a) 行为级:read-only + always write PathRule → 抛 ValueError 且**不写文件**
+    # (持久化在 apply_update 返回之后,异常使落盘整体跳过);会话不砖化,
+    # 随后的合法 always 更新照常生效并落盘。
+    session = open_session(
+        ws,
+        ScriptedAdapter([script_call("c1", "bash", {"command": "echo hi"}), script_stop("done")]),
+        policy=PermissionPolicy(profile="read-only"),
+    )
+    try:
+        with pytest.raises(ValueError, match="read-only"):
+            session.update_permission(
+                PermissionUpdate(rule=PathRule(path=str(ws / "sub"), access="write"), destination="always")
+            )
+        assert not permissions_file(ws).exists()
+        session.update_permission(
+            PermissionUpdate(rule=ToolRule(pattern="bash", decision="deny"), destination="always")
+        )
+        result = asyncio.run(session.submit("run it"))
+        assert result.status is TurnStatus.COMPLETED
+        assert tool_result_for(session, "c1").payload["status"] == "denied"
+    finally:
+        session.close()
+    data = json.loads(permissions_file(ws).read_text(encoding="utf-8"))
+    assert data["profile"] == "read-only"
+    assert data["filesystem"] == []  # 被拒的 write grant 既不在内存也不在盘
+    assert {"pattern": "bash", "decision": "deny"} in data["tools"]
+    # 重开(含只读面):文件合法可加载,工作区未被砖化
+    session2 = open_session(ws, ScriptedAdapter([]))
+    session2.close()
 
 
 def test_once_grant_effective_cleared_after_batch(ws: Path) -> None:

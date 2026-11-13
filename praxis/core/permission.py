@@ -320,21 +320,29 @@ def decide(tool: Tool, use: ResolvedUse, ctx: PermissionContext) -> Decision:
 
 
 def _extend_policy(policy: PermissionPolicy, rule: PolicyRule) -> PermissionPolicy:
-    """把 grant 规则追加进 policy 对应集合(model_copy 扩展;R6 代数)。
+    """把 grant 规则追加进 policy 对应集合并**完整重验**(R6 代数;R11 修补丁)。
 
-    PathRule→filesystem、ToolRule→tools、NetworkRule→network.rules。
-    边界注记:model_copy(update=...) 不重跑校验器——read-only profile 下扩展
-    write PathRule 会绕开声明期校验,但 resolve_policy 的 profile 检查继续
-    拒绝写操作(安全语义不变),且 Session 落盘重载时 strict 校验在边界拒绝。
+    PathRule→filesystem、ToolRule→tools、NetworkRule→network.rules,扩展机制
+    仍是 model_copy。R11:model_copy(update=...) 不重跑校验器——若不复核,
+    read-only profile 下的 write PathRule 会产出违反自身不变量
+    (readonly_cannot_widen)的策略,一旦 always 落盘,后续每次打开(含只读的
+    log/status/verify)都在 strict 边界 ValueError,工作区被砖化。故产物一律
+    经 type(policy).model_validate(extended.model_dump()) 重验(跑全部校验器,
+    含 readonly_cannot_widen):非法 grant 在 UPDATE 时刻抛 pydantic
+    ValidationError(ValueError 子类),Session.update_permission 不捕获直接
+    传播;因持久化发生在 apply_update 返回之后,坏策略绝不落盘。
+    decide/第 6 步/_rule_layers/command_network_decision 零改动。
     """
     if isinstance(rule, PathRule):
-        return policy.model_copy(update={"filesystem": (*policy.filesystem, rule)})
-    if isinstance(rule, ToolRule):
-        return policy.model_copy(update={"tools": (*policy.tools, rule)})
-    if isinstance(rule, NetworkRule):
+        extended = policy.model_copy(update={"filesystem": (*policy.filesystem, rule)})
+    elif isinstance(rule, ToolRule):
+        extended = policy.model_copy(update={"tools": (*policy.tools, rule)})
+    elif isinstance(rule, NetworkRule):
         network = policy.network.model_copy(update={"rules": (*policy.network.rules, rule)})
-        return policy.model_copy(update={"network": network})
-    raise ValueError(f"unknown policy rule type: {rule!r}")
+        extended = policy.model_copy(update={"network": network})
+    else:
+        raise ValueError(f"unknown policy rule type: {rule!r}")
+    return type(policy).model_validate(extended.model_dump())
 
 
 def apply_update(ctx: PermissionContext, update: PermissionUpdate) -> PermissionContext:
@@ -348,6 +356,8 @@ def apply_update(ctx: PermissionContext, update: PermissionUpdate) -> Permission
       always→always_rules+session_rules,供审计与调用方落盘)。
     always 的持久化(原子写 .praxis/permissions.json)是 Session.update_permission
     的事,本函数无磁盘 IO;返回新冻结上下文,原 ctx 不变。
+    R11:policy 扩展经 _extend_policy 完整重验——非法 grant(read-only profile
+    的 write PathRule 等)在本函数即抛 ValidationError,ctx 与磁盘双双不动。
 
     D9 注记:session/always 的 NetworkRule 授权使 policy.network.rules 非空,
     command_network_decision 对 EXECUTE_PROCESS(bash)一律 deny——放行的是
