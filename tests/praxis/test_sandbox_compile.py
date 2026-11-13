@@ -179,6 +179,77 @@ def test_validate_aliases_clean_policy_passes(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# R8:跨地板硬链接检测(S9 预存别名穿透闭合;主防御 = preflight 拒绝)
+# ---------------------------------------------------------------------------
+
+
+def test_preexisting_hardlink_alias_refused_by_preflight(tmp_path: Path):
+    # 攻击本体:沙箱外预置 .git/config 的硬链接别名,沙箱内经别名写可穿透地板
+    # (SBPL 无 inode 规则)——compile 必须在 preflight 拒绝。
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("orig")
+    os.link(tmp_path / ".git" / "config", tmp_path / "prealias")
+    with pytest.raises(SandboxRefusal, match="hardlink alias crosses the safety floor"):
+        compile_sandbox(make_ctx(tmp_path), bash_use_of(tmp_path), tmp_path)
+
+
+@pytest.mark.skipif(not _AVAILABLE.available, reason="no sandbox backend (bwrap deferred)")
+def test_unprotected_hardlink_pair_compiles(tmp_path: Path):
+    # 两个非保护工作区文件互为硬链接:不跨地板,不得误报
+    first = tmp_path / "a.txt"
+    first.write_text("x")
+    os.link(first, tmp_path / "b.txt")
+    spec = compile_sandbox(make_ctx(tmp_path), bash_use_of(tmp_path), tmp_path)
+    finalize_sandbox(spec, tmp_path)
+
+
+@pytest.mark.skipif(not _AVAILABLE.available, reason="no sandbox backend (bwrap deferred)")
+def test_protected_hardlink_pair_compiles(tmp_path: Path):
+    # .git/config ↔ .git/other 同属保护域:不跨地板,不得误报
+    (tmp_path / ".git").mkdir()
+    config = tmp_path / ".git" / "config"
+    config.write_text("orig")
+    os.link(config, tmp_path / ".git" / "other")
+    spec = compile_sandbox(make_ctx(tmp_path), bash_use_of(tmp_path), tmp_path)
+    finalize_sandbox(spec, tmp_path)
+
+
+@pytest.mark.skipif(not _AVAILABLE.available, reason="no sandbox backend (bwrap deferred)")
+def test_cross_floor_hardlink_readonly_compiles(tmp_path: Path):
+    # read-only ⇒ allow_write False:只读沙箱无法经别名写,扫描按旧门控关闭
+    (tmp_path / ".git").mkdir()
+    config = tmp_path / ".git" / "config"
+    config.write_text("orig")
+    os.link(config, tmp_path / "prealias")
+    spec = compile_sandbox(
+        make_ctx(tmp_path, policy=PermissionPolicy(profile="read-only")), bash_use_of(tmp_path), tmp_path
+    )
+    finalize_sandbox(spec, tmp_path)
+
+
+def test_nested_floor_dir_cross_link_refused(tmp_path: Path):
+    # 嵌套地板目录 workspace/sub/.git:成分匹配与 floor_reason 同语义
+    (tmp_path / "sub" / ".git").mkdir(parents=True)
+    config = tmp_path / "sub" / ".git" / "config"
+    config.write_text("orig")
+    os.link(config, tmp_path / "alias")
+    with pytest.raises(SandboxRefusal, match="hardlink alias crosses the safety floor"):
+        compile_sandbox(make_ctx(tmp_path), bash_use_of(tmp_path), tmp_path)
+
+
+def test_private_path_hardlink_cross_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # 保护域含宿主私有目录:私有配置文件的硬链接别名同样拒绝
+    private = tmp_path / "private-config"
+    private.mkdir()
+    secret = private / "permissions.json"
+    secret.write_text("{}")
+    monkeypatch.setenv("PRAXIS_CONFIG_DIR", str(private))
+    os.link(secret, tmp_path / "alias")
+    with pytest.raises(SandboxRefusal, match="hardlink alias crosses the safety floor"):
+        compile_sandbox(make_ctx(tmp_path), bash_use_of(tmp_path), tmp_path)
+
+
+# ---------------------------------------------------------------------------
 # S2 地板穷举:任何 profile 的产物恒含地板段(FLOOR_ENTRIES 单一来源)
 # ---------------------------------------------------------------------------
 

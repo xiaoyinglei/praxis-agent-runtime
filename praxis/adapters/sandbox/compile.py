@@ -18,12 +18,13 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import stat
 import tempfile
 from pathlib import Path
 
 from praxis.adapters.sandbox.base import probe_backend
 from praxis.adapters.sandbox.seatbelt import compile_seatbelt
-from praxis.protocol.floor import host_private_paths
+from praxis.protocol.floor import floor_reason, host_private_paths
 from praxis.protocol.permission import PermissionContext
 from praxis.protocol.policy import (
     ResolvedPolicy,
@@ -95,20 +96,20 @@ def finalize_sandbox(spec: SandboxSpec, workspace: Path) -> None:
 
 
 def validate_aliases(resolved: ResolvedPolicy, workspace: Path, *, allow_write: bool) -> None:
-    """S9 preflight(移植旧 _validate_permission_aliases + 边界检查,ruling 5)。
+    """S9 preflight(移植旧 _validate_permission_aliases + 边界检查,ruling 5;R8 扩展)。
 
-    四类拒绝(fail-closed,一律 SandboxRefusal):
+    五类拒绝(fail-closed,一律 SandboxRefusal):
     1. symlink 策略边界:seatbelt 按解析后路径裁决,边界含 symlink 不可表示;
     2. 硬链接授权文件:st_nlink>1 的授权文件,inode 共享使词法限制不可强制;
     3. 授权根 symlink 逃逸:alias 无权限但 target 有权限 → 词法限制被擦除;
-    4. 扫描失败(OSError/不可解析):无法验证即拒绝。
+    4. 扫描失败(OSError/不可解析):无法验证即拒绝;
+    5. 跨地板硬链接(R8,仅 allow_write):同一 inode 同时出现在保护域
+       (地板目录/宿主私有目录)与非保护工作区路径 → 预存别名可绕过地板写,
+       SBPL 无 inode 规则,编译期拒绝(见 _scan_cross_floor_hardlinks)。
 
     根选择逻辑忠实移植旧实现:broad-root-read 时选 deny 根,否则选授权根
     (含被授权父覆盖的 deny 根);去掉 symlink/非目录根与嵌套根。
-
-    workspace 是冻结契约参数(brief ACI);旧实现用它跳过外部根的
-    _workspace_sandbox_preflight_issue——该重型扫描不在本任务移植范围
-    (brief 四类检查),参数保留以对齐签名。
+    workspace 参数供第 5 类扫描定位工作区树(R8 hook)。
     """
     rules = resolved.filesystem
     for rule in rules:
@@ -160,3 +161,52 @@ def validate_aliases(resolved: ResolvedPolicy, workspace: Path, *, allow_write: 
                         raise SandboxRefusal(
                             f"sandbox cannot enforce lexical permission restriction on symlink: {alias}"
                         )
+    if allow_write:
+        # R8:只读沙箱无法经别名写,扫描按旧门控关闭(allow_workspace_write gate)
+        _scan_cross_floor_hardlinks(workspace, private_paths=resolved.private_paths)
+
+
+def _scan_cross_floor_hardlinks(workspace: Path, *, private_paths: tuple[str, ...]) -> None:
+    """跨地板硬链接 inode 检测(R8;移植旧 inode 跨域检查核心,S9 预存别名闭合)。
+
+    扫描工作区树(含根级与嵌套地板目录,以及落在工作区内的私有目录),对
+    st_nlink>1 的常规文件按 (st_dev, st_ino) 记录保护/非保护两域:protected =
+    floor_reason(write=True)命中(地板成分 casefold 匹配或私有目录——直接消费
+    单一来源,与 decide 第 4 步同语义);unprotected = 其余工作区路径。同一
+    inode 跨两域即存在可绕过地板写的硬链接别名(SBPL 无法表达 inode 规则)
+    → 拒绝。不跟随 symlink(os.walk followlinks=False + lstat 跳过);扫描失败
+    拒绝(fail-closed)。
+
+    成本:每次编译 O(workspace + 地板目录)全量扫描(correctness first;旧
+    _workspace_sandbox_preflight_issue 付同样成本)。扫描范围即工作区树——
+    工作区外的私有目录不遍历(旧代码同样不扫;R8 成本口径)。仅移植跨地板
+    inode 检查;verification-toolchain/git-pointer 等重型检查留待 phase 3+。
+    """
+    protected_inodes: set[tuple[int, int]] = set()
+    unprotected_aliases: dict[tuple[int, int], str] = {}
+
+    def scan_error(error: OSError) -> None:
+        raise SandboxRefusal(f"cannot validate sandbox hardlink aliases: {error.filename}") from error
+
+    try:
+        if not workspace.is_dir():
+            return  # 缺失工作区无文件可扫(与既有根选择的 is_dir 过滤一致)
+    except OSError as error:
+        raise SandboxRefusal(f"cannot validate sandbox hardlink aliases: {workspace}") from error
+    for directory, _directories, files in os.walk(workspace, followlinks=False, onerror=scan_error):
+        for name in files:
+            path = Path(directory) / name
+            try:
+                metadata = path.lstat()
+            except OSError as error:
+                raise SandboxRefusal(f"cannot validate sandbox hardlink aliases: {path}") from error
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink <= 1:
+                continue  # nlink==1 不可能有别名;非常规文件不在范围(同旧代码)
+            key = (metadata.st_dev, metadata.st_ino)
+            if floor_reason(path, write=True, private_paths=private_paths):
+                protected_inodes.add(key)
+            else:
+                unprotected_aliases.setdefault(key, os.path.relpath(path, workspace))
+    for key, relative in unprotected_aliases.items():
+        if key in protected_inodes:
+            raise SandboxRefusal(f"hardlink alias crosses the safety floor: {relative}")

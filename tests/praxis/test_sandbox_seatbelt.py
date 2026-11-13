@@ -7,9 +7,10 @@
 真实强制(subprocess 直跑 /usr/bin/sandbox-exec,非 mock):
 - S2:.git 写阻断 / .praxis 读阻断 / workspace 写 + .git 读放行;
 - 网络默认阻断(profile 无 network-outbound + best-effort curl,离线优雅降级);
-- S9/D8 实证:沙箱内 ln .git/config 硬链接攻击;
-- S9/D8 findings 补充(xfail strict):先存硬链接别名写穿透——seatbelt 按路径
-  裁决无法表达 inode 规则,实证记录不假装解决(结构性修复随 bwrap 视图延后)。
+- S9/D8 实证:沙箱内 ln .git/config 硬链接攻击(seatbelt 阻断 link() 源写);
+- S9/R8:先存硬链接的主防御 = compile preflight 跨地板拒绝(见
+  test_sandbox_compile.py);本文件仅留档 SBPL 限制(xfail strict,刻意绕过
+  preflight 直接渲染)——seatbelt 按路径裁决无法表达 inode 规则。
 """
 
 from __future__ import annotations
@@ -307,19 +308,29 @@ def test_seatbelt_runtime_hardlink_probe(tmp_path: Path):
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "S9/D8 findings 补充(实证 2026-11-13 darwin):先存硬链接别名写穿透——"
-        "seatbelt 按路径裁决无法表达 inode 规则,echo > alias 改写 .git/config。"
-        "结构性修复 = bwrap 复制视图断硬链接(Task 6 延后);若本测试 XPASS 说明平台已修复,应重评。"
+        "SBPL 限制留档(R8;实证 2026-11-13 darwin):主防御是 compile preflight 的"
+        "跨地板硬链接拒绝(test_preexisting_hardlink_alias_refused_by_preflight)。"
+        "本测试刻意绕过 preflight(直接 render_profile)证明 seatbelt 本身无法表达 "
+        "inode 规则——先存硬链接别名写穿透 .git 地板。若 XPASS 说明平台获得 inode "
+        "强制能力,应重评 preflight 必要性。"
     ),
 )
-def test_seatbelt_preexisting_hardlink_alias_write(tmp_path: Path):
-    # 沙箱外预先创建硬链接(模拟攻击者预置),沙箱内经别名写:安全期望仍是 config 不变。
+def test_seatbelt_sbpl_limitation_hardlink_penetrates_when_preflight_bypassed(tmp_path: Path):
+    # 非主防御测试:绕过 compile(直接渲染)时,先存硬链接别名写穿透——SBPL 限制留档。
     (tmp_path / ".git").mkdir()
     (tmp_path / ".git" / "config").write_text("orig")
     os.link(tmp_path / ".git" / "config", tmp_path / "prealias")
-    spec = compile_sandbox(make_ctx(tmp_path), bash_use_of(tmp_path), tmp_path)
-    try:
-        run_sandboxed_bash(spec, tmp_path, "echo hacked > prealias")
-        assert (tmp_path / ".git" / "config").read_text() == "orig"
-    finally:
-        finalize_sandbox(spec, tmp_path)
+    resolved = resolve_policy(PermissionPolicy(), tmp_path)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    profile = render_profile(
+        resolved, workspace=tmp_path, scratch=scratch, allow_network=False, allow_write=True, private_paths=()
+    )
+    spec = SandboxSpec(
+        backend="seatbelt",
+        argv_prefix=("/usr/bin/sandbox-exec", "-p", profile),
+        scratch_dir=str(scratch),
+        profile_text=profile,
+    )
+    run_sandboxed_bash(spec, tmp_path, "echo hacked > prealias")
+    assert (tmp_path / ".git" / "config").read_text() == "orig"
