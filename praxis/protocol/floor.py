@@ -2,6 +2,13 @@
 
 这是全项目唯一的安全地板定义。核心判定管线(Task 4)和沙箱 profile
 编译器(Task 5)均消费此模块——不得有第二套地板列表。
+
+调用约定：
+- floor_reason 在内部对 path 做 expanduser() + os.path.abspath 词法规范化
+  （不解析 symlink，保持 B10 非严格 totality）。
+- caller 检查 symlink 目标时应同时传入词法路径与真实路径两个候选（沿用
+  protocol/policy.py:path_reason 的双候选语义）；Task 4 将在 decide 层完成
+  这一调用模式。
 """
 
 from __future__ import annotations
@@ -11,8 +18,7 @@ import tempfile
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-
-from praxis.protocol.policy import Access
+from typing import Literal
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,10 +28,19 @@ class FloorEntry:
     Parameters:
         name: 目录名（casefold + NFC 匹配任意路径成分）。
         access: "read" = 只读（write 拒，read 放）；"deny" = 无访问。
+
+    Validation: access is restricted to "read"/"deny"; any other value
+    raises ValueError (D4 floor semantics only use read/deny).
     """
 
     name: str
-    access: Access
+    access: Literal["read", "deny"]
+
+    def __post_init__(self) -> None:
+        if self.access not in ("read", "deny"):
+            raise ValueError(
+                f"FloorEntry.access must be 'read' or 'deny', got {self.access!r}"
+            )
 
 
 # ── 地板常量：唯一来源 ────────────────────────────────────────────────
@@ -47,12 +62,18 @@ def _is_under(candidate: Path, root_str: str) -> bool:
 
     non-strict: 不抛 OSError / broken symlink / missing target。
     逻辑与 policy._under_path 同风格，但本地实现、不跨模块导入私有符号。
+    对 candidate 做 expanduser() + os.path.abspath 词法规范化（不解析 symlink）。
     """
     try:
-        if candidate.is_relative_to(root_str):
+        lex = candidate.expanduser()
+        canon = os.path.abspath(str(lex))
+    except (OSError, ValueError):
+        return False
+    try:
+        if Path(canon).is_relative_to(root_str):
             return True
         root_normed = _normalize_component(root_str)
-        for ancestor in (candidate, *candidate.parents):
+        for ancestor in (Path(canon), *Path(canon).parents):
             try:
                 ancestor_normed = _normalize_component(str(ancestor))
                 if ancestor_normed == root_normed:
@@ -90,7 +111,7 @@ def host_private_paths() -> tuple[str, ...]:
 def floor_reason(
     path: Path,
     *,
-    write: bool = False,
+    write: bool,
     private_paths: tuple[str, ...],
 ) -> str:
     """判定给定 path 是否触达安全地板。
@@ -99,15 +120,22 @@ def floor_reason(
         "" = 无地板命中（通过），否则为拒绝理由字符串。
 
     Logic:
-        1. 检查 path 的任何路径成分是否命中 FLOOR_ENTRIES（casefold+NFC）。
+        1. 对输入做词法规范化：expanduser() + os.path.abspath（不解析 symlink，
+           保持 B10 non-strict totality）。
+        2. 检查任何路径成分是否命中 FLOOR_ENTRIES（casefold+NFC）。
            - deny → 读写都拒。
            - read → write 时拒，read 时放行。
-        2. 检查 path 是否在 private_paths 下（NFC/casefold+samefile tolerant）。
+        3. 检查是否在 private_paths 下（NFC/casefold+samefile tolerant）。
            - 在私有目录下 → 读写都拒。
-        3. 全程 non-strict：不对文件系统做任何存在性假设，不抛异常。
+        4. 全程 non-strict：不对文件系统做任何存在性假设，不抛异常。
     """
-    # ── 步骤 1: FLOOR_ENTRIES 成分匹配 ───────────────────────────────
-    path_str = str(path)
+    # ── 步骤 0: 输入词法规范化 ───────────────────────────────────────
+    try:
+        lex = Path(path).expanduser()
+        path_str = os.path.abspath(str(lex))
+    except (OSError, ValueError):
+        return "path cannot be safely normalized"
+
     floor_hit: str | None = None
 
     for entry in FLOOR_ENTRIES:
@@ -128,7 +156,7 @@ def floor_reason(
     if floor_hit is not None:
         return floor_hit
 
-    # ── 步骤 2: private_paths Containment ────────────────────────────
+    # ── 步骤 1: private_paths Containment ────────────────────────────
     for priv in private_paths:
         if _is_under(path, priv):
             return "path is under a private directory"
