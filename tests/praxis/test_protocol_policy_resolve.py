@@ -127,6 +127,8 @@ def test_outside_and_symlink_reason_strings(tmp_path):
 
 
 def test_symlink_loop_fails_closed(tmp_path):
+    # 依赖受支持解释器范围(>=3.12,<3.14,见 .python-version):3.14 起 Path.resolve
+    # 移除 loop 抛错语义(non-strict 直接返回 loop 路径),届时此契约需随迁移重审——超出本任务范围。
     (tmp_path / "loop").symlink_to(tmp_path / "loop")
     r = resolve_policy(PermissionPolicy(), tmp_path)
     assert path_reason(r, tmp_path / "loop") == "path cannot be safely resolved"  # ELOOP → OSError,不抛
