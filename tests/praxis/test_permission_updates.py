@@ -344,6 +344,62 @@ def test_r11_readonly_always_write_grant_no_file_session_still_usable(ws: Path) 
     session2.close()
 
 
+def test_r13_session_grant_never_persisted_when_always_follows(ws: Path) -> None:
+    # (a) 混合序列:session 授权(ToolRule allow + PathRule read)先,always 授权后——
+    # 落盘文件必须只含 always 规则;重开后 session 授权随会话消亡(always 仍在)。
+    script = [script_call("c1", "probe"), script_stop("t1")]
+    session = open_session(ws, ScriptedAdapter(script), tools=(probe_tool(),))
+    try:
+        session.update_permission(
+            PermissionUpdate(rule=ToolRule(pattern="probe", decision="allow"), destination="session")
+        )
+        session.update_permission(
+            PermissionUpdate(rule=PathRule(path=str(ws / "sub"), access="read"), destination="session")
+        )
+        assert not permissions_file(ws).exists()  # session-only:不写文件
+        r1 = asyncio.run(session.submit("go"))
+        assert r1.status is TurnStatus.COMPLETED
+        assert tool_result_for(session, "c1").payload["status"] == "ok"  # session 授权内存生效
+        session.update_permission(
+            PermissionUpdate(rule=NetworkRule(domain="ok.com", decision="allow"), destination="always")
+        )
+    finally:
+        session.close()
+    data = json.loads(permissions_file(ws).read_text(encoding="utf-8"))
+    assert data["tools"] == []  # R13:session ToolRule 授权绝不静默升级落盘
+    assert data["filesystem"] == []  # session PathRule 授权同样不上盘
+    assert data["network"]["rules"] == [{"domain": "ok.com", "decision": "allow"}]  # always 在
+    session2 = open_session(ws, ScriptedAdapter(script), tools=(probe_tool(),))
+    try:
+        r2 = asyncio.run(session2.submit("go after reopen"))
+        assert r2.status is TurnStatus.PAUSED  # session 授权随会话消亡:probe 回到 fallback ask
+        assert [a.call_id for a in r2.pending_approvals] == ["c1"]
+    finally:
+        session2.close()
+
+
+def test_r13_always_rules_fold_in_order_with_session_between(ws: Path) -> None:
+    # (d) 多条 always 按序折叠;夹在中间的 session 授权不出现在文件。
+    session = open_session(ws, ScriptedAdapter([]))
+    try:
+        session.update_permission(
+            PermissionUpdate(rule=ToolRule(pattern="bash", decision="deny"), destination="always")
+        )
+        session.update_permission(
+            PermissionUpdate(rule=ToolRule(pattern="write", decision="deny"), destination="session")
+        )
+        session.update_permission(
+            PermissionUpdate(rule=ToolRule(pattern="read", decision="ask"), destination="always")
+        )
+    finally:
+        session.close()
+    data = json.loads(permissions_file(ws).read_text(encoding="utf-8"))
+    assert data["tools"] == [
+        {"pattern": "bash", "decision": "deny"},
+        {"pattern": "read", "decision": "ask"},
+    ]  # 顺序 = always_rules 折叠序;session 的 write-deny 不在盘上
+
+
 def test_once_grant_effective_cleared_after_batch(ws: Path) -> None:
     adapter = [
         script_call("c1", "probe"),

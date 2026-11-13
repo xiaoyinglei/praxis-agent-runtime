@@ -49,7 +49,7 @@ from uuid import uuid4
 
 from praxis.core.events import EventBus, Subscription
 from praxis.core.locks import ThreadBusy, thread_execution_lock
-from praxis.core.permission import apply_update
+from praxis.core.permission import apply_update, extend_policy
 from praxis.core.pipeline import SandboxCompiler, SandboxFinalizer
 from praxis.core.recovery import classify_pending
 from praxis.core.statemachine import TurnStatus, transition
@@ -271,6 +271,10 @@ class Session:
         self._adapter = adapter
         self._tools = dict(tools)
         self._permissions = permissions
+        # R13:base = composition 载入/构造的策略声明(live policy 之前)。
+        # session/once 更新会扩展 live policy(仅内存生效)但绝不进 base;
+        # always 落盘 = base ⊕ always_rules 折叠,杜绝 session 授权静默升级。
+        self._base_policy = permissions.policy
         self._thread_id = thread_id
         self._max_steps = max_steps
         self._system_prompt = (
@@ -301,9 +305,10 @@ class Session:
         """权限更新的会话级唯一入口:经 apply_update 纯代数落地,always 同批落盘。
 
         once/session 只改内存(once 由 _execute 在下一批结束时清除;session
-        永不落盘)。always 额外把**已扩展规则**的 policy 原子写
-        ``.praxis/permissions.json``——该文件即策略声明,composition 下次打开
-        时按"显式参数 > 文件 > 默认"加载,规则跨重启生效。
+        永不落盘)。always 额外落盘,R13:写的是 base 声明 ⊕ always_rules
+        折叠(非 live policy——后者还含 session 扩展,直 dump 会静默升级
+        session→always),原子写 ``.praxis/permissions.json``——该文件即策略
+        声明,composition 下次打开时按"显式参数 > 文件 > 默认"加载。
 
         D9 提醒:session/always 的 NetworkRule 授权只对 URL 级工具(web 类)
         放行;bash(EXECUTE_PROCESS)的命令网络因规则在场而 fail-closed deny。
@@ -313,10 +318,20 @@ class Session:
             self._persist_policy()
 
     def _persist_policy(self) -> None:
-        """策略声明落盘(原子写;mode 不进 policy,C5——approval 域只有 on-request/never)。"""
+        """R13 落盘真值 = base 声明 ⊕ always_rules 顺序折叠;session/once 绝不上盘。
+
+        直接 dump live policy 会把 session 授权静默升级为 always(R6 的
+        session 扩展只该活在内存)——违反 D10。base(composition 载入的声明)
+        叠加 always_rules 记录层(存在正是为此)才是文件该写的内容;每条折叠
+        经 extend_policy 重验(R11),mode 不进 policy(C5,approval 域只有
+        on-request/never)。原子写:同目录 tmp + os.replace。
+        """
+        persisted = self._base_policy
+        for rule in self._permissions.always_rules:
+            persisted = extend_policy(persisted, rule)
         praxis_dir = self._workspace / ".praxis"
         praxis_dir.mkdir(parents=True, exist_ok=True)
-        _atomic_write_text(praxis_dir / "permissions.json", self._permissions.policy.model_dump_json(indent=2))
+        _atomic_write_text(praxis_dir / "permissions.json", persisted.model_dump_json(indent=2))
 
     # -- submit ---------------------------------------------------------------
 

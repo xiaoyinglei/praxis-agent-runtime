@@ -319,8 +319,8 @@ def decide(tool: Tool, use: ResolvedUse, ctx: PermissionContext) -> Decision:
     return decision
 
 
-def _extend_policy(policy: PermissionPolicy, rule: PolicyRule) -> PermissionPolicy:
-    """把 grant 规则追加进 policy 对应集合并**完整重验**(R6 代数;R11 修补丁)。
+def extend_policy(policy: PermissionPolicy, rule: PolicyRule) -> PermissionPolicy:
+    """把 grant 规则追加进 policy 对应集合并**完整重验**(R6 代数;R11 修补丁;R13 公开)。
 
     PathRule→filesystem、ToolRule→tools、NetworkRule→network.rules,扩展机制
     仍是 model_copy。R11:model_copy(update=...) 不重跑校验器——若不复核,
@@ -331,6 +331,9 @@ def _extend_policy(policy: PermissionPolicy, rule: PolicyRule) -> PermissionPoli
     含 readonly_cannot_widen):非法 grant 在 UPDATE 时刻抛 pydantic
     ValidationError(ValueError 子类),Session.update_permission 不捕获直接
     传播;因持久化发生在 apply_update 返回之后,坏策略绝不落盘。
+    R13:公开为唯一 policy 扩展代数入口——apply_update(内存生效)与
+    Session._persist_policy(base ⊕ always_rules 折叠落盘)共用,
+    避免跨模块私有访问(anti-pattern)。
     decide/第 6 步/_rule_layers/command_network_decision 零改动。
     """
     if isinstance(rule, PathRule):
@@ -356,8 +359,10 @@ def apply_update(ctx: PermissionContext, update: PermissionUpdate) -> Permission
       always→always_rules+session_rules,供审计与调用方落盘)。
     always 的持久化(原子写 .praxis/permissions.json)是 Session.update_permission
     的事,本函数无磁盘 IO;返回新冻结上下文,原 ctx 不变。
-    R11:policy 扩展经 _extend_policy 完整重验——非法 grant(read-only profile
+    R11:policy 扩展经 extend_policy 完整重验——非法 grant(read-only profile
     的 write PathRule 等)在本函数即抛 ValidationError,ctx 与磁盘双双不动。
+    R13 注记:session 扩展只存在于内存 live policy;落盘真值由 Session 用
+    base ⊕ always_rules 折叠,session/once 规则绝不进文件。
 
     D9 注记:session/always 的 NetworkRule 授权使 policy.network.rules 非空,
     command_network_decision 对 EXECUTE_PROCESS(bash)一律 deny——放行的是
@@ -367,11 +372,11 @@ def apply_update(ctx: PermissionContext, update: PermissionUpdate) -> Permission
     if update.destination == "once":
         return replace(ctx, once_rules=(*ctx.once_rules, rule))
     if update.destination == "session":
-        return replace(ctx, policy=_extend_policy(ctx.policy, rule), session_rules=(*ctx.session_rules, rule))
+        return replace(ctx, policy=extend_policy(ctx.policy, rule), session_rules=(*ctx.session_rules, rule))
     if update.destination == "always":
         return replace(
             ctx,
-            policy=_extend_policy(ctx.policy, rule),
+            policy=extend_policy(ctx.policy, rule),
             always_rules=(*ctx.always_rules, rule),
             session_rules=(*ctx.session_rules, rule),
         )
