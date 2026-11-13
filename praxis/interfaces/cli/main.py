@@ -187,6 +187,24 @@ def _load_policy_file(path: Path) -> PermissionPolicy:
         raise typer.BadParameter(f"invalid PermissionPolicy JSON {path}: {exc}") from None
 
 
+def _open_session_guarded(
+    workspace: Path,
+    adapter: Any,
+    *,
+    policy: PermissionPolicy | None,
+    mode: PermissionMode | None,
+    thread_id: str,
+) -> Session:
+    """R12:open_session 的 ValueError(损坏的既有状态,如 .praxis/permissions.json
+    无法解析)是运行时失败 → 干净错误消息 + EXIT_FAILED(1),绝不裸 traceback(C4)。
+    用法错误(--policy/--scripted 坏参)在此之前已以 BadParameter 抛出,保持退出码 3。"""
+    try:
+        return open_session(workspace, adapter, policy=policy, mode=mode, thread_id=thread_id)
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(EXIT_FAILED) from None
+
+
 def _open_from_options(
     workspace: Path | None,
     model: str | None,
@@ -202,7 +220,7 @@ def _open_from_options(
     resolved_mode = cast("PermissionMode | None", mode)
     if scripted is not None:
         adapter: Any = ScriptedAdapter(_load_scripted(Path(scripted)))
-        return open_session(
+        return _open_session_guarded(
             _resolve_workspace(workspace),
             adapter,
             policy=resolved_policy,
@@ -217,7 +235,7 @@ def _open_from_options(
         raise typer.BadParameter("missing API key: set PRAXIS_API_KEY (or OPENAI_API_KEY), or use --scripted")
     resolved_base_url = base_url or os.environ.get("PRAXIS_BASE_URL") or None
     adapter = OpenAICompatAdapter(ModelSpec(model_id=resolved_model), api_key=api_key, base_url=resolved_base_url)
-    return open_session(
+    return _open_session_guarded(
         _resolve_workspace(workspace),
         adapter,
         policy=resolved_policy,
@@ -228,7 +246,13 @@ def _open_from_options(
 
 def _open_read_only(workspace: Path | None, thread: str | None) -> Session:
     """log/status/steer/verify 不需要模型:空剧本 adapter 只是 open_session 的必填参数。"""
-    return open_session(_resolve_workspace(workspace), ScriptedAdapter([]), thread_id=_resolve_thread(thread))
+    return _open_session_guarded(
+        _resolve_workspace(workspace),
+        ScriptedAdapter([]),
+        policy=None,
+        mode=None,
+        thread_id=_resolve_thread(thread),
+    )
 
 
 # ---------------------------------------------------------------------------

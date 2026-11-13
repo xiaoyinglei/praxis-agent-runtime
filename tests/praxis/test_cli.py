@@ -927,3 +927,82 @@ def test_cli_policy_and_mode_forwarded_orthogonally(workspace: Path, tmp_path: P
     assert captured["policy"].approval == "never"  # mode 不进 policy(正交)
     assert captured["mode"] == "bypass"
     assert captured["thread_id"] == "default"
+
+
+# ---------------------------------------------------------------------------
+# Task 9 RULING R12:损坏的既有 .praxis/permissions.json → 干净错误 + 退出码 1
+# (状态损坏≈运行时失败,非用法错误;--policy 坏参仍 exit 3;C4 形态无裸 traceback)
+# ---------------------------------------------------------------------------
+
+
+def _corrupt_existing_policy(workspace: Path) -> None:
+    praxis_dir = workspace / ".praxis"
+    praxis_dir.mkdir(parents=True, exist_ok=True)
+    (praxis_dir / "permissions.json").write_text("{ this is not json", encoding="utf-8")
+
+
+def test_cli_corrupt_existing_policy_run_exit_1_clean(workspace: Path, tmp_path: Path) -> None:
+    """R12(a):既有策略文件损坏 → run 退出 1、干净消息、无 ValueError 裸 traceback。"""
+    _corrupt_existing_policy(workspace)
+    script = _write_script(tmp_path, "done.json", [{"content": "x"}])
+    result = runner.invoke(
+        app,
+        ["run", "hi", "--workspace", str(workspace), "--scripted", str(script)],
+        env=_CLEAN_ENV,
+    )
+    assert result.exit_code == 1, result.output
+    assert not isinstance(result.exception, ValueError), repr(result.exception)
+    assert "Traceback" not in result.output
+    assert "error" in result.output.lower()
+    assert "permissions.json" in result.output  # 消息指向损坏文件
+
+
+def test_cli_corrupt_existing_policy_readonly_commands_exit_1_clean(workspace: Path) -> None:
+    """R12:只读命令(log/status)同样经 open_session → 损坏状态干净退出 1,非 traceback。"""
+    _corrupt_existing_policy(workspace)
+    for command in (["log"], ["status"]):
+        result = runner.invoke(app, [*command, "--workspace", str(workspace)], env=_CLEAN_ENV)
+        assert result.exit_code == 1, (command, result.output)
+        assert not isinstance(result.exception, ValueError), repr(result.exception)
+        assert "Traceback" not in result.output
+        assert "error" in result.output.lower()
+
+
+def test_cli_corrupt_existing_policy_overridden_by_valid_policy_flag(workspace: Path, tmp_path: Path) -> None:
+    """R12:显式 --policy 覆盖损坏的既有文件(来源序:显式 > 文件)→ 正常退出 0。"""
+    _corrupt_existing_policy(workspace)
+    policy = _write_policy(tmp_path, "good.json", json.dumps({"profile": "workspace"}))
+    script = _write_script(tmp_path, "done.json", [{"content": "x"}])
+    result = runner.invoke(
+        app,
+        ["run", "hi", "--workspace", str(workspace), "--scripted", str(script), "--policy", str(policy)],
+        env=_CLEAN_ENV,
+    )
+    assert result.exit_code == 0, result.output
+
+
+def test_cli_valid_existing_policy_file_runs_normal(workspace: Path, tmp_path: Path) -> None:
+    """R12(c):既有策略文件合法 → 正常加载并执行(退出 0),无误伤。"""
+    praxis_dir = workspace / ".praxis"
+    praxis_dir.mkdir(parents=True, exist_ok=True)
+    (praxis_dir / "permissions.json").write_text(json.dumps({"profile": "workspace"}), encoding="utf-8")
+    script = _write_script(tmp_path, "done.json", [{"content": "all good"}])
+    result = runner.invoke(
+        app,
+        ["run", "hi", "--workspace", str(workspace), "--scripted", str(script)],
+        env=_CLEAN_ENV,
+    )
+    assert result.exit_code == 0, result.output
+    assert "all good" in result.output
+
+
+def test_cli_policy_bad_json_still_exit_3_not_1(workspace: Path, tmp_path: Path) -> None:
+    """R12(b):--policy 坏 JSON 是用户用法错误 → 仍 exit 3(与既有状态损坏的 exit 1 区分)。"""
+    bad = _write_policy(tmp_path, "bad.json", "{ not json")
+    script = _write_script(tmp_path, "done.json", [{"content": "x"}])
+    result = runner.invoke(
+        app,
+        ["run", "hi", "--workspace", str(workspace), "--scripted", str(script), "--policy", str(bad)],
+        env=_CLEAN_ENV,
+    )
+    assert result.exit_code == 3, result.output
