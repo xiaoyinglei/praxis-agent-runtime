@@ -21,8 +21,8 @@ from praxis.core.statemachine import TurnStatus
 from praxis.core.turn import TurnDeps, TurnState, run_turn
 from praxis.protocol.items import ItemKind
 from praxis.protocol.models import ModelResponse, ModelToolCall, Usage
-from praxis.protocol.permission import PermissionContext
-from praxis.protocol.policy import PermissionPolicy
+from praxis.protocol.permission import PermissionContext, SandboxAvailability
+from praxis.protocol.policy import NetworkPolicy, PermissionPolicy
 from praxis.protocol.tools import Tool
 from praxis.store.log import ItemEntry, Store
 from praxis.store.turns import create_turn, get_turn
@@ -76,7 +76,12 @@ def test_multitool_turn_end_to_end(tmp_path: Path) -> None:
             adapter=adapter,
             tools=tools,
             permissions=PermissionContext(
-                workspace=str(workspace), policy=PermissionPolicy(), mode="on-request"
+                workspace=str(workspace),
+                # Task 4 迁移:真实 decide 下 bash 需 network allow(默认 ask 会第 2 步暂停)
+                # + 沙箱可用占位(Task 5/7 接真实 probe/compiler)。
+                policy=PermissionPolicy(network=NetworkPolicy(decision="allow")),
+                mode="on-request",
+                sandbox=SandboxAvailability(backend="fake", available=True),
             ),
             workspace=workspace,
             system_prompt="你是验收 agent:按 write → bash → read 的顺序完成任务。",

@@ -22,7 +22,7 @@ from praxis.core.events import EventBus
 from praxis.core.recovery import sweep
 from praxis.core.session import Session
 from praxis.protocol.models import ModelAdapter
-from praxis.protocol.permission import PermissionContext
+from praxis.protocol.permission import PermissionContext, SandboxAvailability
 from praxis.protocol.policy import PermissionPolicy
 from praxis.protocol.tools import Tool
 from praxis.store.log import Store
@@ -68,7 +68,11 @@ def build_session(
         tool_map: dict[str, Tool] = {tool.definition.name: tool for tool in tool_seq}
         effective_policy = policy if policy is not None else PermissionPolicy()
         permissions = PermissionContext(
-            workspace=str(root), policy=effective_policy, mode=effective_policy.approval
+            workspace=str(root),
+            policy=effective_policy,
+            mode=effective_policy.approval,
+            # TODO(Task 5/7): replace with probe_backend() + real compiler wiring
+            sandbox=SandboxAvailability(backend="fake", available=True),
         )
         resolved_thread = thread_id if thread_id is not None else store.create_thread()
         store.ensure_thread(resolved_thread)

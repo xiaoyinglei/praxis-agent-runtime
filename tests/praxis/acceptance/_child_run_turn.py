@@ -47,6 +47,7 @@ from praxis.core.turn import execute as _real_execute  # noqa: E402
 from praxis.interfaces.sdk import open_session  # noqa: E402
 from praxis.protocol.json import JsonValue  # noqa: E402
 from praxis.protocol.models import ModelResponse, ModelToolCall, Usage  # noqa: E402
+from praxis.protocol.policy import NetworkPolicy, PermissionPolicy  # noqa: E402
 from praxis.protocol.sandbox import ToolExecContext  # noqa: E402
 from praxis.protocol.tools import Tool  # noqa: E402
 from praxis.tools.builtins.command import create_bash_tool  # noqa: E402
@@ -109,7 +110,15 @@ async def _amain(workspace: Path, specs: list[Mapping[str, Any]], thread_id: str
         _install_dispatch_seam()
     tools = _slow_read_tools(workspace) if variant == "c" else None
     adapter = ScriptedAdapter([_to_response(spec) for spec in specs])
-    session = open_session(workspace, adapter, thread_id=thread_id, tools=tools)
+    # Task 4 迁移:真实 decide 下 bash 需 network allow(默认 ask 会第 2 步暂停);
+    # 沙箱可用占位由 composition 提供(Task 5/7 接真实 probe/compiler)。
+    session = open_session(
+        workspace,
+        adapter,
+        thread_id=thread_id,
+        tools=tools,
+        policy=PermissionPolicy(network=NetworkPolicy(decision="allow")),
+    )
     try:
         result = await session.submit(f"acceptance: kill -9 resume matrix, variant {variant}")
     finally:
