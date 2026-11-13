@@ -168,3 +168,11 @@ forbidden_modules =
     praxis.core
     praxis.store
 allow_indirect_imports = true
+
+[importlinter:contract:praxis_tools_adapters_isolation]
+name = Praxis tools never import sandbox backends directly (sandbox enters via pipeline injection)
+type = forbidden
+source_modules =
+    praxis.tools
+forbidden_modules =
+    praxis.adapters
