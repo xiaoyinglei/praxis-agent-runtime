@@ -1,8 +1,12 @@
 """bash 内置工具(移植旧 agent_runtime shell.py:653-840 的子进程/进程组语义,修正 EOF)。
 
 执行算法(brief Step 3,修正 asyncio 的 EOF 语义):
-1. ``/bin/bash -lc command``,cwd=workspace,stdout/stderr 管道,``start_new_session=True``
-   (独立进程组,超时才能整组回收);
+1. ``[*sandbox.argv_prefix, "/bin/bash", "-lc", command]``,cwd=workspace,
+   stdout/stderr 管道,``start_new_session=True``(独立进程组,超时才能整组回收);
+   沙箱时 env TMPDIR=spec.scratch_dir(沙箱内唯一可写临时区)。run 只允许经
+   管道调用:管道对 EXECUTE_PROCESS 恒编译沙箱(后端不可用已在 decide 第 7 步
+   deny);``exec_ctx.sandbox=None`` 为单测路径直跑。trusted-local 等不可沙箱化
+   策略在编译期 SandboxRefusal → 管道转 sandbox_refused 结果(R9 fail-closed);
 2. 读管道任务与主进程监视并发启动——边跑边读,大输出不会把管道灌满造成死锁;
 3. 主进程退出的判据是 ``proc.returncode``(子进程回收事件),**不是** ``proc.wait()``:
    CPython 的 ``wait()`` 把"进程退出"与"所有管道 EOF"混为一谈,后台孙进程持写端
@@ -215,16 +219,24 @@ def create_bash_tool(workspace: Path) -> Tool:
 
     async def run(
         arguments: Mapping[str, JsonValue],
-        exec_ctx: ToolExecContext,  # 沙箱接线(Task 7)在此消费 exec_ctx.sandbox;本任务忽略
+        exec_ctx: ToolExecContext,
     ) -> ToolResult:
         args = validate_input(arguments)
         command = cast("str", args["command"])
         timeout = cast("float", args.get("timeout_seconds", _DEFAULT_TIMEOUT_SECONDS))
+        # 沙箱接线(Task 7):argv_prefix 拼在真实命令之前(sandbox-exec -p profile);
+        # TMPDIR 指向沙箱可写 scratch。run 只允许经管道调用:管道对 EXECUTE_PROCESS
+        # 恒编译(不可用已在 decide 第 7 步 deny);sandbox=None 为单测路径直跑。
+        spec = exec_ctx.sandbox
+        prefix = spec.argv_prefix if spec is not None else ()
+        env = {**os.environ, "TMPDIR": spec.scratch_dir} if spec is not None else None
         proc = await asyncio.create_subprocess_exec(
+            *prefix,
             "/bin/bash",
             "-lc",
             command,
             cwd=str(workspace),
+            env=env,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -292,7 +304,10 @@ def create_bash_tool(workspace: Path) -> Tool:
             name="bash",
             description=(
                 "Run a shell command with /bin/bash -lc in the workspace; "
-                "returns combined stdout/stderr and exit_code."
+                "returns combined stdout/stderr and exit_code. Commands run under the "
+                "OS sandbox compiled from the permission policy; policies that cannot "
+                "be sandboxed (e.g. trusted-local with write grants) refuse execution "
+                "with sandbox_refused — use the read/write tools for file edits instead."
             ),
             input_schema={
                 "type": "object",

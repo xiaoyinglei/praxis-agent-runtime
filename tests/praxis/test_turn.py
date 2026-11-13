@@ -332,6 +332,8 @@ def test_resume_calls_execute_then_complete(
     assert paused.status is TurnStatus.PAUSED
 
     # Task 14 语义:approval_decision item + 回合回 RUNNING,然后带 resume_calls 重入
+    # Task 7 R5(b) 迁移:决策必须 stamp 批准时刻的 policy_revision(与 _deps 的
+    # 默认策略一致),否则按 legacy 缺 revision fail-closed 作废 → re-ask。
     store.append_items(
         THREAD,
         TURN,
@@ -343,6 +345,7 @@ def test_resume_calls_execute_then_complete(
                     "verdict": "allow",
                     "args_digest": args_digest(args),
                     "destination": "session",
+                    "policy_revision": PermissionPolicy().revision,
                 },
             )
         ],

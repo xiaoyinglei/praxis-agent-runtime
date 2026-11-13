@@ -31,6 +31,7 @@ from praxis.interfaces.sdk import (
 from praxis.protocol.items import ItemKind
 from praxis.protocol.models import ModelResponse, ModelToolCall, Usage
 from praxis.protocol.permission import Decision
+from praxis.protocol.policy import PathRule, PermissionPolicy
 from praxis.protocol.tools import args_digest
 from praxis.store.log import ItemEntry, Store
 from praxis.store.turns import create_turn, list_turns
@@ -440,6 +441,8 @@ def test_resume_approval_allow_executes_once_then_completes(
     assert decisions[0]["verdict"] == "allow"
     assert decisions[0]["args_digest"] == args_digest(args)  # 摘要绑定进 decision item
     assert decisions[0]["destination"] == "once"
+    # R5(b):批准时刻的 policy revision 落 decision item(默认策略的 revision)
+    assert decisions[0]["policy_revision"] == PermissionPolicy().revision
     assert call_count == 1 and result_count == 1  # 批准重放恰好一次
     assert session.result(paused.turn_id).pending_approvals == ()
 
@@ -463,6 +466,33 @@ def test_resume_approval_denies_writes_denied_result(
 
     results = _with_other_store(workspace, _check)
     assert len(results) == 1 and results[0]["status"] == "denied"
+
+
+def test_resume_approval_stamps_current_revision_not_request_revision(
+    workspace: Path, open_ws: Callable[..., Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R5(b):decision 的 policy_revision 取批准时刻的当前策略,不是 request 的旧
+    revision;重入按 decision item 校验——跨策略续跑时批准依然有效且绑定新 revision。"""
+    monkeypatch.setattr(permission, "decide", lambda *a: Decision.ask("test"))
+    args = {"path": "f.txt", "content": "revision bound"}
+    first = open_ws(ScriptedAdapter([_resp("", (("c1", "write", args),)), _resp("不可达")]))
+    paused = asyncio.run(first.submit("write it"))
+    assert paused.status is TurnStatus.PAUSED
+
+    # 另一策略(revision 不同)的会话续跑同一 turn:批准落笔必须 stamp 新 revision
+    new_policy = PermissionPolicy(filesystem=(PathRule(path="extra", access="read"),))
+    assert new_policy.revision != PermissionPolicy().revision
+    second = open_ws(ScriptedAdapter([_resp("all done")]), policy=new_policy, thread_id=first.thread_id)
+    done = asyncio.run(second.resume(paused.turn_id, approval={"c1": "allow"}))
+    assert done.status is TurnStatus.COMPLETED and done.output == "all done"
+    assert (workspace / "f.txt").read_text(encoding="utf-8") == "revision bound"
+
+    def _check(other: Store) -> list[Any]:
+        return [i.payload for i in other.read_turn_items(paused.turn_id) if i.kind == ItemKind.APPROVAL_DECISION]
+
+    decisions = _with_other_store(workspace, _check)
+    assert len(decisions) == 1
+    assert decisions[0]["policy_revision"] == new_policy.revision
 
 
 # ---------------------------------------------------------------------------

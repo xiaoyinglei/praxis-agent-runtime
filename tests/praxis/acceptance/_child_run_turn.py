@@ -111,7 +111,7 @@ async def _amain(workspace: Path, specs: list[Mapping[str, Any]], thread_id: str
     tools = _slow_read_tools(workspace) if variant == "c" else None
     adapter = ScriptedAdapter([_to_response(spec) for spec in specs])
     # Task 4 迁移:真实 decide 下 bash 需 network allow(默认 ask 会第 2 步暂停);
-    # 沙箱可用占位由 composition 提供(Task 5/7 接真实 probe/compiler)。
+    # Task 7:composition 已接真实 probe_backend + compile/finalize 注入(darwin seatbelt)。
     session = open_session(
         workspace,
         adapter,

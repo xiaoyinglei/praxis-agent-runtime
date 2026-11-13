@@ -18,7 +18,7 @@ from praxis.core.pipeline import ExecCtx, execute
 from praxis.core.statemachine import TurnStatus, transition
 from praxis.protocol.items import ItemKind
 from praxis.protocol.permission import Decision, PermissionContext
-from praxis.protocol.policy import PermissionPolicy
+from praxis.protocol.policy import NetworkPolicy, PermissionPolicy
 from praxis.protocol.sandbox import ToolExecContext
 from praxis.protocol.tools import (
     CancellationMode,
@@ -29,12 +29,15 @@ from praxis.protocol.tools import (
     ToolCall,
     ToolContentBlock,
     ToolDefinition,
+    ToolEffect,
     ToolResult,
+    ToolTarget,
     args_digest,
     json_schema_input,
 )
 from praxis.store.log import ItemEntry, Store
 from praxis.store.turns import create_turn, get_turn
+from praxis.tools.builtins.command import create_bash_tool
 from praxis.tools.builtins.filesystem import create_read_tool
 
 ARGS_A = {"path": "f.txt"}
@@ -65,8 +68,13 @@ def ctx(store: Store, workspace: Path) -> ExecCtx:
     return make_ctx(store, EventBus(), workspace, {"read": create_read_tool(workspace)})
 
 
-def _decision_item(ctx: ExecCtx, verdict: str, digest: str) -> None:
-    """模拟 Task 14 的审批落笔:approval_decision item(payload 约定 T12 定义)。"""
+def _decision_item(ctx: ExecCtx, verdict: str, digest: str, *, revision: str | None = None) -> None:
+    """模拟 Task 14 的审批落笔:approval_decision item(payload 约定 T12 定义)。
+
+    Task 7 R5(b) 迁移:决策必须携带批准时刻的 policy_revision(缺省=当前 ctx
+    revision,与 Session._write_approval_decisions 的真实落笔一致);revision
+    参数用于构造过期批准的负例。
+    """
     ctx.store.append_items(
         ctx.thread_id,
         ctx.turn_id,
@@ -78,6 +86,7 @@ def _decision_item(ctx: ExecCtx, verdict: str, digest: str) -> None:
                     "verdict": verdict,
                     "args_digest": digest,
                     "destination": "session",
+                    "policy_revision": ctx.policy_revision if revision is None else revision,
                 },
             )
         ],
@@ -236,3 +245,172 @@ def test_output_bounded_to_model_limit(store: Store, workspace: Path) -> None:
     result_item = ctx.store.read_turn_items(ctx.turn_id)[-1]
     assert result_item.payload["truncated"] is True
     assert result_item.payload["content"][0]["data"]["text"] == "x" * 10  # type: ignore[index]
+
+
+# ---------------------------------------------------------------------------
+# Task 7 R5:审批重入硬化 —— 新鲜 deny 终局 / revision 绑定 / 执行时地板守卫
+# ---------------------------------------------------------------------------
+
+
+def _floor_write_tool(target: Path, runs: list[int]) -> Tool:
+    """resolve_use 直指任意 target 的写工具(不经 checked_path 围栏):
+    地板目标由此进入决策/守卫,模拟 ask 规则放行后批准落笔的重入现场。"""
+    schema: dict = {"type": "object", "properties": {}, "additionalProperties": False}
+
+    async def run(arguments: dict, exec_ctx: ToolExecContext) -> ToolResult:
+        runs.append(1)
+        return ToolResult(
+            tool_call_id="pending",
+            tool_name="floorwriter",
+            content=(ToolContentBlock(type="text", data={"text": "ran"}),),
+            status=ResultStatus.OK,
+        )
+
+    return Tool(
+        definition=ToolDefinition(name="floorwriter", description="floor target toy", input_schema=schema),
+        validate_input=json_schema_input(schema),
+        run=run,
+        static_effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+        resolve_use=lambda arguments: ResolvedUse(
+            effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+            targets=(ToolTarget(kind="path", value=str(target)),),
+        ),
+        idempotent=False,
+        concurrency_safe=False,
+        cancellation_mode=CancellationMode.COOPERATIVE,
+        interrupt_behavior=InterruptBehavior.CANCEL,
+        timeout_seconds=30,
+        max_model_output_bytes=4096,
+    )
+
+
+def test_reentry_with_stale_revision_reasks(ctx: ExecCtx, monkeypatch: pytest.MonkeyPatch) -> None:
+    """R5(b):digest 一致但 policy_revision 过期 → 批准作废,走新鲜 decide(re-ask)。"""
+    monkeypatch.setattr(permission, "decide", lambda *a: Decision.ask("test"))
+    assert asyncio.run(execute(ToolCall("c1", "read", dict(ARGS_A)), ctx)).status is ResultStatus.PAUSED
+    _decision_item(ctx, "allow", args_digest(ARGS_A), revision="0" * 64)  # 非当前 revision
+    _resume(ctx)
+    r = asyncio.run(execute(ToolCall("c1", "read", dict(ARGS_A)), ctx))
+    assert r.status is ResultStatus.PAUSED  # 过期批准不得执行
+    items = ctx.store.read_turn_items(ctx.turn_id)
+    assert all(i.kind != ItemKind.TOOL_CALL for i in items)
+    reqs = [i for i in items if i.kind == ItemKind.APPROVAL_REQUEST]
+    assert len(reqs) == 1  # 同 call_id+digest 幂等,不重复写请求
+
+
+def test_reentry_with_legacy_missing_revision_reasks(ctx: ExecCtx, monkeypatch: pytest.MonkeyPatch) -> None:
+    """R5(b):legacy 决策 item 缺 policy_revision → fail-closed 作废,re-ask。"""
+    monkeypatch.setattr(permission, "decide", lambda *a: Decision.ask("test"))
+    assert asyncio.run(execute(ToolCall("c1", "read", dict(ARGS_A)), ctx)).status is ResultStatus.PAUSED
+    ctx.store.append_items(
+        ctx.thread_id,
+        ctx.turn_id,
+        [
+            ItemEntry(
+                kind=ItemKind.APPROVAL_DECISION,
+                payload={
+                    "call_id": "c1",
+                    "verdict": "allow",
+                    "args_digest": args_digest(ARGS_A),
+                    "destination": "session",
+                },
+            )
+        ],
+    )
+    _resume(ctx)
+    r = asyncio.run(execute(ToolCall("c1", "read", dict(ARGS_A)), ctx))
+    assert r.status is ResultStatus.PAUSED
+    assert all(i.kind != ItemKind.TOOL_CALL for i in ctx.store.read_turn_items(ctx.turn_id))
+
+
+def test_fresh_deny_not_overridden_by_bound_allow(ctx: ExecCtx, monkeypatch: pytest.MonkeyPatch) -> None:
+    """R5(a):新鲜 decide deny(规则)是终局——digest/revision 全匹配的 bound allow 不得翻案。"""
+    monkeypatch.setattr(permission, "decide", lambda *a: Decision.deny("rule: hard deny"))
+    _decision_item(ctx, "allow", args_digest(ARGS_A))
+    r = asyncio.run(execute(ToolCall("c1", "read", dict(ARGS_A)), ctx))
+    assert r.status is ResultStatus.DENIED and r.error_code == "permission_denied"
+    assert r.error_message == "rule: hard deny"
+    assert [i.kind for i in ctx.store.read_turn_items(ctx.turn_id)] == [
+        ItemKind.APPROVAL_DECISION,
+        ItemKind.TOOL_RESULT,
+    ]
+
+
+def test_fresh_floor_deny_not_overridden_by_bound_allow(store: Store, workspace: Path) -> None:
+    """R5(a):新鲜地板 deny 同样终局(真实 decide,非 monkeypatch)。"""
+    (workspace / ".git").mkdir()
+    runs: list[int] = []
+    tool = _floor_write_tool(workspace / ".git" / "config", runs)
+    ctx = make_ctx(store, EventBus(), workspace, {"floorwriter": tool})
+    _decision_item(ctx, "allow", args_digest({}))
+    r = asyncio.run(execute(ToolCall("c1", "floorwriter", {}), ctx))
+    assert r.status is ResultStatus.DENIED and r.error_code == "permission_denied"
+    assert isinstance(r.error_message, str) and r.error_message.startswith("floor:")
+    assert runs == []
+    assert all(i.kind != ItemKind.TOOL_CALL for i in ctx.store.read_turn_items(ctx.turn_id))
+
+
+def test_fresh_sandbox_deny_not_overridden_by_bound_allow(store: Store, workspace: Path) -> None:
+    """R5(a):沙箱不可用的新鲜 deny 终局(bound allow 不得把 bash 放进无沙箱执行)。"""
+    policy = PermissionPolicy(network=NetworkPolicy(decision="allow"))
+    turn = create_turn(store, turn_id="turn-1", thread_id="thread-1", binding={})
+    ctx = ExecCtx(
+        store=store,
+        bus=EventBus(),
+        workspace=workspace,
+        tools={"bash": create_bash_tool(workspace)},
+        permissions=PermissionContext(workspace=str(workspace), policy=policy, mode="on-request"),
+        turn_id=turn.turn_id,
+        thread_id="thread-1",
+        policy_revision=policy.revision,
+    )
+    args = {"command": "echo should-not-run"}
+    _decision_item(ctx, "allow", args_digest(args))
+    r = asyncio.run(execute(ToolCall("c1", "bash", args), ctx))
+    assert r.status is ResultStatus.DENIED and r.error_message == "sandbox_unavailable"
+    assert all(i.kind != ItemKind.TOOL_CALL for i in ctx.store.read_turn_items(ctx.turn_id))
+
+
+def test_floor_guard_denies_approved_floor_target(
+    store: Store, workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R5(c):ask 规则 + 地板目标 → 批准 → 执行时守卫仍 deny(地板不可批准)。"""
+    monkeypatch.setattr(permission, "decide", lambda *a: Decision.ask("test"))
+    (workspace / ".git").mkdir()
+    runs: list[int] = []
+    tool = _floor_write_tool(workspace / ".git" / "config", runs)
+    ctx = make_ctx(store, EventBus(), workspace, {"floorwriter": tool})
+
+    assert asyncio.run(execute(ToolCall("c1", "floorwriter", {}), ctx)).status is ResultStatus.PAUSED
+    _decision_item(ctx, "allow", args_digest({}))
+    _resume(ctx)
+    r = asyncio.run(execute(ToolCall("c1", "floorwriter", {}), ctx))
+
+    assert r.status is ResultStatus.DENIED and r.error_code == "permission_denied"
+    assert isinstance(r.error_message, str) and r.error_message.startswith("floor:")
+    assert runs == []  # 从未 dispatch
+    items = ctx.store.read_turn_items(ctx.turn_id)
+    assert all(i.kind != ItemKind.TOOL_CALL for i in items)
+    assert len([i for i in items if i.kind == ItemKind.TOOL_RESULT]) == 1
+
+
+def test_floor_guard_checks_real_symlink_candidate(
+    store: Store, workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R5(c) 双候选:词法路径干净、realpath 命中地板 → 守卫仍 deny(symlink 不转移豁免)。"""
+    monkeypatch.setattr(permission, "decide", lambda *a: Decision.ask("test"))
+    (workspace / ".git").mkdir()
+    (workspace / "link").symlink_to(workspace / ".git")
+    runs: list[int] = []
+    tool = _floor_write_tool(workspace / "link" / "config", runs)
+    ctx = make_ctx(store, EventBus(), workspace, {"floorwriter": tool})
+
+    assert asyncio.run(execute(ToolCall("c1", "floorwriter", {}), ctx)).status is ResultStatus.PAUSED
+    _decision_item(ctx, "allow", args_digest({}))
+    _resume(ctx)
+    r = asyncio.run(execute(ToolCall("c1", "floorwriter", {}), ctx))
+
+    assert r.status is ResultStatus.DENIED and r.error_code == "permission_denied"
+    assert isinstance(r.error_message, str) and r.error_message.startswith("floor:")
+    assert runs == []
+    assert all(i.kind != ItemKind.TOOL_CALL for i in ctx.store.read_turn_items(ctx.turn_id))

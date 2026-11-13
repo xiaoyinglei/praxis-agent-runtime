@@ -34,7 +34,7 @@ from pathlib import Path
 
 from praxis.core.context import build_context, to_messages
 from praxis.core.events import EventBus
-from praxis.core.pipeline import ExecCtx, execute
+from praxis.core.pipeline import ExecCtx, SandboxCompiler, SandboxFinalizer, execute
 from praxis.core.statemachine import TurnStatus, transition
 from praxis.protocol.events import ModelResponseReceived
 from praxis.protocol.items import ItemKind
@@ -61,7 +61,11 @@ _UNKNOWN_TOOL_ERROR_CODE = "unknown_tool"
 
 @dataclass(frozen=True)
 class TurnDeps:
-    """一次 run_turn 所需的全部注入依赖:管道环境 + 模型适配 + 提示与预算。"""
+    """一次 run_turn 所需的全部注入依赖:管道环境 + 模型适配 + 提示与预算。
+
+    compile_sandbox/finalize_sandbox 透传至 ExecCtx(Task 7 沙箱接线);
+    缺省 None = 无沙箱(单测路径),生产 composition 恒注入。
+    """
 
     store: Store
     bus: EventBus
@@ -71,6 +75,8 @@ class TurnDeps:
     workspace: Path
     system_prompt: str
     max_steps: int = 50
+    compile_sandbox: SandboxCompiler | None = None
+    finalize_sandbox: SandboxFinalizer | None = None
 
 
 @dataclass
@@ -124,6 +130,8 @@ def _exec_ctx(deps: TurnDeps, state: TurnState) -> ExecCtx:
         turn_id=state.turn_id,
         thread_id=state.thread_id,
         policy_revision=deps.permissions.policy.revision,
+        compile_sandbox=deps.compile_sandbox,
+        finalize_sandbox=deps.finalize_sandbox,
     )
 
 

@@ -103,7 +103,7 @@ def create_read_tool(workspace: Path) -> Tool:
     )
 
     async def run(
-        arguments: Mapping[str, JsonValue], exec_ctx: ToolExecContext  # 阶段 2 沙箱接线(Task 7)前不消费
+        arguments: Mapping[str, JsonValue], exec_ctx: ToolExecContext  # 进程内工具:不消费沙箱(R9)
     ) -> ToolResult:
         args = validate_input(arguments)
         path_value = cast("str", args["path"])
@@ -231,7 +231,7 @@ def create_write_tool(workspace: Path) -> Tool:
     )
 
     async def run(
-        arguments: Mapping[str, JsonValue], exec_ctx: ToolExecContext  # 阶段 2 沙箱接线(Task 7)前不消费
+        arguments: Mapping[str, JsonValue], exec_ctx: ToolExecContext  # 进程内工具:不消费沙箱(R9)
     ) -> ToolResult:
         args = validate_input(arguments)
         content = cast("str", args["content"])

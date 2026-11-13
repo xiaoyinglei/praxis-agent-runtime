@@ -41,6 +41,7 @@ from typing import Any
 
 import pytest
 
+from praxis.adapters.sandbox.base import probe_backend
 from praxis.core.statemachine import TurnStatus
 from praxis.interfaces.sdk import (
     Item,
@@ -261,7 +262,10 @@ def _assert_interrupted_anchor(items: Sequence[Item]) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(not probe_backend().available, reason="no sandbox backend")
 def test_kill9_mid_bash_resume_no_double_side_effect(tmp_path: Path) -> None:
+    # Task 7:变体 A 真实 dispatch bash,需要真实沙箱后端(composition 注入);
+    # 无后端平台 bash 被 decide 第 7 步 fail-closed deny,验收跳过。B/C 只跑 read,不受限。
     thread_id = "accept-kill9-a"
     workspace = _prepare(tmp_path, thread_id)
     marker = workspace / "marker"

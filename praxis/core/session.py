@@ -19,7 +19,8 @@ resume 的处理序(与代码一一对应):守卫 → 映射校验(目标存在�
 合法——在**任何** transition 之前,失败即零写入,绝不把 turn 留在无执行者的
 RUNNING 等 sweep 误标 interrupted)→ transition(RUNNING,真实 reason) →
 reconcile 写结果(先) → approval 写决策(摘要从 approval_request item 取,绑定
-digest)→ classify_pending 分类(**先 started 后 decision**:未 started 且有
+digest;policy_revision stamp 当前策略——R5(b) 批准时刻绑定)→ classify_pending
+分类(**先 started 后 decision**:未 started 且有
 matching decision 的调用进重放队列承接审批重入;已 started 的决策一律失效于
 安全矩阵——非幂等 outcome_unknown,见 _classify_and_prepare)→ 若有 outcome_unknown 则
 transition(PAUSED) 直接返回 → 否则带 resume_calls 重入 run_turn。
@@ -46,6 +47,7 @@ from uuid import uuid4
 
 from praxis.core.events import EventBus, Subscription
 from praxis.core.locks import ThreadBusy, thread_execution_lock
+from praxis.core.pipeline import SandboxCompiler, SandboxFinalizer
 from praxis.core.recovery import classify_pending
 from praxis.core.statemachine import TurnStatus, transition
 from praxis.core.turn import ApprovalSummary, TurnDeps, TurnResult, TurnState, run_turn
@@ -242,6 +244,8 @@ class Session:
         thread_id: str,
         max_steps: int = 50,
         system_prompt: str | None = None,
+        compile_sandbox: SandboxCompiler | None = None,
+        finalize_sandbox: SandboxFinalizer | None = None,
     ) -> None:
         self._store = store
         self._bus = bus
@@ -256,6 +260,8 @@ class Session:
             if system_prompt is not None
             else DEFAULT_SYSTEM_PROMPT_TEMPLATE.format(workspace=self._workspace)
         )
+        self._compile_sandbox = compile_sandbox
+        self._finalize_sandbox = finalize_sandbox
 
     # -- 身份与生命周期 -------------------------------------------------------
 
@@ -398,6 +404,10 @@ class Session:
                 "verdict": verdict,
                 "args_digest": request.get("args_digest"),
                 "destination": "once",
+                # R5(b):批准绑定批准时刻的 policy revision(当前 ctx 策略,而非
+                # request 的旧 revision)——管道重入按 decision item 校验,
+                # 策略变更使旧批准作废(fail-closed re-ask)。
+                "policy_revision": self._permissions.policy.revision,
             }
             entries.append(ItemEntry(kind=ItemKind.APPROVAL_DECISION, payload=payload))
         self._store.append_items(self._thread_id, turn_id, entries)
@@ -499,6 +509,8 @@ class Session:
             workspace=self._workspace,
             system_prompt=self._system_prompt,
             max_steps=self._max_steps,
+            compile_sandbox=self._compile_sandbox,
+            finalize_sandbox=self._finalize_sandbox,
         )
         try:
             with thread_execution_lock(self._workspace, self._thread_id):

@@ -10,16 +10,26 @@ execute 步骤序(与代码一一对应):
    ``unknown_tool``/``invalid_input``)返回——已有 result 即非 pending,
    recovery 不会列它,故不写 tool_call item、不发 started/finished;
 2. ``resolve_use`` + ``permission.decide``(经模块属性调用:唯一决策入口);
-3. 审批重入:该 call 最新 approval_decision 的 digest 与当前 args 一致 →
-   按 allow/deny 陈述执行;不一致 → 作废,按新鲜决策处理;
+3. 审批重入(R5 硬化):**新鲜 deny 是终局**,任何 bound 决策不得翻案;
+   bound 决策仅在 args_digest 一致 **且** policy_revision 等于当前 revision
+   时有效(legacy item 缺 revision = 作废,fail-closed)→ 按 allow/deny 陈述;
+   不一致 → 作废,按新鲜决策处理(re-ask);
 4. ask → approval_request item(同 call_id+digest 幂等,不重复写)→
    transition(PAUSED) → emit ApprovalRequested → 返回 PAUSED;
 5. deny → tool_result(DENIED, error_code ``permission_denied``);
-6. allow → **先写 tool_call item** 再执行(崩溃后 recovery 才能判 pending);
+6. allow → 执行时地板守卫(R5(c):floor_reason 双候选,命中 → DENIED,
+   不写 tool_call、不 dispatch——地板在任何入口都不可批准)→ EXECUTE_PROCESS
+   **先编译沙箱**再写 tool_call item(SandboxRefusal → ERROR/sandbox_refused,
+   不写 tool_call,未 dispatch 语义同 invalid_input;read/write 进程内工具不编译);
 7. ``run_with_timeout``(移植旧 executor 超时/取消语义,任务全程被持有;
-   透传 ``ToolExecContext``,阶段 2 Task 1 起工具为双参签名);
+   透传 ``ToolExecContext(sandbox=spec)``)→ **finally: finalize_sandbox**
+   (commit/清理;超时/取消路径也执行;finalize 异常归一 tool_error,不炸穿);
 8. 占位符替换 + 按 ``max_model_output_bytes`` 截断 → tool_result item →
    emit ToolFinished。
+
+沙箱编译/清理经注入进入 core(``SandboxCompiler``/``SandboxFinalizer`` 结构
+签名,adapters 结构匹配;core 不 import adapters——praxis_core_purity)。
+``compile_sandbox=None`` → 无沙箱直跑(单测路径;生产 composition 恒注入)。
 
 item payload 约定(Task 10/13/14 消费,勿漂移):content 块为
 ``{"type": "text", "data": {"text": str}}``(镜像 ToolResult.text);
@@ -35,7 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import Awaitable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
@@ -44,10 +54,11 @@ from praxis.core import permission  # 唯一决策入口:经模块属性调用,�
 from praxis.core.events import EventBus
 from praxis.core.statemachine import TurnStatus, transition
 from praxis.protocol.events import ApprovalRequested, ToolFinished, ToolStarted
+from praxis.protocol.floor import floor_reason, host_private_paths
 from praxis.protocol.items import Item, ItemKind
 from praxis.protocol.json import JsonValue, thaw_json
 from praxis.protocol.permission import Decision, PermissionContext
-from praxis.protocol.sandbox import ToolExecContext
+from praxis.protocol.sandbox import SandboxRefusal, SandboxSpec, ToolExecContext
 from praxis.protocol.tools import (
     InterruptBehavior,
     ResolvedUse,
@@ -55,6 +66,7 @@ from praxis.protocol.tools import (
     Tool,
     ToolCall,
     ToolContentBlock,
+    ToolEffect,
     ToolResult,
     ToolValidationError,
     args_digest,
@@ -64,10 +76,19 @@ from praxis.store.log import ItemEntry, Store
 PENDING_TOOL_CALL_ID = "pending"
 _MAX_ERROR_MESSAGE_CHARS = 512
 
+# 沙箱编译/清理的注入签名(core 内类型别名,adapters.sandbox 结构匹配;
+# core 不 import adapters——compiler/finalizer 由 composition 经 ExecCtx/TurnDeps 注入)。
+type SandboxCompiler = Callable[[PermissionContext, ResolvedUse, Path], SandboxSpec]
+type SandboxFinalizer = Callable[[SandboxSpec, Path], None]
+
 
 @dataclass(frozen=True)
 class ExecCtx:
-    """一次工具执行所需的全部环境:日志、总线、工作区、工具表、权限上下文、归属回合。"""
+    """一次工具执行所需的全部环境:日志、总线、工作区、工具表、权限上下文、归属回合。
+
+    compile_sandbox/finalize_sandbox 缺省 None = 无沙箱(单测路径);
+    生产 composition 恒注入真实 compiler/finalizer。
+    """
 
     store: Store
     bus: EventBus
@@ -77,6 +98,8 @@ class ExecCtx:
     turn_id: str
     thread_id: str
     policy_revision: str
+    compile_sandbox: SandboxCompiler | None = None
+    finalize_sandbox: SandboxFinalizer | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +225,41 @@ def _decision_reason(item: Item) -> str:
     return f"approval_decision {item.payload.get('verdict')} bound to args digest"
 
 
+def _bound_decision_valid(bound: Item, digest: str, policy_revision: str) -> bool:
+    """R5(b):digest 绑定 + 批准时刻 policy_revision 绑定,二者缺一不可。
+
+    revision 从 approval_decision item 读取(Session 落笔时 stamp);legacy item
+    缺 revision → None != 当前 revision → 作废(fail-closed,重新 ask)。
+    """
+    return bound.payload.get("args_digest") == digest and bound.payload.get("policy_revision") == policy_revision
+
+
+def _execution_floor_reason(use: ResolvedUse) -> str:
+    """R5(c) 执行时地板守卫:allow 之后、tool_call/dispatch 之前的最后一道地板。
+
+    与 decide 第 4 步同一调用模式(protocol/floor.py 单一数据源,双候选):
+    词法(floor_reason 内部 expanduser+abspath)与真实(non-strict resolve())
+    任一命中即拒——symlink 不转移地板豁免。write 旗标 = WRITE_WORKSPACE 或
+    DESTRUCTIVE ∈ effects。ask 规则 + 地板目标 → 批准 → 此处仍 deny:
+    地板在任何入口都不可批准。"" = 全部通过。
+    """
+    write = ToolEffect.WRITE_WORKSPACE in use.effects or ToolEffect.DESTRUCTIVE in use.effects
+    private_paths = host_private_paths()
+    for target in use.targets:
+        if target.kind != "path":
+            continue
+        candidates = [Path(target.value)]
+        try:
+            candidates.append(Path(target.value).expanduser().resolve())
+        except (OSError, RuntimeError, ValueError):
+            pass  # 词法候选仍裁决(non-strict totality,同 decide 第 4 步)
+        for candidate in candidates:
+            reason = floor_reason(candidate, write=write, private_paths=private_paths)
+            if reason:
+                return reason
+    return ""
+
+
 def _pause_for_approval(
     ctx: ExecCtx,
     call: ToolCall,
@@ -282,7 +340,9 @@ async def execute(call: ToolCall, ctx: ExecCtx) -> ToolResult:
 
     decision = permission.decide(tool, use, ctx.permissions)
     bound = _latest_approval_decision(items, call.tool_call_id)
-    if bound is not None and bound.payload.get("args_digest") == digest:
+    # R5(a):新鲜 deny 是终局——bound allow 只能把 ask/fallback 带入执行,
+    # 绝不覆盖规则 deny/地板 deny/sandbox_unavailable。
+    if not decision.is_deny and bound is not None and _bound_decision_valid(bound, digest, ctx.policy_revision):
         verdict = bound.payload.get("verdict")
         if verdict == "allow":
             decision = Decision.allow("approval_decision: args digest bound")
@@ -300,14 +360,51 @@ async def execute(call: ToolCall, ctx: ExecCtx) -> ToolResult:
         _append_result_item(ctx, result)
         return result
 
+    # R5(c):执行时地板守卫(含 bound-allow 重入)——命中即 DENIED,
+    # 不写 tool_call item、不 dispatch。
+    floor_hit = _execution_floor_reason(use)
+    if floor_hit:
+        result = _error_result(
+            call, status=ResultStatus.DENIED, error_code="permission_denied",
+            message=f"floor: {floor_hit}",
+        )
+        _append_result_item(ctx, result)
+        return result
+
+    # 沙箱编译先于 tool_call item:拒绝即结果(ERROR/sandbox_refused),未 dispatch。
+    # 只对 EXECUTE_PROCESS 编译——read/write 进程内工具不消费沙箱(R9);
+    # 不可用已在 decide 第 7 步 deny,此处 compile_sandbox=None 为单测路径。
+    spec: SandboxSpec | None = None
+    if ctx.compile_sandbox is not None and ToolEffect.EXECUTE_PROCESS in use.effects:
+        try:
+            spec = ctx.compile_sandbox(ctx.permissions, use, ctx.workspace)
+        except SandboxRefusal as exc:
+            result = _error_result(
+                call, status=ResultStatus.ERROR, error_code="sandbox_refused", message=exc.reason,
+            )
+            _append_result_item(ctx, result)
+            return result
+
     _append_call_item(ctx, call, tool, use, args, digest)
     ctx.bus.emit(
         ToolStarted(turn_id=ctx.turn_id, call_id=call.tool_call_id, tool_name=tool.definition.name)
     )
 
-    # 阶段 2 Task 1:执行上下文先行落形——本任务恒传裸 ToolExecContext,
-    # sandbox 字段由 Task 7 依权限上下文编译后填充。
-    raw = await run_with_timeout(tool, args, ToolExecContext())
+    finalize_failure: str | None = None
+    try:
+        raw = await run_with_timeout(tool, args, ToolExecContext(sandbox=spec))
+    finally:
+        # commit/清理在超时/取消路径也执行;异常归一为 tool_error,绝不炸穿管道。
+        if spec is not None and ctx.finalize_sandbox is not None:
+            try:
+                ctx.finalize_sandbox(spec, ctx.workspace)
+            except Exception as exc:  # noqa: BLE001 — finalize 异常一律归一
+                finalize_failure = str(exc)
+    if finalize_failure is not None:
+        raw = _synthetic_result(
+            tool, status=ResultStatus.ERROR, error_code="tool_error",
+            message=f"sandbox finalize failed: {finalize_failure}",
+        )
     result = _finalize(raw, call=call, tool=tool)
     _append_result_item(ctx, result)
     ctx.bus.emit(

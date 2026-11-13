@@ -16,12 +16,14 @@ from typing import Any
 import pytest
 
 from praxis.adapters.models.scripted import ScriptedAdapter
+from praxis.adapters.sandbox.base import probe_backend
+from praxis.adapters.sandbox.compile import compile_sandbox, finalize_sandbox
 from praxis.core.events import EventBus
 from praxis.core.statemachine import TurnStatus
 from praxis.core.turn import TurnDeps, TurnState, run_turn
 from praxis.protocol.items import ItemKind
 from praxis.protocol.models import ModelResponse, ModelToolCall, Usage
-from praxis.protocol.permission import PermissionContext, SandboxAvailability
+from praxis.protocol.permission import PermissionContext
 from praxis.protocol.policy import NetworkPolicy, PermissionPolicy
 from praxis.protocol.tools import Tool
 from praxis.store.log import ItemEntry, Store
@@ -33,6 +35,9 @@ THREAD_ID = "accept-multitool"
 TURN_ID = "accept-turn"
 NOTE = "note.txt"
 CONTENT = "praxis phase1 acceptance\n"
+
+# Task 7:真实 bash 需要真实沙箱后端;无后端平台 fail-closed deny,验收跳过。
+pytestmark = pytest.mark.skipif(not probe_backend().available, reason="no sandbox backend")
 
 
 def _resp(content: str, calls: tuple[tuple[str, str, dict[str, Any]], ...] = ()) -> ModelResponse:
@@ -77,14 +82,16 @@ def test_multitool_turn_end_to_end(tmp_path: Path) -> None:
             tools=tools,
             permissions=PermissionContext(
                 workspace=str(workspace),
-                # Task 4 迁移:真实 decide 下 bash 需 network allow(默认 ask 会第 2 步暂停)
-                # + 沙箱可用占位(Task 5/7 接真实 probe/compiler)。
+                # Task 4 迁移:真实 decide 下 bash 需 network allow(默认 ask 会第 2 步暂停)。
                 policy=PermissionPolicy(network=NetworkPolicy(decision="allow")),
                 mode="on-request",
-                sandbox=SandboxAvailability(backend="fake", available=True),
+                # Task 7:真实 probe + compiler/finalizer 注入(darwin seatbelt)。
+                sandbox=probe_backend(),
             ),
             workspace=workspace,
             system_prompt="你是验收 agent:按 write → bash → read 的顺序完成任务。",
+            compile_sandbox=compile_sandbox,
+            finalize_sandbox=finalize_sandbox,
         )
 
         result = asyncio.run(run_turn(deps, TurnState(TURN_ID, THREAD_ID)))
