@@ -19,11 +19,29 @@ R-T12-1(不堵事件循环):解析主体在 ``await asyncio.to_thread(...)`` 里
 
 阈值口径(唯一一套):``_MAX_GRID_CELLS`` 是**跨本次调用所有 sheet 共享**的
 预算;``max_rows`` 实际值 = ``min(max_rows, _MAX_GRID_CELLS // max_columns)``。
-截断时 ``truncated_cells`` 记录源 ``(row, col)``:被字符预算缩短的单元格,以及
-翻页边界上第一个未返回的单元格;``next_row``/``next_column``/``next_sheet_offset``
-一律是可继续翻页的真值(绝不出现"截断但不前进")。错误码:
-``data_inspection_failed``(超 200 MiB / 扩展名不支持 / 解析异常,消息经
-``_bounded_error`` 空白折叠且 ≤1000 字符)、``not_found``。
+截断时 ``truncated_cells`` 记录源 ``(row, col)``:被字符预算缩短的单元格
+(包括预算耗尽后被标记的普通格),以及翻页边界上第一个未返回的单元格;
+``next_row``/``next_column``/``next_sheet_offset`` 一律是可继续翻页的真值
+(绝不出现"截断但不前进")。错误码:``data_inspection_failed``(超 200 MiB /
+扩展名不支持 / 解析异常,消息经 ``_bounded_error`` 空白折叠且 ≤1000 字符)、
+``not_found``。
+
+有界输入 ⇒ 有界输出(各格式的准入与降级口径):
+- CSV/TSV/XLSX/PDF 走流式/有界读;XLSX 用 openpyxl ``read_only=True`` +
+  ``reset_dimensions()``。
+- JSON 会全量物化为解析图,**专属准入上限 8 MiB**(``_MAX_JSON_INPUT_BYTES``),
+  超限即 ``data_inspection_failed``;预览先做紧凑序列化(``separators=(",", ":")``)
+  再切到 ``max_characters``,因此"有界输入 ⇒ 有界 dump"。``NaN``/``Infinity``
+  能进 ``json.load`` 但不是合法 JSON,交给专门错误消息而不是漂在异常分类里。
+- XLSX ``read_only`` 仍会整表加载 sharedStrings,峰值由**解压后**尺寸决定,
+  不受 200 MiB 压缩包准入约束;这是格式本身的既有限制。
+- CSV/TSV 把单字段读取上限抬到 ``_MAX_GRID_CELLS * _MAX_CELL_CHARACTERS``
+  字符,避免默认 128 KiB 让一个长文本字段炸掉整份文件。
+- PDF 页面文本的**总量**受 ``max_characters`` 约束(与网格同一口径),不随
+  ``max_pages`` 线性放大。
+- ``start_row`` 只作用于本次调用的第一个被选 sheet;其余 sheet 从第 1 行开始。
+  若最后一个被处理的 sheet 仍被行截断(``next_row`` 非空),``next_sheet_offset``
+  **不会越过它**(返回该 sheet 的 offset),调用方应先用 ``next_row`` 读完它。
 """
 
 from __future__ import annotations
@@ -65,9 +83,13 @@ from praxis.tools.builtins.paths import checked_path
 PENDING_TOOL_CALL_ID = "pending"
 
 _MAX_INSPECTABLE_BYTES = 200 * 1024 * 1024
+# JSON 全量物化(解析图 + 紧凑 dump)的专属准入上限:200 MiB 准入只适用于流式格式。
+_MAX_JSON_INPUT_BYTES = 8 * 1024 * 1024
 _MAX_CELL_CHARACTERS = 2_000
 _MAX_GRID_CELLS = 2_000
 _MAX_GRID_CHARACTERS = 32_000
+# 单个 CSV/TSV 字段的读取上限(默认 128 KiB 会把"长值截断可续读"变成整份文件失败)。
+_MAX_CSV_FIELD_CHARACTERS = _MAX_GRID_CELLS * _MAX_CELL_CHARACTERS
 _MAX_ERROR_CHARACTERS = 1_000
 _CSV_SNIFF_CHARACTERS = 16_384
 
@@ -90,6 +112,11 @@ class _GridBudget:
         result = rendered[: max(0, limit - 1)] + "…" if shortened else rendered
         self.characters = max(0, self.characters - len(result))
         return result, shortened
+
+    def reserve(self, rows: int, width: int) -> None:
+        """一次页面的单元格消耗;不变量只在 _GridBudget 内维护。"""
+        self.cells -= rows * width
+        assert self.cells >= 0, "grid cell budget must never go negative"
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,15 +273,19 @@ def create_inspect_data_file_tool(workspace: Path) -> Tool:
                 "expressions are never evaluated. Use start_row/start_column with "
                 "max_rows/max_columns to page a grid (1-based source coordinates; CSV rows "
                 "are logical records), sheet_name to select one worksheet, or sheet_offset "
-                "with max_sheets for worksheet pages. next_row/next_column continue this "
-                "grid page; next_sheet_offset continues worksheet pages. One call shares a "
-                "2000-cell budget across all returned sheets; max_characters bounds combined "
-                "cell text with a hard cap of 32000 characters, and truncated_cells lists "
-                "source (row, column) coordinates shortened by limits or left beyond the "
-                "page (use bash to read values longer than the 2000-character cell cap in "
-                "full). Files above 200 MiB are rejected. Parsing runs in an in-process "
-                "worker thread; threads cannot be killed, so after a timeout or cancellation "
-                "the parse must finish naturally before the turn can continue."
+                "with max_sheets for worksheet pages. start_row applies only to the first "
+                "selected sheet; later sheets start at row 1. next_row/next_column continue "
+                "this grid page; next_sheet_offset continues worksheet pages, but never skips "
+                "past a sheet that is still row-truncated (finish it with next_row first). "
+                "One call shares a 2000-cell budget across all returned sheets; "
+                "max_characters bounds combined cell text (hard cap 32000) and also bounds "
+                "total PDF text. truncated_cells lists source (row, column) coordinates of "
+                "cells shortened by the character budget (including ordinary cells once that "
+                "budget is exhausted) or left beyond the page (use bash to read values longer "
+                "than the 2000-character cell cap in full). Files above 200 MiB are rejected; "
+                "JSON above 8 MiB is rejected because it is materialized whole. Parsing runs "
+                "in an in-process worker thread; threads cannot be killed, so after a timeout "
+                "or cancellation the parse must finish naturally before the turn can continue."
             ),
             input_schema=_INSPECT_INPUT_SCHEMA,
         ),
@@ -342,7 +373,10 @@ def _inspect_data_file(target: Path, requests: Mapping[str, JsonValue]) -> _Insp
             return _inspect_delimited(target, path_value, requests, "tsv", size_bytes, digest)
         if file_format == "pdf":
             return _inspect_pdf(target, path_value, requests, size_bytes, digest)
-        return _inspect_json(target, path_value, requests, size_bytes, digest)
+        if file_format == "json":
+            return _inspect_json(target, path_value, requests, size_bytes, digest)
+        # 显式收口:_Format 新增成员时在这里炸出,而不是静默走错分支。
+        raise AssertionError(f"unhandled data format: {file_format}")
     except Exception as exc:  # noqa: BLE001 — 解析异常一律归一为 data_inspection_failed
         return _failure(file_format, size_bytes, digest, _bounded_error(exc))
 
@@ -358,6 +392,7 @@ def _inspect_workbook(
     sheet_name = _optional_str(requests, "sheet_name")
     sheet_offset = _int_argument(requests, "sheet_offset", 0)
     max_sheets = _int_argument(requests, "max_sheets", 20)
+    request_start_row = _int_argument(requests, "start_row", 1)
     workbook = load_workbook(target, read_only=True, data_only=False, keep_links=False)
     try:
         sheet_names = list(workbook.sheetnames)
@@ -382,12 +417,31 @@ def _inspect_workbook(
             records = worksheet.iter_rows()
             try:
                 previews.append(
-                    _preview_grid(worksheet.title, records, requests, excel=True, budget=budget)
+                    _preview_grid(
+                        worksheet.title,
+                        records,
+                        requests,
+                        excel=True,
+                        budget=budget,
+                        # start_row 只对被选中的第一张 sheet 生效:否则续页会
+                        # 顺手跳掉后续 sheet 的开头(I-2)。
+                        start_row=request_start_row if index == 0 else 1,
+                    )
                 )
             finally:
                 records.close()
-        # 同样的"截断必须前进"纪律:sheet 游标只会往后指。
-        assert next_sheet is None or next_sheet > sheet_offset, "sheet paging must advance"
+        if sheet_name is None:
+            # 游标优先级:最后一张表若仍被行截断,next_sheet_offset 不得越过它
+            # (先按 next_row 读完这张表,否则跟 next_sheet_offset 会静默丢行)。
+            if previews and previews[-1].next_row is not None:
+                next_sheet = sheet_offset + len(previews) - 1
+            if next_sheet is not None:
+                assert next_sheet >= sheet_offset, "sheet paging must not move backwards"
+                if next_sheet == sheet_offset:
+                    # 只有"同一张表仍有 next_row"才允许不前进,且行游标必须已前进。
+                    assert previews and previews[-1].next_row is not None, (
+                        "same-sheet sheet cursor requires an advancing row cursor"
+                    )
     finally:
         workbook.close()
     lines = [
@@ -413,6 +467,7 @@ def _inspect_delimited(
     digest: str,
 ) -> _Inspection:
     delimiter = "\t" if file_format == "tsv" else ","
+    _raise_csv_field_limit()
     with target.open("r", encoding="utf-8-sig", newline="") as stream:
         sample = stream.read(_CSV_SNIFF_CHARACTERS)
         stream.seek(0)
@@ -431,6 +486,7 @@ def _inspect_delimited(
                     _int_argument(requests, "max_characters", 8_000), _MAX_GRID_CHARACTERS
                 )
             ),
+            start_row=_int_argument(requests, "start_row", 1),
         )
     lines = [
         _header_line(file_format, path_value, size_bytes, digest),
@@ -457,15 +513,21 @@ def _inspect_pdf(
             raise ValueError("encrypted PDF requires a password")
         page_count = document.page_count
         pages: list[_PagePreview] = []
+        # 聚合文本总量受 max_characters 约束:不随 max_pages 线性放大输出。
+        remaining = max_characters
         for page_index in range(min(page_count, max_pages)):
+            if remaining <= 0:
+                break
             text = document.load_page(page_index).get_text("text")
+            preview = text[:remaining]
             pages.append(
                 _PagePreview(
                     page_number=page_index + 1,
-                    text=text[:max_characters],
-                    truncated=len(text) > max_characters,
+                    text=preview,
+                    truncated=len(text) > len(preview),
                 )
             )
+            remaining -= len(preview)
     finally:
         document.close()
     lines = [_header_line("pdf", path_value, size_bytes, digest), f"page_count={page_count}"]
@@ -476,7 +538,10 @@ def _inspect_pdf(
         )
         lines.append(page.text)
     if page_count > len(pages):
-        lines.append(f"[only {len(pages)} of {page_count} pages returned; increase max_pages]")
+        lines.append(
+            f"[only {len(pages)} of {page_count} pages returned; "
+            "increase max_pages or max_characters]"
+        )
     truncated = page_count > len(pages) or any(page.truncated for page in pages)
     metadata = _empty_metadata("pdf", size_bytes, digest)
     metadata.update(
@@ -496,13 +561,39 @@ def _inspect_json(
     digest: str,
 ) -> _Inspection:
     max_characters = _int_argument(requests, "max_characters", 8_000)
+    if size_bytes > _MAX_JSON_INPUT_BYTES:
+        # JSON 必然全量物化(解析图 + dump):在解析前用专属上限挡住 OOM 形状。
+        return _failure(
+            "json",
+            size_bytes,
+            digest,
+            (
+                f"JSON input exceeds the {_MAX_JSON_INPUT_BYTES // (1024 * 1024)} MiB "
+                "preview limit; extract targeted values with bash"
+            ),
+        )
     with target.open("r", encoding="utf-8-sig") as stream:
         value = json.load(stream)
     json_type = _json_type(value)
     json_keys = sorted(str(key) for key in value) if isinstance(value, dict) else []
-    rendered = json.dumps(
-        value, ensure_ascii=False, indent=2, allow_nan=False, default=_json_default
-    )
+    try:
+        # 紧凑序列化后再截断:有界输入(≤8 MiB)⇒ 有界 dump(同数量级),不构建
+        # indent=2 的第二份大字符串。allow_nan=False 让 NaN/Infinity 走专门错误。
+        rendered = json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+            default=_json_default,
+        )
+    except ValueError:
+        return _failure(
+            "json",
+            size_bytes,
+            digest,
+            "JSON contains NaN/Infinity, which is not valid JSON and cannot be previewed; "
+            "inspect it with bash",
+        )
     truncated = len(rendered) > max_characters
     lines = [
         _header_line("json", path_value, size_bytes, digest),
@@ -534,9 +625,13 @@ def _preview_grid(
     *,
     excel: bool,
     budget: _GridBudget,
+    start_row: int,
 ) -> _TablePreview:
-    """按 1-based 源坐标限界网格;不解释行语义、不信任 XLSX 声明尺寸。"""
-    start_row = _int_argument(requests, "start_row", 1)
+    """按 1-based 源坐标限界网格;不解释行语义、不信任 XLSX 声明尺寸。
+
+    ``start_row`` 由调用方显式给出:多 sheet 分页时只有第一张被选 sheet 继承
+    请求里的 start_row,其余 sheet 从第 1 行开始(否则续页会跳过后续 sheet 开头)。
+    """
     start_column = _int_argument(requests, "start_column", 1)
     max_rows = _int_argument(requests, "max_rows", 10)
     max_columns = _int_argument(requests, "max_columns", 20)
@@ -571,7 +666,7 @@ def _preview_grid(
         numbers.append(row_number)
 
     width = min(width_limit, max(0, page_columns - start_column + 1))
-    budget.cells -= len(rows) * width
+    budget.reserve(len(rows), width)
     column_names = list(rows[0]) if rows else []
     for values in rows:
         values.extend([""] * (width - len(values)))
@@ -768,6 +863,17 @@ def _file_sha256(path: Path) -> str:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _raise_csv_field_limit() -> None:
+    """把 csv 模块的单字段读取上限抬到网格预算量级。
+
+    默认 128 KiB 会让一个长文本字段把整份文件变成 data_inspection_failed,与
+    "长值截断后可用 bash 读全"的描述矛盾。这是进程级设置的**单调放宽**;仍超过
+    本上限的极端字段按结果返回失败,不会炸穿 turn。
+    """
+    if csv.field_size_limit() < _MAX_CSV_FIELD_CHARACTERS:
+        csv.field_size_limit(_MAX_CSV_FIELD_CHARACTERS)
 
 
 def _bounded_error(error: Exception) -> str:

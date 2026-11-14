@@ -66,6 +66,25 @@ def row_numbers(result: Any) -> list[int]:
     return [int(match.group(1)) for line in result.text.splitlines() if (match := _ROW_LINE.match(line))]
 
 
+_SHEET_SECTION = re.compile(r'^\[sheet "([^"]+)"')
+
+
+def sheet_rows(text: str) -> dict[str, list[int]]:
+    """把 content 按 sheet 段切开,返回每张表出现的源行号(顺序保留)。"""
+    sections: dict[str, list[int]] = {}
+    current: str | None = None
+    for line in text.splitlines():
+        section = _SHEET_SECTION.match(line)
+        if section:
+            current = section.group(1)
+            sections.setdefault(current, [])
+            continue
+        match = _ROW_LINE.match(line)
+        if match and current is not None:
+            sections[current].append(int(match.group(1)))
+    return sections
+
+
 def make_workbook(path: Path, sheets: dict[str, list[list[Any]]]) -> None:
     from openpyxl import Workbook
 
@@ -185,6 +204,76 @@ def test_grid_cell_budget_is_shared_across_sheets(tmp_path: Path) -> None:
     assert "second-r0c0" in second.text
     assert not second.truncated
     assert second.metadata["next_sheet_offset"] is None
+
+
+def test_multi_sheet_row_truncation_never_skips_rows(tmp_path: Path) -> None:
+    # I-2:sheet1 超 2000 格被行截断时,next_sheet_offset 不得越过它;
+    # 按返回游标依次翻页,两张表所有行必须各覆盖一次、不重不漏。
+    first_rows = [[f"a-{row}-{column}" for column in range(20)] for row in range(120)]
+    second_rows = [[f"b-{row}-{column}" for column in range(20)] for row in range(30)]
+    make_workbook(tmp_path / "t.xlsx", {"Data": first_rows, "Second": second_rows})
+    tool = create_inspect_data_file_tool(tmp_path)
+    arguments: dict[str, Any] = {"path": "t.xlsx", "max_rows": 100, "max_columns": 20}
+    seen: dict[str, list[int]] = {"Data": [], "Second": []}
+    pages = 0
+    while True:
+        result = run(tool, arguments)
+        assert result.status is ResultStatus.OK
+        pages += 1
+        for name, numbers in sheet_rows(result.text).items():
+            seen[name].extend(numbers)
+        next_sheet = result.metadata["next_sheet_offset"]
+        next_row = result.metadata["next_row"]
+        if next_sheet is None and next_row is None:
+            break
+        assert pages <= 5
+        if next_row is not None:
+            arguments = {
+                "path": "t.xlsx",
+                "max_rows": 100,
+                "max_columns": 20,
+                "sheet_offset": next_sheet if next_sheet is not None else 0,
+                "start_row": next_row,
+            }
+        else:
+            assert next_sheet is not None
+            arguments = {
+                "path": "t.xlsx",
+                "max_rows": 100,
+                "max_columns": 20,
+                "sheet_offset": next_sheet,
+            }
+    assert seen["Data"] == list(range(1, 121))
+    assert seen["Second"] == list(range(1, 31))
+
+
+def test_first_call_points_next_sheet_at_the_truncated_sheet(tmp_path: Path) -> None:
+    first_rows = [[f"a-{row}-{column}" for column in range(20)] for row in range(120)]
+    second_rows = [[f"b-{row}-{column}" for column in range(20)] for row in range(5)]
+    make_workbook(tmp_path / "t.xlsx", {"Data": first_rows, "Second": second_rows})
+    r = inspect(tmp_path, "t.xlsx", max_rows=100, max_columns=20)
+    assert r.metadata["next_row"] == 101
+    # 不越过仍有剩余行的 Data(next_sheet_offset 停在 0)
+    assert r.metadata["next_sheet_offset"] == 0
+    assert "next_sheet_offset=0" in r.text
+
+
+def test_max_sheets_paging_advances_next_sheet_offset(tmp_path: Path) -> None:
+    make_workbook(
+        tmp_path / "t.xlsx",
+        {"One": [["one"]], "Two": [["two"]], "Three": [["three"]]},
+    )
+    first = inspect(tmp_path, "t.xlsx", max_sheets=2)
+    assert first.status is ResultStatus.OK
+    assert first.metadata["next_sheet_offset"] == 2
+    assert "one" in first.text
+    assert "two" in first.text
+    assert "three" not in first.text
+    second = inspect(tmp_path, "t.xlsx", sheet_offset=2)
+    assert second.status is ResultStatus.OK
+    assert second.metadata["next_sheet_offset"] is None
+    assert "three" in second.text
+    assert "one" not in second.text
 
 
 def test_grid_budget_truncated_cells_and_row_cursor(tmp_path: Path) -> None:
@@ -421,6 +510,29 @@ def test_json_array_and_preview_truncation(tmp_path: Path) -> None:
     assert "json_preview" not in r.metadata
 
 
+def test_json_over_8mib_is_rejected_before_parsing(tmp_path: Path) -> None:
+    # I-1:JSON 全量物化 → 专属 8 MiB 准入,超限走结果而不是 OOM
+    target = tmp_path / "big.json"
+    with target.open("wb") as stream:
+        stream.truncate(8 * 1024 * 1024 + 1)
+    r = inspect(tmp_path, "big.json")
+    assert r.status is ResultStatus.ERROR
+    assert r.error_code == "data_inspection_failed"
+    assert "8 MiB" in r.text
+    assert "preview limit" in r.text
+    assert r.metadata["valid"] is False
+
+
+def test_json_nan_has_dedicated_error(tmp_path: Path) -> None:
+    # json.load 接受 NaN/Infinity,但 allow_nan=False 的 dump 会抛;专门消息明确化
+    (tmp_path / "t.json").write_text('{"v": NaN, "n": Infinity}', encoding="utf-8")
+    r = inspect(tmp_path, "t.json")
+    assert r.status is ResultStatus.ERROR
+    assert r.error_code == "data_inspection_failed"
+    assert "NaN" in r.text
+    assert r.metadata["valid"] is False
+
+
 def test_tsv_uses_tab_delimiter(tmp_path: Path) -> None:
     (tmp_path / "t.tsv").write_text("name\tage\na\t1\n", encoding="utf-8")
     r = inspect(tmp_path, "t.tsv")
@@ -439,6 +551,36 @@ def test_pdf_pages_and_truncation(tmp_path: Path) -> None:
     assert "page-1-text" in r.text
     assert "page-2-text" in r.text
     assert "page-3-text" not in r.text
+
+
+def test_csv_field_beyond_default_limit_is_truncated_not_failed(tmp_path: Path) -> None:
+    # 默认 csv 字段上限 128 KiB 会让 200k 字符的字段炸掉整份文件;抬高后应正常截断
+    (tmp_path / "t.csv").write_text("a,b\n" + "x" * 200_000 + ",1\n", encoding="utf-8")
+    r = inspect(tmp_path, "t.csv")
+    assert r.status is ResultStatus.OK
+    assert r.error_code is None
+    assert r.truncated
+    assert "…" in r.text
+
+
+def test_pdf_total_text_is_bounded_by_max_characters(tmp_path: Path) -> None:
+    import pymupdf
+
+    target = tmp_path / "t.pdf"
+    document = pymupdf.open()
+    first = document.new_page()
+    first.insert_textbox(pymupdf.Rect(20, 20, 580, 800), "A" * 2_000, fontsize=8)
+    second = document.new_page()
+    second.insert_text((72, 72), "SECOND-PAGE")
+    document.save(target)
+    document.close()
+    r = inspect(tmp_path, "t.pdf", max_characters=100)
+    assert r.status is ResultStatus.OK
+    assert r.metadata["page_count"] == 2
+    assert r.truncated
+    assert r.text.count("A") == 100  # 聚合文本总量不超过 max_characters
+    assert "SECOND-PAGE" not in r.text
+    assert "[page 1/2: 100 characters, truncated]" in r.text
 
 
 def test_xlsx_formula_is_not_evaluated(tmp_path: Path) -> None:
