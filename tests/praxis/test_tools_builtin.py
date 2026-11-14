@@ -28,26 +28,8 @@ def run(tool: Any, arguments: dict[str, Any]) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# brief Step 1 的五个形态,逐条保留
+# brief Step 1 的五个形态,逐条保留(read 用例已迁至 test_tools_files_search.py)
 # ---------------------------------------------------------------------------
-
-
-def test_read_pages_and_next_offset(tmp_path: Path) -> None:
-    (tmp_path / "f.txt").write_text("a" * 100)
-    tool = create_read_tool(tmp_path)
-    r = run(tool, {"path": "f.txt", "max_bytes": 40})
-    assert r.text == "a" * 40
-    assert r.metadata["next_offset"] == 40
-    assert r.truncated
-    # 续页直到读完:offset 链必须精确覆盖 100 字节
-    offset = r.metadata["next_offset"]
-    total = len(r.text)
-    while offset is not None:
-        r = run(tool, {"path": "f.txt", "offset": offset, "max_bytes": 40})
-        total += len(r.text)
-        offset = r.metadata["next_offset"]
-    assert total == 100
-    assert r.metadata["size_bytes"] == 100
 
 
 def test_write_atomic_and_confined(tmp_path: Path) -> None:
@@ -110,24 +92,6 @@ def test_bash_background_child_does_not_hang(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # 补充用例
 # ---------------------------------------------------------------------------
-
-
-def test_read_missing_file(tmp_path: Path) -> None:
-    tool = create_read_tool(tmp_path)
-    r = run(tool, {"path": "nope.txt"})
-    assert r.status is ResultStatus.ERROR
-    assert r.is_error
-    assert r.error_code == "not_found"
-
-
-def test_read_binary_file(tmp_path: Path) -> None:
-    (tmp_path / "blob.bin").write_bytes(b"\x00\x01\x02\xff" * 16)
-    tool = create_read_tool(tmp_path)
-    r = run(tool, {"path": "blob.bin"})
-    assert r.status is ResultStatus.ERROR
-    assert r.error_code == "binary_file"
-    assert r.metadata["is_binary"]
-    assert r.metadata["size_bytes"] == 64
 
 
 def test_write_creates_parent_dirs(tmp_path: Path) -> None:
@@ -293,11 +257,3 @@ def test_bash_cancellation_cleans_up(tmp_path: Path, capfd: Any) -> None:
     assert_dead(pidfile)
     captured = capfd.readouterr()
     assert "Event loop is closed" not in captured.err
-
-
-def test_pending_tool_call_id_convention(tmp_path: Path) -> None:
-    # Task 12 管道写 item 时替换真实 call id;工具层只放占位符
-    (tmp_path / "f.txt").write_text("hello")
-    r = run(create_read_tool(tmp_path), {"path": "f.txt"})
-    assert r.tool_call_id == "pending"
-    assert r.tool_name == "read"

@@ -257,6 +257,13 @@ def test_invalid_input_is_result_not_exception(ctx: ExecCtx) -> None:
     assert items[0].payload["is_error"] is True
 
 
+def test_read_mixed_line_and_byte_modes_is_invalid_input(ctx: ExecCtx) -> None:
+    # Task 10:行/字节模式互斥在 validate_input 层拒绝,管道归一为 invalid_input 结果
+    r = asyncio.run(execute(ToolCall("c1", "read", {"path": "f.txt", "start_line": 1, "offset": 0}), ctx))
+    assert r.status is ResultStatus.ERROR and r.error_code == "invalid_input"
+    assert [i.kind for i in ctx.store.read_turn_items(ctx.turn_id)] == [ItemKind.TOOL_RESULT]
+
+
 def test_unknown_tool_is_result_not_exception(ctx: ExecCtx) -> None:
     r = asyncio.run(execute(ToolCall("c1", "nope", {}), ctx))
     assert r.status is ResultStatus.ERROR and r.error_code == "unknown_tool"
