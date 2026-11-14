@@ -18,6 +18,10 @@ b  故障注入缝(patch 执行循环对管道唯一 ``execute`` 的调用点)�
 c  故障注入缝(dataclasses.replace 换掉 read 工具的 run):协程先睡
    _HOLD_SECONDS 再真实读。tool_call item 已写、幂等工具执行中,kill
    落在执行中途;resume 应自动重跑(重放安全性由 read.idempotent=True 给出)。
+d  Task 18 后台命令飞行中:首个 bash 带 yield_time_seconds 起长命令并
+   立即返回 running tool_result;第二次 ``execute``(后续 read)前睡
+   _HOLD_SECONDS,kill 落在"后台命令仍在跑、turn 仍在执行"的窗口。
+   清扫由父测试以真实 sweep_orphan_command_jobs 验证。
 
 responses.json 形状(剧本每条一个对象,与 model_response item payload 同构):
     {"content": str,
@@ -92,6 +96,21 @@ def _install_dispatch_seam() -> None:
     turn_module.execute = _seam_execute
 
 
+def _install_second_dispatch_seam() -> None:
+    """变体 d:第二次 execute(后台命令已 running 后的后续工具)前挂起。"""
+    state = {"count": 0}
+
+    async def _seam_execute(call: Any, ctx: Any) -> Any:
+        state["count"] += 1
+        if state["count"] == 2:
+            await asyncio.sleep(_HOLD_SECONDS)
+        return await _real_execute(call, ctx)
+
+    import praxis.core.turn as turn_module
+
+    turn_module.execute = _seam_execute
+
+
 def _slow_read_tools(workspace: Path) -> list[Tool]:
     """变体 c:read.run 换成"睡 _HOLD_SECONDS 再真实读"的协程,其余字段原样。"""
     read_tool = create_read_tool(workspace)
@@ -108,6 +127,8 @@ def _slow_read_tools(workspace: Path) -> list[Tool]:
 async def _amain(workspace: Path, specs: list[Mapping[str, Any]], thread_id: str, variant: str) -> int:
     if variant == "b":
         _install_dispatch_seam()
+    if variant == "d":
+        _install_second_dispatch_seam()
     tools = _slow_read_tools(workspace) if variant == "c" else None
     adapter = ScriptedAdapter([_to_response(spec) for spec in specs])
     # Task 4 迁移:真实 decide 下 bash 需 network allow(默认 ask 会第 2 步暂停);
