@@ -41,7 +41,7 @@ Session 构造只允许 praxis/composition.py(CI 规则 7,设计 §4.1 唯一组
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Literal
@@ -56,7 +56,7 @@ from praxis.core.statemachine import TurnStatus, transition
 from praxis.core.turn import ApprovalSummary, TurnDeps, TurnResult, TurnState, run_turn
 from praxis.protocol.items import Item, ItemKind
 from praxis.protocol.json import JsonValue
-from praxis.protocol.models import ModelAdapter, ModelSettings, ModelToolCall
+from praxis.protocol.models import ModelAdapter, ModelSettings, ModelToolCall, WireRequest
 from praxis.protocol.permission import PermissionContext, PermissionUpdate
 from praxis.protocol.retry import RetryingStream
 from praxis.protocol.tools import ResultStatus, Tool
@@ -296,6 +296,8 @@ class Session:
         finalize_sandbox: SandboxFinalizer | None = None,
         retry_stream: RetryingStream | None = None,
         artifacts: ArtifactStore | None = None,
+        compact_limit_tokens: int | None = None,
+        measure_tokens: Callable[[WireRequest], int] | None = None,
     ) -> None:
         self._store = store
         self._bus = bus
@@ -318,6 +320,8 @@ class Session:
         self._finalize_sandbox = finalize_sandbox
         self._retry_stream = retry_stream
         self._artifacts = artifacts
+        self._compact_limit_tokens = compact_limit_tokens
+        self._measure_tokens = measure_tokens
 
     # -- 身份与生命周期 -------------------------------------------------------
 
@@ -603,6 +607,8 @@ class Session:
             finalize_sandbox=self._finalize_sandbox,
             retry_stream=self._retry_stream,
             artifacts=self._artifacts,
+            compact_limit_tokens=self._compact_limit_tokens,
+            measure_tokens=self._measure_tokens,
         )
         try:
             with thread_execution_lock(self._workspace, self._thread_id):

@@ -31,8 +31,10 @@ from praxis.adapters.config.store import ModelConfigStore
 from praxis.adapters.models.ollama import OllamaAdapter
 from praxis.adapters.models.openai_compat import OpenAICompatAdapter
 from praxis.adapters.models.retry import make_retry_stream
+from praxis.adapters.models.tokenization import measure_request
 from praxis.adapters.sandbox.base import probe_backend
 from praxis.adapters.sandbox.compile import compile_sandbox, finalize_sandbox
+from praxis.core.compaction import default_compact_limit
 from praxis.core.events import EventBus
 from praxis.core.recovery import sweep
 from praxis.core.session import Session
@@ -41,6 +43,7 @@ from praxis.protocol.models import (
     ModelMessage,
     ModelSettings,
     ModelSpec,
+    WireRequest,
 )
 from praxis.protocol.permission import PermissionContext, PermissionMode
 from praxis.protocol.policy import PermissionPolicy
@@ -148,14 +151,15 @@ def _temporary_spec_from_env(base_url: str | None) -> ModelSpec | None:
     )
 
 
-def _adapter_from_registry(
+def _adapter_and_spec_from_registry(
     model: str | None,
     config_store: ModelConfigStore | None,
-) -> ModelAdapter:
+) -> tuple[ModelAdapter, ModelSpec]:
     """从全局配置库解析 ModelSpec 并交给唯一分派点(R-T6-2)。
 
     自建的 store 在解析完即关闭(CLI 单次调用);调用方注入的 store 由其自己
-    管理生命周期。
+    管理生命周期。返回 spec 是为了让组合根计算自动压缩阈值(D15)——
+    ModelSpec 只在这里可解析,core 不接触配置库。
     """
     owned = config_store is None
     store = config_store if config_store is not None else ModelConfigStore()
@@ -172,7 +176,7 @@ def _adapter_from_registry(
                 if temporary is None:
                     raise
                 api_key = os.environ.get("PRAXIS_API_KEY") or None
-                return _adapter_for(temporary, api_key)
+                return _adapter_for(temporary, api_key), temporary
         else:
             spec = store.resolve_spec(model)
     finally:
@@ -183,7 +187,12 @@ def _adapter_from_registry(
         if spec.api_key_env is not None
         else None
     )
-    return _adapter_for(spec, api_key)
+    return _adapter_for(spec, api_key), spec
+
+
+def _measure_request_tokens(req: WireRequest) -> int:
+    """D2 唯一测量入口的注入形式(core 不得 import adapters)。"""
+    return measure_request(req).count
 
 
 def _resolve_policy(root: Path, explicit: PermissionPolicy | None) -> PermissionPolicy:
@@ -237,7 +246,14 @@ def build_session(
     if mode is not None and mode not in _VALID_MODES:
         raise ValueError(f"unknown permission mode: {mode!r} (expected on-request/never/bypass)")
     if adapter is None:
-        adapter = _adapter_from_registry(model, config_store)
+        adapter, resolved_spec = _adapter_and_spec_from_registry(model, config_store)
+    else:
+        # 显式注入(测试/--scripted)没有可解析的 ModelSpec → 关闭自动压缩,
+        # 既有测试的 item 序列保持完全不变。
+        resolved_spec = None
+    compact_limit_tokens = (
+        default_compact_limit(resolved_spec) if resolved_spec is not None else None
+    )
     root = Path(workspace)
     praxis_dir = root / ".praxis"
     praxis_dir.mkdir(parents=True, exist_ok=True)
@@ -289,6 +305,8 @@ def build_session(
                 policy=RetryPolicy(), clock=time.time, sleep=asyncio.sleep
             ),
             artifacts=effective_artifacts,
+            compact_limit_tokens=compact_limit_tokens,
+            measure_tokens=_measure_request_tokens,
         )
     except BaseException:
         store.close()

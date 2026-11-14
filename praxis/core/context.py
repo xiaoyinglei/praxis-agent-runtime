@@ -12,6 +12,7 @@ fail-open 读:algorithm_version 未知、boundary payload 畸形(非 int 区间�
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import Final, TypeGuard
 
 from praxis.protocol.items import Item, ItemKind
@@ -21,6 +22,15 @@ from praxis.protocol.models import ModelMessage, ModelToolCall
 _SUPPORTED_BOUNDARY_VERSION: Final = "v1"
 _SUMMARY_PREFIX: Final = "[conversation summary]\n"
 _UNPAIRED_TOOL_RESULT_NOTE: Final = "[tool result unavailable: turn ended before execution]"
+
+# 省略策略阈值(D15:数据,不进 core 的 if 字面量)。保持最后 12 条工具输出完整,
+# 更早且正文 > 2 KiB 的才省略——旧输出仍留在 store,模型可经 artifact 指针回读。
+ELIDE_KEEP_ITEMS: Final = 12
+ELIDE_MIN_BYTES: Final = 2048
+
+_ELIDED_MARKER: Final = "[elided tool output: {chars} chars from {tool_name}]"
+_ARTIFACT_POINTER_MARKER: Final = "artifact://"
+_ELIDED_FLAG: Final = "elided"
 
 
 def build_context(items: Sequence[Item]) -> list[Item]:
@@ -189,6 +199,65 @@ def to_messages(items: Sequence[Item]) -> list[ModelMessage]:
 
 
 # ---------------------------------------------------------------------------
+# 旧工具输出省略(设计 §5.7 第 2 层;D11/D15;B22 读侧收口)
+# ---------------------------------------------------------------------------
+
+
+def elide_old_tool_outputs(
+    items: Sequence[Item],
+    *,
+    keep_last: int = ELIDE_KEEP_ITEMS,
+    min_bytes: int = ELIDE_MIN_BYTES,
+) -> list[Item]:
+    """省略较早的 ``tool_result`` 正文:纯函数、幂等、永不抛。
+
+    - 只动 ``tool_result``;最后 ``keep_last`` 条工具输出保持完整
+      (``keep_last <= 0`` → 全部符合条件者省略);
+    - 更早的若投影文本 ``len(text.encode()) > min_bytes`` → 单 text 块
+      ``[elided tool output: N chars from <tool>]`` 并标 ``payload["elided"]=True``;
+    - 已标 ``elided`` 的不重复处理(二次应用返回等值列表);
+    - **R-T9-1**:正文里含 ``artifact://`` 的指针行**原样保留**在省略后的文本里
+      ——模型必须还能用 ``read_artifact`` 回读自己那份被外部化的大输出;
+    - 原文仍留在 store/输入序列里:本函数只返回一份替换后的新 list。
+
+    文本口径与 ``to_messages`` 一致(仅 ``type=="text"`` 块的 ``data["text"]``,
+    ``"\\n"`` 拼接);畸形 content 按空文本处理,不触发省略也不抛。
+    """
+    tool_positions = sorted(
+        (position for position, item in enumerate(items) if item.kind == ItemKind.TOOL_RESULT),
+        key=lambda position: (items[position].seq, position),
+    )
+    eligible = tool_positions if keep_last <= 0 else tool_positions[: max(0, len(tool_positions) - keep_last)]
+    out = list(items)
+    for position in eligible:
+        item = items[position]
+        payload = item.payload
+        if payload.get(_ELIDED_FLAG) is True:
+            continue  # 幂等:已省略过
+        text = _tool_result_text(payload)
+        if len(text.encode("utf-8")) <= min_bytes:
+            continue
+        tool_name = payload.get("tool_name")
+        marker = _ELIDED_MARKER.format(
+            chars=len(text),
+            tool_name=tool_name if isinstance(tool_name, str) else "unknown",
+        )
+        pointer_lines = [
+            line for line in text.splitlines() if _ARTIFACT_POINTER_MARKER in line
+        ]
+        if pointer_lines:
+            marker = "\n".join([marker, *pointer_lines])
+        block: JsonValue = {"type": "text", "data": {"text": marker}}
+        new_payload: dict[str, JsonValue] = {
+            **payload,
+            "content": (block,),
+            _ELIDED_FLAG: True,
+        }
+        out[position] = replace(item, payload=new_payload)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 折叠内部实现
 # ---------------------------------------------------------------------------
 
@@ -279,6 +348,30 @@ def _reconstruct_tool_calls(raw_calls: object) -> list[ModelToolCall] | None:
             return None
         calls.append(ModelToolCall(call_id=call_id, name=name, arguments=arguments))
     return calls
+
+
+def _tool_result_text(payload: Mapping[str, JsonValue]) -> str:
+    """``tool_result`` 的模型可见文本(与 ``_tool_result_message`` 同一口径)。
+
+    与投影不同,这里对畸形块**逐块跳过**而不是整条放弃:省略函数永不抛,
+    且只关心"这段正文有多大 / 有没有指针"。
+    """
+    raw_blocks = payload.get("content")
+    if not isinstance(raw_blocks, (list, tuple)):
+        return ""
+    parts: list[str] = []
+    for block in raw_blocks:
+        if not isinstance(block, Mapping):
+            continue
+        if block.get("type") != "text":
+            continue
+        data = block.get("data")
+        if not isinstance(data, Mapping):
+            continue
+        value = data.get("text")
+        if isinstance(value, str):
+            parts.append(value)
+    return "\n".join(parts)
 
 
 def _tool_result_message(payload: Mapping[str, JsonValue]) -> ModelMessage | None:

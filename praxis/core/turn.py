@@ -35,12 +35,13 @@ from __future__ import annotations
 import asyncio
 import math
 import time
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-from praxis.core.context import build_context, to_messages
+from praxis.core.compaction import maybe_compact
+from praxis.core.context import build_context, elide_old_tool_outputs, to_messages
 from praxis.core.events import EventBus
 from praxis.core.pipeline import ExecCtx, SandboxCompiler, SandboxFinalizer, execute
 from praxis.core.statemachine import TurnStatus, transition
@@ -105,6 +106,12 @@ class TurnDeps:
     # None = 不重试(ScriptedAdapter/单测路径);生产 composition 注入真实机制。
     # 只有注入时才有 model_attempt 事实账——无重试机制就没有第二个账本。
     retry_stream: RetryingStream | None = None
+    # None = 不自动压缩(单测/ScriptedAdapter 路径);生产 composition 按 ModelSpec
+    # 计算并注入。0 同样视为关闭(预算耗尽)。
+    compact_limit_tokens: int | None = None
+    # D2 唯一测量入口(measure_request)的注入形式:praxis_core_purity 禁止
+    # core import adapters,由 composition 绑定。压缩阈值判定只走这一份数据。
+    measure_tokens: Callable[[WireRequest], int] | None = None
 
 
 @dataclass
@@ -389,6 +396,7 @@ async def run_turn(
     ctx = _exec_ctx(deps, state)
     unknown_calls: list[str] = []
     last_content = ""
+    compacted = False  # R-P4:本 turn 已尝试过压缩(最多一次)
     try:
         # 步序 1:审批重入——先重放已批准的调用,再进模型循环。
         for call in resume_calls:
@@ -401,11 +409,33 @@ async def run_turn(
             items = deps.store.read_items(state.thread_id)
             messages = [
                 ModelMessage(role="system", content=deps.system_prompt),
-                *to_messages(build_context(items)),
+                # D11 读侧固定链:先按 boundary 折叠,再省略旧工具输出,最后投影。
+                *to_messages(elide_old_tool_outputs(build_context(items))),
             ]
             definitions = [tool.definition for tool in deps.tools.values()]
             # 步序 3:构建请求 → 补全 → 落 model_response item → emit 预览事件。
             req = deps.adapter.build_request(messages, definitions, ModelSettings())
+            # 步边界自动压缩(设计 §5.7 / D11):只在实际出站请求超阈值时触发,
+            # 摘要由同一 adapter 完成;下一轮重建上下文。每 turn 最多一次(R-P4):
+            # 即使压缩后仍超阈值也不重试,避免本地小模型摘要不够短时的 livelock。
+            if (
+                not compacted
+                and deps.compact_limit_tokens
+                and deps.measure_tokens is not None
+                and deps.measure_tokens(req) > deps.compact_limit_tokens
+            ):
+                compacted = True
+                await maybe_compact(
+                    store=deps.store,
+                    bus=deps.bus,
+                    adapter=deps.adapter,
+                    thread_id=state.thread_id,
+                    turn_id=state.turn_id,
+                    items=items,
+                    limit_tokens=deps.compact_limit_tokens,
+                    measure_tokens=deps.measure_tokens,
+                )
+                continue
             # core 只走流式(D1);complete() 也由同一条 stream 装配派生。
             # 重试机制由 composition 以结构签名注入(R-T3-1):core 不认识
             # openai/httpx,只认识"给工厂、已有尝试、clock floor,拿回事件"。
