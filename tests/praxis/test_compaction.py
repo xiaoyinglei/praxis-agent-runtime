@@ -261,6 +261,10 @@ def test_summary_request_is_bounded_and_elides_old_tool_bodies(store: Store) -> 
     assert "LONG-TOOL-OUTPUT-BODY" not in prompt
     assert "[elided tool output:" in prompt
     assert "更近的内容已截断" in prompt
+    # 方向断言:保留的是最早那段(elided 工具输出在投影开头),丢的是更近的内容
+    # (末尾 USER_MESSAGE "after")。把 head/tail 调换时这两条必须失败。
+    assert "after" not in prompt
+    assert prompt.rstrip().endswith("[... 更近的内容已截断 ...]")
     # composition 注入的输出预算原样进入摘要请求(小窗口模型不会被 2048 撞拒)。
     assert adapter.last_request.max_output_tokens == 64
 

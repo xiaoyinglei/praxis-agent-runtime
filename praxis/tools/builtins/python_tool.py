@@ -20,7 +20,7 @@
   ``workspace_write``/``network`` 布尔旗标(计划 D1 的有意差异,写进描述);
 - 子进程环境由 ``child_env`` 唯一构造:宿主环境变量与凭据不可见(R-T16-2)。
 
-本任务不把 ``run_python`` 注册进默认工具表(Task 17 负责)。
+``run_python`` 已由 composition 注册进默认工具表(Task 17),与 bash 同列。
 """
 
 from __future__ import annotations

@@ -295,10 +295,14 @@ def _runtime_interpreter_roots() -> tuple[Path, ...]:
     """
     roots: set[Path] = set()
     try:
-        roots.add(Path(sys.executable).resolve().parent)
+        executable = sys.executable
+        if executable:  # 空值守卫:Path("").resolve() == 当前目录,会把其祖先加进受信根
+            roots.add(Path(executable).resolve().parent)
     except (OSError, RuntimeError):
         pass
     for candidate in (sys.prefix, sys.base_prefix):
+        if not candidate:  # 同上:空 prefix 不得解析成当前目录
+            continue
         try:
             roots.add(Path(candidate).resolve())
         except (OSError, RuntimeError):
