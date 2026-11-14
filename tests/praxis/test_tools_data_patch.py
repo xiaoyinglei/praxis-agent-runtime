@@ -206,6 +206,63 @@ def test_grid_cell_budget_is_shared_across_sheets(tmp_path: Path) -> None:
     assert second.metadata["next_sheet_offset"] is None
 
 
+def test_default_parameters_page_two_sheets_without_loss_or_repeat(tmp_path: Path) -> None:
+    # 复审复现形状:两表各 20 行 × 2 列 + 默认参数。按返回游标翻页,
+    # A/B 的 1..20 各覆盖恰好一次(修 round 1 的 next_sheet_offset 覆盖曾丢 A 11-20、重读 B 1-10)。
+    rows_a = [[f"a-{row}-{column}" for column in range(2)] for row in range(1, 21)]
+    rows_b = [[f"b-{row}-{column}" for column in range(2)] for row in range(1, 21)]
+    make_workbook(tmp_path / "t.xlsx", {"A": rows_a, "B": rows_b})
+    tool = create_inspect_data_file_tool(tmp_path)
+    arguments: dict[str, Any] = {"path": "t.xlsx"}
+    seen: dict[str, list[int]] = {"A": [], "B": []}
+    calls = 0
+    while True:
+        result = run(tool, arguments)
+        assert result.status is ResultStatus.OK
+        calls += 1
+        for name, numbers in sheet_rows(result.text).items():
+            seen[name].extend(numbers)
+        next_sheet = result.metadata["next_sheet_offset"]
+        next_row = result.metadata["next_row"]
+        if next_sheet is None and next_row is None:
+            break
+        assert calls <= 10
+        if next_row is not None:
+            arguments = {
+                "path": "t.xlsx",
+                "sheet_offset": next_sheet if next_sheet is not None else 0,
+                "start_row": next_row,
+            }
+        else:
+            assert next_sheet is not None
+            arguments = {"path": "t.xlsx", "sheet_offset": next_sheet}
+    assert calls == 3
+    assert seen["A"] == list(range(1, 21))
+    assert seen["B"] == list(range(1, 21))
+
+
+def test_column_truncated_table_owns_the_sheet_cursor(tmp_path: Path) -> None:
+    # 表 0 未截断、表 1 列截断:截断表必须是本页最后一张,next_sheet_offset 指向它自己
+    make_workbook(
+        tmp_path / "t.xlsx",
+        {"A": [["a1"]], "B": [["b1", "b2"], ["b3", "b4"]]},
+    )
+    first = inspect(tmp_path, "t.xlsx", max_columns=1)
+    assert first.status is ResultStatus.OK
+    assert first.metadata["next_row"] is None
+    assert first.metadata["next_column"] == 2
+    assert first.metadata["next_sheet_offset"] == 1
+    assert "a1" in first.text
+    assert "b1" in first.text
+    assert "b2" not in first.text
+    second = inspect(tmp_path, "t.xlsx", sheet_offset=1, start_column=2, max_columns=1)
+    assert second.status is ResultStatus.OK
+    assert second.metadata["next_column"] is None
+    assert second.metadata["next_sheet_offset"] is None
+    assert "b2" in second.text
+    assert "b1" not in second.text
+
+
 def test_multi_sheet_row_truncation_never_skips_rows(tmp_path: Path) -> None:
     # I-2:sheet1 超 2000 格被行截断时,next_sheet_offset 不得越过它;
     # 按返回游标依次翻页,两张表所有行必须各覆盖一次、不重不漏。
@@ -521,6 +578,8 @@ def test_json_over_8mib_is_rejected_before_parsing(tmp_path: Path) -> None:
     assert "8 MiB" in r.text
     assert "preview limit" in r.text
     assert r.metadata["valid"] is False
+    # 准入在哈希之前:拒绝路径不会把整个文件再流一遍
+    assert r.metadata["sha256"] == ""
 
 
 def test_json_nan_has_dedicated_error(tmp_path: Path) -> None:

@@ -4,8 +4,8 @@
 ``metadata`` 是**扁平摘要**:``format``/``size_bytes``/``sha256``/``valid``/
 ``row_count``/``column_count``/``column_names``/``next_row``/``next_column``/
 ``next_sheet_offset``/``page_count``/``json_type``/``json_keys``/``truncated``/
-``truncated_cells``。多 sheet 时标量字段取自第一个返回的表,每张表的逐页游标
-在 content 的各段里如实给出。
+``truncated_cells``。多表返回时表级标量字段与游标取自**最后一张返回的表**
+(游标契约见下),每张表的逐页游标在 content 的各段里如实给出。
 
 R-T12-2(B8 不带病移植):``column_names`` 就是 1-based ``start_row`` 这一行的
 单元格文本,由迭代器行号**直接定位**,绝不叠加任何 skiprows/header-1 语义
@@ -39,9 +39,14 @@ R-T12-1(不堵事件循环):解析主体在 ``await asyncio.to_thread(...)`` 里
   字符,避免默认 128 KiB 让一个长文本字段炸掉整份文件。
 - PDF 页面文本的**总量**受 ``max_characters`` 约束(与网格同一口径),不随
   ``max_pages`` 线性放大。
-- ``start_row`` 只作用于本次调用的第一个被选 sheet;其余 sheet 从第 1 行开始。
-  若最后一个被处理的 sheet 仍被行截断(``next_row`` 非空),``next_sheet_offset``
-  **不会越过它**(返回该 sheet 的 offset),调用方应先用 ``next_row`` 读完它。
+- 游标契约(扁平的 metadata 一次调用只能描述一张表):
+  ``next_row``/``next_column`` 只描述**本次返回的最后一张表**;任何表发生
+  行/列分页截断时它就是本次返回的最后一张(其后的表留到下一次调用)。最后一张表
+  被行/列截断 → ``next_sheet_offset`` 等于**它自己的索引**(调用方先用
+  ``next_row``/``next_column`` 把它读完);一张表都未被分页截断 →
+  ``next_sheet_offset`` 等于最后一张表**之后**的索引。
+- ``start_row``/``start_column`` 只作用于本次调用的第一张被选表;其余表从第 1 行/
+  第 1 列开始。
 """
 
 from __future__ import annotations
@@ -273,10 +278,12 @@ def create_inspect_data_file_tool(workspace: Path) -> Tool:
                 "expressions are never evaluated. Use start_row/start_column with "
                 "max_rows/max_columns to page a grid (1-based source coordinates; CSV rows "
                 "are logical records), sheet_name to select one worksheet, or sheet_offset "
-                "with max_sheets for worksheet pages. start_row applies only to the first "
-                "selected sheet; later sheets start at row 1. next_row/next_column continue "
-                "this grid page; next_sheet_offset continues worksheet pages, but never skips "
-                "past a sheet that is still row-truncated (finish it with next_row first). "
+                "with max_sheets for worksheet pages. Pagination cursors describe only the LAST "
+                "table returned in this call: a table with a row/column cursor is always the "
+                "last table of the page; next_sheet_offset equals that table's own index "
+                "(finish it with next_row/next_column first), otherwise it is the index after "
+                "the last returned table. start_row/start_column apply only to the first "
+                "selected sheet; later sheets start at row 1/column 1. "
                 "One call shares a 2000-cell budget across all returned sheets; "
                 "max_characters bounds combined cell text (hard cap 32000) and also bounds "
                 "total PDF text. truncated_cells lists source (row, column) coordinates of "
@@ -361,6 +368,17 @@ def _inspect_data_file(target: Path, requests: Mapping[str, JsonValue]) -> _Insp
             "",
             "unsupported data format; expected .xlsx, .xlsm, .pdf, .csv, .tsv, or .json",
         )
+    if file_format == "json" and size_bytes > _MAX_JSON_INPUT_BYTES:
+        # 哈希之前就挡住:JSON 必然全量物化,拒绝时不必把整个文件再流一遍。
+        return _failure(
+            "json",
+            size_bytes,
+            "",
+            (
+                f"JSON input exceeds the {_MAX_JSON_INPUT_BYTES // (1024 * 1024)} MiB "
+                "preview limit; extract targeted values with bash"
+            ),
+        )
 
     digest = ""
     try:
@@ -375,10 +393,10 @@ def _inspect_data_file(target: Path, requests: Mapping[str, JsonValue]) -> _Insp
             return _inspect_pdf(target, path_value, requests, size_bytes, digest)
         if file_format == "json":
             return _inspect_json(target, path_value, requests, size_bytes, digest)
-        # 显式收口:_Format 新增成员时在这里炸出,而不是静默走错分支。
-        raise AssertionError(f"unhandled data format: {file_format}")
     except Exception as exc:  # noqa: BLE001 — 解析异常一律归一为 data_inspection_failed
         return _failure(file_format, size_bytes, digest, _bounded_error(exc))
+    # 编程错误不是用户级数据失败:放在 try 之外,让它炸到 _call_runner 归 tool_error。
+    raise AssertionError(f"unhandled data format: {file_format}")
 
 
 def _inspect_workbook(
@@ -393,6 +411,7 @@ def _inspect_workbook(
     sheet_offset = _int_argument(requests, "sheet_offset", 0)
     max_sheets = _int_argument(requests, "max_sheets", 20)
     request_start_row = _int_argument(requests, "start_row", 1)
+    request_start_column = _int_argument(requests, "start_column", 1)
     workbook = load_workbook(target, read_only=True, data_only=False, keep_links=False)
     try:
         sheet_names = list(workbook.sheetnames)
@@ -409,39 +428,41 @@ def _inspect_workbook(
         previews: list[_TablePreview] = []
         for index, worksheet in enumerate(selected):
             if budget.cells == 0:
-                # 共享预算耗尽:剩余 sheet 留给下一次 sheet_offset 页。
+                # 共享预算耗尽:本页到此为止,下一张表留给下一次 sheet_offset 页。
                 if sheet_name is None:
                     next_sheet = sheet_offset + index
                 break
             worksheet.reset_dimensions()
             records = worksheet.iter_rows()
             try:
-                previews.append(
-                    _preview_grid(
-                        worksheet.title,
-                        records,
-                        requests,
-                        excel=True,
-                        budget=budget,
-                        # start_row 只对被选中的第一张 sheet 生效:否则续页会
-                        # 顺手跳掉后续 sheet 的开头(I-2)。
-                        start_row=request_start_row if index == 0 else 1,
-                    )
+                preview = _preview_grid(
+                    worksheet.title,
+                    records,
+                    requests,
+                    excel=True,
+                    budget=budget,
+                    # start_row/start_column 只对被选中的第一张表生效;
+                    # 其余表从第 1 行/第 1 列开始,续页才不会跳掉后续表开头。
+                    start_row=request_start_row if index == 0 else 1,
+                    start_column=request_start_column if index == 0 else 1,
                 )
             finally:
                 records.close()
-        if sheet_name is None:
-            # 游标优先级:最后一张表若仍被行截断,next_sheet_offset 不得越过它
-            # (先按 next_row 读完这张表,否则跟 next_sheet_offset 会静默丢行)。
-            if previews and previews[-1].next_row is not None:
-                next_sheet = sheet_offset + len(previews) - 1
-            if next_sheet is not None:
-                assert next_sheet >= sheet_offset, "sheet paging must not move backwards"
-                if next_sheet == sheet_offset:
-                    # 只有"同一张表仍有 next_row"才允许不前进,且行游标必须已前进。
-                    assert previews and previews[-1].next_row is not None, (
-                        "same-sheet sheet cursor requires an advancing row cursor"
-                    )
+            previews.append(preview)
+            if preview.next_row is not None or preview.next_column is not None:
+                # 游标契约:被行/列截断的表必须是本页返回的最后一张,
+                # next_sheet_offset 指向它自己(先用 next_row/next_column 读完)。
+                if sheet_name is None:
+                    next_sheet = sheet_offset + index
+                break
+        if sheet_name is None and next_sheet is not None:
+            # 同一张表上的 sheet 游标只有在该表仍有前进的分页游标时才合法。
+            if next_sheet == sheet_offset:
+                assert previews and (
+                    previews[-1].next_row is not None or previews[-1].next_column is not None
+                ), "same-sheet sheet cursor requires an advancing table cursor"
+            else:
+                assert next_sheet > sheet_offset, "sheet cursor must not move backwards"
     finally:
         workbook.close()
     lines = [
@@ -487,6 +508,7 @@ def _inspect_delimited(
                 )
             ),
             start_row=_int_argument(requests, "start_row", 1),
+            start_column=_int_argument(requests, "start_column", 1),
         )
     lines = [
         _header_line(file_format, path_value, size_bytes, digest),
@@ -561,17 +583,6 @@ def _inspect_json(
     digest: str,
 ) -> _Inspection:
     max_characters = _int_argument(requests, "max_characters", 8_000)
-    if size_bytes > _MAX_JSON_INPUT_BYTES:
-        # JSON 必然全量物化(解析图 + dump):在解析前用专属上限挡住 OOM 形状。
-        return _failure(
-            "json",
-            size_bytes,
-            digest,
-            (
-                f"JSON input exceeds the {_MAX_JSON_INPUT_BYTES // (1024 * 1024)} MiB "
-                "preview limit; extract targeted values with bash"
-            ),
-        )
     with target.open("r", encoding="utf-8-sig") as stream:
         value = json.load(stream)
     json_type = _json_type(value)
@@ -626,13 +637,13 @@ def _preview_grid(
     excel: bool,
     budget: _GridBudget,
     start_row: int,
+    start_column: int,
 ) -> _TablePreview:
     """按 1-based 源坐标限界网格;不解释行语义、不信任 XLSX 声明尺寸。
 
-    ``start_row`` 由调用方显式给出:多 sheet 分页时只有第一张被选 sheet 继承
-    请求里的 start_row,其余 sheet 从第 1 行开始(否则续页会跳过后续 sheet 开头)。
+    ``start_row``/``start_column`` 由调用方显式给出:多 sheet 分页时只有第一张
+    被选表继承请求里的起点,其余表从第 1 行/第 1 列开始(否则续页会跳过后续表开头)。
     """
-    start_column = _int_argument(requests, "start_column", 1)
     max_rows = _int_argument(requests, "max_rows", 10)
     max_columns = _int_argument(requests, "max_columns", 20)
 
@@ -744,8 +755,8 @@ def _tables_metadata(
     previews: Sequence[_TablePreview],
     next_sheet: int | None,
 ) -> dict[str, Any]:
-    """扁平摘要:标量字段取自第一个返回的表;truncated/truncated_cells 覆盖全部表。"""
-    primary = previews[0] if previews else None
+    """扁平摘要:表级字段取自**最后一张返回的表**(游标契约);truncated/truncated_cells 覆盖全部表。"""
+    primary = previews[-1] if previews else None
     truncated_cells: list[tuple[int, int]] = []
     for preview in previews:
         truncated_cells.extend(preview.truncated_cells)
