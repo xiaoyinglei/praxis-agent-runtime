@@ -254,7 +254,7 @@ def _open_from_options(
             thread_id=_resolve_thread(thread),
         )
     # R-T6-2:CLI 不再直接构造 provider adapter;模型解析与唯一分派都在
-    # composition(_adapter_from_registry → _adapter_for)。
+    # composition(_adapter_and_spec_from_registry → _adapter_for)。
     return _open_session_guarded(
         _resolve_workspace(workspace),
         None,

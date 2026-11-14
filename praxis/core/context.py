@@ -34,9 +34,13 @@ _ELIDED_FLAG: Final = "elided"
 
 
 def build_context(items: Sequence[Item]) -> list[Item]:
-    """按 compaction_boundary 折叠:丢弃覆盖区间内的 item,保留 boundary/summary 本身。
+    """按 compaction_boundary 折叠:丢弃覆盖区间内的 item。
 
     - 已知版本 "v1" 且区间为 int → 折叠 [covered_from, covered_to](多 boundary 取并集);
+    - ``compaction_boundary`` 自身永远保留(折叠只发生在读端,写端 append-only);
+    - ``summary`` 仅当其 seq **不在任何** boundary 覆盖区间内才保留:后续压缩的
+      boundary 覆盖旧 summary 时,旧摘要被更新摘要取代(否则摘要随压缩次数单调
+      累积、上下文实际未被约束);
     - 未知版本或畸形 payload → 该 boundary 不折叠(fail-open,原样保留全部 item);
     - 纯函数:返回新 list,元素与输入同一对象;幂等。
     """
@@ -51,10 +55,14 @@ def build_context(items: Sequence[Item]) -> list[Item]:
         return list(items)
     folded: list[Item] = []
     for item in items:
-        if item.kind == ItemKind.COMPACTION_BOUNDARY or item.kind == ItemKind.SUMMARY:
-            folded.append(item)  # boundary 与 summary 自身永远保留
+        in_range = any(low <= item.seq <= high for low, high in ranges)
+        if item.kind == ItemKind.COMPACTION_BOUNDARY:
+            folded.append(item)  # boundary 自身永远保留
             continue
-        if any(low <= item.seq <= high for low, high in ranges):
+        if item.kind == ItemKind.SUMMARY and not in_range:
+            folded.append(item)  # 未被后续摘要取代的摘要保留
+            continue
+        if in_range:
             continue
         folded.append(item)
     return folded
@@ -139,15 +147,18 @@ def to_messages(items: Sequence[Item]) -> list[ModelMessage]:
       但 tool_calls 可重建时投 content=""(R7 读端 fail-open,保住配对 tool_result)。
       payload["reasoning"] 永不读取:思考文本一旦进助手历史就会被回灌 provider。
     - tool_result → tool(文本口径与 protocol.tools.ToolResult.text 一致,tool_call_id=payload["call_id"])
-    - summary → user,前缀 "[conversation summary]\\n"
+    - summary → user,前缀 "[conversation summary]\\n";**投影在所有非摘要消息之前**
+      ——summary 的 seq 天然晚于它概括的旧历史(压缩时追加),但语义上它是"更早
+      历史的摘要",必须出现在保留尾部之前,否则模型先读尾部再读摘要。多条
+      存活摘要按各自 seq 升序,彼此之间仍保持时间先后。
     - 其余 kind(turn_status/approval_*/tool_call/未知)→ 跳过
 
-    配对(B31/R9/R10,判据唯一来源是 ``pair_tool_results``):投影按 seq 顺序
-    进行(列表顺序不是事实,seq 才是),紧跟每个携带 tool_calls 的 assistant
-    消息之后,按声明顺序逐条输出该声明的配对结果;没有可用结果(未闭合声明,
-    或结果 payload 不可重建)时补 ``_UNPAIRED_TOOL_RESULT_NOTE`` 合成消息
-    (R9,覆盖 cancelled/failed/abandoned-paused 轮次;INTERRUPTED 轮次由
-    recovery 写入真实 not_executed/outcome_unknown 结果,属已配结果)。
+    配对(B31/R9/R10,判据唯一来源是 ``pair_tool_results``):非摘要 item 的投影
+    按 seq 顺序进行(列表顺序不是事实,seq 才是),紧跟每个携带 tool_calls 的
+    assistant 消息之后,按声明顺序逐条输出该声明的配对结果;没有可用结果
+    (未闭合声明,或结果 payload 不可重建)时补 ``_UNPAIRED_TOOL_RESULT_NOTE``
+    合成消息(R9,覆盖 cancelled/failed/abandoned-paused 轮次;INTERRUPTED 轮次
+    由 recovery 写入真实 not_executed/outcome_unknown 结果,属已配结果)。
     同一声明窗口内多条结果只投影最新 seq 的一条(R10;reconcile 在
     outcome_unknown 之后追加对账结果时旧结果仅留库审计),同一响应重复声明
     同一 call_id 时第一次消费真实结果、后续声明补合成——每个声明恰有一条
@@ -159,11 +170,13 @@ def to_messages(items: Sequence[Item]) -> list[ModelMessage]:
     turn_id 为 None 的 item 退化为 (None, seq, call_id),单线程行为不变。
     """
     ordered = sorted(enumerate(items), key=lambda entry: (entry[1].seq, entry[0]))
+    projection_order = [entry for entry in ordered if entry[1].kind == ItemKind.SUMMARY]
+    projection_order.extend(entry for entry in ordered if entry[1].kind != ItemKind.SUMMARY)
     paired, orphans = pair_tool_results(items)
     latest_position = {key: position for key, (_seq, position) in paired.items()}
     messages: list[ModelMessage] = []
     used_keys: set[DeclarationKey] = set()
-    for _position, item in ordered:
+    for _position, item in projection_order:
         if item.kind == ItemKind.TOOL_RESULT:
             call_id = item.payload.get("call_id")
             if not isinstance(call_id, str):

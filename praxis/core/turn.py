@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-from praxis.core.compaction import maybe_compact
+from praxis.core.compaction import SUMMARY_MAX_OUTPUT_TOKENS, maybe_compact
 from praxis.core.context import build_context, elide_old_tool_outputs, to_messages
 from praxis.core.events import EventBus
 from praxis.core.pipeline import ExecCtx, SandboxCompiler, SandboxFinalizer, execute
@@ -112,6 +112,8 @@ class TurnDeps:
     # D2 唯一测量入口(measure_request)的注入形式:praxis_core_purity 禁止
     # core import adapters,由 composition 绑定。压缩阈值判定只走这一份数据。
     measure_tokens: Callable[[WireRequest], int] | None = None
+    # 摘要请求输出预算;composition 按 min(2048, spec.max_output_tokens) 注入。
+    summary_max_output_tokens: int = SUMMARY_MAX_OUTPUT_TOKENS
 
 
 @dataclass
@@ -427,12 +429,12 @@ async def run_turn(
                 compacted = True
                 await maybe_compact(
                     store=deps.store,
-                    bus=deps.bus,
                     adapter=deps.adapter,
                     thread_id=state.thread_id,
                     turn_id=state.turn_id,
                     items=items,
                     limit_tokens=deps.compact_limit_tokens,
+                    summary_max_output_tokens=deps.summary_max_output_tokens,
                     measure_tokens=deps.measure_tokens,
                 )
                 continue

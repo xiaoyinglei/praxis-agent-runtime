@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
+from praxis.core.compaction import SUMMARY_MAX_OUTPUT_TOKENS
 from praxis.core.events import EventBus, Subscription
 from praxis.core.locks import ThreadBusy, thread_execution_lock
 from praxis.core.permission import apply_update, extend_policy
@@ -298,6 +299,7 @@ class Session:
         artifacts: ArtifactStore | None = None,
         compact_limit_tokens: int | None = None,
         measure_tokens: Callable[[WireRequest], int] | None = None,
+        summary_max_output_tokens: int = SUMMARY_MAX_OUTPUT_TOKENS,
     ) -> None:
         self._store = store
         self._bus = bus
@@ -322,6 +324,7 @@ class Session:
         self._artifacts = artifacts
         self._compact_limit_tokens = compact_limit_tokens
         self._measure_tokens = measure_tokens
+        self._summary_max_output_tokens = summary_max_output_tokens
 
     # -- 身份与生命周期 -------------------------------------------------------
 
@@ -609,6 +612,7 @@ class Session:
             artifacts=self._artifacts,
             compact_limit_tokens=self._compact_limit_tokens,
             measure_tokens=self._measure_tokens,
+            summary_max_output_tokens=self._summary_max_output_tokens,
         )
         try:
             with thread_execution_lock(self._workspace, self._thread_id):

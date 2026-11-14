@@ -169,12 +169,18 @@ def test_multiple_boundaries_union() -> None:
     assert build_context(out) == out  # 幂等:折叠后的重放不变
 
 
-def test_boundary_keeps_summary_even_inside_covered_range() -> None:
-    # summary/boundary 自身永远保留,即使 seq 落入覆盖区间
-    summary = mk(3, "summary", {"text": "s"})
+def test_summary_inside_covered_range_is_folded_but_boundary_kept() -> None:
+    # 后续 boundary 覆盖旧 summary → 旧摘要被更新摘要取代(否则摘要随压缩次数累积);
+    # boundary 自身永远保留。未落入覆盖区间的 summary 照常保留。
+    summary = mk(3, "summary", {"text": "old"})
     boundary = mk(4, "compaction_boundary", {"covered_from": 1, "covered_to": 3, "algorithm_version": "v1"})
     out = build_context([mk(1, "user_message", {"text": "a"}), summary, mk(5, "steering", {"text": "b"}), boundary])
-    assert [i.seq for i in out] == [3, 5, 4]  # 保留输入顺序;seq 1 被折叠
+    assert [i.seq for i in out] == [5, 4]  # summary 被折叠,boundary 保留
+    new_summary = mk(6, "summary", {"text": "new"})
+    out2 = build_context(
+        [mk(1, "user_message", {"text": "a"}), summary, mk(5, "steering", {"text": "b"}), boundary, new_summary]
+    )
+    assert [i.seq for i in out2] == [5, 4, 6]  # 新摘要不在区间内 → 保留
 
 
 def test_malformed_boundary_payload_folds_nothing_never_raises() -> None:

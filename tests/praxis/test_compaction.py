@@ -21,8 +21,11 @@ from praxis.adapters.models.scripted import ScriptedAdapter
 from praxis.adapters.models.tokenization import measure_request
 from praxis.core.compaction import (
     COMPACT_VERSION,
+    SUMMARY_MAX_OUTPUT_TOKENS,
+    SUMMARY_PROMPT_MAX_CHARS,
     CompactionOutcome,
     default_compact_limit,
+    default_summary_max_output_tokens,
     maybe_compact,
 )
 from praxis.core.context import build_context, to_messages
@@ -120,7 +123,6 @@ def test_below_limit_writes_nothing(store: Store, bus: EventBus) -> None:
     async def run() -> CompactionOutcome | None:
         return await maybe_compact(
             store=store,
-            bus=bus,
             adapter=_summary_adapter(),
             thread_id=THREAD,
             turn_id=TURN,
@@ -142,7 +144,6 @@ def test_writes_summary_and_boundary_only_and_never_copies_body(
     async def run() -> CompactionOutcome | None:
         return await maybe_compact(
             store=store,
-            bus=bus,
             adapter=adapter,
             thread_id=THREAD,
             turn_id=TURN,
@@ -199,9 +200,113 @@ def test_default_compact_limit_from_spec_or_override() -> None:
         auto_compact_token_limit=50_000,
     )
     assert default_compact_limit(overridden) == 50_000
-    # 预算耗尽 → 0(调用方把 0/None 都视为"不自动压缩")
+    # 显式 0 是合法值("预算耗尽"),不得被 `or` 当成"没配"回落到窗口值。
+    disabled = ModelSpec(
+        model_id="m",
+        context_window_tokens=100_000,
+        max_output_tokens=8_000,
+        auto_compact_token_limit=0,
+    )
+    assert default_compact_limit(disabled) == 0
+    # 窗口预算耗尽 → 0(调用方把 0/None 都视为"不自动压缩")
     tiny = ModelSpec(model_id="m", context_window_tokens=10_000, max_output_tokens=9_000)
     assert default_compact_limit(tiny) == 0
+
+
+def test_default_summary_max_output_tokens_respects_small_windows() -> None:
+    big = ModelSpec(model_id="m", context_window_tokens=100_000, max_output_tokens=8_000)
+    assert default_summary_max_output_tokens(big) == SUMMARY_MAX_OUTPUT_TOKENS
+    small = ModelSpec(model_id="m", context_window_tokens=4_000, max_output_tokens=1_024)
+    assert default_summary_max_output_tokens(small) == 1_024
+
+
+def test_summary_request_is_bounded_and_elides_old_tool_bodies(store: Store) -> None:
+    # 压缩恰在"旧输出很多"时触发:摘要请求必须过 elide + 硬字符上限,
+    # 否则摘要自身会被撑爆、静默失败,自动压缩对长历史失效。
+    before = _seed(
+        store,
+        [
+            ItemEntry(
+                kind=ItemKind.TOOL_RESULT,
+                payload={
+                    "call_id": "c1",
+                    "tool_name": "bash",
+                    "content": [{"type": "text", "data": {"text": LONG_BODY}}],
+                },
+            ),
+            # 用户正文本身无界:只有 elide 不够,必须还有硬上限。
+            ItemEntry(kind=ItemKind.USER_MESSAGE, payload={"text": "Z" * 50_000}),
+            ItemEntry(kind=ItemKind.USER_MESSAGE, payload={"text": "after"}),
+        ],
+    )
+    adapter = _summary_adapter()
+
+    async def run() -> CompactionOutcome | None:
+        return await maybe_compact(
+            store=store,
+            adapter=adapter,
+            thread_id=THREAD,
+            turn_id=TURN,
+            items=before,
+            limit_tokens=10,
+            keep_tail_items=0,
+            summary_max_output_tokens=64,
+            measure_tokens=_measure,
+        )
+
+    assert asyncio.run(run()) is not None
+    assert adapter.last_request is not None
+    prompt = adapter.last_request.messages[0].content
+    assert len(prompt) <= SUMMARY_PROMPT_MAX_CHARS
+    assert "LONG-TOOL-OUTPUT-BODY" not in prompt
+    assert "[elided tool output:" in prompt
+    assert "更早的内容已截断" in prompt
+    # composition 注入的输出预算原样进入摘要请求(小窗口模型不会被 2048 撞拒)。
+    assert adapter.last_request.max_output_tokens == 64
+
+
+def test_second_compaction_folds_previous_summary_before_tail(store: Store) -> None:
+    store.ensure_thread(THREAD)
+    store.append_items(
+        THREAD,
+        TURN,
+        [ItemEntry(kind=ItemKind.USER_MESSAGE, payload={"text": f"m{i}"}) for i in range(10)],
+    )
+    adapter = ScriptedAdapter([_response("S1"), _response("S2")])
+
+    async def compact(items: Sequence[Item]) -> CompactionOutcome | None:
+        return await maybe_compact(
+            store=store,
+            adapter=adapter,
+            thread_id=THREAD,
+            turn_id=TURN,
+            items=items,
+            limit_tokens=10,
+            keep_tail_items=4,
+            measure_tokens=_measure,
+        )
+
+    assert asyncio.run(compact(store.read_items(THREAD))) is not None
+    store.append_items(
+        THREAD,
+        TURN,
+        [ItemEntry(kind=ItemKind.USER_MESSAGE, payload={"text": f"n{i}"}) for i in range(4)],
+    )
+    assert asyncio.run(compact(store.read_items(THREAD))) is not None
+
+    visible = build_context(store.read_items(THREAD))
+    summaries = [item for item in visible if item.kind == ItemKind.SUMMARY]
+    assert len(summaries) == 1  # 旧摘要被新 boundary 覆盖并折叠,不累积
+    assert summaries[0].payload["text"] == "S2"
+
+    messages = to_messages(visible)
+    summary_indexes = [
+        index
+        for index, message in enumerate(messages)
+        if message.content.startswith("[conversation summary]")
+    ]
+    assert summary_indexes == [0]  # 存活摘要投影在保留尾部之前
+    assert any(message.role == "user" and message.content.startswith("n") for message in messages)
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +349,6 @@ def test_does_not_cut_open_declaration_window(store: Store, bus: EventBus) -> No
     async def run() -> CompactionOutcome | None:
         return await maybe_compact(
             store=store,
-            bus=bus,
             adapter=_summary_adapter(),
             thread_id=THREAD,
             turn_id=TURN,
@@ -266,11 +370,13 @@ def test_does_not_cut_open_declaration_window(store: Store, bus: EventBus) -> No
 
     messages = to_messages(visible)
     roles = [message.role for message in messages]
-    assert roles == ["assistant", "tool", "user"]
+    # summary 投影在保留尾部之前(seq 上它更晚,语义上是"更早历史的摘要")。
+    assert roles == ["user", "assistant", "tool"]
+    assert messages[0].content.startswith("[conversation summary]")
     tool_messages = [message for message in messages if message.role == "tool"]
     assert len(tool_messages) == 1  # 无孤儿、无重复
     assert tool_messages[0].tool_call_id == "c2"
-    assert messages[0].tool_calls and messages[0].tool_calls[0].call_id == "c2"
+    assert messages[1].tool_calls and messages[1].tool_calls[0].call_id == "c2"
 
     pending = classify_pending(visible, {})
     assert [call.call.call_id for call in pending] == ["c2"]
@@ -313,7 +419,6 @@ def test_retreats_iteratively_when_first_cut_exposes_an_older_pair(store: Store,
     async def run() -> CompactionOutcome | None:
         return await maybe_compact(
             store=store,
-            bus=bus,
             adapter=_summary_adapter(),
             thread_id=THREAD,
             turn_id=TURN,
@@ -329,14 +434,14 @@ def test_retreats_iteratively_when_first_cut_exposes_an_older_pair(store: Store,
 
     visible = build_context(store.read_items(THREAD))
     messages = to_messages(visible)
-    # 声明 c1 与它的真实结果都在可见区;c2 未闭合补合成;没有孤儿重复。
+    # 声明 c1 与它的真实结果都在可见区;c2 未闭合补合成;summary 在最前。
     assert [message.role for message in messages] == [
-        "assistant",
-        "tool",
         "user",
         "assistant",
         "tool",
         "user",
+        "assistant",
+        "tool",
         "user",
     ]
     assert [m.content for m in messages if m.role == "tool"] == [
@@ -359,7 +464,6 @@ def test_model_exception_returns_none_and_writes_nothing(
     async def run() -> CompactionOutcome | None:
         return await maybe_compact(
             store=store,
-            bus=bus,
             adapter=adapter,
             thread_id=THREAD,
             turn_id=TURN,
@@ -381,7 +485,6 @@ def test_empty_summary_returns_none_and_writes_nothing(store: Store, bus: EventB
     async def run() -> CompactionOutcome | None:
         return await maybe_compact(
             store=store,
-            bus=bus,
             adapter=_summary_adapter("   \n  "),
             thread_id=THREAD,
             turn_id=TURN,
@@ -522,7 +625,6 @@ def test_keep_tail_excludes_non_projecting_status_items(
     async def run() -> CompactionOutcome | None:
         return await maybe_compact(
             store=store,
-            bus=bus,
             adapter=_summary_adapter(),
             thread_id=THREAD,
             turn_id=TURN,
@@ -546,7 +648,6 @@ def test_to_messages_after_compaction_has_no_orphan_tool_result(
     async def run() -> CompactionOutcome | None:
         return await maybe_compact(
             store=store,
-            bus=bus,
             adapter=_summary_adapter(),
             thread_id=THREAD,
             turn_id=TURN,

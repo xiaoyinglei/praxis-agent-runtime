@@ -15,6 +15,7 @@ provider 会拒收。判据复用 ``context.pair_tool_results``(投影与恢复�
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -26,8 +27,8 @@ from praxis.core.context import (
     pair_tool_results,
     to_messages,
 )
-from praxis.core.events import EventBus
 from praxis.protocol.items import Item, ItemKind
+from praxis.protocol.json import JsonValue, thaw_json
 from praxis.protocol.models import (
     ModelAdapter,
     ModelMessage,
@@ -43,10 +44,16 @@ logger = logging.getLogger(__name__)
 COMPACT_VERSION: Final = "praxis-compaction-v1"
 _ALGORITHM_VERSION: Final = "v1"
 _DEFAULT_KEEP_TAIL_ITEMS: Final = 8
-# 摘要输出预算上界(与 ModelSpec 的 max_output_tokens 取小由调用方适配;
-# 本函数拿不到 spec,2048 是安全上界)。
-_SUMMARY_MAX_OUTPUT_TOKENS: Final = 2048
 _DEFAULT_RESERVE_OUTPUT: Final = 8192
+# 摘要输出预算的**安全上界**(D15 数据)。真实值由 composition 按
+# ``min(SUMMARY_MAX_OUTPUT_TOKENS, spec.max_output_tokens)`` 注入——小输出窗口
+# 的模型不会被 2048 硬顶撞出 provider 上限。
+SUMMARY_MAX_OUTPUT_TOKENS: Final = 2048
+# 摘要请求正文的硬字符上限:elide 只能约束工具输出,用户/助手正文本身无界,
+# 没有这一层,压缩会在"长历史"上把自身请求撑爆(context overflow → 静默失败)。
+SUMMARY_PROMPT_MAX_CHARS: Final = 16_000
+_TRUNCATION_NOTE: Final = "[... 更早的内容已截断 ...]\n"
+_ARGS_PREVIEW_CHARS: Final = 200
 
 # 这些 kind 不参与覆盖区间选择(turn_status/approval_* 不投影成模型消息;
 # 排除它们能让"最后 keep_tail_items 条"数的是真正的对话内容)。
@@ -73,24 +80,34 @@ class CompactionOutcome:
 def default_compact_limit(spec: ModelSpec, reserve_output: int = _DEFAULT_RESERVE_OUTPUT) -> int:
     """ModelSpec → 自动压缩阈值(D15:数据,不是 core 里的魔法数字)。
 
-    优先用显式 ``auto_compact_token_limit``;否则从上下文窗口扣掉输出预算与
-    保留区。返回值 0 表示预算耗尽——调用方把 0/None 都当作"不自动压缩"。
+    优先用显式 ``auto_compact_token_limit``(0 是合法值,表示预算耗尽;
+    **不得**用 ``or`` 把它误当成"没配");否则从上下文窗口扣掉输出预算与保留区。
+    返回值 0 表示不自动压缩。
     """
-    return spec.auto_compact_token_limit or max(
-        0, spec.context_window_tokens - spec.max_output_tokens - reserve_output
-    )
+    if spec.auto_compact_token_limit is not None:
+        return spec.auto_compact_token_limit
+    return max(0, spec.context_window_tokens - spec.max_output_tokens - reserve_output)
+
+
+def default_summary_max_output_tokens(spec: ModelSpec) -> int:
+    """摘要请求的输出预算 = ``min(安全上界, spec.max_output_tokens)``。
+
+    ``OpenAICompatAdapter`` 会把 ``settings.max_output_tokens`` 原样透传给
+    provider;硬编码 2048 会让输出窗口更小的模型直接拒收摘要请求。
+    """
+    return min(SUMMARY_MAX_OUTPUT_TOKENS, spec.max_output_tokens)
 
 
 async def maybe_compact(
     *,
     store: Store,
-    bus: EventBus,
     adapter: ModelAdapter,
     thread_id: str,
     turn_id: str,
     items: Sequence[Item],
     limit_tokens: int,
     keep_tail_items: int = _DEFAULT_KEEP_TAIL_ITEMS,
+    summary_max_output_tokens: int = SUMMARY_MAX_OUTPUT_TOKENS,
     measure_tokens: Callable[[WireRequest], int] | None = None,
 ) -> CompactionOutcome | None:
     """超阈值时压缩 ``items`` 的较旧部分;未超阈值/区间为空/失败 → ``None``。
@@ -101,12 +118,13 @@ async def maybe_compact(
     2. 覆盖区间 = 可见对话中除最后 ``keep_tail_items`` 条可压缩 item 之外的部分;
        上界按 R-T9-2 回退到不切断声明窗口的位置;为空 → ``None``;
     3. 用**同一个** ``adapter.complete()`` 请求摘要(单次调用,不再递归压缩);
+       摘要投影同样经过 elide,并有 ``SUMMARY_PROMPT_MAX_CHARS`` 硬上限;
     4. 一次批量追加 ``SUMMARY`` + ``COMPACTION_BOUNDARY`` 两条 item;
     5. 任何失败 → ``logger.warning`` + ``None``。
 
     ``measure_tokens`` 是 D2 的唯一测量入口(``measure_request``)的注入形式:
     ``praxis_core_purity`` 禁止 core import adapters,由 composition 注入。
-    ``bus`` 预留给未来压缩事件,当前不 emit。
+    ``summary_max_output_tokens`` 同样由 composition 按 ModelSpec 注入。
     """
     if measure_tokens is None:
         logger.warning("compaction skipped: no token measurement injected")
@@ -117,7 +135,7 @@ async def maybe_compact(
             # 与 turn 的真实请求同一条读侧链(D11):折叠 → 省略 → 投影。
             to_messages(elide_old_tool_outputs(visible)),
             (),
-            ModelSettings(max_output_tokens=_SUMMARY_MAX_OUTPUT_TOKENS),
+            ModelSettings(max_output_tokens=summary_max_output_tokens),
         )
         if measure_tokens(measured) <= limit_tokens:
             return None
@@ -130,7 +148,7 @@ async def maybe_compact(
         summary_req = adapter.build_request(
             [ModelMessage(role="user", content=_summary_prompt(covered_items))],
             (),
-            ModelSettings(max_output_tokens=_SUMMARY_MAX_OUTPUT_TOKENS),
+            ModelSettings(max_output_tokens=summary_max_output_tokens),
         )
         response = await adapter.complete(summary_req)
         summary_text = response.content.strip()
@@ -253,8 +271,46 @@ def _declaration_call_ids(item: Item) -> list[str] | None:
 
 
 def _summary_prompt(covered_items: Sequence[Item]) -> str:
-    """固定中文指令 + 覆盖区间的投影文本(只进请求,不落库)。"""
+    """固定中文指令 + 有界的覆盖区间投影文本(只进请求,不落库)。
+
+    压缩恰恰在"旧工具输出很多"时触发,所以这里必须再过一层
+    ``elide_old_tool_outputs(keep_last=0)``(R-T9-1 保证 artifact 指针行原样
+    保留);用户/助手正文本身无界,再由 ``SUMMARY_PROMPT_MAX_CHARS`` 硬截断。
+    """
     projection = "\n".join(
-        f"{message.role}: {message.content}" for message in to_messages(covered_items)
+        _render_message(message)
+        for message in to_messages(elide_old_tool_outputs(covered_items, keep_last=0))
     )
-    return f"{_SUMMARY_INSTRUCTION}\n\n{projection}"
+    header = f"{_SUMMARY_INSTRUCTION}\n\n"
+    budget = SUMMARY_PROMPT_MAX_CHARS - len(header)
+    if budget <= 0:
+        return header[:SUMMARY_PROMPT_MAX_CHARS]
+    if len(projection) <= budget:
+        return header + projection
+    keep = max(0, budget - len(_TRUNCATION_NOTE))
+    # 保留最早的一段(被压缩历史的起点),末尾注明更近的内容已截断。
+    return header + projection[:keep] + _TRUNCATION_NOTE
+
+
+def _render_message(message: ModelMessage) -> str:
+    """一条投影消息的单行渲染;tool_call-only 的助手轮也带上有界的调用名/参数。"""
+    parts: list[str] = []
+    if message.content:
+        parts.append(message.content)
+    if message.tool_calls:
+        rendered_calls = ", ".join(
+            f"{call.name}({_bounded_arguments(call.arguments)})" for call in message.tool_calls
+        )
+        parts.append(f"[tool_calls: {rendered_calls}]")
+    return f"{message.role}: {' '.join(parts)}"
+
+
+def _bounded_arguments(arguments: Mapping[str, JsonValue]) -> str:
+    """tool_call 参数摘要:JSON 渲染并截到 ``_ARGS_PREVIEW_CHARS``。"""
+    try:
+        rendered = json.dumps(thaw_json(arguments), ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        rendered = repr(dict(arguments))
+    if len(rendered) > _ARGS_PREVIEW_CHARS:
+        return rendered[:_ARGS_PREVIEW_CHARS] + "..."
+    return rendered

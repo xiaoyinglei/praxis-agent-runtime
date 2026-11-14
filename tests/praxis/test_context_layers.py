@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from hypothesis import HealthCheck, given, settings
+from hypothesis import HealthCheck, example, given, settings
 from hypothesis import strategies as st
 
 from praxis.core.context import build_context, elide_old_tool_outputs, to_messages
@@ -164,6 +164,20 @@ def test_unknown_boundary_version_still_fail_open() -> None:
     assert build_context(items) == list(items)
 
 
+def test_summary_projects_before_later_tail_messages() -> None:
+    # 压缩时 summary 的 seq 天然晚于它概括的旧历史;投影必须把它放在保留尾部之前。
+    items = [
+        mk(1, "user_message", {"text": "tail1"}),
+        mk(2, "user_message", {"text": "tail2"}),
+        mk(3, "summary", {"text": "old history"}),
+    ]
+    assert [message.content for message in to_messages(items)] == [
+        "[conversation summary]\nold history",
+        "tail1",
+        "tail2",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # hypothesis:fold → elide → to_messages 对任意序列不抛且 elide 幂等
 # ---------------------------------------------------------------------------
@@ -193,6 +207,30 @@ def item_lists(draw: st.SearchStrategy) -> list[Item]:  # type: ignore[misc]
         max_leaves=6,
     )
     junk_payload = st.dictionaries(st.text(max_size=8), junk_values, max_size=4)
+    # 合法 tool_result 形状 + 能真正越过大小的文本,让 elide 的替换分支被覆盖。
+    tool_payload = st.fixed_dictionaries(
+        {"call_id": st.text(min_size=1, max_size=6)},
+        optional={
+            "tool_name": st.text(max_size=8),
+            "content": st.lists(
+                st.fixed_dictionaries(
+                    {
+                        "type": st.just("text"),
+                        "data": st.fixed_dictionaries(
+                            {
+                                "text": st.one_of(
+                                    st.text(max_size=5),
+                                    st.text(min_size=20, max_size=300),
+                                )
+                            }
+                        ),
+                    }
+                ),
+                max_size=3,
+            ),
+            "elided": st.booleans(),
+        },
+    )
     boundary_payload = st.fixed_dictionaries(
         {},
         optional={
@@ -211,12 +249,25 @@ def item_lists(draw: st.SearchStrategy) -> list[Item]:  # type: ignore[misc]
     kinds = draw(st.lists(kinds_st, min_size=n, max_size=n))
     items: list[Item] = []
     for seq, kind in enumerate(kinds, start=1):
-        payload = draw(boundary_payload if kind == "compaction_boundary" else junk_payload)
+        if kind == "compaction_boundary":
+            payload = draw(boundary_payload)
+        elif kind == "tool_result":
+            payload = draw(st.one_of(junk_payload, tool_payload))
+        else:
+            payload = draw(junk_payload)
         items.append(mk(seq, kind, payload))
     return items
 
 
 @given(item_lists())
+# 固定的"必然触发替换"样本:属性测试整体跑 200 例,但显式钉一例保证分支被执行。
+@example(
+    [
+        tool_result(1, "a" * 300),
+        tool_result(2, "b" * 300, call_id="c2"),
+        tool_result(3, "c" * 300, call_id="c3"),
+    ]
+)
 @settings(deadline=None, max_examples=200, suppress_health_check=[HealthCheck.too_slow])
 def test_fold_elide_project_never_raises_and_elide_is_idempotent(items: list[Item]) -> None:
     before = [(i.item_id, i.seq, i.kind, dict(i.payload)) for i in items]

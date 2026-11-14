@@ -34,7 +34,11 @@ from praxis.adapters.models.retry import make_retry_stream
 from praxis.adapters.models.tokenization import measure_request
 from praxis.adapters.sandbox.base import probe_backend
 from praxis.adapters.sandbox.compile import compile_sandbox, finalize_sandbox
-from praxis.core.compaction import default_compact_limit
+from praxis.core.compaction import (
+    SUMMARY_MAX_OUTPUT_TOKENS,
+    default_compact_limit,
+    default_summary_max_output_tokens,
+)
 from praxis.core.events import EventBus
 from praxis.core.recovery import sweep
 from praxis.core.session import Session
@@ -254,6 +258,11 @@ def build_session(
     compact_limit_tokens = (
         default_compact_limit(resolved_spec) if resolved_spec is not None else None
     )
+    summary_max_output_tokens = (
+        default_summary_max_output_tokens(resolved_spec)
+        if resolved_spec is not None
+        else SUMMARY_MAX_OUTPUT_TOKENS
+    )
     root = Path(workspace)
     praxis_dir = root / ".praxis"
     praxis_dir.mkdir(parents=True, exist_ok=True)
@@ -307,6 +316,7 @@ def build_session(
             artifacts=effective_artifacts,
             compact_limit_tokens=compact_limit_tokens,
             measure_tokens=_measure_request_tokens,
+            summary_max_output_tokens=summary_max_output_tokens,
         )
     except BaseException:
         store.close()
