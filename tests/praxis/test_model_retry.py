@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from pathlib import Path
 
@@ -184,7 +185,8 @@ def test_retryable_set_is_only_rate_limited_server_error_transport_not_sent() ->
         decision = policy.plan(
             retry_count=0, first_dispatched_at=0, failure=failure, now=0, random_fraction=0.5
         )
-        assert isinstance(decision, NoRetryPlan) and decision.reason_code == kind
+        assert isinstance(decision, NoRetryPlan)
+        assert decision.reason_code == f"not_retryable:{kind}"
 
 
 def test_status_code_classification_and_x_should_retry() -> None:
@@ -220,6 +222,20 @@ def test_unknown_transport_failure_is_not_retryable() -> None:
     assert failure.kind == "protocol_error" and failure.retryable is False
     assert failure.message == "Provider response violated the model protocol."
     assert failure.diagnostic == "mystery"
+
+
+def test_model_failure_message_is_unconditionally_fixed() -> None:
+    """D7 类型级不变量:调用方塞入的 provider 文本一律被固定文案覆盖。"""
+    failure = ModelFailure(
+        "server_error",
+        "sk-leak-provider-body-123",
+        retryable=True,
+        retry_at=None,
+        output_started=False,
+        phase="request",
+    )
+    assert failure.message == "Provider server failed."
+    assert "sk-leak" not in failure.message
 
 
 def test_provider_without_streaming_is_non_retryable_but_diagnostic_survives() -> None:
@@ -316,9 +332,14 @@ def test_stream_with_retry_resumes_after_one_failure() -> None:
 def test_retry_after_header_becomes_retry_at_source() -> None:
     clock = _Clock(1000.0)
     attempts: list[AttemptRecord] = []
+    sleeps: list[float] = []
     factory, _calls = _failing_factory(
         _status_error(429, headers={"retry-after": "7"}), fail_calls=1
     )
+
+    async def tracked_sleep(delay: float) -> None:
+        sleeps.append(delay)
+        await clock.sleep(delay)
 
     async def drive() -> None:
         await collect_events(
@@ -326,7 +347,7 @@ def test_retry_after_header_becomes_retry_at_source() -> None:
                 factory,
                 policy=RetryPolicy(),
                 clock=clock,
-                sleep=clock.sleep,
+                sleep=tracked_sleep,
                 attempts=attempts,
                 floor=0.0,
             )
@@ -335,6 +356,10 @@ def test_retry_after_header_becomes_retry_at_source() -> None:
     asyncio.run(drive())
     assert attempts[0].retry_at_source == "retry_after"
     assert attempts[0].retry_at == pytest.approx(1007.0)
+    # 时间线真的被走了:注入时钟推进到 retry_at,且 sleep 参数序列可观测
+    # (删掉 await sleep 会让这两条断言失败)。
+    assert sleeps == [pytest.approx(7.0)]
+    assert clock.now == pytest.approx(1007.0)
 
 
 def test_stream_with_retry_exhausts_and_records_every_attempt() -> None:
@@ -662,3 +687,122 @@ def test_retry_stream_none_writes_no_attempt_items(
 
     assert result.status is TurnStatus.COMPLETED and result.output == "fine"
     assert [i for i in store.read_turn_items(_TURN) if i.kind == ItemKind.MODEL_ATTEMPT] == []
+
+
+# ---------------------------------------------------------------------------
+# R-T3-10:core + 真实机制(不是 fake)的完整链路
+# ---------------------------------------------------------------------------
+
+
+class _RaisingAdapter(ScriptedAdapter):
+    """每次 stream 都抛同一个 provider 异常;记录调用次数。"""
+
+    def __init__(self, exc: BaseException) -> None:
+        super().__init__([])
+        self._exc = exc
+        self.calls = 0
+
+    async def stream(self, request: object) -> AsyncIterator[ModelEvent]:
+        self.calls += 1
+        raise self._exc
+        yield ModelTextDelta("")  # pragma: no cover — 让函数成为 async generator
+
+
+class _FlakyAdapter(ScriptedAdapter):
+    """第一次 503,第二次成功;用于真实机制下的"失败→成功"链路。"""
+
+    def __init__(self) -> None:
+        super().__init__([])
+        self.calls = 0
+
+    async def stream(self, request: object) -> AsyncIterator[ModelEvent]:
+        self.calls += 1
+        if self.calls == 1:
+            raise _status_error(503)
+        yield ModelTextDelta("ok")
+        yield ModelStreamFinished(Usage(1, 1), "stop")
+
+
+def test_real_retry_refuses_when_item_clock_floor_is_in_the_future(
+    store: Store, bus: object, workspace: Path
+) -> None:
+    """历史 item 的 dispatched_at 在未来 → 时钟回拨,真实机制不再重试。"""
+    _turn(store)
+    future = time.time() + 60.0
+    store.append_items(
+        _THREAD,
+        _TURN,
+        [
+            ItemEntry(
+                kind=ItemKind.MODEL_ATTEMPT,
+                payload={
+                    "attempt": 0,
+                    "kind": "ok",
+                    "retry_at": None,
+                    "dispatched_at": future,
+                    "output_started": False,
+                    "outcome": "ok",
+                    "retry_at_source": None,
+                },
+            )
+        ],
+    )
+    adapter = _RaisingAdapter(_status_error(503))
+    sleeps: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    deps = _deps(
+        workspace,
+        store,
+        bus,
+        make_retry_stream(policy=RetryPolicy(), clock=time.time, sleep=sleep),
+        adapter=adapter,
+    )
+
+    result = asyncio.run(run_turn(deps, TurnState(_TURN, _THREAD)))
+
+    assert result.status is TurnStatus.FAILED
+    assert result.reason is not None and result.reason.startswith("ModelUnavailableError:")
+    assert "Provider server failed." in result.reason
+    assert adapter.calls == 1 and sleeps == []  # 没有第二次派发,更没有退避等待
+    attempts = [i for i in store.read_turn_items(_TURN) if i.kind == ItemKind.MODEL_ATTEMPT]
+    assert len(attempts) == 2  # 预置的历史 + 最终失败
+    assert (attempts[-1].payload["kind"], attempts[-1].payload["outcome"]) == (
+        "server_error",
+        "failed",
+    )
+
+
+def test_real_retry_failure_then_success_emits_one_delta_and_two_attempts(
+    store: Store, bus: object, workspace: Path
+) -> None:
+    """真实机制:一次失败转成功 → delta 恰好一次,attempt item 数 = 尝试次数。"""
+    _turn(store)
+    adapter = _FlakyAdapter()
+    sleeps: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    deps = _deps(
+        workspace,
+        store,
+        bus,
+        make_retry_stream(policy=RetryPolicy(), clock=time.time, sleep=sleep),
+        adapter=adapter,
+    )
+    sub = bus.subscribe()  # type: ignore[attr-defined]
+
+    result = asyncio.run(run_turn(deps, TurnState(_TURN, _THREAD)))
+
+    assert result.status is TurnStatus.COMPLETED and result.output == "ok"
+    assert adapter.calls == 2 and len(sleeps) == 1
+    events = _drain(sub)
+    deltas = [event for event in events if isinstance(event, ModelOutputDelta)]
+    assert [(d.kind, d.text) for d in deltas] == [("text", "ok")]  # 失败首帧没有重影
+    assert len([event for event in events if isinstance(event, ModelRetried)]) == 1
+    attempts = [i for i in store.read_turn_items(_TURN) if i.kind == ItemKind.MODEL_ATTEMPT]
+    assert [item.payload["outcome"] for item in attempts] == ["failed", "ok"]
+    assert len(attempts) == adapter.calls

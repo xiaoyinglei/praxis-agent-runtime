@@ -72,10 +72,11 @@ def _is_finite_number(value: object) -> bool:
 class ModelFailure:
     """一次 provider 尝试的安全失败事实。
 
-    ``message`` 若为空则由 ``kind`` 填固定文案;调用方(仅 classification)
-    不应传入 provider 文本。``diagnostic`` 承载有界原文摘要,绝不含 body。
-    ``output_started=True`` 会强制 ``retryable=False`` 且 ``phase="stream"``
-    ——已经产出过增量的请求重放会在 UI 上留下回滚不掉的重影。
+    ``message`` 是类型级不变量:构造后**无条件**被覆盖为 ``kind`` 对应的固定
+    文案,调用方传入的任何文本都不会进入持久化事实(D7:绝不回显 body)。
+    ``diagnostic`` 承载有界原文摘要,只供上层诊断。``output_started=True``
+    会强制 ``retryable=False`` 且 ``phase="stream"``——已经产出过增量的请求
+    重放会在 UI 上留下回滚不掉的重影。
     """
 
     kind: FailureKind
@@ -95,8 +96,8 @@ class ModelFailure:
             raise TypeError("model failure flags must be booleans")
         if self.retry_at is not None and not _is_finite_number(self.retry_at):
             raise ValueError("retry_at must be a finite epoch time or None")
-        if not self.message:
-            object.__setattr__(self, "message", _MESSAGES[self.kind])
+        # D7 类型级不变量:message 恒为固定文案,调用方文本一律丢弃。
+        object.__setattr__(self, "message", _MESSAGES[self.kind])
         if self.output_started:
             object.__setattr__(self, "retryable", False)
             object.__setattr__(self, "phase", "stream")
@@ -197,6 +198,9 @@ class RetryPolicy:
 
         方法名必须是 ``plan`` 而非 ``decide``(R-T3-2):CI 把权限决策入口
         钉死为全仓唯一、只在 ``core/permission.py``,策略对象不开路径豁免。
+        ``NoRetryPlan.reason_code`` 分两族:自动重试失败为 ``model_retry_*``;
+        kind 本身不可重试为 ``not_retryable:<kind>``(R-T3-8,避免原因码
+        长得像可重试类别)。
         """
         if not all(math.isfinite(value) for value in (now, first_dispatched_at, random_fraction)):
             raise ValueError("retry times and jitter must be finite")
@@ -213,7 +217,7 @@ class RetryPolicy:
             or not failure.retryable
             or failure.kind not in _RETRYABLE_KINDS
         ):
-            return NoRetryPlan(failure.kind)
+            return NoRetryPlan(f"not_retryable:{failure.kind}")
         deadline_at = first_dispatched_at + self.max_elapsed_ms / 1000
         ceiling = min(self.max_delay_ms, self.base_delay_ms * 2 ** min(retry_count, 63))
         delay_ms = int(ceiling * random_fraction)
