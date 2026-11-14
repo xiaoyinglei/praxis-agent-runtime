@@ -11,8 +11,9 @@
       uv run pytest tests/praxis/acceptance/test_model_stream_live.py -v -s
 
 断言口径（brief Step 2）：
-- 真增量：首个 ``Model*Delta`` 的到达时刻严格早于流结束时刻（证明不是伪流式
-  缓冲后一次性吐出）；
+- 真增量(H-3):至少 2 个 ``Model*Delta`` 事件,且首个 delta 到达时刻相对
+  请求起点的耗时 < 总耗时的 50%(全缓冲实现无法满足;旧 ``delta[0] <
+  finished[-1]`` 对缓冲实现也成立,不是可失败断言);
 - ``usage.source == "provider"``（provider 未回 usage 时实现会标 estimated）；
 - ``measure_request``（praxis 唯一估算入口）与 provider ``input_tokens`` 偏差
   < 25%:仅对 ``openai-compatible`` 作硬门；``ollama`` 属"本地模型",偏差只打印
@@ -115,6 +116,8 @@ def test_live_stream_is_incremental_and_usage_is_provider(tmp_path: Path) -> Non
 
     async def collect() -> list[Any]:
         events: list[Any] = []
+        started = time.monotonic()
+        timings.append((started, None))
         async for event in adapter.stream(request):
             timings.append((time.monotonic(), event))
             events.append(event)
@@ -122,11 +125,20 @@ def test_live_stream_is_incremental_and_usage_is_provider(tmp_path: Path) -> Non
 
     events = asyncio.run(collect())
     response = assemble_model_events(events)
-    delta_times = [at for at, event in timings if isinstance(event, _DELTA_TYPES)]
-    finished_times = [at for at, event in timings if isinstance(event, ModelStreamFinished)]
+    started = timings[0][0]
+    event_timings = [timing for timing in timings if timing[1] is not None]
+    delta_times = [at for at, event in event_timings if isinstance(event, _DELTA_TYPES)]
+    finished_times = [at for at, event in event_timings if isinstance(event, ModelStreamFinished)]
     assert delta_times, "no incremental delta event observed"
     assert finished_times, "no ModelStreamFinished event observed"
-    assert delta_times[0] < finished_times[-1], "stream was buffered, not incremental"
+    # H-3:相对请求起点的比例判据(全缓冲实现也会让 delta[0] < finished[-1],
+    # 旧断言无法失败)。要求 ≥2 个 delta,且首个 delta 在总耗时的前 50% 到达。
+    assert len(delta_times) >= 2, "need at least two delta events to prove incrementality"
+    elapsed = finished_times[-1] - started
+    assert elapsed > 0, "stream finished immediately; timing measurement is unreliable"
+    assert delta_times[0] - started < elapsed * 0.5, (
+        "first delta arrived after 50% of the stream duration; likely buffered, not incremental"
+    )
     assert response.usage.source == "provider", (
         f"provider did not report usage (source={response.usage.source!r})"
     )

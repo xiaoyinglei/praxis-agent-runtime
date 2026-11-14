@@ -23,6 +23,11 @@ latest_plan、ModelEvent 与三个 delta 型、assemble_model_events;宿主/UI �
 ``ConversationBusy``/``ResumeNotConfirmed`` 定义在 core.session 并由这里
 re-export:core 不得 import interfaces(import-linter praxis_core_purity),
 异常类必须定义在使用它们的最低层;sdk 仍是用户可见的唯一出口。
+
+H-5:``OpenAICompatAdapter`` 保留导出(CLI/host 显式装配需要它),但它绕过
+注册库装配路径(``composition._adapter_for``)。嵌入方直接构造时**须自行
+负责** ``base_url`` 与凭据校验——``model_adapter_for``/``validate_model_spec``
+才是带这些边界检查的唯一装配入口。
 """
 
 from __future__ import annotations

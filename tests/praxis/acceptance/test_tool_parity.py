@@ -8,7 +8,8 @@
   真实执行行为(真子进程/真文件系统),不 import 任何模块私有常量；
 - 有意差异显式断言而非省略：``run_python``/``apply_patch`` 不接收
   ``workspace_write``/``network``(D1 授权来自 policy)；``search_text`` 输出改为
-  模型可读文本行 + ``metadata``(旧为 structured_content 主体)；
+  模型可读文本行 + ``metadata``(旧为 structured_content 主体)；``apply_patch``
+  的失败提示语义一致但去掉 ``Codex`` 前缀(H-4:不携带第三方产品名)；
 - B33(B33/findings 补充节;旧 ``shell.py:1089-1125``):praxis ``child_env``
   是唯一构造入口,宿主环境变量一律不继承;
 - B20(旧 ``shell.py:822-840`` 把命令结束绑在管道 EOF):praxis 以主进程退出
@@ -243,6 +244,8 @@ def test_apply_patch_rejects_patch_over_30000_chars(tmp_path: Path) -> None:
 
 def test_apply_patch_is_not_transactional_and_uses_patch_failed_message(tmp_path: Path) -> None:
     # 旧 codex_patch.py:82(错误码)与 :104(先前的 hunk 可能已写盘)。
+    # H-4:错误码与提示**语义一致**,但文案有意去掉第三方产品名前缀
+    # (``Codex patch failed.`` → ``patch failed.``);断言仍钉死 praxis 的完整文案。
     (tmp_path / "a.py").write_text("old-a\n", encoding="utf-8")
     (tmp_path / "b.py").write_text("actual\n", encoding="utf-8")
     patch = (

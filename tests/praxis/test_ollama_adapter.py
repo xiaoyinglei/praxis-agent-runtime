@@ -245,6 +245,30 @@ def test_ollama_tool_calls_accumulate_like_openai() -> None:
     assert response.finish_reason == "stop"
 
 
+def test_ollama_complete_equals_stream_assembly() -> None:
+    """H-2:``complete(req)`` == ``assemble(collect(stream(req)))``(ollama 侧)。"""
+    adapter, _ = _adapter(
+        [
+            {"message": {"role": "assistant", "content": "he"}, "done": False},
+            {
+                "message": {"role": "assistant", "content": "llo"},
+                "done": True,
+                "prompt_eval_count": 5,
+                "eval_count": 7,
+            },
+        ]
+    )
+    req = _request(adapter)
+
+    async def both() -> tuple[Any, Any]:
+        completed = await adapter.complete(req)
+        streamed = assemble_model_events(await collect_events(adapter.stream(req)))
+        return completed, streamed
+
+    completed, streamed = asyncio.run(both())
+    assert completed == streamed
+
+
 def test_ollama_stream_emits_text_reasoning_and_finish() -> None:
     adapter, _ = _adapter(
         [

@@ -28,8 +28,8 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Literal
 
+from praxis.adapters.config.credentials import CredentialSource
 from praxis.adapters.models.retry import classify_failure
 from praxis.protocol.models import (
     DROPPED_TOOL_ARGUMENTS_MARKER,
@@ -42,8 +42,6 @@ from praxis.protocol.models import (
 )
 from praxis.protocol.retry import ModelFailure
 from praxis.protocol.tools import ToolDefinition
-
-CredentialSource = Literal["env", "store", "missing"]
 
 _TEXT_STEP = "text"
 _TOOL_STEP = "tools"

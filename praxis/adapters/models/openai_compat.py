@@ -145,6 +145,10 @@ class OpenAICompatAdapter:
 
     async def stream(self, req: WireRequest) -> AsyncIterator[ModelEvent]:
         """真实增量流:逐 chunk 产出 text/reasoning/tool 分片,末尾 finish。"""
+        # H-5 对称守卫(与 ollama 一致):D2 契约要求出站请求由 build_request
+        # 定型;绕过它直接构造的 WireRequest 没有可审计的 wire_revision/body。
+        if not req.serialized_json:
+            raise ValueError("openai-compatible stream requires a request built by build_request")
         result = await self._client.chat.completions.create(
             **openai_payload(req, stream=True)
         )

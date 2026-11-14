@@ -368,6 +368,35 @@ def test_complete_missing_usage_yields_zero_usage() -> None:
     assert response.tool_calls == ()
 
 
+# --- H-2:complete 必须等于 stream 的同一装配路径 --------------------------------
+
+
+def test_complete_equals_stream_assembly_for_openai_compat() -> None:
+    """钉死生产 adapter:``complete(req)`` == ``assemble(collect(stream(req)))``。
+
+    现在若有人在 ``complete()`` 里塞第二套聚合,全仓没有一条测试会红;这条
+    在两个 provider adapter 上分别显式比较(同一 MockTransport 对每次请求返回
+    同一 body,因此两条路径的输入完全相同)。
+    """
+    transport, _seen = _mock_transport(_openai_payload())
+    adapter = OpenAICompatAdapter(
+        ModelSpec(model_id="m", base_url="https://unit.test/v1"),
+        api_key="k",
+        http_client=httpx.AsyncClient(transport=transport),
+    )
+    req = adapter.build_request(
+        [ModelMessage(role="user", content="hi")], [], ModelSettings()
+    )
+
+    async def both() -> tuple[ModelResponse, ModelResponse]:
+        completed = await adapter.complete(req)
+        streamed = assemble_model_events(await collect_events(adapter.stream(req)))
+        return completed, streamed
+
+    completed, streamed = asyncio.run(both())
+    assert completed == streamed
+
+
 # --- ScriptedAdapter:确定性驱动 --------------------------------------------------
 
 

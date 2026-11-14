@@ -11,8 +11,10 @@
 - effects 按实际动作给(R-T13-1):含 Add/Update/Move 声明读写;只有含
   ``*** Delete File:`` 才追加 ``DESTRUCTIVE``(删除不可逆,应走强制审批)。
 - 跨文件**非事务**(R-T13-3):逐文件顺序应用,失败即停、已改的不回滚,
-  返回 ``error_code="patch_failed"`` 并逐字保留旧语义提示;单文件内写入一律
-  走 ``paths.atomic_write_text``(同目录 tmp + ``os.replace``),绝不出现半个文件。
+  返回 ``error_code="patch_failed"`` 并保留与旧实现**语义一致**的提示
+  (有意差异:去掉 ``Codex`` 前缀——不把第三方产品名带进 praxis 文案);
+  单文件内写入一律走 ``paths.atomic_write_text``(同目录 tmp + ``os.replace``),
+  绝不出现半个文件。
 - 完整性检查留在工具内且与权限无关(R-T13-4):路径不得含 ``..``、必须在
   workspace 内、路径各级不得是 symlink、目标必须是常规文件、patch ≤30_000
   字符、``<<EOF ... EOF`` 外层包裹剥离、``*** Move to:`` 支持。
