@@ -125,7 +125,9 @@ def test_probe_passes_provider_options_without_typeerror() -> None:
     assert [tool["function"]["name"] for tool in tool_body["tools"]] == ["__probe_noop"]
 
 
-def test_probe_missing_credential_detail_is_precise() -> None:
+def test_probe_missing_credential_detail_is_precise(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             401,
@@ -150,6 +152,35 @@ def test_probe_missing_credential_detail_is_precise() -> None:
     # 旧探针的误导归因必须消亡。
     assert "check endpoint, model, and credential environment" not in detail
     assert "unexpected keyword" not in detail
+
+
+def test_probe_rejected_credential_is_not_reported_as_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """I-1:env 在位但 provider 拒绝时,不得说成"环境变量没设"。"""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-present-but-provider-rejects")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401,
+            json={
+                "error": {
+                    "message": "invalid api key",
+                    "type": "invalid_request_error",
+                    "code": "invalid_api_key",
+                }
+            },
+        )
+
+    spec = ModelSpec(model_id="deepseek-flash", base_url=_BASE, api_key_env="DEEPSEEK_API_KEY")
+    outcome = asyncio.run(probe_model(_compat(spec, handler, api_key="wrong")))
+
+    assert outcome.ok is False
+    detail = outcome.detail or ""
+    assert "credential from DEEPSEEK_API_KEY was rejected by the provider" in detail
+    assert "is not set" not in detail
+    # 值本身绝不进 detail。
+    assert "sk-present-but-provider-rejects" not in detail
 
 
 def test_probe_skips_tool_step_when_spec_says_no_tool_support() -> None:
@@ -191,6 +222,70 @@ def test_probe_tool_step_neither_call_nor_text_fails() -> None:
     assert outcome.steps == ("text", "tools")
     assert "tools step failed" in (outcome.detail or "")
     assert "neither text nor tool calls" in (outcome.detail or "")
+
+
+def test_probe_tool_step_fails_when_assembler_dropped_arguments() -> None:
+    """#7:装配器的 "[invalid tool call arguments dropped: N]" 不是自然拒答。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("tools"):
+            return httpx.Response(
+                200,
+                content=b"".join(
+                    [
+                        _chunk(
+                            {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "__probe_noop",
+                                            "arguments": "not-json{",
+                                        },
+                                    }
+                                ],
+                            }
+                        ),
+                        _chunk({}, finish="tool_calls"),
+                        b"data: [DONE]\n\n",
+                    ]
+                ),
+                headers=_SSE_HEADERS,
+            )
+        return httpx.Response(200, content=_text_sse("ok"), headers=_SSE_HEADERS)
+
+    outcome = asyncio.run(probe_model(_compat(ModelSpec(model_id="m", base_url=_BASE), handler)))
+
+    assert outcome.ok is False
+    assert outcome.steps == ("text", "tools")
+    assert "malformed tool call arguments" in (outcome.detail or "")
+    assert "invalid tool call arguments dropped" not in (outcome.detail or "")
+
+
+def test_probe_local_configuration_errors_are_not_provider_protocol_errors() -> None:
+    """#8:坏 provider_options 是本地配置错误,不能被说成 provider 协议违规。"""
+    adapter = OllamaAdapter(
+        ModelSpec(
+            model_id="qwen2.5:7b",
+            provider="ollama",
+            base_url="http://127.0.0.1:11434",
+            provider_options={"stream": False},
+        )
+    )
+    outcome = asyncio.run(probe_model(adapter))
+
+    assert outcome.ok is False
+    assert outcome.steps == ("text",)
+    assert outcome.usage is None
+    detail = outcome.detail or ""
+    assert "local model configuration error" in detail
+    assert "wire-owned field: stream" in detail
+    assert "Provider response violated the model protocol" not in detail
+    assert "(protocol_error)" not in detail
 
 
 def test_probe_text_transport_failure_names_root_cause() -> None:

@@ -47,6 +47,8 @@ from praxis.protocol.tools import ToolDefinition
 
 _WIRE_REVISION = "praxis-ollama-chat-v1"
 _CHAT_PATH = "/api/chat"
+# 带内 error 最多带出这么多字符;错误帧的其余字段绝不回显。
+_MAX_ERROR_TEXT = 200
 
 # Ollama body 里由本模块独占的字段:provider_options 不得覆盖(含 num_predict,
 # 它等价于 OpenAI 的 max_tokens;options 整体也不允许被顶掉)。
@@ -119,13 +121,35 @@ def ollama_payload(req: WireRequest) -> dict[str, Any]:
     return payload
 
 
+def _count(value: object) -> int | None:
+    """只接受真正的整数(``True``/``False`` 是 bool,不是 token 计数)。"""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
 def _usage_from_done_frame(frame: Mapping[str, Any]) -> Usage:
-    """``prompt_eval_count`` / ``eval_count`` 都在才敢称 provider 记账。"""
-    prompt_eval = frame.get("prompt_eval_count")
-    eval_count = frame.get("eval_count")
-    if isinstance(prompt_eval, int) and isinstance(eval_count, int):
-        return Usage(prompt_eval, eval_count, source="provider")
-    return Usage(0, 0, source="estimated")
+    """``prompt_eval_count`` / ``eval_count`` 有多少用多少(缺的记 0)。
+
+    两个计数都在才敢称整份 usage 是 provider 记账,只有一个时如实标 ``estimated``。
+    """
+    prompt_eval = _count(frame.get("prompt_eval_count"))
+    eval_count = _count(frame.get("eval_count"))
+    return Usage(
+        0 if prompt_eval is None else prompt_eval,
+        0 if eval_count is None else eval_count,
+        source=(
+            "provider"
+            if prompt_eval is not None and eval_count is not None
+            else "estimated"
+        ),
+    )
+
+
+def _error_frame_text(error: object) -> str:
+    """带内 error 的有界文本;绝不回显整帧。"""
+    text = error if isinstance(error, str) else json.dumps(error, ensure_ascii=False)
+    return " ".join(text.split())[:_MAX_ERROR_TEXT]
 
 
 class OllamaAdapter:
@@ -213,9 +237,22 @@ class OllamaAdapter:
                     continue
                 saw_frame = True
                 frame = self._parse_frame(line, model=req.model)
+                error = frame.get("error")
+                if error is not None:
+                    # 带内错误帧(HTTP 200 但 body 是 {"error": ...})绝不是成功空应答。
+                    raise ValueError(
+                        f"provider returned an error frame for model {req.model!r}: "
+                        f"{_error_frame_text(error)}"
+                    )
                 message = frame.get("message")
+                if not isinstance(message, dict) and frame.get("done") is not True:
+                    raise ValueError(
+                        f"provider returned a frame without a message for model {req.model!r}"
+                    )
                 if isinstance(message, dict):
-                    reasoning = message.get("reasoning")
+                    reasoning = message.get("thinking")
+                    if not isinstance(reasoning, str) or not reasoning:
+                        reasoning = message.get("reasoning")
                     if isinstance(reasoning, str) and reasoning:
                         yield ModelReasoningDelta(reasoning)
                     content = message.get("content")
@@ -229,6 +266,9 @@ class OllamaAdapter:
                                 continue
                             name = function.get("name")
                             arguments = function.get("arguments")
+                            # Ollama 不按帧碎片化一条 tool call:每个对象都是完整调用,
+                            # 因此每个对象分配新的跨流 index。若未来出现 name/arguments
+                            # 分帧,需改为按 provider 调用 id 合并(当前不做,YAGNI)。
                             yield ModelToolCallDelta(
                                 index=tool_index,
                                 call_id=f"ollama_call_{tool_index}",

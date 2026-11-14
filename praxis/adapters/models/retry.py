@@ -141,6 +141,44 @@ def _failure(
     )
 
 
+def _status_failure(
+    *,
+    status: int,
+    codes: tuple[str, ...],
+    headers: Mapping[str, str],
+    observed_at: float,
+    output_started: bool,
+    diagnostic: str,
+) -> ModelFailure:
+    """HTTP status → 失败事实(唯一映射;OpenAI SDK 与原生 httpx 共用)。"""
+    code = next((value for value in codes if value in _QUOTA_CODES), next(iter(codes), None))
+    kind: FailureKind
+    if code in _QUOTA_CODES or status == 402:
+        kind = "quota_exhausted"
+    elif status == 400 and code in {"context_length_exceeded", "context_window_exceeded"}:
+        kind = "context_overflow"
+    elif status == 401:
+        kind = "authentication"
+    elif status == 403:
+        kind = "permission"
+    elif status == 429:
+        kind = "rate_limited"
+    elif status >= 500:
+        kind = "server_error"
+    else:
+        kind = "invalid_request"
+    retryable = kind == "rate_limited" or (kind == "server_error" and status not in {501, 505})
+    if headers.get("x-should-retry", "").lower() == "false":
+        retryable = False
+    return _failure(
+        kind=kind,
+        retryable=retryable,
+        retry_at=_retry_deadline(headers, observed_at),
+        output_started=output_started,
+        diagnostic=diagnostic,
+    )
+
+
 def classify_failure(
     exc: BaseException, *, output_started: bool = False, now: float | None = None
 ) -> ModelFailure:
@@ -153,32 +191,24 @@ def classify_failure(
     diagnostic = _diagnostic(exc)
 
     if isinstance(exc, openai.APIStatusError):
-        status = exc.status_code
-        codes = _error_codes(exc)
-        code = next((value for value in codes if value in _QUOTA_CODES), next(iter(codes), None))
-        headers = exc.response.headers
-        kind: FailureKind
-        if code in _QUOTA_CODES or status == 402:
-            kind = "quota_exhausted"
-        elif status == 400 and code in {"context_length_exceeded", "context_window_exceeded"}:
-            kind = "context_overflow"
-        elif status == 401:
-            kind = "authentication"
-        elif status == 403:
-            kind = "permission"
-        elif status == 429:
-            kind = "rate_limited"
-        elif status >= 500:
-            kind = "server_error"
-        else:
-            kind = "invalid_request"
-        retryable = kind == "rate_limited" or (kind == "server_error" and status not in {501, 505})
-        if headers.get("x-should-retry", "").lower() == "false":
-            retryable = False
-        return _failure(
-            kind=kind,
-            retryable=retryable,
-            retry_at=_retry_deadline(headers, observed_at),
+        return _status_failure(
+            status=exc.status_code,
+            codes=_error_codes(exc),
+            headers=exc.response.headers,
+            observed_at=observed_at,
+            output_started=output_started,
+            diagnostic=diagnostic,
+        )
+
+    # 原生 httpx provider(ollama 的 /api/chat 等)不经过 openai SDK:
+    # 非 2xx 也走同一条 status→kind 映射,否则 429/5xx 会被误判成不可重试的
+    # protocol_error(D7 重试静默失效)。
+    if isinstance(exc, httpx.HTTPStatusError):
+        return _status_failure(
+            status=exc.response.status_code,
+            codes=(),
+            headers=exc.response.headers,
+            observed_at=observed_at,
             output_started=output_started,
             diagnostic=diagnostic,
         )

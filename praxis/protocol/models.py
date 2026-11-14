@@ -26,7 +26,9 @@ ModelProvider = Literal["openai-compatible", "ollama", "scripted"]
 _API_KEY_ENV_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # 坏 tool arguments 的有界提示:只留计数,不把 provider 原文抄进会话内容。
-_DROPPED_ARGUMENTS_HINT = "[invalid tool call arguments dropped: {count}]"
+# 公开 marker 供探针识别"装配期丢弃过调用"(不得从私有常量跨模块 import)。
+DROPPED_TOOL_ARGUMENTS_MARKER = "[invalid tool call arguments dropped:"
+_DROPPED_ARGUMENTS_HINT = DROPPED_TOOL_ARGUMENTS_MARKER + " {count}]"
 
 
 @dataclass(frozen=True, slots=True)

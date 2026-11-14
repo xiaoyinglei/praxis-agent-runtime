@@ -205,6 +205,38 @@ def test_status_code_classification_and_x_should_retry() -> None:
     assert vetoed.kind == "rate_limited" and vetoed.retryable is False
 
 
+def _httpx_status_error(
+    status: int, *, headers: dict[str, str] | None = None
+) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "http://127.0.0.1:11434/api/chat")
+    response = httpx.Response(status, headers=headers or {}, request=request)
+    return httpx.HTTPStatusError("httpx body must never leak", request=request, response=response)
+
+
+def test_httpx_status_errors_share_the_same_status_mapping() -> None:
+    """I-2:原生 httpx provider(ollama)的非 2xx 不得退化成 protocol_error。"""
+    assert classify_failure(_httpx_status_error(429)).kind == "rate_limited"
+    assert classify_failure(_httpx_status_error(429)).retryable is True
+    assert classify_failure(_httpx_status_error(503)).kind == "server_error"
+    assert classify_failure(_httpx_status_error(503)).retryable is True
+    assert classify_failure(_httpx_status_error(501)).retryable is False
+    assert classify_failure(_httpx_status_error(401)).kind == "authentication"
+    assert classify_failure(_httpx_status_error(401)).retryable is False
+    assert classify_failure(_httpx_status_error(403)).kind == "permission"
+    assert classify_failure(_httpx_status_error(404)).kind == "invalid_request"
+    assert classify_failure(_httpx_status_error(402)).kind == "quota_exhausted"
+    retry_after = classify_failure(
+        _httpx_status_error(429, headers={"retry-after": "3"}), now=100.0
+    )
+    assert retry_after.retry_at == pytest.approx(103.0, abs=0.1)
+    vetoed = classify_failure(
+        _httpx_status_error(500, headers={"x-should-retry": "false"})
+    )
+    assert vetoed.kind == "server_error" and vetoed.retryable is False
+    # provider body 绝不进入 message/diagnostic。
+    assert "must never leak" not in classify_failure(_httpx_status_error(500)).message
+
+
 def test_connect_error_in_cause_chain_is_transport_not_sent() -> None:
     request = httpx.Request("POST", "https://unit.test/v1/chat/completions")
     try:

@@ -8,18 +8,31 @@
 2. **工具步**(``spec.supports_tools`` 为真时):带一个真实 ``ToolDefinition``
    走**同一** ``build_request`` → 能装配出 tool_calls 或模型自然拒答都算 ok。
 
-所有异常都经 ``adapters/models/retry.classify_failure`` 归一(唯一分类器),
-detail = 步骤名 + 固定文案 + kind(+有界 diagnostic);凭据类失败精确到
-``api_key_env``,绝不出现"check endpoint, model, and credential environment"
-这类误导归因。探针不进 turn 循环,也不写任何 item。
+失败分两阶段:
+
+- **本地配置期**(``build_request`` 抛 ``ValueError``,如 wire-owned
+  ``provider_options``、无工具能力却带工具、坏 ``base_url``):不喂给 provider
+  分类器,detail 明确写 "local model configuration error"——运维校验配置时不会
+  被指向"provider 协议违规"。
+- **provider 期**(``complete`` 抛出的任何异常):经
+  ``adapters/models/retry.classify_failure``(唯一分类器)归一,detail =
+  步骤名 + 固定文案 + kind(+有界 diagnostic)。凭据类失败先判
+  ``api_key_env`` 的**在位性**(只读存在/非空,绝不读值):缺失/空 →
+  ``credential environment <NAME> is not set``;在位仍被拒 →
+  ``credential from <NAME> was rejected by the provider``。绝不出现旧实现的
+  "check endpoint, model, and credential environment" 这种误导归因。
+
+探针不进 turn 循环,也不写任何 item。
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 from praxis.adapters.models.retry import classify_failure
 from praxis.protocol.models import (
+    DROPPED_TOOL_ARGUMENTS_MARKER,
     ModelAdapter,
     ModelMessage,
     ModelResponse,
@@ -37,6 +50,10 @@ _TOOL_PROMPT = (
     "Call the {name} tool with no arguments. "
     "If you cannot call tools, explain why in one sentence."
 )
+
+
+class _LocalConfigError(Exception):
+    """``build_request`` 期的本地配置错误;在进 provider 分类器之前分流。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,15 +75,18 @@ def _spec_of(adapter: ModelAdapter) -> ModelSpec | None:
     return spec if isinstance(spec, ModelSpec) else None
 
 
+def _credential_root(env: str) -> str:
+    """凭据根因:只判 ``api_key_env`` 的存在与非空,值本身绝不读出/输出。"""
+    if not os.environ.get(env):
+        return f"credential environment {env} is not set"
+    return f"credential from {env} was rejected by the provider"
+
+
 def _detail(step: str, failure: ModelFailure, spec: ModelSpec | None) -> str:
     """把分类器事实变成可行动的一句话;凭据失败点名 ``api_key_env``。"""
-    if failure.kind == "authentication":
+    if failure.kind in ("authentication", "permission"):
         env = spec.api_key_env if spec is not None else None
-        root = (
-            f"credential environment {env} is not set"
-            if env
-            else "credential rejected by provider"
-        )
+        root = _credential_root(env) if env else "credential was rejected by the provider"
     else:
         root = failure.message
     detail = f"{step} step failed: {root} ({failure.kind})"
@@ -83,6 +103,22 @@ def _probe_tool(tool_name: str) -> ToolDefinition:
     )
 
 
+async def _build_and_complete(
+    adapter: ModelAdapter,
+    *,
+    prompt: str,
+    tools: tuple[ToolDefinition, ...],
+) -> ModelResponse:
+    """两步共用的唯一路径:本地构造期与 provider 期在此边界明确分开。"""
+    try:
+        request = adapter.build_request(
+            [ModelMessage(role="user", content=prompt)], tools, ModelSettings()
+        )
+    except ValueError as exc:  # 本地配置错误(含 ToolsNotSupportedError)
+        raise _LocalConfigError(str(exc)) from exc
+    return await adapter.complete(request)
+
+
 async def probe_model(
     adapter: ModelAdapter, *, tool_name: str = "__probe_noop"
 ) -> ProbeOutcome:
@@ -92,10 +128,14 @@ async def probe_model(
 
     steps.append(_TEXT_STEP)
     try:
-        text_request = adapter.build_request(
-            [ModelMessage(role="user", content=_TEXT_PROMPT)], (), ModelSettings()
+        text_response = await _build_and_complete(adapter, prompt=_TEXT_PROMPT, tools=())
+    except _LocalConfigError as exc:
+        return ProbeOutcome(
+            ok=False,
+            steps=tuple(steps),
+            detail=f"{_TEXT_STEP} step failed: local model configuration error: {exc}",
+            usage=None,
         )
-        text_response: ModelResponse = await adapter.complete(text_request)
     except Exception as exc:  # noqa: BLE001 — 所有 provider 失败都归一进 detail
         return ProbeOutcome(
             ok=False,
@@ -108,17 +148,34 @@ async def probe_model(
     if spec is not None and spec.supports_tools:
         steps.append(_TOOL_STEP)
         try:
-            tool_request = adapter.build_request(
-                [ModelMessage(role="user", content=_TOOL_PROMPT.format(name=tool_name))],
-                (_probe_tool(tool_name),),
-                ModelSettings(),
+            tool_response = await _build_and_complete(
+                adapter,
+                prompt=_TOOL_PROMPT.format(name=tool_name),
+                tools=(_probe_tool(tool_name),),
             )
-            tool_response = await adapter.complete(tool_request)
+        except _LocalConfigError as exc:
+            return ProbeOutcome(
+                ok=False,
+                steps=tuple(steps),
+                detail=f"{_TOOL_STEP} step failed: local model configuration error: {exc}",
+                usage=usage,
+            )
         except Exception as exc:  # noqa: BLE001 — 同上
             return ProbeOutcome(
                 ok=False,
                 steps=tuple(steps),
                 detail=_detail(_TOOL_STEP, classify_failure(exc), spec),
+                usage=usage,
+            )
+        if DROPPED_TOOL_ARGUMENTS_MARKER in tool_response.content:
+            # 装配器丢弃了畸形 tool call;这不是"自然拒答",而是工具协议失败。
+            return ProbeOutcome(
+                ok=False,
+                steps=tuple(steps),
+                detail=(
+                    f"{_TOOL_STEP} step failed: "
+                    "provider returned malformed tool call arguments"
+                ),
                 usage=usage,
             )
         if not tool_response.tool_calls and not tool_response.content.strip():

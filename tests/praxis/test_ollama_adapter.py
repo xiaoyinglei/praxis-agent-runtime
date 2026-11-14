@@ -17,6 +17,7 @@ import pytest
 from praxis.adapters.models.base import collect_events
 from praxis.adapters.models.ollama import OllamaAdapter, ToolsNotSupportedError
 from praxis.adapters.models.openai_compat import OpenAICompatAdapter
+from praxis.adapters.models.retry import classify_failure
 from praxis.composition import _adapter_for
 from praxis.protocol.models import (
     ModelMessage,
@@ -264,6 +265,28 @@ def test_ollama_tool_delta_arguments_are_json_encoded_fragments() -> None:
     assert json.loads(delta.arguments_fragment) == {"path": "a"}
 
 
+def test_ollama_reads_thinking_field_and_prefers_it_over_reasoning() -> None:
+    """#3:ollama 文档字段是 ``thinking``;两键都读,thinking 优先。"""
+    adapter, _ = _adapter(
+        [
+            {"message": {"role": "assistant", "thinking": "think ", "content": "hi"}, "done": False},
+            {
+                "message": {
+                    "role": "assistant",
+                    "thinking": "winner",
+                    "reasoning": "loser",
+                    "content": "",
+                },
+                "done": False,
+            },
+            {"message": {"role": "assistant", "content": ""}, "done": True},
+        ]
+    )
+    response = asyncio.run(adapter.complete(_request(adapter)))
+    assert response.reasoning == "think winner"
+    assert response.content == "hi"
+
+
 def test_ollama_missing_usage_counts_is_estimated_zero() -> None:
     adapter, _ = _adapter(
         [
@@ -273,6 +296,32 @@ def test_ollama_missing_usage_counts_is_estimated_zero() -> None:
     )
     response = asyncio.run(adapter.complete(_request(adapter)))
     assert response.usage == Usage(0, 0, source="estimated")
+
+
+def test_ollama_usage_keeps_whichever_count_is_present() -> None:
+    """#6:只有一个计数时保留已知数字,缺的记 0(布尔不算计数)。"""
+    for frame, expected in (
+        (
+            {"message": {"role": "assistant", "content": ""}, "done": True, "prompt_eval_count": 5},
+            Usage(5, 0, source="estimated"),
+        ),
+        (
+            {"message": {"role": "assistant", "content": ""}, "done": True, "eval_count": 7},
+            Usage(0, 7, source="estimated"),
+        ),
+        (
+            {
+                "message": {"role": "assistant", "content": ""},
+                "done": True,
+                "prompt_eval_count": True,
+                "eval_count": True,
+            },
+            Usage(0, 0, source="estimated"),
+        ),
+    ):
+        adapter, _ = _adapter([frame])
+        response = asyncio.run(adapter.complete(_request(adapter)))
+        assert response.usage == expected
 
 
 def test_ollama_stream_sends_exact_accounted_bytes_without_auth_header() -> None:
@@ -310,6 +359,38 @@ def test_ollama_malformed_frame_fails_with_bounded_message() -> None:
     with pytest.raises(ValueError, match="malformed stream frame") as excinfo:
         asyncio.run(collect_events(adapter.stream(_request(adapter))))
     assert "not-json" not in str(excinfo.value)
+
+
+def test_ollama_in_band_error_frame_fails_loudly() -> None:
+    """#5:HTTP 200 + ``{"error": ...}`` 绝不能被跳过成"空成功"。"""
+    adapter, _ = _adapter([{"error": "model 'ghost' not found", "type": "not_found"}])
+    with pytest.raises(ValueError, match="returned an error frame") as excinfo:
+        asyncio.run(collect_events(adapter.stream(_request(adapter))))
+    assert "model 'ghost' not found" in str(excinfo.value)
+    assert "not_found" not in str(excinfo.value)  # 不回显整帧
+
+
+def test_ollama_frame_without_message_or_done_fails_loudly() -> None:
+    adapter, _ = _adapter([{"status": "loading"}])
+    with pytest.raises(ValueError, match="frame without a message"):
+        asyncio.run(collect_events(adapter.stream(_request(adapter))))
+
+
+# --- 非 2xx:必须走唯一分类器的 status→kind 映射(D7 重试不失效) -----------------
+
+
+def test_ollama_http_status_errors_use_the_only_classifier() -> None:
+    for status, kind, retryable in (
+        (429, "rate_limited", True),
+        (500, "server_error", True),
+        (401, "authentication", False),
+        (404, "invalid_request", False),
+    ):
+        adapter, _ = _adapter(body=b"{}", status=status)
+        with pytest.raises(httpx.HTTPStatusError) as excinfo:
+            asyncio.run(collect_events(adapter.stream(_request(adapter))))
+        failure = classify_failure(excinfo.value)
+        assert (failure.kind, failure.retryable) == (kind, retryable)
 
 
 # --- base_url 必须是 loopback/私有主机 ------------------------------------------
