@@ -23,6 +23,8 @@ from typing import Any
 import pytest
 
 from praxis.core import permission
+from praxis.core.pipeline import ExecCtx, execute
+from praxis.protocol.items import ItemKind
 from praxis.protocol.permission import PermissionContext
 from praxis.protocol.policy import PermissionPolicy, ToolRule
 from praxis.protocol.sandbox import ToolExecContext
@@ -30,9 +32,11 @@ from praxis.protocol.tools import (
     CancellationMode,
     InterruptBehavior,
     ResultStatus,
+    ToolCall,
     ToolEffect,
     ToolValidationError,
 )
+from praxis.store.turns import create_turn
 from praxis.tools.builtins import data as data_module
 from praxis.tools.builtins.data import _MAX_INSPECTABLE_BYTES, create_inspect_data_file_tool
 from praxis.tools.builtins.patch import (
@@ -983,3 +987,210 @@ def test_apply_patch_tool_contract(tmp_path: Path) -> None:
     assert tool.static_effects == frozenset(
         {ToolEffect.READ_WORKSPACE, ToolEffect.WRITE_WORKSPACE, ToolEffect.DESTRUCTIVE}
     )
+
+
+# ---------------------------------------------------------------------------
+# 复审 I-1:Move 目标策略(自移动/已存在都是数据丢失,必须 invalid_input)
+# ---------------------------------------------------------------------------
+
+_PATCH_METADATA_KEYS = {
+    "applied_files",
+    "failed_file",
+    "hunk_index",
+    "expected_context_line",
+    "move_incomplete",
+}
+
+
+def test_self_move_is_rejected(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("hello\n", encoding="utf-8")
+    patch = _patch("*** Update File: a.py\n*** Move to: a.py\n@@\n-hello\n+bye")
+    tool = create_apply_patch_tool(tmp_path)
+    with pytest.raises(ToolValidationError) as excinfo:
+        tool.resolve_use({"patch": patch})
+    assert "must differ" in str(excinfo.value)
+    r = run_patch(tmp_path, patch)
+    assert r.status is ResultStatus.ERROR
+    assert r.error_code == "invalid_input"
+    assert "must differ" in r.text
+    # 源文件既未被改写也未被删除
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "hello\n"
+    assert r.metadata["applied_files"] == ()
+
+
+def test_move_to_existing_destination_is_rejected(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("src\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("dest\n", encoding="utf-8")
+    patch = _patch("*** Update File: a.py\n*** Move to: b.py\n@@\n-src\n+SRC")
+    tool = create_apply_patch_tool(tmp_path)
+    with pytest.raises(ToolValidationError) as excinfo:
+        tool.resolve_use({"patch": patch})
+    assert "already exists" in str(excinfo.value)
+    r = run_patch(tmp_path, patch)
+    assert r.status is ResultStatus.ERROR
+    assert r.error_code == "invalid_input"
+    assert "already exists" in r.text
+    # 目标未被覆盖、源未被移动
+    assert (tmp_path / "b.py").read_text(encoding="utf-8") == "dest\n"
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "src\n"
+
+
+# ---------------------------------------------------------------------------
+# 复审 #2/#3:解析计数溢出与 preflight 完整性(预检不过就不写)
+# ---------------------------------------------------------------------------
+
+
+def test_huge_hunk_count_is_validation_error() -> None:
+    # CPython 4300 位 int 转换上限不得泄漏成裸 ValueError
+    huge = "9" * 5_000
+    with pytest.raises(ToolValidationError):
+        parse_patch(
+            "*** Begin Patch\n*** Update File: a.py\n"
+            f"@@ -1,{huge} +1,1 @@\n-x\n+y\n*** End Patch\n"
+        )
+
+
+def test_preflight_failure_leaves_everything_untouched(tmp_path: Path) -> None:
+    (tmp_path / "first.py").write_text("one\n", encoding="utf-8")
+    patch = _patch(
+        "*** Update File: first.py\n@@\n-one\n+ONE",
+        "*** Update File: missing/a.py\n@@\n-x\n+y",
+    )
+    r = run_patch(tmp_path, patch)
+    assert r.status is ResultStatus.ERROR
+    assert r.error_code == "invalid_input"
+    assert "does not exist" in r.text
+    # 第二个目标父目录缺失在 preflight 就拒绝:第一个文件一个字节都没动
+    assert (tmp_path / "first.py").read_text(encoding="utf-8") == "one\n"
+    assert r.metadata["applied_files"] == ()
+
+
+# ---------------------------------------------------------------------------
+# 复审 #6/#7:Update 尺寸准入与换行风格保留
+# ---------------------------------------------------------------------------
+
+
+def test_oversized_update_target_is_rejected(tmp_path: Path) -> None:
+    target = tmp_path / "big.txt"
+    with target.open("wb") as stream:
+        stream.truncate(64 * 1024 * 1024 + 1)
+    r = run_patch(tmp_path, _patch("*** Update File: big.txt\n@@\n-a\n+b"))
+    assert r.status is ResultStatus.ERROR
+    assert r.error_code == "invalid_input"
+    assert "too large" in r.text
+    assert r.metadata["applied_files"] == ()
+
+
+def test_update_preserves_crlf_line_endings(tmp_path: Path) -> None:
+    (tmp_path / "w.py").write_bytes(b"one\r\ntwo\r\n")
+    r = run_patch(tmp_path, _patch("*** Update File: w.py\n@@\n-two\n+TWO"))
+    assert r.status is ResultStatus.OK
+    # 只改一行,不得把整文件换行风格换掉
+    assert (tmp_path / "w.py").read_bytes() == b"one\r\nTWO\r\n"
+
+
+# ---------------------------------------------------------------------------
+# 复审 #8:Move 半成功(已写 dest、删源失败)的 metadata 必须诚实
+# ---------------------------------------------------------------------------
+
+
+def test_move_cleanup_failure_reports_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "a.py").write_text("x\n", encoding="utf-8")
+    real_unlink = Path.unlink
+
+    def failing_unlink(self: Path, *args: Any, **kwargs: Any) -> None:
+        if self.name == "a.py":
+            raise OSError("simulated unlink failure")
+        real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+    r = run_patch(
+        tmp_path, _patch("*** Update File: a.py\n*** Move to: moved.py\n@@\n-x\n+y")
+    )
+    assert r.status is ResultStatus.ERROR
+    assert r.error_code == "patch_failed"
+    assert r.metadata["move_incomplete"] is True
+    assert r.metadata["applied_files"] == (_abs(tmp_path, "moved.py"),)
+    # dest 内容已写成,源文件仍在(半移动状态对调用方可见)
+    assert (tmp_path / "moved.py").read_text(encoding="utf-8") == "y\n"
+    assert (tmp_path / "a.py").exists()
+
+
+# ---------------------------------------------------------------------------
+# 复审 #10:真 pipeline.execute 级别的 R-T13-1 两面
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_update_patch_executes(store: Any, bus: Any, tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("old\n", encoding="utf-8")
+    policy = PermissionPolicy()
+    permissions = PermissionContext(workspace=str(tmp_path), policy=policy, mode="on-request")
+    created = create_turn(store, turn_id="turn-apply-up", thread_id="thread-apply-up", binding={})
+    ctx = ExecCtx(
+        store=store,
+        bus=bus,
+        workspace=tmp_path,
+        tools={"apply_patch": create_apply_patch_tool(tmp_path)},
+        permissions=permissions,
+        turn_id=created.turn_id,
+        thread_id=created.thread_id,
+        policy_revision=policy.revision,
+    )
+    result = asyncio.run(
+        execute(
+            ToolCall(
+                tool_call_id="c1",
+                tool_name="apply_patch",
+                arguments={"patch": _patch("*** Update File: a.py\n@@\n-old\n+new")},
+            ),
+            ctx,
+        )
+    )
+    assert result.status is ResultStatus.OK
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "new\n"
+
+
+def test_pipeline_delete_patch_pauses_for_approval(
+    store: Any, bus: Any, tmp_path: Path
+) -> None:
+    (tmp_path / "a.py").write_text("x\n", encoding="utf-8")
+    policy = PermissionPolicy(tools=(ToolRule(pattern="*", decision="allow"),))
+    permissions = PermissionContext(workspace=str(tmp_path), policy=policy, mode="on-request")
+    created = create_turn(store, turn_id="turn-apply-del", thread_id="thread-apply-del", binding={})
+    ctx = ExecCtx(
+        store=store,
+        bus=bus,
+        workspace=tmp_path,
+        tools={"apply_patch": create_apply_patch_tool(tmp_path)},
+        permissions=permissions,
+        turn_id=created.turn_id,
+        thread_id=created.thread_id,
+        policy_revision=policy.revision,
+    )
+    result = asyncio.run(
+        execute(
+            ToolCall(
+                tool_call_id="c1",
+                tool_name="apply_patch",
+                arguments={"patch": _patch("*** Delete File: a.py")},
+            ),
+            ctx,
+        )
+    )
+    assert result.status is ResultStatus.PAUSED
+    # 审批前绝不执行:删除没有发生,并留下 approval_request
+    assert (tmp_path / "a.py").exists()
+    kinds = [item.kind for item in store.read_turn_items(created.turn_id)]
+    assert ItemKind.APPROVAL_REQUEST in kinds
+
+
+def test_patch_metadata_key_set_is_exact(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("x\n", encoding="utf-8")
+    success = run_patch(tmp_path, _patch("*** Update File: a.py\n@@\n-x\n+y"))
+    failure = run_patch(tmp_path, _patch("*** Update File: a.py\n@@\n-wrong\n+z"))
+    invalid = run_patch(tmp_path, "not a patch")
+    for result in (success, failure, invalid):
+        assert set(result.metadata) == _PATCH_METADATA_KEYS
+    assert success.metadata["move_incomplete"] is False

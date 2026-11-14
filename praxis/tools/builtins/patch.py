@@ -16,6 +16,10 @@
 - 完整性检查留在工具内且与权限无关(R-T13-4):路径不得含 ``..``、必须在
   workspace 内、路径各级不得是 symlink、目标必须是常规文件、patch ≤30_000
   字符、``<<EOF ... EOF`` 外层包裹剥离、``*** Move to:`` 支持。
+- ``*** Move to:`` 的目标必须**不同于源路径且尚不存在**(自移动会先写后删、
+  目标已存在会静默覆盖;二者都是数据丢失),违者 ``invalid_input``。写目标前
+  再复核一次(TOCTOU)。Update 目标有 64 MiB 准入上限,保留原文件换行风格
+  (CRLF 不被整文件改写)。
 
 解析器 ``parse_patch`` 是纯函数,便于单测穷举畸形输入(空 patch、缺 @@、
 hunk 行数不符、未知头等)。畸形输入成为**结果**(``invalid_input``),不炸管道。
@@ -50,6 +54,7 @@ from praxis.tools.builtins.paths import atomic_write_text, checked_path
 
 PENDING_TOOL_CALL_ID = "pending"
 _MAX_PATCH_CHARS = 30_000
+_MAX_UPDATE_BYTES = 64 * 1024 * 1024
 _MAX_CONTEXT_LINE_CHARS = 200
 _FAILURE_MESSAGE = (
     "patch failed. Earlier hunks may already have changed files; "
@@ -105,6 +110,15 @@ class _HunkMismatchError(Exception):
         self.expected = expected
 
 
+class _MoveCleanupError(Exception):
+    """Move 的目标已写成,但删除源文件失败(如实报告"已移动未删源")。"""
+
+    def __init__(self, *, destination: str, error: OSError) -> None:
+        super().__init__(str(error))
+        self.destination = destination
+        self.error = error
+
+
 # ---------------------------------------------------------------------------
 # 纯函数解析器
 # ---------------------------------------------------------------------------
@@ -140,13 +154,23 @@ def _header_path(header: str, marker: str) -> str:
     return path
 
 
+def _hunk_count(value: str | None) -> int:
+    """统一 diff 计数;超长数字触发 CPython int 上限时必须仍是 ToolValidationError。"""
+    if value is None:
+        return 1
+    try:
+        return int(value)
+    except ValueError:
+        raise _parse_error(f"hunk line count is not a valid integer: {value[:32]}") from None
+
+
 def _finish_hunk(label: str, lines: list[HunkLine]) -> Hunk:
     if not lines:
         raise _parse_error("hunk contains no lines")
     match = _UNIFIED_HUNK.match(label)
     if match is not None:
-        old_count = int(match.group(2)) if match.group(2) is not None else 1
-        new_count = int(match.group(4)) if match.group(4) is not None else 1
+        old_count = _hunk_count(match.group(2))
+        new_count = _hunk_count(match.group(4))
         old_actual = sum(1 for line in lines if line.kind != "+")
         new_actual = sum(1 for line in lines if line.kind != "-")
         if old_actual != old_count or new_actual != new_count:
@@ -252,8 +276,8 @@ def parse_patch(text: str) -> tuple[PatchOp, ...]:
 # ---------------------------------------------------------------------------
 
 
-def _lexical_target(workspace: Path, raw: str) -> Path:
-    """绝对化但**不解析 symlink** 的词法目标;``..`` 与越界在此拒绝。"""
+def _fence_target(workspace: Path, raw: str) -> Path:
+    """空路径/``..``/越界的**唯一**校验;返回不解析 symlink 的词法绝对路径。"""
     if not raw:
         raise _parse_error("patch path is empty")
     try:
@@ -271,6 +295,21 @@ def _lexical_target(workspace: Path, raw: str) -> Path:
     return target
 
 
+def _path_for_use(workspace: Path, raw: str) -> Path:
+    """resolve_use 的 target:同一份词法围栏 + 共享 ``checked_path`` 的真实路径检查。"""
+    return checked_path(workspace, str(_fence_target(workspace, raw)))
+
+
+def _validate_move(workspace: Path, source: Path, move_to: str) -> Path:
+    """Move 策略:目标必须不同于源、且尚不存在(否则先写后删/静默覆盖)。"""
+    destination = _fence_target(workspace, move_to)
+    if destination == source:
+        raise _parse_error("move destination must differ from the source path")
+    if destination.exists() or destination.is_symlink():
+        raise _parse_error(f"move destination already exists: {move_to}")
+    return destination
+
+
 def _assert_regular_path(workspace: Path, target: Path, *, must_exist: bool) -> None:
     """逐级 lstat:任何一级 symlink 拒绝;已存在目标必须是常规文件。"""
     base = workspace.resolve()
@@ -281,11 +320,12 @@ def _assert_regular_path(workspace: Path, target: Path, *, must_exist: bool) -> 
         try:
             info = current.lstat()
         except FileNotFoundError:
-            if current == target and must_exist:
+            if must_exist:
                 raise _parse_error(
-                    f"patch target does not exist: {relative.as_posix()}"
+                    "patch target does not exist (or a parent directory is missing): "
+                    f"{relative.as_posix()}"
                 ) from None
-            return  # 后续成分不存在:不可能藏 symlink
+            return  # 目标不必存在:后续成分不存在,不可能藏 symlink
         except OSError as exc:
             raise _parse_error(
                 f"patch target cannot be inspected: {exc.strerror or exc}"
@@ -301,27 +341,34 @@ def _assert_regular_path(workspace: Path, target: Path, *, must_exist: bool) -> 
             raise _parse_error("patch target is not a regular file")
 
 
+def _assert_update_size(target: Path) -> None:
+    try:
+        size = target.stat().st_size
+    except OSError as exc:
+        raise _parse_error(
+            f"patch target cannot be inspected: {exc.strerror or exc}"
+        ) from None
+    if size > _MAX_UPDATE_BYTES:
+        raise _parse_error(
+            f"update target is too large ({size} bytes; limit {_MAX_UPDATE_BYTES}); "
+            "use read/search for targeted inspection instead"
+        )
+
+
 def _preflight(workspace: Path, ops: Sequence[PatchOp]) -> None:
     """写任何文件之前校验全部目标(完整性失败不留部分修改)。"""
     for op in ops:
-        target = _lexical_target(workspace, op.path)
-        if isinstance(op, AddFile):
-            _assert_regular_path(workspace, target, must_exist=False)
-        else:
+        target = _fence_target(workspace, op.path)
+        if isinstance(op, UpdateFile):
             _assert_regular_path(workspace, target, must_exist=True)
-        if isinstance(op, UpdateFile) and op.move_to is not None:
-            destination = _lexical_target(workspace, op.move_to)
-            _assert_regular_path(workspace, destination, must_exist=False)
-
-
-def _path_for_use(workspace: Path, raw: str) -> Path:
-    if not raw:
-        raise _parse_error("patch path is empty")
-    if ".." in Path(raw).parts:
-        raise _parse_error(
-            "patch paths must stay within the workspace without parent traversal"
-        )
-    return checked_path(workspace, raw)
+            _assert_update_size(target)
+            if op.move_to is not None:
+                destination = _validate_move(workspace, target, op.move_to)
+                _assert_regular_path(workspace, destination, must_exist=False)
+        elif isinstance(op, DeleteFile):
+            _assert_regular_path(workspace, target, must_exist=True)
+        else:
+            _assert_regular_path(workspace, target, must_exist=False)
 
 
 # ---------------------------------------------------------------------------
@@ -371,28 +418,58 @@ def _add_content(lines: Sequence[str]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _newline_style(text: str) -> str:
+    """纯 CRLF 文件识别:所有 ``\\n`` 都是某个 ``\\r\\n`` 的一部分。"""
+    crlf = text.count("\r\n")
+    return "\r\n" if crlf and crlf == text.count("\n") else "\n"
+
+
+def _apply_hunks_preserving_newlines(text: str, hunks: Sequence[Hunk]) -> str:
+    """按文件原有换行风格应用 hunk:只改内容,不把整文件换行换掉。"""
+    style = _newline_style(text)
+    working = text.replace("\r\n", "\n") if style == "\r\n" else text
+    after = _apply_hunks(working, hunks)
+    return after.replace("\n", "\r\n") if style == "\r\n" else after
+
+
+def _read_update_text(target: Path) -> str:
+    """有界读取 Update 目标(保留原换行;超限走结果而不是 OOM/长时间阻塞)。"""
+    _assert_update_size(target)
+    with target.open("r", encoding="utf-8", newline="") as stream:
+        return stream.read()
+
+
 def _apply_one(workspace: Path, op: PatchOp) -> tuple[str, tuple[str, ...]]:
     """应用单个操作,返回 (模型可见摘要, 触达的绝对路径)。失败以异常上抛。"""
     if isinstance(op, AddFile):
-        target = _lexical_target(workspace, op.path)
+        target = _fence_target(workspace, op.path)
+        _assert_regular_path(workspace, target, must_exist=False)  # 写前复核(TOCTOU)
         target.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(target, _add_content(op.lines))
         return f"added {op.path} ({len(op.lines)} lines)", (str(target),)
 
     if isinstance(op, DeleteFile):
-        target = _lexical_target(workspace, op.path)
+        target = _fence_target(workspace, op.path)
+        _assert_regular_path(workspace, target, must_exist=True)  # 写前复核(TOCTOU)
         target.unlink()
         return f"deleted {op.path}", (str(target),)
 
-    target = _lexical_target(workspace, op.path)
-    after = _apply_hunks(target.read_text(encoding="utf-8"), op.hunks)
+    target = _fence_target(workspace, op.path)
+    _assert_regular_path(workspace, target, must_exist=True)  # 写前复核(TOCTOU)
+    before = _read_update_text(target)
+    after = _apply_hunks_preserving_newlines(before, op.hunks)
     if op.move_to is None:
         atomic_write_text(target, after)
         return f"updated {op.path} ({len(op.hunks)} hunks)", (str(target),)
-    destination = _lexical_target(workspace, op.move_to)
+    # 写 dest 前再复核一次:自移动/目标已存在都在这里拒绝
+    destination = _validate_move(workspace, target, op.move_to)
+    _assert_regular_path(workspace, destination, must_exist=False)
     destination.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(destination, after)
-    target.unlink()
+    try:
+        target.unlink()
+    except OSError as exc:
+        raise _MoveCleanupError(destination=str(destination), error=exc) from exc
     return (
         f"moved {op.path} -> {op.move_to} ({len(op.hunks)} hunks)",
         (str(target), str(destination)),
@@ -409,6 +486,8 @@ def _metadata(
     failed_file: str | None,
     hunk_index: int | None,
     expected_context_line: str | None,
+    *,
+    move_incomplete: bool = False,
 ) -> dict[str, JsonValue]:
     return {
         "applied_files": tuple(applied),
@@ -419,6 +498,7 @@ def _metadata(
             if expected_context_line is not None
             else None
         ),
+        "move_incomplete": move_incomplete,
     }
 
 
@@ -461,6 +541,7 @@ def _failure_result(
     hunk_index: int | None,
     expected_context_line: str | None,
     detail: str,
+    move_incomplete: bool = False,
 ) -> ToolResult:
     return _result(
         content=f"{_FAILURE_MESSAGE}\n{failed_file}: {detail}",
@@ -468,13 +549,19 @@ def _failure_result(
         error_code="patch_failed",
         error_message=_FAILURE_MESSAGE,
         retryable=True,
-        metadata=_metadata(applied, failed_file, hunk_index, expected_context_line),
+        metadata=_metadata(
+            applied,
+            failed_file,
+            hunk_index,
+            expected_context_line,
+            move_incomplete=move_incomplete,
+        ),
     )
 
 
 def _op_path(workspace: Path, op: PatchOp) -> str:
     try:
-        return str(_lexical_target(workspace, op.path))
+        return str(_fence_target(workspace, op.path))
     except ToolValidationError:
         return op.path
 
@@ -497,6 +584,19 @@ def _apply_ops(workspace: Path, ops: tuple[PatchOp, ...]) -> ToolResult:
                 hunk_index=mismatch.hunk_index,
                 expected_context_line=mismatch.expected,
                 detail=f"hunk {mismatch.hunk_index} expected context line {mismatch.expected!r}",
+            )
+        except _MoveCleanupError as cleanup:
+            # dest 已写成但删源失败:如实把 dest 记进 applied_files,并标记 move_incomplete
+            return _failure_result(
+                [*applied, cleanup.destination],
+                failed_file=_op_path(workspace, op),
+                hunk_index=None,
+                expected_context_line=None,
+                detail=(
+                    f"moved content to {cleanup.destination} but could not remove the "
+                    f"source: {cleanup.error}"
+                ),
+                move_incomplete=True,
             )
         except ToolValidationError as exc:
             return _invalid_result(exc.message, applied=applied)
@@ -572,6 +672,10 @@ def create_apply_patch_tool(workspace: Path) -> Tool:
         for op in ops:
             if isinstance(op, DeleteFile):
                 effects.add(ToolEffect.DESTRUCTIVE)
+            if isinstance(op, UpdateFile) and op.move_to is not None:
+                _validate_move(
+                    workspace, _fence_target(workspace, op.path), op.move_to
+                )
             paths = (op.path, op.move_to) if isinstance(op, UpdateFile) else (op.path,)
             for raw in paths:
                 if raw is None:
@@ -591,12 +695,13 @@ def create_apply_patch_tool(workspace: Path) -> Tool:
                 "line prefixed with +), *** Delete File: path, or *** Update File: path "
                 "followed by @@ hunks using a leading space for unchanged context, - for "
                 "removed lines and + for added lines; an update may include "
-                "*** Move to: destination. Context must match the file exactly. Each file "
-                "is written atomically, but the patch is not transactional: on failure "
-                "earlier files may already be changed. Deletions require explicit approval. "
-                "Paths must stay inside the workspace, may not contain '..' or traverse "
-                "symlinks, and must name regular files. Maximum patch length is 30,000 "
-                "characters."
+                "*** Move to: destination. Context must match the file exactly; a move "
+                "destination must differ from its source and must not already exist. "
+                "Each file is written atomically, but the patch is not transactional: on "
+                "failure earlier files may already be changed. Deletions require explicit "
+                "approval. Paths must stay inside the workspace, may not contain '..' or "
+                "traverse symlinks, and must name regular files; update targets are "
+                "limited to 64 MiB. Maximum patch length is 30,000 characters."
             ),
             input_schema={
                 "type": "object",
