@@ -3,7 +3,8 @@
 执行算法(brief Step 3,修正 asyncio 的 EOF 语义):
 1. ``[*sandbox.argv_prefix, "/bin/bash", "-lc", command]``,cwd=workspace,
    stdout/stderr 管道,``start_new_session=True``(独立进程组,超时才能整组回收);
-   沙箱时 env TMPDIR=spec.scratch_dir(沙箱内唯一可写临时区)。run 只允许经
+   子进程环境由 ``child_env`` 唯一构造(R-T16-2:固定 PATH、HOME/TMPDIR 指向
+   沙箱可写 scratch、不继承任何宿主环境变量——凭据不可见)。run 只允许经
    管道调用:管道对 EXECUTE_PROCESS 恒编译沙箱(后端不可用已在 decide 第 7 步
    deny);``exec_ctx.sandbox=None`` 为单测路径直跑。trusted-local 等不可沙箱化
    策略在编译期 SandboxRefusal → 管道转 sandbox_refused 结果(R9 fail-closed);
@@ -45,7 +46,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import os
 import signal
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -67,6 +67,7 @@ from praxis.protocol.tools import (
     ToolTarget,
     json_schema_input,
 )
+from praxis.tools.builtins.child_env import child_env, scratch_dir_for
 from praxis.tools.builtins.filesystem import PENDING_TOOL_CALL_ID
 from praxis.tools.builtins.process import await_main_exit, drain_stream, signal_group
 
@@ -175,7 +176,7 @@ class CommandExecution:
     - ``wait_terminal(timeout)``:等主进程退出/超时收敛,收尾读取,返回终态;
     - ``cancel()``:任何阶段取消的统一收敛(Finding 3),不留悬空任务/孤儿进程组;
     - ``stdout_bytes``/``stderr_bytes``:已缓冲的头(≤``_MAX_STREAM_BUFFER_BYTES``/路)。
-    所有进程组信号都经 process.py 原语,本类不直接调用 os.killpg。
+    所有进程组信号都经 process.py 原语,本类不直接发送组信号。
     """
 
     def __init__(
@@ -413,12 +414,13 @@ def create_bash_tool(workspace: Path, *, sessions: CommandSessions | None = None
         command = cast("str", args["command"])
         timeout = cast("float", args.get("timeout_seconds", _DEFAULT_TIMEOUT_SECONDS))
         yield_seconds = cast("float | None", args.get("yield_time_seconds"))
-        # 沙箱接线(Task 7):argv_prefix 拼在真实命令之前(sandbox-exec -p profile);
-        # TMPDIR 指向沙箱可写 scratch。run 只允许经管道调用:管道对 EXECUTE_PROCESS
-        # 恒编译(不可用已在 decide 第 7 步 deny);sandbox=None 为单测路径直跑。
+        # 沙箱接线(Task 7):argv_prefix 拼在真实命令之前(sandbox-exec -p profile)。
+        # R-T16-2:子进程环境一律由 child_env 构造(固定 PATH、HOME/TMPDIR 指向
+        # scratch、宿主变量与凭据不透传);sandbox=None 为单测路径直跑,用同一份
+        # 最小环境(进程私有临时目录作 scratch),不存在透传 os.environ 的第二条路径。
         spec = exec_ctx.sandbox
         prefix = spec.argv_prefix if spec is not None else ()
-        env = {**os.environ, "TMPDIR": spec.scratch_dir} if spec is not None else None
+        env = child_env(scratch_dir_for(spec), workspace)
         argv = (*prefix, "/bin/bash", "-lc", command)
 
         # Task 15:yield 窗口 + 会话注册表 → 后台会话(D13:返回的 tool_result
@@ -512,6 +514,8 @@ def create_bash_tool(workspace: Path, *, sessions: CommandSessions | None = None
                 "OS sandbox compiled from the permission policy; policies that cannot "
                 "be sandboxed (e.g. trusted-local with write grants) refuse execution "
                 "with sandbox_refused — use the read/write tools for file edits instead. "
+                "The subprocess receives only a minimal environment: host environment "
+                "variables and credentials are not visible to it. "
                 "Set yield_time_seconds to return while a long command keeps running in "
                 "the background; the result then carries a session_id for manage_command."
             ),
