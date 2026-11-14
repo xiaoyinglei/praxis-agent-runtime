@@ -115,6 +115,11 @@ class OpenAICompatAdapter:
             timeout=spec.timeout_seconds,
         )
 
+    @property
+    def spec(self) -> ModelSpec:
+        """静态模型配置;探针据此判断工具步是否适用(不读取适配器私有状态)。"""
+        return self._spec
+
     def build_request(
         self,
         messages: Sequence[ModelMessage],

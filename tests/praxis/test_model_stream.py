@@ -409,6 +409,19 @@ def test_provider_option_extra_body_must_be_an_object() -> None:
         openai_payload(_wire_request(provider_options={"extra_body": [1, 2]}), stream=False)
 
 
+@pytest.mark.parametrize("key", sorted(WIRE_OWNED_FIELDS))
+def test_extra_body_cannot_override_wire_owned_fields(key: str) -> None:
+    """R-T4-1:嵌套进 extra_body 的键同样受 WIRE_OWNED_FIELDS 守卫。
+
+    SDK 把 extra_body 合并在 JSON body 之上且后者胜出——放过就是
+    "真实请求覆盖了记账文本里看不见的字段"(B6 的最后一个生长点)。
+    """
+    with pytest.raises(
+        ValueError, match=f"cannot override wire-owned field via extra_body: {key}"
+    ):
+        openai_payload(_wire_request(provider_options={"extra_body": {key: None}}), stream=False)
+
+
 def test_known_sdk_options_land_top_level() -> None:
     payload = openai_payload(
         _wire_request(

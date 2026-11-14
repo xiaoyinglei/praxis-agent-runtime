@@ -118,6 +118,14 @@ def openai_payload(req: WireRequest, *, stream: bool) -> dict[str, Any]:
         if key == "extra_body":
             if not isinstance(thawed, dict):
                 raise ValueError("provider option 'extra_body' must be an object")
+            # R-T4-1:SDK 把 extra_body 合并在 JSON body 之上且后者胜出,嵌套键
+            # 同样不得覆盖 wire-owned 字段——否则真实请求与记账文本出现第二口径。
+            for nested_key in thawed:
+                if nested_key in WIRE_OWNED_FIELDS:
+                    raise ValueError(
+                        "provider option cannot override wire-owned field via extra_body: "
+                        f"{nested_key}"
+                    )
             extra_body.update(thawed)
         elif key in _TOP_LEVEL_PROVIDER_OPTION_KEYS:
             payload[key] = thawed

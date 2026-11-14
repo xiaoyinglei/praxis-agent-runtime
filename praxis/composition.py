@@ -22,13 +22,17 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
+import httpx
+
+from praxis.adapters.models.ollama import OllamaAdapter
+from praxis.adapters.models.openai_compat import OpenAICompatAdapter
 from praxis.adapters.models.retry import make_retry_stream
 from praxis.adapters.sandbox.base import probe_backend
 from praxis.adapters.sandbox.compile import compile_sandbox, finalize_sandbox
 from praxis.core.events import EventBus
 from praxis.core.recovery import sweep
 from praxis.core.session import Session
-from praxis.protocol.models import ModelAdapter
+from praxis.protocol.models import ModelAdapter, ModelSpec
 from praxis.protocol.permission import PermissionContext, PermissionMode
 from praxis.protocol.policy import PermissionPolicy
 from praxis.protocol.retry import RetryPolicy
@@ -49,6 +53,31 @@ def _validate_thread_id(thread_id: str) -> None:
         raise ValueError("thread_id must not contain NUL bytes")
     if ".." in Path(thread_id).parts:
         raise ValueError(f"thread_id must not contain '..' components: {thread_id!r}")
+
+
+def _adapter_for(
+    spec: ModelSpec,
+    api_key: str | None = None,
+    *,
+    http_client: httpx.AsyncClient | None = None,
+) -> ModelAdapter:
+    """按 provider 的唯一分派点:openai-compatible 与 ollama 在此装配。
+
+    ``scripted`` 永远由 CLI/测试显式注入(它没有远端配置可解析),这里明确拒绝;
+    openai-compatible 缺 key 属于边界错误——凭据只经参数进入,适配器不回读环境。
+    """
+    if spec.provider == "ollama":
+        return OllamaAdapter(spec, http_client=http_client)
+    if spec.provider == "openai-compatible":
+        if api_key is None:
+            raise ValueError(
+                f"provider openai-compatible requires an API key for model {spec.model_id!r}"
+            )
+        return OpenAICompatAdapter(spec, api_key=api_key, http_client=http_client)
+    raise ValueError(
+        f"provider {spec.provider!r} must be injected explicitly (scripted), "
+        "not constructed via composition"
+    )
 
 
 def _resolve_policy(root: Path, explicit: PermissionPolicy | None) -> PermissionPolicy:
