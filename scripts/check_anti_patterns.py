@@ -21,9 +21,7 @@ Also scans praxis/ for architecture hard-rule violations (阶段1 CI 硬规则):
      因此协议层 docstring"解释"后端名词不误报(与验收 test_s1 同一口径)。
   9. def path_access/resolve_policy/tool_decision/network_decision/
      command_network_decision 只允许 protocol/policy.py(唯一合并器)。
- 10. def decide 只允许 core/permission.py(唯一权限决策入口);
-     protocol/retry.py 的 RetryPolicy.decide 是模型重试计划,非权限决策(R-T3-1,
-     RetryPolicy 必须零依赖,不能放进 adapters)。
+ 10. def decide 只允许 core/permission.py(唯一权限决策入口)。
  11. def floor_reason 与 FLOOR_ENTRIES 赋值只允许 protocol/floor.py(唯一地板)。
 
 ``--praxis-only``:只扫 praxis 硬规则、跳过 rag 存量扫描(CI 门 R5:阶段1 只强制 praxis 规则)。
@@ -127,9 +125,6 @@ _PRAXIS_SESSION_FILE = ("composition.py",)
 _PRAXIS_SANDBOX_PKG = ("adapters", "sandbox")
 _PRAXIS_POLICY_FILE = ("protocol", "policy.py")
 _PRAXIS_DECIDE_FILE = ("core", "permission.py")
-# RetryPolicy.decide 是模型重试计划(纯策略),不是权限决策;R-T3-1 要求它
-# 定义在零依赖的 protocol/retry.py(adapters 反而不允许被 protocol import)。
-_PRAXIS_RETRY_FILE = ("protocol", "retry.py")
 _PRAXIS_FLOOR_FILE = ("protocol", "floor.py")
 
 # profile 构造字面量(S1):seatbelt SBPL / bwrap argv 的构造痕迹,唯一编译器持有
@@ -306,10 +301,7 @@ def scan_praxis_file(path: Path, praxis_root: Path | None = None) -> list[str]:
                     f"line {node.lineno}: rule algebra outside protocol/policy.py (single merger) — "
                     f"def {node.name}() 权限规则代数只允许在 policy.py"
                 )
-            if node.name == "decide" and rel_parts not in (
-                _PRAXIS_DECIDE_FILE,
-                _PRAXIS_RETRY_FILE,
-            ):
+            if node.name == "decide" and rel_parts != _PRAXIS_DECIDE_FILE:
                 violations.append(
                     f"line {node.lineno}: permission decision outside core/permission.py (single entry) — "
                     "def decide()(含同名方法)权限决策唯一入口"

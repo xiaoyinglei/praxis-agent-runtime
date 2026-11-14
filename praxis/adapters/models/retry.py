@@ -41,6 +41,7 @@ from praxis.protocol.retry import (
     FailureKind,
     ModelFailure,
     ModelUnavailableError,
+    NoRetryPlan,
     RetryAtSource,
     RetryingStream,
     RetryPlan,
@@ -275,8 +276,8 @@ async def stream_with_retry(
             assert first_dispatched_at is not None
             # 本次 call 的首个派发时刻同样是地板:中途回拨也不得自动重试。
             retry_floor = max(floor, first_dispatched_at)
-            plan: RetryPlan | None = (
-                policy.decide(
+            decision: RetryPlan | NoRetryPlan = (
+                policy.plan(
                     retry_count=retries_used,
                     first_dispatched_at=first_dispatched_at,
                     failure=failure,
@@ -284,9 +285,9 @@ async def stream_with_retry(
                     random_fraction=random.random(),
                 )
                 if now >= retry_floor
-                else None
+                else NoRetryPlan("model_retry_clock_invalid")
             )
-            retry_at = plan.retry_at if plan is not None and plan.allowed else None
+            retry_at = decision.retry_at if isinstance(decision, RetryPlan) else None
             source: RetryAtSource | None = None
             if retry_at is not None:
                 source = (
@@ -305,20 +306,11 @@ async def stream_with_retry(
                     retry_at_source=source,
                 )
             )
-            if plan is None or not plan.allowed:
-                reason_code = None
-                if plan is not None:
-                    reason_code = plan.reason_code
-                elif (
-                    failure.retryable
-                    and not failure.output_started
-                    and now >= retry_floor
-                    and retries_used >= policy.max_auto_retries
-                ):
-                    reason_code = "model_retry_exhausted"
-                raise ModelUnavailableError(failure, reason_code=reason_code) from exc
-            assert retry_at is not None
-            await sleep(max(0.0, retry_at - clock()))
+            if isinstance(decision, NoRetryPlan):
+                raise ModelUnavailableError(
+                    failure, reason_code=decision.reason_code
+                ) from exc
+            await sleep(max(0.0, decision.retry_at - clock()))
             retries_used += 1
             continue
 

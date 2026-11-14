@@ -10,8 +10,8 @@
   原文摘要放 ``diagnostic``(有界、白名单字符),只供上层诊断,不参与重试判定。
 - ``AttemptRecord`` 是 ``model_attempt`` item 的内存形状;真正的 append-only
   写点在 core(turn 归属),本模块不碰 store。
-- ``RetryPolicy`` 是纯授权:给定失败、已用重试数与随机分数,返回带 deadline
-  的 ``RetryPlan`` 或拒绝(None/``allowed=False``)。
+- ``RetryPolicy.plan`` 是纯授权:给定失败、已用重试数与随机分数,返回值只有
+  两种——“要重试”的 ``RetryPlan`` 或“不重试”的 ``NoRetryPlan``(R-T3-3)。
 - ``clock_floor`` 把历史尝试的派发时刻与当前观察时刻都当作地板:任何一条
   观测都足以证明时钟曾经到达过那里,回拨即拒绝自动重试(跨进程重启成立)。
 """
@@ -39,7 +39,6 @@ FailureKind = Literal[
 ]
 FailurePhase = Literal["request", "stream"]
 AttemptOutcome = Literal["ok", "failed"]
-RetryReasonCode = Literal["model_retry_exhausted", "model_retry_deadline_exceeded"]
 RetryAtSource = Literal["retry_after", "backoff"]
 
 # 固定文案表:provider 原始消息绝不进入 message(只进 diagnostic)。
@@ -140,23 +139,28 @@ class AttemptRecord:
 
 @dataclass(frozen=True, slots=True)
 class RetryPlan:
-    """一次可重试失败的调度计划;``allowed=False`` 时只承载拒绝原因。"""
+    """一次允许重试的调度计划(唯一表示"要重试")。"""
 
     retry_at: float
     deadline_at: float
     delay_ms: int
-    reason_code: RetryReasonCode | None = None
-    allowed: bool = True
 
     def __post_init__(self) -> None:
         if not _is_finite_number(self.retry_at) or not _is_finite_number(self.deadline_at):
             raise ValueError("retry plan times must be finite")
         if type(self.delay_ms) is not int or self.delay_ms < 0:
             raise ValueError("delay_ms must be a non-negative int")
-        if self.reason_code not in (None, "model_retry_exhausted", "model_retry_deadline_exceeded"):
-            raise ValueError(f"unsupported retry reason code: {self.reason_code!r}")
-        if type(self.allowed) is not bool:
-            raise TypeError("allowed must be a boolean")
+
+
+@dataclass(frozen=True, slots=True)
+class NoRetryPlan:
+    """不重试的唯一表示与机器可读原因(R-T3-3:不再有 None/allowed 两套口径)。"""
+
+    reason_code: str
+
+    def __post_init__(self) -> None:
+        if not self.reason_code:
+            raise ValueError("NoRetryPlan.reason_code must be non-empty")
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,7 +184,7 @@ class RetryPolicy:
         if self.max_elapsed_ms < 1 or self.max_delay_ms < self.base_delay_ms:
             raise ValueError("invalid model retry delay bounds")
 
-    def decide(
+    def plan(
         self,
         *,
         retry_count: int,
@@ -188,11 +192,11 @@ class RetryPolicy:
         failure: ModelFailure,
         now: float,
         random_fraction: float,
-    ) -> RetryPlan | None:
-        """返回 full-jitter 重试计划;None 表示明确拒绝。
+    ) -> RetryPlan | NoRetryPlan:
+        """返回 full-jitter 重试计划;``NoRetryPlan`` 是"不重试"的唯一表示。
 
-        deadline 越界仍返回 ``RetryPlan(allowed=False, reason_code=...)``,
-        让上层拿到机器可读原因;重试次数耗尽/不可重试 kind/时钟回拨返回 None。
+        方法名必须是 ``plan`` 而非 ``decide``(R-T3-2):CI 把权限决策入口
+        钉死为全仓唯一、只在 ``core/permission.py``,策略对象不开路径豁免。
         """
         if not all(math.isfinite(value) for value in (now, first_dispatched_at, random_fraction)):
             raise ValueError("retry times and jitter must be finite")
@@ -201,27 +205,21 @@ class RetryPolicy:
         if type(retry_count) is not int or retry_count < 0:
             raise ValueError("retry_count must be a non-negative integer")
         if now < first_dispatched_at:
-            return None
+            return NoRetryPlan("model_retry_clock_invalid")
         if retry_count >= self.max_auto_retries:
-            return None
+            return NoRetryPlan("model_retry_exhausted")
         if (
             failure.output_started
             or not failure.retryable
             or failure.kind not in _RETRYABLE_KINDS
         ):
-            return None
+            return NoRetryPlan(failure.kind)
         deadline_at = first_dispatched_at + self.max_elapsed_ms / 1000
         ceiling = min(self.max_delay_ms, self.base_delay_ms * 2 ** min(retry_count, 63))
         delay_ms = int(ceiling * random_fraction)
         retry_at = max(now + delay_ms / 1000, failure.retry_at if failure.retry_at is not None else now)
         if now > deadline_at or retry_at > deadline_at:
-            return RetryPlan(
-                retry_at=retry_at,
-                deadline_at=deadline_at,
-                delay_ms=delay_ms,
-                reason_code="model_retry_deadline_exceeded",
-                allowed=False,
-            )
+            return NoRetryPlan("model_retry_deadline_exceeded")
         return RetryPlan(retry_at=retry_at, deadline_at=deadline_at, delay_ms=delay_ms)
 
 
@@ -244,7 +242,7 @@ class ModelUnavailableError(RuntimeError):  # noqa: N818 — 名称由计划契�
     同时绝不回显 provider body。
     """
 
-    def __init__(self, failure: ModelFailure, *, reason_code: RetryReasonCode | None = None) -> None:
+    def __init__(self, failure: ModelFailure, *, reason_code: str | None = None) -> None:
         self.failure = failure
         self.reason_code = reason_code
         detail = failure.message
@@ -264,10 +262,10 @@ __all__ = [
     "FailurePhase",
     "ModelFailure",
     "ModelUnavailableError",
+    "NoRetryPlan",
     "RetryAtSource",
     "RetryPlan",
     "RetryPolicy",
-    "RetryReasonCode",
     "RetryingStream",
     "StreamFactory",
     "clock_floor",

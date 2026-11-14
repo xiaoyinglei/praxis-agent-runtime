@@ -28,6 +28,7 @@ from praxis.adapters.models.retry import (
     stream_with_retry,
 )
 from praxis.adapters.models.scripted import ScriptedAdapter
+from praxis.composition import build_session
 from praxis.core.turn import (
     TurnDeps,
     TurnState,
@@ -39,6 +40,7 @@ from praxis.protocol.events import ModelOutputDelta, ModelRetried, ModelResponse
 from praxis.protocol.items import Item, ItemKind
 from praxis.protocol.models import (
     ModelEvent,
+    ModelResponse,
     ModelStreamFinished,
     ModelTextDelta,
     Usage,
@@ -50,6 +52,8 @@ from praxis.protocol.retry import (
     AttemptRecord,
     ModelFailure,
     ModelUnavailableError,
+    NoRetryPlan,
+    RetryPlan,
     RetryPolicy,
     clock_floor,
 )
@@ -142,36 +146,33 @@ def test_output_started_is_never_retryable() -> None:
     failure = classify_failure(_status_error(503), output_started=True, now=0.0)
     assert failure.kind == "server_error" and failure.phase == "stream"
     assert failure.retryable is False
-    assert (
-        RetryPolicy().decide(
-            retry_count=0,
-            first_dispatched_at=0,
-            failure=ModelFailure("server_error", "x", True, None, True, "stream"),
-            now=0,
-            random_fraction=0.5,
-        )
-        is None
+    decision = RetryPolicy().plan(
+        retry_count=0,
+        first_dispatched_at=0,
+        failure=ModelFailure("server_error", "x", True, None, True, "stream"),
+        now=0,
+        random_fraction=0.5,
     )
+    assert isinstance(decision, NoRetryPlan)
 
 
 def test_full_jitter_and_limits() -> None:
     ok = ModelFailure("server_error", "x", True, None, False, "request")
-    plan = RetryPolicy().decide(
+    plan = RetryPolicy().plan(
         retry_count=1, first_dispatched_at=0, failure=ok, now=0, random_fraction=0.5
     )
-    assert plan is not None and plan.delay_ms == int(min(20_000, 500 * 2) * 0.5)
+    assert isinstance(plan, RetryPlan)
+    assert plan.delay_ms == int(min(20_000, 500 * 2) * 0.5)
     assert plan.retry_at == pytest.approx(0.5)
-    assert (
-        RetryPolicy().decide(
-            retry_count=2, first_dispatched_at=0, failure=ok, now=0, random_fraction=0.5
-        )
-        is None
+    exhausted = RetryPolicy().plan(
+        retry_count=2, first_dispatched_at=0, failure=ok, now=0, random_fraction=0.5
     )
-    deadline = RetryPolicy().decide(
+    assert isinstance(exhausted, NoRetryPlan)
+    assert exhausted.reason_code == "model_retry_exhausted"
+    deadline = RetryPolicy().plan(
         retry_count=0, first_dispatched_at=0, failure=ok, now=121.0, random_fraction=0.5
     )
-    assert deadline is not None
-    assert deadline.allowed is False
+    assert isinstance(deadline, NoRetryPlan)
     assert deadline.reason_code == "model_retry_deadline_exceeded"
 
 
@@ -180,9 +181,10 @@ def test_retryable_set_is_only_rate_limited_server_error_transport_not_sent() ->
     for kind in ("authentication", "permission", "invalid_request", "context_overflow",
                  "quota_exhausted", "transport_unknown", "protocol_error"):
         failure = ModelFailure(kind, "x", True, None, False, "request")
-        assert policy.decide(
+        decision = policy.plan(
             retry_count=0, first_dispatched_at=0, failure=failure, now=0, random_fraction=0.5
-        ) is None, kind
+        )
+        assert isinstance(decision, NoRetryPlan) and decision.reason_code == kind
 
 
 def test_status_code_classification_and_x_should_retry() -> None:
@@ -462,11 +464,18 @@ def _turn(store: Store) -> None:
     )
 
 
-def _deps(workspace: Path, store: Store, bus: object, retry_stream: object) -> TurnDeps:
+def _deps(
+    workspace: Path,
+    store: Store,
+    bus: object,
+    retry_stream: object,
+    *,
+    adapter: object | None = None,
+) -> TurnDeps:
     return TurnDeps(
         store=store,
         bus=bus,  # type: ignore[arg-type]
-        adapter=ScriptedAdapter([]),
+        adapter=adapter if adapter is not None else ScriptedAdapter([]),  # type: ignore[arg-type]
         tools={},
         permissions=PermissionContext(
             workspace=str(workspace), policy=PermissionPolicy(), mode="on-request"
@@ -609,3 +618,47 @@ def test_attempt_records_from_items_is_fail_open_on_malformed_payload() -> None:
         (0, "server_error", "failed", None),
         (1, "ok", "ok", 12.5),
     ]
+
+
+# ---------------------------------------------------------------------------
+# 是否写 attempt item 由"机制是否注入"决定,而不是分支特判(R-T3-3 附加钉住)
+# ---------------------------------------------------------------------------
+
+
+def _scripted_response(content: str = "ok") -> ModelResponse:
+    return ModelResponse(
+        content=content,
+        tool_calls=(),
+        usage=Usage(1, 1),
+        finish_reason="stop",
+    )
+
+
+def test_composition_injected_retry_records_exactly_one_ok_attempt(workspace: Path) -> None:
+    """生产组合根注入真实机制:一次无故障调用恰好一条 outcome=ok 的 item。"""
+    session = build_session(workspace, ScriptedAdapter([_scripted_response("done")]))
+    try:
+        result = asyncio.run(session.submit("hi"))
+        assert result.status is TurnStatus.COMPLETED and result.output == "done"
+        attempts = [item for item in session.items() if item.kind == ItemKind.MODEL_ATTEMPT]
+        assert len(attempts) == 1
+        assert attempts[0].payload["attempt"] == 0
+        assert attempts[0].payload["outcome"] == "ok"
+        assert attempts[0].payload["kind"] == "ok"
+    finally:
+        session.close()
+
+
+def test_retry_stream_none_writes_no_attempt_items(
+    store: Store, bus: object, workspace: Path
+) -> None:
+    """scripted/单测路径(无机制)不产生尝试账,且照常完成。"""
+    _turn(store)
+    deps = _deps(
+        workspace, store, bus, None, adapter=ScriptedAdapter([_scripted_response("fine")])
+    )
+
+    result = asyncio.run(run_turn(deps, TurnState(_TURN, _THREAD)))
+
+    assert result.status is TurnStatus.COMPLETED and result.output == "fine"
+    assert [i for i in store.read_turn_items(_TURN) if i.kind == ItemKind.MODEL_ATTEMPT] == []
