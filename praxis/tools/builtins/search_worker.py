@@ -15,8 +15,9 @@ ripgrep 配置、不用 Python 正则求值(rg 的正则是公开契约)。
   (regex 加 ``--crlf``,literal 加 ``--fixed-strings``);``RLIMIT_FSIZE`` 在解码前
   封顶原生输出;
 - 阈值常量集中在本模块,``search.py`` 原样写入 ``metadata["limits"]``。
-- R-T11-2:遍历触达每个条目时复用 ``protocol.policy.path_access`` 做执行侧
-  deny 过滤,被拒文件跳过并计入 ``skipped_denied``(deny 子树整棵剪除)。
+- R-T11-2:遍历触达每个条目时复用 ``read_access.is_read_denied``(与
+  ``protocol.policy.path_access`` 同一规则代数)做执行侧 deny 过滤,被拒文件
+  跳过并计入 ``skipped_denied``(deny 子树整棵剪除)。
 """
 
 from __future__ import annotations
@@ -107,7 +108,11 @@ def _under_deny_floor(root: Path, target: Path) -> str:
 
 
 def _policy_sources(payload: dict[str, Any], root: Path) -> tuple[ResolvedPolicy, ...]:
-    """worker 侧重建权限来源(policy + ceilings);空 = 无快照(单测直跑)。"""
+    """worker 侧按 search.py 序列化的声明重建来源集合。
+
+    声明包含 policy + ceilings + session/once 覆盖层(与执行侧
+    ``permission_declarations`` 同一组来源);空 = 无快照(单测直跑)。
+    """
     raw = payload.get("policies")
     if not raw:
         return ()

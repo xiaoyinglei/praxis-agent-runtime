@@ -875,8 +875,14 @@ def test_agent_memory_target_is_invalid_input(tmp_path: Path) -> None:
     assert "agent memory is not searchable" in r.text
 
 
-def _spawn_sleeping_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[int]:
-    """把 worker bootstrap 换成 sleep,并记录真实子进程 pid。"""
+def _spawn_sleeping_worker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[list[int], Path]:
+    """把 worker bootstrap 换成"再生一个孙进程 + 记录 pid"再 sleep。
+
+    孙进程留在 worker 的进程组里:若 ``_stop_worker`` 从杀组退化为杀单进程,
+    孙进程仍活着,``killpg(pgid, 0)`` 探针会失败。
+    """
     (tmp_path / "f.txt").write_text("needle\n", encoding="utf-8")
     pids: list[int] = []
     real = asyncio.create_subprocess_exec
@@ -887,8 +893,23 @@ def _spawn_sleeping_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> l
         return proc
 
     monkeypatch.setattr(search_module.asyncio, "create_subprocess_exec", spy)
-    monkeypatch.setattr(search_module, "_bootstrap", lambda: "import time; time.sleep(30)")
-    return pids
+    grandchild_pidfile = tmp_path / "grandchild.pid"
+    bootstrap = (
+        "import subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+        f"open({str(grandchild_pidfile)!r}, 'w').write(str(child.pid))\n"
+        "time.sleep(30)\n"
+    )
+    monkeypatch.setattr(search_module, "_bootstrap", lambda: bootstrap)
+    return pids, grandchild_pidfile
+
+
+def _read_grandchild_pid(pidfile: Path, budget: float = 6.0) -> int:
+    deadline = time.monotonic() + budget
+    while not pidfile.exists():
+        assert time.monotonic() < deadline, "worker never spawned its grandchild"
+        time.sleep(0.01)
+    return int(pidfile.read_text().strip())
 
 
 def _assert_pid_dead(pid: int, budget: float = 6.0) -> None:
@@ -902,33 +923,50 @@ def _assert_pid_dead(pid: int, budget: float = 6.0) -> None:
         time.sleep(0.05)
 
 
+def _assert_group_dead(pgid: int, budget: float = 6.0) -> None:
+    """进程组内已无成员:杀单进程而非整组的实现会在这里失败。"""
+    deadline = time.monotonic() + budget
+    while True:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return
+        assert time.monotonic() < deadline, f"process group {pgid} survived; expected group kill"
+        time.sleep(0.05)
+
+
 def test_worker_process_group_killed_on_cancel(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    pids = _spawn_sleeping_worker(monkeypatch, tmp_path)
+    pids, grandchild_pidfile = _spawn_sleeping_worker(monkeypatch, tmp_path)
 
     async def scenario() -> None:
         tool = create_search_text_tool(tmp_path)
         task = asyncio.create_task(tool.run({"pattern": "needle"}, ToolExecContext()))
-        while not pids:
+        deadline = time.monotonic() + 6.0
+        while not pids or not grandchild_pidfile.exists():
+            assert time.monotonic() < deadline, "worker never spawned its grandchild"
             await asyncio.sleep(0.01)
-        await asyncio.sleep(0.05)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
 
     asyncio.run(scenario())
     assert pids
-    _assert_pid_dead(pids[0])
+    grandchild = _read_grandchild_pid(grandchild_pidfile)
+    _assert_group_dead(pids[0])
+    _assert_pid_dead(grandchild)
 
 
 def test_worker_process_group_killed_on_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    pids = _spawn_sleeping_worker(monkeypatch, tmp_path)
-    monkeypatch.setattr(search_module, "_WORKER_TIMEOUT_SECONDS", 0.2)
+    pids, grandchild_pidfile = _spawn_sleeping_worker(monkeypatch, tmp_path)
+    monkeypatch.setattr(search_module, "_WORKER_TIMEOUT_SECONDS", 1.0)
     r = run(create_search_text_tool(tmp_path), {"pattern": "needle"})
     assert r.status is ResultStatus.TIMEOUT
     assert r.error_code == "timeout"
     assert pids
-    _assert_pid_dead(pids[0])
+    grandchild = _read_grandchild_pid(grandchild_pidfile)
+    _assert_group_dead(pids[0])
+    _assert_pid_dead(grandchild)

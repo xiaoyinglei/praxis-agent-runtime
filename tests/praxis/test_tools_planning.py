@@ -248,9 +248,6 @@ def test_malformed_store_payload_is_fail_open(workspace: Path) -> None:
     """
     store = Store(workspace / "db.db")
     try:
-        # Manually append malformed tool_result entries via execute pipeline path
-        # We use a simpler approach: create valid items, mutate their serialized payload.
-        # Actually simplest: use store transact + raw SQL for exact control.
         def _write_malware(conn):
             """Write a raw tool_result with known bad metadata into sqlite."""
             now = time.time()

@@ -42,6 +42,7 @@ from praxis.protocol.tools import ToolCall, ToolEffect
 from praxis.store.log import Store
 from praxis.store.turns import create_turn
 from praxis.tools.builtins import command_sessions as command_sessions_module
+from praxis.tools.builtins.process import signal_group
 from praxis.tools.builtins.command import CommandExecution, create_bash_tool
 from praxis.tools.builtins.command_sessions import (
     CommandSessionError,
@@ -870,7 +871,7 @@ def test_composition_wires_sessions_sweep_and_close(tmp_path: Path, monkeypatch:
     try:
         tools = session._tools  # noqa: SLF001 — 装配覆盖:检查同一实例注入两个工具
         assert "bash" in tools and "manage_command" in tools
-        assert recorded.get("kill_group") is not None
+        assert recorded.get("kill_group") is signal_group
 
         async def drive() -> tuple[Any, Any]:
             started = await tools["bash"].run(

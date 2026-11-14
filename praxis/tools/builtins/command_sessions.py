@@ -73,7 +73,6 @@ _MAX_RETAINED = 32
 _MAX_COMMAND_PREFIX_CHARS = 200
 _JOBS_DIR_MODE = 0o700
 _MARKER_MODE = 0o600
-_MARKER_MAX_BYTES = 4096
 _MAX_READ_BYTES = 64_000
 _SESSION_ID_PATTERN = re.compile(r"cmd_[0-9a-f]{32}")
 
@@ -392,7 +391,7 @@ class CommandSessions:
         except Exception:  # noqa: BLE001 — 执行器自身失败:先证明组已收敛,再记 lost
             try:
                 await execution.cancel()
-            except Exception:  # noqa: BLE001 — 收敛失败也不能炸穿事件循环;marker 留待清扫
+            except Exception:  # noqa: BLE001 — 收敛失败也不能炸穿事件循环;marker 由收编/清扫删除
                 pass
             with self._lock:
                 entry.status = "lost"

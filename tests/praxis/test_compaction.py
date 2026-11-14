@@ -260,7 +260,7 @@ def test_summary_request_is_bounded_and_elides_old_tool_bodies(store: Store) -> 
     assert len(prompt) <= SUMMARY_PROMPT_MAX_CHARS
     assert "LONG-TOOL-OUTPUT-BODY" not in prompt
     assert "[elided tool output:" in prompt
-    assert "更早的内容已截断" in prompt
+    assert "更近的内容已截断" in prompt
     # composition 注入的输出预算原样进入摘要请求(小窗口模型不会被 2048 撞拒)。
     assert adapter.last_request.max_output_tokens == 64
 

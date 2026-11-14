@@ -52,7 +52,7 @@ SUMMARY_MAX_OUTPUT_TOKENS: Final = 2048
 # 摘要请求正文的硬字符上限:elide 只能约束工具输出,用户/助手正文本身无界,
 # 没有这一层,压缩会在"长历史"上把自身请求撑爆(context overflow → 静默失败)。
 SUMMARY_PROMPT_MAX_CHARS: Final = 16_000
-_TRUNCATION_NOTE: Final = "[... 更早的内容已截断 ...]\n"
+_TRUNCATION_NOTE: Final = "[... 更近的内容已截断 ...]\n"
 _ARGS_PREVIEW_CHARS: Final = 200
 
 # 这些 kind 不参与覆盖区间选择(turn_status/approval_* 不投影成模型消息;
