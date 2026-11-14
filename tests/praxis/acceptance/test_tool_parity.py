@@ -35,6 +35,7 @@ import asyncio
 import os
 import re
 import subprocess
+import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -43,7 +44,7 @@ from typing import Any
 
 import pytest
 
-from praxis.protocol.sandbox import ToolExecContext
+from praxis.protocol.sandbox import SandboxSpec, ToolExecContext
 from praxis.protocol.tools import Tool, ToolValidationError
 from praxis.tools.builtins.child_env import child_env
 from praxis.tools.builtins.command import create_bash_tool
@@ -66,8 +67,21 @@ _PATCH_FAILURE_MESSAGE = (
 )
 
 
+def _search_exec_ctx() -> ToolExecContext:
+    """S-1:search_text 是 EXECUTE_PROCESS;对齐测试只验证工具自身契约,
+    用 identity 前缀模拟管道已编译的沙箱(真实 seatbelt 强制在 acceptance/S-1)。"""
+    return ToolExecContext(
+        sandbox=SandboxSpec(
+            backend="seatbelt",
+            argv_prefix=("/usr/bin/env",),
+            scratch_dir=tempfile.gettempdir(),
+        )
+    )
+
+
 def _run(tool: Tool, arguments: Mapping[str, Any]) -> Any:
-    return asyncio.run(tool.run(arguments, ToolExecContext()))
+    exec_ctx = _search_exec_ctx() if tool.definition.name == "search_text" else ToolExecContext()
+    return asyncio.run(tool.run(arguments, exec_ctx))
 
 
 def _schema_properties(tool: Tool) -> Mapping[str, Any]:

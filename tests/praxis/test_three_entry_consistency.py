@@ -444,8 +444,14 @@ _NET_DENY = PermissionPolicy(network=NetworkPolicy(decision="deny"))
         # ask 规则(decide 第2步)先于地板(第4步)→ 首次 asked;resume 批准后执行时地板守卫 deny(R5c)。
         ("ask-rule-before-floor", Call("read", {"path": ".praxis/state.json"}), Scenario(PermissionPolicy(tools=(ToolRule(pattern="read", decision="ask"),)), None), "asked"),
         # Task 18 Step 5:新增五个工具也走同一 decide(每类至少一例)。
-        ("allow-search-text", Call("search_text", {"pattern": "seed"}), Scenario(PermissionPolicy(), None), "executed"),
-        ("deny-floor-search-praxis", Call("search_text", {"pattern": "x", "path": ".praxis"}), Scenario(PermissionPolicy(), None), "denied"),
+        # S-1:search_text 现声明 EXECUTE_PROCESS(worker 在沙箱内运行),因此与
+        # bash/run_python 同一姿态受 command-network 闸支配:默认 network ask
+        # (decide 第 2 步)先于 floor/allow(第 4/6 步)。下面两例用 _NET_ALLOW
+        # 保留 executed/denied 覆盖(网络闸清零后,沙箱 allow / 地板 deny 才是
+        # 决策),并新增一例钉住"默认 network ask → asked"的新语义。
+        ("allow-search-text", Call("search_text", {"pattern": "seed"}), Scenario(_NET_ALLOW, None), "executed"),
+        ("deny-floor-search-praxis", Call("search_text", {"pattern": "x", "path": ".praxis"}), Scenario(_NET_ALLOW, None), "denied"),
+        ("ask-search-text-default-network", Call("search_text", {"pattern": "seed"}), Scenario(PermissionPolicy(), None), "asked"),
         ("allow-apply-patch", Call("apply_patch", {"patch": _PATCH_NOTE}), Scenario(PermissionPolicy(), None), "executed"),
         ("deny-floor-patch-git", Call("apply_patch", {"patch": _PATCH_GIT}), Scenario(PermissionPolicy(), None), "denied"),
         ("ask-tool-rule-apply-patch", Call("apply_patch", {"patch": _PATCH_NOTE}), Scenario(PermissionPolicy(tools=(ToolRule(pattern="apply_patch", decision="ask"),)), None), "asked"),

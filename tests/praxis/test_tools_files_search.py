@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
+import tempfile
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -19,14 +21,21 @@ from typing import Any
 
 import pytest
 
+from praxis import composition
 from praxis.core import permission
 from praxis.core.pipeline import ExecCtx, execute
 from praxis.interfaces.sdk import ScriptedAdapter, open_session
 from praxis.protocol.items import ItemKind
 from praxis.protocol.models import ModelResponse, ModelToolCall, Usage
-from praxis.protocol.permission import PermissionContext, PermissionUpdate
-from praxis.protocol.policy import PathRule, PermissionPolicy, path_access, resolve_policy
-from praxis.protocol.sandbox import ToolExecContext
+from praxis.protocol.permission import PermissionContext, PermissionUpdate, SandboxAvailability
+from praxis.protocol.policy import (
+    NetworkPolicy,
+    PathRule,
+    PermissionPolicy,
+    path_access,
+    resolve_policy,
+)
+from praxis.protocol.sandbox import SandboxSpec, ToolExecContext
 from praxis.protocol.tools import (
     CancellationMode,
     InterruptBehavior,
@@ -46,8 +55,25 @@ from praxis.tools.builtins.search import create_search_text_tool
 from praxis.tools.builtins.search_worker import LIMITS
 
 
+def _fake_sandbox(permissions: PermissionContext | None = None) -> ToolExecContext:
+    """S-1:search_text 现在是 EXECUTE_PROCESS,run 必须有已编译沙箱。
+
+    这些用例验证搜索语义而非沙箱强制;用 identity 前缀(``env``)模拟管道
+    已编译好的 spec,真实座位带强制在 acceptance 的 S-1 用例中验证。
+    """
+    return ToolExecContext(
+        sandbox=SandboxSpec(
+            backend="seatbelt",
+            argv_prefix=("/usr/bin/env",),
+            scratch_dir=tempfile.gettempdir(),
+        ),
+        permissions=permissions,
+    )
+
+
 def run(tool: Any, arguments: dict[str, Any]) -> Any:
-    return asyncio.run(tool.run(arguments, ToolExecContext()))
+    exec_ctx = _fake_sandbox() if tool.definition.name == "search_text" else ToolExecContext()
+    return asyncio.run(tool.run(arguments, exec_ctx))
 
 
 def run_with(tool: Any, arguments: dict[str, Any], exec_ctx: ToolExecContext) -> Any:
@@ -581,8 +607,50 @@ def test_backend_missing_error_code(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert r.error_code == "search_backend_unavailable"
 
 
+def test_search_refuses_to_spawn_without_sandbox(tmp_path: Path) -> None:
+    """S-1 静态断言:没有已编译 argv_prefix 时绝不裸跑宿主解释器。
+
+    行为面断言(比 AST 匹配更稳):``exec_ctx.sandbox is None`` → 直接
+    ``search_backend_unavailable``,不发生任何子进程。
+    """
+    (tmp_path / "f.txt").write_text("needle\n", encoding="utf-8")
+    r = asyncio.run(
+        create_search_text_tool(tmp_path).run({"pattern": "needle"}, ToolExecContext())
+    )
+    assert r.status is ResultStatus.ERROR
+    assert r.error_code == "search_backend_unavailable"
+    assert "sandbox" in r.text
+
+    # 源码面:唯一 spawn 点必须展开编译出的 argv_prefix(防止回归成裸 sys.executable)。
+    source = Path(search_module.__file__).read_text(encoding="utf-8")
+    assert "create_subprocess_exec(" in source
+    spawn = source.split("create_subprocess_exec(", 1)[1][:200]
+    assert "*spec.argv_prefix" in spawn
+
+
+def test_search_and_list_files_hide_private_dir_inside_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S-2:PRAXIS_CONFIG_DIR 落在工作区内时,目录级遍历也不得泄密。"""
+    private = tmp_path / "hostcfg"
+    private.mkdir()
+    (private / "credentials").write_text("TOP-SECRET-TOKEN\n", encoding="utf-8")
+    (tmp_path / "public.txt").write_text("public needle\n", encoding="utf-8")
+    monkeypatch.setenv("PRAXIS_CONFIG_DIR", str(private))
+
+    searched = run(create_search_text_tool(tmp_path), {"pattern": "TOP-SECRET-TOKEN"})
+    assert searched.status is ResultStatus.OK
+    assert "TOP-SECRET-TOKEN" not in searched.text
+    assert searched.metadata["skipped_denied"] >= 1
+
+    listed = run(create_list_files_tool(tmp_path), {"path": ".", "include_hidden": True})
+    assert listed.status is ResultStatus.OK
+    assert "hostcfg" not in listed.text
+    assert "public.txt" in listed.text  # 阳性对照:正常条目仍可见
+
+
 def test_worker_isolated_env_and_flags(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # worker 必须 -I + 空白 env + cwd="/" + 独立进程组:不继承宿主 PYTHONPATH。
+    # worker 必须经沙箱前缀 + -I + child_env + cwd="/" + 独立进程组:不继承宿主 PYTHONPATH。
     (tmp_path / "f.txt").write_text("needle\n", encoding="utf-8")
     captured: dict[str, Any] = {}
     real = asyncio.create_subprocess_exec
@@ -596,9 +664,19 @@ def test_worker_isolated_env_and_flags(tmp_path: Path, monkeypatch: pytest.Monke
     monkeypatch.setattr(search_module.asyncio, "create_subprocess_exec", spy)
     r = run(create_search_text_tool(tmp_path), {"pattern": "needle"})
     assert r.status is ResultStatus.OK
-    assert captured["args"][1:3] == ("-I", "-c")
-    assert captured["kwargs"]["env"] == {"PATH": os.defpath}
-    assert "PYTHONPATH" not in captured["kwargs"]["env"]
+    args = captured["args"]
+    # S-1:已编译沙箱前缀在真实命令之前(fake spec 用 identity `env` 前缀)。
+    assert args[0] == "/usr/bin/env"
+    assert args[1] == sys.executable
+    assert args[2:4] == ("-I", "-c")
+    env = captured["kwargs"]["env"]
+    # child_env 唯一构造:固定 PATH、HOME/TMPDIR 指向 scratch,不继承宿主 env。
+    assert "PYTHONPATH" not in env
+    scratch = os.path.realpath(tempfile.gettempdir())
+    assert env["HOME"] == scratch and env["TMPDIR"] == scratch
+    assert env["PATH"].split(os.pathsep)[0] == os.path.join(
+        os.path.realpath(tmp_path), ".venv", "bin"
+    )
     assert captured["kwargs"]["cwd"] == "/"
     assert captured["kwargs"]["start_new_session"] is True
 
@@ -641,14 +719,18 @@ def test_search_policy_and_resolve_use(tmp_path: Path) -> None:
     workspace.mkdir()
     tool = create_search_text_tool(workspace)
     assert tool.definition.name == "search_text"
-    assert tool.static_effects == frozenset({ToolEffect.READ_WORKSPACE})
+    assert tool.static_effects == frozenset(
+        {ToolEffect.READ_WORKSPACE, ToolEffect.EXECUTE_PROCESS}
+    )
     assert tool.idempotent and tool.concurrency_safe
     assert tool.cancellation_mode is CancellationMode.COOPERATIVE
     assert tool.interrupt_behavior is InterruptBehavior.CANCEL
     assert tool.timeout_seconds == 15
     assert tool.max_model_output_bytes == 2_000_000
     root_use = tool.resolve_use({})
-    assert root_use.effects == frozenset({ToolEffect.READ_WORKSPACE})
+    assert root_use.effects == frozenset(
+        {ToolEffect.READ_WORKSPACE, ToolEffect.EXECUTE_PROCESS}
+    )
     assert root_use.targets[0].value == str(workspace.resolve())
     sub = workspace / "sub"
     sub.mkdir()
@@ -695,7 +777,7 @@ def test_search_skips_denied_file(tmp_path: Path) -> None:
     r = run_with(
         create_search_text_tool(tmp_path),
         {"pattern": "needle"},
-        ToolExecContext(permissions=ctx),
+        _fake_sandbox(ctx),
     )
     assert "needle public" in r.text
     assert "needle secret" not in r.text
@@ -721,7 +803,7 @@ def test_denied_file_does_not_leak_and_decide_stays_denied(tmp_path: Path) -> No
     (tmp_path / "secret.txt").write_text("TOPSECRET", encoding="utf-8")
     (tmp_path / "public.txt").write_text("public", encoding="utf-8")
     ctx = _permission_ctx(tmp_path, PathRule(path="secret.txt", access="deny"))
-    exec_ctx = ToolExecContext(permissions=ctx)
+    exec_ctx = _fake_sandbox(ctx)
 
     # 执行侧:目录级搜索把 denied 文件排除,内容原文不泄露
     searched = run_with(
@@ -749,8 +831,19 @@ def test_pipeline_forwards_permissions_to_search(
     # 否则目录级搜索在真实管道里仍会读穿 deny 子路径。
     (workspace / "secret.txt").write_text("TOPSECRET", encoding="utf-8")
     (workspace / "public.txt").write_text("needle public", encoding="utf-8")
-    policy = PermissionPolicy(filesystem=(PathRule(path="secret.txt", access="deny"),))
-    permissions = PermissionContext(workspace=str(workspace), policy=policy, mode="on-request")
+    policy = PermissionPolicy(
+        filesystem=(PathRule(path="secret.txt", access="deny"),),
+        # EXECUTE_PROCESS 的 command-network 闸:默认 ask 会先于 floor/allow,
+        # 本用例只验证执行侧逐条目过滤,因此显式 allow。
+        network=NetworkPolicy(decision="allow"),
+    )
+    permissions = PermissionContext(
+        workspace=str(workspace),
+        policy=policy,
+        mode="on-request",
+        # S-1:EXECUTE_PROCESS 的 decide 第 7 步要求沙箱可用(fake availability)。
+        sandbox=SandboxAvailability(backend="seatbelt", available=True),
+    )
     created = create_turn(store, turn_id="turn-search", thread_id="thread-search", binding={})
     ctx = ExecCtx(
         store=store,
@@ -761,6 +854,13 @@ def test_pipeline_forwards_permissions_to_search(
         turn_id=created.turn_id,
         thread_id=created.thread_id,
         policy_revision=policy.revision,
+        # S-1:search_text 是 EXECUTE_PROCESS;此用例验证权限转发,用 identity
+        # 前缀模拟管道已编译沙箱(真实 seatbelt 强制在 acceptance/S-1 用例)。
+        compile_sandbox=lambda _permissions, _use, _root: SandboxSpec(
+            backend="seatbelt",
+            argv_prefix=("/usr/bin/env",),
+            scratch_dir=tempfile.gettempdir(),
+        ),
     )
     result = asyncio.run(
         execute(
@@ -833,22 +933,41 @@ def test_custom_overlay_deny_hides_secret(tmp_path: Path, layer: str) -> None:
     r = run_with(
         create_search_text_tool(tmp_path),
         {"pattern": "TOPSECRET"},
-        ToolExecContext(permissions=ctx),
+        _fake_sandbox(ctx),
     )
     assert "TOPSECRET" not in r.text
     assert r.metadata["skipped_denied"] >= 1
 
 
-def test_once_update_deny_applies_to_search(workspace: Path) -> None:
+def test_once_update_deny_applies_to_search(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # 真 Session.update_permission(destination="once"):once 覆盖层是 deny 进入
     # 目录过滤的唯一通道(apply_update 不把它折进 policy)。
+    # S-1:search_text 现在走 EXECUTE_PROCESS 裁决;用 fake availability + identity
+    # 沙箱前缀把本用例限定在"权限覆盖层进入目录过滤"这一点上(network allow
+    # 避免默认 command-network ask 主导决策)。
     (workspace / "secret.txt").write_text("TOPSECRET", encoding="utf-8")
     (workspace / "public.txt").write_text("public needle", encoding="utf-8")
+    monkeypatch.setattr(
+        composition, "probe_backend", lambda: SandboxAvailability(backend="seatbelt", available=True)
+    )
+    monkeypatch.setattr(
+        composition,
+        "compile_sandbox",
+        lambda *args, **kwargs: SandboxSpec(
+            backend="seatbelt",
+            argv_prefix=("/usr/bin/env",),
+            scratch_dir=tempfile.gettempdir(),
+        ),
+    )
+    monkeypatch.setattr(composition, "finalize_sandbox", lambda *args: None)
     session = open_session(
         workspace,
         ScriptedAdapter(
             [_script_call("c1", "search_text", {"pattern": "TOPSECRET"}), _script_stop("done")]
         ),
+        policy=PermissionPolicy(network=NetworkPolicy(decision="allow")),
     )
     try:
         session.update_permission(
@@ -942,7 +1061,7 @@ def test_worker_process_group_killed_on_cancel(
 
     async def scenario() -> None:
         tool = create_search_text_tool(tmp_path)
-        task = asyncio.create_task(tool.run({"pattern": "needle"}, ToolExecContext()))
+        task = asyncio.create_task(tool.run({"pattern": "needle"}, _fake_sandbox()))
         deadline = time.monotonic() + 6.0
         while not pids or not grandchild_pidfile.exists():
             assert time.monotonic() < deadline, "worker never spawned its grandchild"

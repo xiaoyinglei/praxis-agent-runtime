@@ -57,35 +57,58 @@ def _normalize_component(name: str) -> str:
     return unicodedata.normalize("NFC", name).casefold()
 
 
+def _path_forms(value: Path | str) -> tuple[Path, ...]:
+    """一个路径的两种容器形态:词法(expanduser+abspath)与内核 realpath。
+
+    S-3:``host_private_paths()`` 刻意不 resolve env 分支(返回值逐字不变),
+    但 macOS 的 ``/var/folders`` ↔ ``/private/var/folders`` 意味着「父目录给的
+    词法形态」与「目标 realpath 形态」可能不同。containment 判定必须两种形态
+    都比——单一词法比较会让进程内工具绕过私有目录地板。
+
+    non-strict:broken symlink / 缺失目标不抛(``Path.resolve`` 默认 strict=False)。
+    """
+    try:
+        lexical = Path(os.path.abspath(str(Path(value).expanduser())))
+    except (OSError, ValueError):
+        return ()
+    forms = [lexical]
+    try:
+        real = lexical.resolve()
+    except (OSError, RuntimeError, ValueError):
+        real = None
+    if real is not None:
+        forms.append(real)
+    return tuple(dict.fromkeys(forms))
+
+
 def _is_under(candidate: Path, root_str: str) -> bool:
     """判断 candidate 是否位于 root_str 下，使用 NFC/casefold 归一化。
 
     non-strict: 不抛 OSError / broken symlink / missing target。
     逻辑与 policy._under_path 同风格，但本地实现、不跨模块导入私有符号。
-    对 candidate 做 expanduser() + os.path.abspath 词法规范化（不解析 symlink）。
+    S-3:候选与私有根都按词法/realpath 双形态比较(``_path_forms``),因此
+    ``/var/folders/...`` 与 ``/private/var/folders/...`` 不再互相漏判。
     """
-    try:
-        lex = candidate.expanduser()
-        canon = os.path.abspath(str(lex))
-    except (OSError, ValueError):
+    candidates = _path_forms(candidate)
+    roots = _path_forms(root_str)
+    if not candidates or not roots:
         return False
-    try:
-        if Path(canon).is_relative_to(root_str):
-            return True
-        root_normed = _normalize_component(root_str)
-        for ancestor in (Path(canon), *Path(canon).parents):
-            try:
+    for canon in candidates:
+        try:
+            if any(canon.is_relative_to(root) for root in roots):
+                return True
+            for ancestor in (canon, *canon.parents):
                 ancestor_normed = _normalize_component(str(ancestor))
-                if ancestor_normed == root_normed:
+                for root in roots:
+                    if ancestor_normed != _normalize_component(str(root)):
+                        continue
                     try:
-                        if ancestor.samefile(root_str):
+                        if ancestor.samefile(root):
                             return True
                     except OSError:
                         pass
-            except (OSError, ValueError):
-                continue
-    except (OSError, ValueError):
-        pass
+        except (OSError, ValueError):
+            continue
     return False
 
 

@@ -30,7 +30,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, BinaryIO, cast
 
-from praxis.protocol.floor import FLOOR_ENTRIES
+from praxis.protocol.floor import FLOOR_ENTRIES, host_private_paths
 from praxis.protocol.json import JsonValue
 from praxis.protocol.sandbox import ToolExecContext
 from praxis.protocol.tools import (
@@ -565,8 +565,13 @@ def create_list_files_tool(workspace: Path) -> Tool:
                 error_code="not_found",
             )
         root = workspace.resolve()
-        sources = permission_sources(exec_ctx.permissions, workspace)
-        denied = (lambda path: is_read_denied(sources, path)) if sources else None
+        # S-2:地板/私有目录逐条目判定(不只按目录名剪枝)。
+        private_paths = host_private_paths()
+        sources = permission_sources(
+            exec_ctx.permissions, workspace, private_paths=private_paths
+        )
+        def denied(path: Path) -> bool:
+            return is_read_denied(sources, path, private_paths=private_paths)
         lines: list[str] = []
         next_cursor: str | None = None
         truncated = False

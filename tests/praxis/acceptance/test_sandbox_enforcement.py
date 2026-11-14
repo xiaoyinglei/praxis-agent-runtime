@@ -27,6 +27,7 @@ import ast
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
@@ -46,7 +47,7 @@ from praxis.protocol.items import Item, ItemKind
 from praxis.protocol.models import ModelResponse, ModelToolCall, Usage
 from praxis.protocol.permission import Decision, PermissionContext, PermissionMode
 from praxis.protocol.policy import NetworkPolicy, PermissionPolicy, ToolRule, resolve_policy
-from praxis.protocol.sandbox import SandboxRefusal
+from praxis.protocol.sandbox import SandboxRefusal, ToolExecContext
 from praxis.protocol.tools import (
     CancellationMode,
     InterruptBehavior,
@@ -61,7 +62,9 @@ from praxis.protocol.tools import (
     json_schema_input,
 )
 from praxis.store.log import Store
+from praxis.tools.builtins import search as search_module
 from praxis.tools.builtins.filesystem import create_read_tool
+from praxis.tools.builtins.search import create_search_text_tool
 
 _AVAILABLE = probe_backend()
 _NET_ALLOW = PermissionPolicy(network=NetworkPolicy(decision="allow"))
@@ -523,6 +526,83 @@ def test_b10_decide_totality_on_broken_targets(tmp_path: Path) -> None:
         use = ResolvedUse(effects=frozenset({ToolEffect.READ_WORKSPACE}), targets=(ToolTarget(kind="path", value=str(target)),))
         decision = permission.decide(tool, use, ctx)  # 不抛
         assert decision.verdict in {"allow", "ask", "deny"}
+
+
+@pytest.mark.skipif(not _AVAILABLE.available, reason="bwrap deferred / no sandbox backend")
+def test_s1_search_worker_runs_inside_sandbox_and_cannot_escape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S-1 真实座位带:search worker 在沙箱内执行,代理可写的诱饵 rg 逃不出去。
+
+    部署布局里 ``praxis/`` 就在工作区内(``_bootstrap`` 的 package_root ==
+    workspace),因此工作区读授权已覆盖包源码。测试工作区是临时目录,这里把
+    praxis 包复制进去并把 bootstrap 指向该副本——spawn 路径、沙箱 spec、
+    child_env、worker 内部全部走真实实现,只改变包源码位置以匹配生产布局。
+
+    诱饵 rg 证明:即便代理替换了 worker 会 exec 的二进制,也无法写工作区外、
+    读不到 env 派生的私有目录;同时 search_text 仍正常返回结果。
+    """
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    repo_root = Path(__file__).resolve().parents[3]
+    shutil.copytree(
+        repo_root / "praxis",
+        workspace / "praxis",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    (workspace / "data.txt").write_text("needle in data\n", encoding="utf-8")
+    private = tmp_path / "private"
+    private.mkdir()
+    (private / "secret.txt").write_text("TOP-SECRET\n", encoding="utf-8")
+    monkeypatch.setenv("PRAXIS_CONFIG_DIR", str(private))
+    outside = tmp_path / "escaped.txt"
+    leaked = workspace / "leaked.txt"
+    marker = workspace / "decoy-ran.txt"
+    real_rg = search_module.rg_path()
+    decoy = workspace / "decoy-rg"
+    decoy.write_text(
+        "#!/bin/sh\n"
+        f"echo escaped > {outside}\n"
+        f"cp {private / 'secret.txt'} {leaked} 2>/dev/null || true\n"
+        f"echo ran > {marker}\n"
+        f'exec "{real_rg}" "$@"\n',
+        encoding="utf-8",
+    )
+    decoy.chmod(0o755)
+    monkeypatch.setattr(search_module, "rg_path", lambda: decoy)
+    monkeypatch.setattr(
+        search_module,
+        "_bootstrap",
+        lambda: (
+            f"import sys; sys.path.insert(0, {str(workspace)!r}); "
+            "from praxis.tools.builtins.search_worker import main; "
+            "raise SystemExit(main(sys.argv))"
+        ),
+    )
+
+    tool = create_search_text_tool(workspace)
+    permissions = PermissionContext(
+        workspace=str(workspace), policy=PermissionPolicy(), mode="on-request", sandbox=_AVAILABLE
+    )
+    use = tool.resolve_use({"pattern": "needle", "path": "data.txt"})
+    spec = compile_sandbox(permissions, use, workspace)
+    try:
+        result = asyncio.run(
+            tool.run(
+                {"pattern": "needle", "path": "data.txt"},
+                ToolExecContext(sandbox=spec, permissions=permissions),
+            )
+        )
+    finally:
+        finalize_sandbox(spec, workspace)
+
+    assert result.status is ResultStatus.OK, result.text
+    assert "data.txt:1: needle in data" in result.text
+    # 诱饵确实执行过(证明 worker 在沙箱内 exec 了它)。
+    assert marker.exists()
+    # 沙箱阻断:工作区外写入失败;私有目录内容读不出。
+    assert not outside.exists()
+    assert not leaked.exists() or "TOP-SECRET" not in leaked.read_text(encoding="utf-8")
 
 
 if __name__ == "__main__":  # pragma: no cover

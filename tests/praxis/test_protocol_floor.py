@@ -92,6 +92,38 @@ def test_host_private_denied(tmp_path: Path) -> None:
     ) != ""
 
 
+# ── S-3:私有根的词法形态与 realpath 形态都被拒绝 ──────────────────────
+
+
+def test_private_root_alias_and_realpath_forms_both_denied(tmp_path: Path) -> None:
+    """S-3:``host_private_paths()`` 返回值保持词法形态,containment 双向比。
+
+    构造 alias → real 的 symlink:旧实现只做词法比较,realpath 形态的候选
+    (或 real 形态的私有根)会漏判;修复后两种组合都拒绝。
+    """
+    real = tmp_path / "real-private"
+    real.mkdir()
+    alias = tmp_path / "alias-private"
+    alias.symlink_to(real, target_is_directory=True)
+    assert real.resolve() != alias  # 确实有两种形态
+
+    # 私有根=词法 alias:real 形态的候选也被拒绝。
+    assert floor_reason(
+        real / "config.sqlite", write=False, private_paths=(str(alias),)
+    ) != ""
+    assert floor_reason(
+        real / "config.sqlite", write=True, private_paths=(str(alias),)
+    ) != ""
+    # 私有根=real:alias 形态的候选也被拒绝(反向)。
+    assert floor_reason(
+        alias / "config.sqlite", write=False, private_paths=(str(real),)
+    ) != ""
+    # 阳性对照:私有目录之外仍放行。
+    assert floor_reason(
+        tmp_path / "public.txt", write=False, private_paths=(str(alias),)
+    ) == ""
+
+
 # ── Finding 3: Broken symlink WITH non-existent private root ───────────
 # Exercises _is_under OSError path: samefile on missing candidate/root.
 

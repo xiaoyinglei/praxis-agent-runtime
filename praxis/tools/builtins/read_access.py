@@ -22,8 +22,10 @@ session/once 两个覆盖层(``protocol.policy.overlay_policy`` 构造,与
 是安全方向;绝不把覆盖层合并进 base policy——合并会让更具体的 allow 反向
 覆盖较宽的 deny。
 
-``permissions=None``(单测直跑、无快照)返回空来源元组 ⇒ 不做逐条目过滤,
-阶段 1/2 既有工具行为不变。
+``permissions=None``(单测直跑、无快照)返回空来源元组 ⇒ 不做策略过滤,
+阶段 1/2 既有工具行为不变。**但地板与私有目录始终生效**(``floor_reason``
+按路径判定,S-2):环境派生的私有根(PRAXIS_CONFIG_DIR / jobs 目录)落在
+工作区内时,目录级遍历也必须跳过,而不是只按目录名剪枝。
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from pathlib import Path
 
+from praxis.protocol.floor import floor_reason
 from praxis.protocol.permission import PermissionContext
 from praxis.protocol.policy import (
     PermissionPolicy,
@@ -59,14 +62,34 @@ def permission_declarations(
 
 
 def permission_sources(
-    permissions: PermissionContext | None, workspace: Path
+    permissions: PermissionContext | None,
+    workspace: Path,
+    *,
+    private_paths: tuple[str, ...] = (),
 ) -> tuple[ResolvedPolicy, ...]:
-    """把权限快照解析为路径裁决来源(policy + ceilings + session/once 覆盖层)。"""
+    """把权限快照解析为路径裁决来源(policy + ceilings + session/once 覆盖层)。
+
+    ``private_paths`` 由调用方传 ``host_private_paths()``:与 ``decide`` 的
+    path 裁决同一来源集合,私有目录在工作区内时也能被逐条目过滤(S-2)。
+    """
     return tuple(
-        resolve_policy(policy, workspace) for policy in permission_declarations(permissions)
+        resolve_policy(policy, workspace, private_paths=private_paths)
+        for policy in permission_declarations(permissions)
     )
 
 
-def is_read_denied(sources: Iterable[ResolvedPolicy], path: Path) -> bool:
-    """任一来源拒绝该路径(读访问)→ True。空来源 = 不拒绝(无快照直跑)。"""
+def is_read_denied(
+    sources: Iterable[ResolvedPolicy],
+    path: Path,
+    *,
+    private_paths: tuple[str, ...] = (),
+) -> bool:
+    """该路径的读访问是否被拒:地板/私有目录按路径判 + 任一策略来源拒绝。
+
+    地板先判(S-2):私有目录与 deny 地板条目不依赖策略声明——即使没有权限
+    快照(单测直跑),它们也不得被目录级遍历读出。空来源 + 无地板命中 =
+    不拒绝(无快照直跑路径)。
+    """
+    if floor_reason(path, write=False, private_paths=private_paths):
+        return True
     return any(not path_access(source, path, write=False) for source in sources)

@@ -11,15 +11,20 @@
 执行纪律:
 - rg 只从 ``ripgrep-bin`` 发行包里定位(``importlib.metadata``),绝不 PATH 查找;
   拿不到 → ``search_backend_unavailable``(结果,不是异常);
-- worker 用 ``sys.executable -I -c <bootstrap>`` 启动:``-I`` 隔离宿主
-  PYTHONPATH/用户 site,``env={"PATH": os.defpath}``、``cwd="/"``、
+- S-1:``search_text`` 声明 ``EXECUTE_PROCESS``,worker 与 bash 同一姿态走管道
+  编译出的沙箱:``[*sandbox.argv_prefix, sys.executable, -I, -c <bootstrap>]``,
+  环境由 ``child_env`` 唯一构造(HOME/TMPDIR 指向 scratch)、``cwd="/"``、
   ``start_new_session=True``;取消/超时走 ``process`` 原语的整组
-  SIGTERM → 有界宽限 → SIGKILL(与 bash 同一份纪律);
+  SIGTERM → 有界宽限 → SIGKILL(与 bash 同一份纪律)。**没有可用沙箱后端时
+  直接返回 ``search_backend_unavailable``,绝不裸跑宿主解释器**(与 bash 的
+  fail-closed 姿态一致;bwrap 延后期间 Linux 上 search_text 不可用);
 - worker 非 0 → ``search_worker_failed``;rg 参数非法 → ``invalid_input``,
   且 stderr 前 2000 字符只进 metadata,不进模型可见 content;
 - R-T11-2:worker 逐条目复用 ``protocol.policy.path_access`` 过滤 deny,
   被拒文件跳过并计入 ``metadata["skipped_denied"]``;``decide`` 仍是唯一
-  裁决函数,这里不是第二套决策入口。
+  裁决函数,这里不是第二套决策入口。S-2:同一过滤也走 ``floor_reason``,
+  父进程把 ``host_private_paths()`` 随 payload 传给 worker(worker 的
+  HOME/TMPDIR 是沙箱 scratch,不能自行推导宿主私有根)。
 """
 
 from __future__ import annotations
@@ -35,6 +40,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
 
+from praxis.protocol.floor import host_private_paths
 from praxis.protocol.json import JsonValue
 from praxis.protocol.sandbox import ToolExecContext
 from praxis.protocol.tools import (
@@ -50,6 +56,7 @@ from praxis.protocol.tools import (
     ToolTarget,
     json_schema_input,
 )
+from praxis.tools.builtins.child_env import child_env, scratch_dir_for
 from praxis.tools.builtins.filesystem import PENDING_TOOL_CALL_ID
 from praxis.tools.builtins.paths import checked_path
 from praxis.tools.builtins.process import await_main_exit, signal_group
@@ -209,7 +216,7 @@ def create_search_text_tool(workspace: Path) -> Tool:
     )
 
     async def run(
-        arguments: Mapping[str, JsonValue], exec_ctx: ToolExecContext  # 进程内工具:不消费沙箱
+        arguments: Mapping[str, JsonValue], exec_ctx: ToolExecContext  # S-1:EXECUTE_PROCESS → 消费沙箱
     ) -> ToolResult:
         args = validate_input(arguments)
         pattern = cast("str", args["pattern"])
@@ -219,6 +226,20 @@ def create_search_text_tool(workspace: Path) -> Tool:
         context_lines = cast("int", args.get("context_lines", _DEFAULT_CONTEXT_LINES))
         max_results = cast("int", args.get("max_results", _DEFAULT_MAX_RESULTS))
         target = checked_path(workspace, path_value, allow_root=True)
+
+        # S-1:worker 一律在管道编译出的沙箱内运行。没有沙箱后端 = 结果
+        # (search_backend_unavailable),绝不退化成宿主内裸跑——否则代理可写的
+        # 解释器/包源码会绕过 B33/地板/座位带。
+        spec = exec_ctx.sandbox
+        if spec is None:
+            return _result(
+                content=(
+                    "search_backend_unavailable: Search requires an available "
+                    "sandbox backend; none is configured on this host."
+                ),
+                status=ResultStatus.ERROR,
+                error_code="search_backend_unavailable",
+            )
 
         try:
             binary = rg_path()
@@ -245,10 +266,13 @@ def create_search_text_tool(workspace: Path) -> Tool:
                 "regex": _uses_regular_expression(pattern, requested_regex),
                 "binary": str(binary),
                 "policies": _policies(exec_ctx),
+                # S-2:宿主私有根由父进程决定,worker 的 HOME/TMPDIR 是 scratch。
+                "private_paths": list(host_private_paths()),
             }
         ).encode()
 
         proc = await asyncio.create_subprocess_exec(
+            *spec.argv_prefix,
             sys.executable,
             "-I",
             "-c",
@@ -257,7 +281,7 @@ def create_search_text_tool(workspace: Path) -> Tool:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
-            env={"PATH": os.defpath},
+            env=child_env(scratch_dir_for(spec), workspace),
             cwd="/",
         )
         timed_out = False
@@ -336,7 +360,7 @@ def create_search_text_tool(workspace: Path) -> Tool:
         path_value = value if isinstance(value, str) and value else "."
         target = checked_path(workspace, path_value, allow_root=True)
         return ResolvedUse(
-            effects=frozenset({ToolEffect.READ_WORKSPACE}),
+            effects=frozenset({ToolEffect.READ_WORKSPACE, ToolEffect.EXECUTE_PROCESS}),
             targets=(ToolTarget(kind="path", value=str(target)),),
         )
 
@@ -348,9 +372,12 @@ def create_search_text_tool(workspace: Path) -> Tool:
                 "ripgrep regular expression. One file or directory path, optional "
                 "glob, bounded context lines, and a result limit. Results are "
                 "formatted as '<relative path>:<line>: <text>' with context lines "
-                "prefixed '- '. Files are searched in deterministic path order using "
-                "the bundled ripgrep engine; symlinks are never followed and "
-                "permission-denied files are skipped."
+                "prefixed '- '. Files are searched in deterministic path order using the "
+                "bundled ripgrep engine; symlinks are never followed and "
+                "permission-denied files are skipped. The search worker runs "
+                "inside the same sandbox backend as bash; on hosts without an "
+                "available sandbox backend this tool reports "
+                "'search_backend_unavailable' instead of running unsandboxed."
             ),
             input_schema={
                 "type": "object",
@@ -395,7 +422,7 @@ def create_search_text_tool(workspace: Path) -> Tool:
         ),
         validate_input=validate_input,
         run=run,
-        static_effects=frozenset({ToolEffect.READ_WORKSPACE}),
+        static_effects=frozenset({ToolEffect.READ_WORKSPACE, ToolEffect.EXECUTE_PROCESS}),
         resolve_use=resolve_use,
         idempotent=True,
         concurrency_safe=True,

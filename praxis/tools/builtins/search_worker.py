@@ -1,13 +1,14 @@
 """search_text 的可取消 worker:授权范围内的有界读取 + ripgrep 匹配(Task 11)。
 
-由 ``search.py`` 用 ``sys.executable -I -c <code-string>`` 启动
-(``start_new_session=True``、``env={"PATH": os.defpath}``、``cwd="/"``)。
-只有不可变权限快照与请求跨进程边界;不使用 shell、不做 PATH 查找、不读用户
-ripgrep 配置、不用 Python 正则求值(rg 的正则是公开契约)。
+由 ``search.py`` 用 ``[*sandbox.argv_prefix, sys.executable, -I, -c <code-string>]``
+启动(``start_new_session=True``、``child_env`` 最小环境、``cwd="/"``)。
+只有不可变权限快照、私有目录列表与请求跨进程边界;不使用 shell、不做 PATH
+查找、不读用户 ripgrep 配置、不用 Python 正则求值(rg 的正则是公开契约)。
 
 移植语义(只读参照 agent_runtime/tools/builtins/search_worker.py,禁止 import):
 - 逐文件读取用 ``O_NOFOLLOW`` 且逐级目录 fd 打开,父目录被替换为 symlink 也不能
-  把读取面扩大到未授权子树;非常规文件拒;
+  把读取面扩大到未授权子树;非常规文件拒。S-1 沙箱适配:走查从已授权的
+  workspace 根开始(而非 ``/``),否则座位带必须给宿主祖先目录 file-read*;
 - symlink 文件/目录一律跳过;``.agent_memory``/``.praxis`` 等 deny 地板条目
   由 ``FLOOR_ENTRIES`` 派生并从遍历中剪除,目标本身落在 deny 子树时显式失败;
 - 每个文件作为 stdin 交给打包的 rg,固定参数
@@ -17,7 +18,8 @@ ripgrep 配置、不用 Python 正则求值(rg 的正则是公开契约)。
 - 阈值常量集中在本模块,``search.py`` 原样写入 ``metadata["limits"]``。
 - R-T11-2:遍历触达每个条目时复用 ``read_access.is_read_denied``(与
   ``protocol.policy.path_access`` 同一规则代数)做执行侧 deny 过滤,被拒文件
-  跳过并计入 ``skipped_denied``(deny 子树整棵剪除)。
+  跳过并计入 ``skipped_denied``(deny 子树整棵剪除)。S-2:同一判定也走
+  ``floor_reason``,父进程传入的 env 派生私有根在工作区内同样被跳过。
 """
 
 from __future__ import annotations
@@ -112,13 +114,26 @@ def _policy_sources(payload: dict[str, Any], root: Path) -> tuple[ResolvedPolicy
 
     声明包含 policy + ceilings + session/once 覆盖层(与执行侧
     ``permission_declarations`` 同一组来源);空 = 无快照(单测直跑)。
+    ``private_paths`` 由父进程传入(S-2):worker 环境里的 HOME/TMPDIR 是
+    沙箱 scratch,自己调用 ``host_private_paths()`` 会得到与宿主不同的答案。
     """
     raw = payload.get("policies")
     if not raw:
         return ()
+    private_paths = tuple(str(path) for path in payload.get("private_paths", ()))
     return tuple(
-        resolve_policy(PermissionPolicy.model_validate(entry), root) for entry in raw
+        resolve_policy(
+            PermissionPolicy.model_validate(entry), root, private_paths=private_paths
+        )
+        for entry in raw
     )
+
+
+def _private_paths(payload: dict[str, Any]) -> tuple[str, ...]:
+    raw = payload.get("private_paths")
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    return tuple(path for path in raw if isinstance(path, str))
 
 
 class _Counters:
@@ -134,15 +149,16 @@ def _files(
     glob: str | None,
     sources: tuple[ResolvedPolicy, ...],
     counters: _Counters,
+    private_paths: tuple[str, ...] = (),
 ) -> Iterator[tuple[Path, str]]:
-    """确定性前序深搜(子项排序后逆序入栈),逐条目执行 deny 过滤。"""
+    """确定性前序深搜(子项排序后逆序入栈),逐条目执行 deny/地板过滤。"""
     pending = [target]
     enumerated = 0
     while pending:
         path = pending.pop()
         if path.is_symlink():
             continue
-        if is_read_denied(sources, path):
+        if is_read_denied(sources, path, private_paths=private_paths):
             counters.skipped_denied += 1
             continue
         if path.is_dir():
@@ -165,18 +181,30 @@ def _files(
                 yield path, label
 
 
-def _read_file(path: Path, limit: int) -> bytes:
-    """逐级目录 fd + O_NOFOLLOW 打开;父目录被换成 symlink 也不能扩大读取面。"""
-    descriptor = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
+def _read_file(path: Path, limit: int, *, root: Path) -> bytes:
+    """从授权根开始逐级 fd + O_NOFOLLOW 打开;父目录被换成 symlink 也不能扩大读取面。
+
+    S-1 沙箱适配:从 ``/`` 起逐级打开祖先目录需要对其有 file-read*(座位带只授予
+    工作区子树与元数据),会在 ``/private`` 等宿主祖先上失败。改为从已授权的
+    workspace 根一次打开、再对**根之下的每一级**用 ``O_NOFOLLOW`` 走查——
+    symlink 替换防护面不变(唯一一次非 O_NOFOLLOW 的打开是宿主选定的根本身)。
+    """
     try:
-        for component in path.parts[1:-1]:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise PermissionError("search target is outside the workspace root") from exc
+    if not relative.parts:
+        raise PermissionError("search target is not a regular file")
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for component in relative.parts[:-1]:
             following = os.open(
                 component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor
             )
             os.close(descriptor)
             descriptor = following
         file_descriptor = os.open(
-            path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor
+            relative.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor
         )
         with os.fdopen(file_descriptor, "rb") as handle:
             if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
@@ -275,6 +303,7 @@ def _backend(
 def _search(payload: dict[str, Any]) -> dict[str, Any]:
     root = Path(payload["root"])
     sources = _policy_sources(payload, root)
+    private_paths = _private_paths(payload)
     request = payload["request"]
     matches: list[dict[str, Any]] = []
     truncated = False
@@ -300,13 +329,15 @@ def _search(payload: dict[str, Any]) -> dict[str, Any]:
 
     counters = _Counters()
     try:
-        for path, label in _files(root, target, request["glob"], sources, counters):
+        for path, label in _files(
+            root, target, request["glob"], sources, counters, private_paths
+        ):
             if total_bytes >= _MAX_TOTAL_BYTES:
                 truncated = True
                 break
             remaining = min(_MAX_FILE_BYTES, _MAX_TOTAL_BYTES - total_bytes)
             try:
-                raw = _read_file(path, remaining)
+                raw = _read_file(path, remaining, root=root)
             except (OSError, ValueError):
                 # 文件消失或被替换属于不完整观察,不是异常。
                 truncated = True
