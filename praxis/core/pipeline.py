@@ -24,8 +24,9 @@ execute 步骤序(与代码一一对应):
 7. ``run_with_timeout``(移植旧 executor 超时/取消语义,任务全程被持有;
    透传 ``ToolExecContext(sandbox=spec)``)→ **finally: finalize_sandbox**
    (commit/清理;超时/取消路径也执行;finalize 异常归一 tool_error,不炸穿);
-8. 占位符替换 + 按 ``max_model_output_bytes`` 截断 → tool_result item →
-   emit ToolFinished。
+8. 占位符替换 + 超 ``max_model_output_bytes`` 的**写时外部化**(注入
+   ``artifacts`` 时:全文进内容寻址 artifact,item 只留头部+指针+摘要;
+   未注入则旧字节截断)→ tool_result item → emit ToolFinished。
 
 沙箱编译/清理经注入进入 core(``SandboxCompiler``/``SandboxFinalizer`` 结构
 签名,adapters 结构匹配;core 不 import adapters——praxis_core_purity)。
@@ -71,10 +72,13 @@ from praxis.protocol.tools import (
     ToolValidationError,
     args_digest,
 )
+from praxis.store.artifacts import ArtifactStore
 from praxis.store.log import ItemEntry, Store
 
 PENDING_TOOL_CALL_ID = "pending"
 _MAX_ERROR_MESSAGE_CHARS = 512
+# 外部化时 item 里保留的头部片段上限(字节;按 UTF-8 边界切,见 _finalize)。
+_ARTIFACT_HEAD_BYTES = 2_048
 
 # 沙箱编译/清理的注入签名(core 内类型别名,adapters.sandbox 结构匹配;
 # core 不 import adapters——compiler/finalizer 由 composition 经 ExecCtx/TurnDeps 注入)。
@@ -100,6 +104,8 @@ class ExecCtx:
     policy_revision: str
     compile_sandbox: SandboxCompiler | None = None
     finalize_sandbox: SandboxFinalizer | None = None
+    # None = 不外部化(单测/裸管道):超限结果退回旧字节截断语义。
+    artifacts: ArtifactStore | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -156,15 +162,48 @@ def _error_result(
     )
 
 
-def _finalize(raw: ToolResult, *, call: ToolCall, tool: Tool) -> ToolResult:
-    """占位符替换 + 模型输出字节上限(超限:保留 joined 文本头部,重建单 text 块)。"""
+def _finalize(
+    raw: ToolResult,
+    *,
+    call: ToolCall,
+    tool: Tool,
+    artifacts: ArtifactStore | None = None,
+) -> ToolResult:
+    """占位符替换 + 模型输出字节上限。
+
+    超限且注入 ``artifacts`` 时**写时外部化**(设计 §5.7;D10):全文进
+    内容寻址 artifact,item 只留头部片段 + 指针 + digest/字节数——全文只存一份
+    (B22)。头部预算 ``min(_ARTIFACT_HEAD_BYTES, limit - 指针长度 - 1)`` 保证它
+    严格短于全文(外部化条件即全文 > limit),因此完整正文绝不会随 item 落库。
+    未注入 ``artifacts``(单测/裸管道)时保留旧字节截断语义。
+    """
     result = replace(raw, tool_call_id=call.tool_call_id, tool_name=call.tool_name)
     encoded = result.text.encode("utf-8")
     limit = tool.max_model_output_bytes
-    if len(encoded) > limit:
+    if len(encoded) <= limit:
+        return result
+    if artifacts is None:
         cut = encoded[:limit].decode("utf-8", errors="ignore")
-        result = replace(result, content=(_text_block(cut),), truncated=True)
-    return result
+        return replace(result, content=(_text_block(cut),), truncated=True)
+
+    digest = artifacts.put(encoded)
+    note = (
+        f"\n[full output stored: artifact://{digest} "
+        f"({len(encoded)} bytes); read with read_artifact]"
+    )
+    # 头部预算先扣掉指针本身,尽量守住 max_model_output_bytes;且恒 < 全文
+    # (外部化条件 len(encoded) > limit ≥ 预算),全文不会随 item 落库。
+    head_budget = min(_ARTIFACT_HEAD_BYTES, max(0, limit - len(note.encode("utf-8")) - 1))
+    head = encoded[:head_budget].decode("utf-8", errors="ignore")
+    metadata: dict[str, JsonValue] = dict(result.metadata)
+    metadata["artifact_digest"] = digest
+    metadata["artifact_bytes"] = len(encoded)
+    return replace(
+        result,
+        content=(_text_block(f"{head}{note}"),),
+        truncated=True,
+        metadata=metadata,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -412,7 +451,7 @@ async def execute(call: ToolCall, ctx: ExecCtx) -> ToolResult:
             tool, status=ResultStatus.ERROR, error_code="tool_error",
             message=f"sandbox finalize failed: {finalize_failure}",
         )
-    result = _finalize(raw, call=call, tool=tool)
+    result = _finalize(raw, call=call, tool=tool, artifacts=ctx.artifacts)
     _append_result_item(ctx, result)
     ctx.bus.emit(
         ToolFinished(turn_id=ctx.turn_id, call_id=call.tool_call_id, status=result.status.value)

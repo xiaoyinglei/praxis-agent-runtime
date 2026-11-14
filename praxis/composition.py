@@ -3,7 +3,7 @@
 build_session 把分层组件装配成一个可用会话,顺序即依赖序:
 建 ``.praxis/`` 目录 → Store(单写者线程) → EventBus → **sweep**(打开即收编
 崩溃遗留的 running turn → interrupted,§5.8;活执行者持锁,Sweep 跳过,绝不误伤)
-→ 默认三内置工具(read/write/bash,可由 tools 参数整体替换)→ PermissionContext
+→ 默认四内置工具(read/write/bash/read_artifact,可由 tools 参数整体替换)→ PermissionContext
 (``probe_backend()`` 真实沙箱探测)→ 线程 ensure/create → Session(注入
 ``compile_sandbox``/``finalize_sandbox`` 与唯一重试机制 ``retry_stream``——
 core 经结构签名消费,不 import adapters)。
@@ -46,7 +46,9 @@ from praxis.protocol.permission import PermissionContext, PermissionMode
 from praxis.protocol.policy import PermissionPolicy
 from praxis.protocol.retry import RetryPolicy
 from praxis.protocol.tools import Tool
+from praxis.store.artifacts import ArtifactStore
 from praxis.store.log import Store
+from praxis.tools.builtins.artifacts_tool import create_read_artifact_tool
 from praxis.tools.builtins.command import create_bash_tool
 from praxis.tools.builtins.filesystem import create_read_tool, create_write_tool
 
@@ -239,10 +241,17 @@ def build_session(
     try:
         bus = EventBus()
         sweep(store, bus, root)
+        # 内容寻址 artifact 目录(D10):.praxis 是地板,模型只能经 read_artifact 回读。
+        artifact_store = ArtifactStore(praxis_dir / "artifacts")
         tool_seq = (
             tools
             if tools is not None
-            else (create_read_tool(root), create_write_tool(root), create_bash_tool(root))
+            else (
+                create_read_tool(root),
+                create_write_tool(root),
+                create_bash_tool(root),
+                create_read_artifact_tool(artifact_store),
+            )
         )
         tool_map: dict[str, Tool] = {tool.definition.name: tool for tool in tool_seq}
         effective_policy = _resolve_policy(root, policy)
@@ -272,6 +281,7 @@ def build_session(
             retry_stream=make_retry_stream(
                 policy=RetryPolicy(), clock=time.time, sleep=asyncio.sleep
             ),
+            artifacts=artifact_store,
         )
     except BaseException:
         store.close()

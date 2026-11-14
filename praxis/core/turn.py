@@ -70,6 +70,7 @@ from praxis.protocol.retry import (
     clock_floor,
 )
 from praxis.protocol.tools import ResultStatus, Tool, ToolCall, ToolResult
+from praxis.store.artifacts import ArtifactStore
 from praxis.store.log import ItemEntry, Store
 
 _CONTENT_PREVIEW_CHARS = 200
@@ -99,6 +100,8 @@ class TurnDeps:
     max_steps: int = 50
     compile_sandbox: SandboxCompiler | None = None
     finalize_sandbox: SandboxFinalizer | None = None
+    # None = 工具结果不外部化(单测路径);生产 composition 注入 ArtifactStore。
+    artifacts: ArtifactStore | None = None
     # None = 不重试(ScriptedAdapter/单测路径);生产 composition 注入真实机制。
     # 只有注入时才有 model_attempt 事实账——无重试机制就没有第二个账本。
     retry_stream: RetryingStream | None = None
@@ -157,6 +160,7 @@ def _exec_ctx(deps: TurnDeps, state: TurnState) -> ExecCtx:
         policy_revision=deps.permissions.policy.revision,
         compile_sandbox=deps.compile_sandbox,
         finalize_sandbox=deps.finalize_sandbox,
+        artifacts=deps.artifacts,
     )
 
 

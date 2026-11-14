@@ -8,7 +8,9 @@ monkeypatch praxis.core.permission.decide 证明管道真实经过唯一决策�
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -17,6 +19,7 @@ from praxis.core.events import EventBus
 from praxis.core.pipeline import ExecCtx, execute
 from praxis.core.statemachine import TurnStatus, transition
 from praxis.protocol.items import ItemKind
+from praxis.protocol.json import thaw_json
 from praxis.protocol.permission import Decision, PermissionContext
 from praxis.protocol.policy import NetworkPolicy, PermissionPolicy
 from praxis.protocol.sandbox import ToolExecContext
@@ -35,6 +38,7 @@ from praxis.protocol.tools import (
     args_digest,
     json_schema_input,
 )
+from praxis.store.artifacts import ArtifactStore
 from praxis.store.log import ItemEntry, Store
 from praxis.store.turns import create_turn, get_turn
 from praxis.tools.builtins.command import create_bash_tool
@@ -44,7 +48,13 @@ ARGS_A = {"path": "f.txt"}
 ARGS_B = {"path": "OTHER.txt"}
 
 
-def make_ctx(store: Store, bus: EventBus, workspace: Path, tools: dict[str, Tool]) -> ExecCtx:
+def make_ctx(
+    store: Store,
+    bus: EventBus,
+    workspace: Path,
+    tools: dict[str, Tool],
+    artifacts: ArtifactStore | None = None,
+) -> ExecCtx:
     """turn 一律以 running 起步:transition(RUNNING→PAUSED) 才合法。"""
     policy = PermissionPolicy()
     turn = create_turn(store, turn_id="turn-1", thread_id="thread-1", binding={})
@@ -59,6 +69,7 @@ def make_ctx(store: Store, bus: EventBus, workspace: Path, tools: dict[str, Tool
         turn_id=turn.turn_id,
         thread_id="thread-1",
         policy_revision=policy.revision,
+        artifacts=artifacts,
     )
 
 
@@ -257,7 +268,7 @@ def test_unknown_tool_is_result_not_exception(ctx: ExecCtx) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _echo_tool(max_bytes: int) -> Tool:
+def _echo_tool(max_bytes: int, text: str = "x" * 100) -> Tool:
     schema = {"type": "object", "properties": {}, "additionalProperties": False}
     validate = json_schema_input(schema)
 
@@ -265,7 +276,7 @@ def _echo_tool(max_bytes: int) -> Tool:
         return ToolResult(
             tool_call_id="pending",  # documented convention:管道负责替换
             tool_name="echo",
-            content=(ToolContentBlock(type="text", data={"text": "x" * 100}),),
+            content=(ToolContentBlock(type="text", data={"text": text}),),
             status=ResultStatus.OK,
         )
 
@@ -285,13 +296,36 @@ def _echo_tool(max_bytes: int) -> Tool:
 
 
 def test_output_bounded_to_model_limit(store: Store, workspace: Path) -> None:
+    """降级路径(artifacts=None):旧字节截断语义,无 artifact 落盘。"""
     ctx = make_ctx(store, EventBus(), workspace, {"echo": _echo_tool(10)})
     r = asyncio.run(execute(ToolCall("c1", "echo", {}), ctx))
     assert r.tool_call_id == "c1"  # pending 占位符已替换
     assert r.truncated and len(r.text.encode("utf-8")) <= 10
+    assert r.metadata.get("artifact_digest") is None
     result_item = ctx.store.read_turn_items(ctx.turn_id)[-1]
     assert result_item.payload["truncated"] is True
     assert result_item.payload["content"][0]["data"]["text"] == "x" * 10  # type: ignore[index]
+
+
+def test_output_externalized_when_artifacts_injected(
+    store: Store, workspace: Path, tmp_path: Path
+) -> None:
+    """新语义:注入 artifacts 后超限结果写时外部化(B22:全文只存一份)。"""
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    full = "y" * 10_000
+    ctx = make_ctx(
+        store, EventBus(), workspace, {"echo": _echo_tool(1024, text=full)}, artifacts=artifacts
+    )
+    r = asyncio.run(execute(ToolCall("c1", "echo", {}), ctx))
+
+    digest = cast("str", r.metadata["artifact_digest"])
+    assert r.truncated and r.metadata["artifact_bytes"] == 10_000
+    assert artifacts.get(digest) == full.encode("utf-8")
+    assert f"artifact://{digest}" in r.text and len(r.text.encode("utf-8")) <= 1024
+    result_item = ctx.store.read_turn_items(ctx.turn_id)[-1]
+    assert result_item.payload["metadata"]["artifact_digest"] == digest
+    assert full not in json.dumps(thaw_json(cast("Any", result_item.payload)))
+    assert result_item.payload["content"][0]["data"]["text"] == r.text  # type: ignore[index]
 
 
 # ---------------------------------------------------------------------------
