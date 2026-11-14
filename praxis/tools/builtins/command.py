@@ -206,6 +206,13 @@ class CommandExecution:
         cwd: Path,
         env: Mapping[str, str] | None,
     ) -> CommandExecution:
+        """起进程并建立读管道;spawn 半路失败时自行收尸(M2)。
+
+        ``create_subprocess_exec`` 成功后任何一步抛出(管道不变量、create_task
+        失败)都**不能**留下无主进程组:整组 SIGKILL → 取消已建任务 → 有界
+        回收主进程,再把异常透传。调用方(``CommandSessions.start``)此时还没有
+        任何句柄,这里必须是唯一的收尸点。
+        """
         proc = await asyncio.create_subprocess_exec(
             *argv,
             cwd=str(cwd),
@@ -215,21 +222,51 @@ class CommandExecution:
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
-        if proc.stdout is None or proc.stderr is None:
-            raise RuntimeError("bash process pipes were not created")
-        out_buf: list[bytes] = []
-        err_buf: list[bytes] = []
-        out_discarded: list[int] = [0]
-        err_discarded: list[int] = [0]
-        out_task = asyncio.create_task(
-            drain_stream(proc.stdout, out_buf, out_discarded, limit=_MAX_STREAM_BUFFER_BYTES)
+        tasks: list[asyncio.Task[Any]] = []
+        try:
+            if proc.stdout is None or proc.stderr is None:
+                raise RuntimeError("bash process pipes were not created")
+            out_buf: list[bytes] = []
+            err_buf: list[bytes] = []
+            out_discarded: list[int] = [0]
+            err_discarded: list[int] = [0]
+            tasks.append(
+                asyncio.create_task(
+                    drain_stream(
+                        proc.stdout, out_buf, out_discarded, limit=_MAX_STREAM_BUFFER_BYTES
+                    )
+                )
+            )
+            tasks.append(
+                asyncio.create_task(
+                    drain_stream(
+                        proc.stderr, err_buf, err_discarded, limit=_MAX_STREAM_BUFFER_BYTES
+                    )
+                )
+            )
+            tasks.append(asyncio.create_task(proc.wait()))
+        except BaseException:
+            signal_group(proc.pid, signal.SIGKILL)
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with contextlib.suppress(BaseException):
+                    await task
+            try:
+                await await_main_exit(proc, _POST_KILL_WAIT_SECONDS)
+            except TimeoutError:
+                pass
+            raise
+        out_task, err_task, wait_task = tasks
+        return cls(
+            proc,
+            out_buf,
+            err_buf,
+            out_discarded,
+            err_discarded,
+            (out_task, err_task, wait_task),
+            wait_task,
         )
-        err_task = asyncio.create_task(
-            drain_stream(proc.stderr, err_buf, err_discarded, limit=_MAX_STREAM_BUFFER_BYTES)
-        )
-        wait_task = asyncio.create_task(proc.wait())
-        tasks: tuple[asyncio.Task[Any], ...] = (out_task, err_task, wait_task)
-        return cls(proc, out_buf, err_buf, out_discarded, err_discarded, tasks, wait_task)
 
     @property
     def pid(self) -> int:
@@ -325,7 +362,8 @@ def _terminal_result(
             "timed_out": timed_out,
             "pid": pid,
             "pgid": pgid,
-            "state": "exited",
+            # R-T15-10:终态词汇与 CommandSessionView.status 统一,不再另说 "exited"。
+            "state": "completed",
         },
     )
 
@@ -385,7 +423,16 @@ def create_bash_tool(workspace: Path, *, sessions: CommandSessions | None = None
 
         # Task 15:yield 窗口 + 会话注册表 → 后台会话(D13:返回的 tool_result
         # item 自身就是孤儿登记;marker 是宿主进程写的崩溃清扫凭据)。
-        if yield_seconds is not None and sessions is not None:
+        if yield_seconds is not None:
+            # M6:没有 owner 时 yield 不可能兑现(会静默退化成前台阻塞),fail loud。
+            if sessions is None:
+                return _error_result(
+                    code="command_session_unavailable",
+                    message=(
+                        "background command sessions are unavailable: this bash tool was "
+                        "built without a CommandSessions owner"
+                    ),
+                )
             try:
                 handle = await sessions.start(
                     lambda: spawn(argv, env),

@@ -13,6 +13,8 @@ core.sandbox(Task 6/7 落地);本模块只定义跨层传递的不可变形状�
 
 from __future__ import annotations
 
+import signal
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -20,6 +22,11 @@ if TYPE_CHECKING:
     from praxis.protocol.permission import PermissionContext
 
 _MAX_REFUSAL_REASON_CHARS = 512
+
+# 纯类型别名(零实现):孤儿清扫需要"向进程组发信号",但 protocol 层不放副作用。
+# composition 绑定 ``tools.builtins.process.signal_group``;core 只经此签名消费
+# (R-T15-7:与 SandboxCompiler/RetryingStream 同一注入纪律)。
+type ProcessSignaler = Callable[[int, signal.Signals], bool]
 
 
 class SandboxRefusal(RuntimeError):  # noqa: N818 — 异常名由阶段 2 计划 ACI 固定(后续任务编译器/管道同名引用)

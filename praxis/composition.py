@@ -69,6 +69,7 @@ from praxis.tools.builtins.filesystem import (
     create_read_tool,
     create_write_tool,
 )
+from praxis.tools.builtins.process import signal_group
 from praxis.tools.builtins.search import create_search_text_tool
 
 _VALID_MODES: tuple[PermissionMode, ...] = ("on-request", "never", "bypass")
@@ -289,7 +290,7 @@ def build_session(
         # 崩溃遗留的命令进程组清扫:结果只记日志,不影响会话可用性(函数自身不抛,
         # 这里再加一层边界围栏,保证任何清扫意外都不会让会话打不开)。
         try:
-            orphan_summaries = sweep_orphan_command_jobs()
+            orphan_summaries = sweep_orphan_command_jobs(kill_group=signal_group)
         except Exception:  # noqa: BLE001 — 清扫不是会话可用性的前置条件
             logger.warning("orphan command job sweep failed", exc_info=True)
             orphan_summaries = ()

@@ -1,20 +1,30 @@
 """后台命令会话(设计 §5.4;findings B20;裁决 D13)。
 
 职责边界(刻意保持最小,durable worker 归阶段 5):
-- ``CommandSessions``:进程/任务/容量/状态的所有权。同一会话最多 1 个 running
-  (``command_session_busy``),最多保留 32 个**已取回终态**的会话
-  (``command_session_retained`` 之外的未取回终态永不驱逐;满了且无可驱逐者
-  → ``command_session_capacity``)。全部状态转换都在 ``threading.Lock`` 内。
+- ``CommandSessions``:进程/任务/容量/状态的所有权。同一会话最多
+  ``_MAX_RUNNING`` 个 running(``command_session_busy``),最多保留
+  ``_MAX_RETAINED`` 个**已取回终态**的会话(未取回终态永不驱逐;满了且无可
+  驱逐者 → ``command_session_capacity``)。全部状态转换都在 ``threading.Lock`` 内。
 - marker(崩溃清扫凭据):``command_jobs_dir()/<session_id>.json``(0600,目录
-  0700),字段 ``{session_id,pid,pgid,command_prefix,created_at}``。**只由宿主
-  Python 进程写**——该目录在安全地板私有集合内,沙箱内的子进程无写权限,
-  这是设计而非缺陷。会话进入终态并被取回后 ``unlink``。
+  0700),字段 ``{session_id,host_pid,pid,pgid,command_prefix,created_at}``。
+  **只由宿主 Python 进程写**——该目录在安全地板私有集合内,沙箱内的子进程无
+  写权限,这是设计而非缺陷。``host_pid`` 让清扫能区分"另一个活会话"与"崩溃
+  遗留"(R-T15-6)。目录与文件都拒绝 symlink、校验属主/权限/普通文件
+  (与 ``adapters/config/credentials.py`` 同一纪律,R-T15-9);会话进入终态并
+  被取回后 ``unlink``。
 - 执行驱动完全复用 ``command.CommandExecution``(spawn/wait_terminal/cancel),
   本模块不出现第二份 killpg 或 TERM→KILL 序列。
 
 取消语义(R-T15-4):``start`` 的 yield 等待与 ``wait`` 用 ``asyncio.wait``——
 调用方被 asyncio 取消时**不会**连带取消正在跑的命令;终止命令是 ``cancel``
-动作的职责。
+动作的职责。``aclose`` 幂等,取消所有在跑会话(不留活口)。
+
+错误码(公开口径):``command_session_busy`` / ``command_session_not_found`` /
+``command_session_capacity`` / ``command_session_lost``(登记过但本进程没有
+终态)/ ``command_session_unavailable``(注册表已关闭或 marker 无法安全登记)。
+
+终态词汇统一为 ``running/completed/cancelled/lost``;bash 终态 metadata 的
+``state`` 同样用 ``completed``(不再另说 ``exited``,R-T15-10)。
 
 D13:后台任务的事实是 bash 返回的那条 ``tool_result`` 的 metadata
 (``session_id/pid/pgid/state``),不新增 ItemKind,不建持久 worker。
@@ -25,8 +35,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import secrets
 import signal
+import stat
 import threading
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -36,7 +48,6 @@ from typing import Literal, cast
 
 from praxis.protocol.floor import command_jobs_dir
 from praxis.protocol.json import JsonValue
-from praxis.protocol.process import signal_group
 from praxis.protocol.sandbox import ToolExecContext
 from praxis.protocol.tools import (
     CancellationMode,
@@ -53,6 +64,7 @@ from praxis.protocol.tools import (
 )
 from praxis.tools.builtins.command import CommandExecution, CommandSessionError
 from praxis.tools.builtins.filesystem import PENDING_TOOL_CALL_ID
+from praxis.tools.builtins.process import signal_group
 
 SessionStatus = Literal["running", "completed", "cancelled", "lost"]
 
@@ -61,7 +73,9 @@ _MAX_RETAINED = 32
 _MAX_COMMAND_PREFIX_CHARS = 200
 _JOBS_DIR_MODE = 0o700
 _MARKER_MODE = 0o600
+_MARKER_MAX_BYTES = 4096
 _MAX_READ_BYTES = 64_000
+_SESSION_ID_PATTERN = re.compile(r"cmd_[0-9a-f]{32}")
 
 __all__ = [
     "CommandLogChunk",
@@ -169,7 +183,11 @@ class CommandSessions:
         timeout_seconds: float,
         yield_time_seconds: float,
     ) -> CommandSessionHandle:
-        """占位 → spawn → 登记 → 等 yield 窗口。busy/capacity 抛 ``CommandSessionError``。"""
+        """占位 → spawn → 登记 → 等 yield 窗口。busy/capacity 抛 ``CommandSessionError``。
+
+        spawn 契约:失败时必须自行收尸(``CommandExecution.spawn`` 已实现:整组
+        SIGKILL + 回收),因为本方法在 spawn 抛出时拿不到任何半成品句柄(M2)。
+        """
         with self._lock:
             if self._closed:
                 raise CommandSessionError(
@@ -194,6 +212,7 @@ class CommandSessions:
         try:
             marker = self._write_marker(
                 session_id,
+                os.getpid(),
                 execution.pid,
                 execution.pid,
                 _bounded_command_prefix(command_prefix),
@@ -220,9 +239,21 @@ class CommandSessions:
         )
         with self._lock:
             self._starting = False
-            self._sessions[session_id] = entry
-            entry.task = asyncio.get_running_loop().create_task(
-                self._drive(entry, execution, timeout_seconds)
+            # R-T15-8:spawn/marker 期间 aclose 可能已经完成关档。绝不把活会话
+            # 登记进已关闭的注册表(否则 Session.close 已返回,没人再取消它)。
+            closed = self._closed
+            if not closed:
+                self._sessions[session_id] = entry
+                entry.task = asyncio.get_running_loop().create_task(
+                    self._drive(entry, execution, timeout_seconds)
+                )
+        if closed:
+            try:
+                await execution.cancel()
+            finally:
+                self._unlink_marker(entry)
+            raise CommandSessionError(
+                "command_session_unavailable", "command sessions closed while starting"
             )
 
         await self._observe(entry, yield_time_seconds)
@@ -358,7 +389,11 @@ class CommandSessions:
                     entry.status = "cancelled"
                     entry.exit_code = None
             raise
-        except Exception:  # noqa: BLE001 — 执行器自身失败:如实记 lost,不炸穿事件循环
+        except Exception:  # noqa: BLE001 — 执行器自身失败:先证明组已收敛,再记 lost
+            try:
+                await execution.cancel()
+            except Exception:  # noqa: BLE001 — 收敛失败也不能炸穿事件循环;marker 留待清扫
+                pass
             with self._lock:
                 entry.status = "lost"
                 entry.exit_code = None
@@ -376,9 +411,10 @@ class CommandSessions:
         await asyncio.wait({task}, timeout=seconds)
 
     def _running_locked(self) -> bool:
-        return self._starting or any(
-            entry.status == "running" for entry in self._sessions.values()
-        )
+        if self._starting:
+            return True
+        running = sum(1 for entry in self._sessions.values() if entry.status == "running")
+        return running >= _MAX_RUNNING
 
     def _evict_locked(self) -> None:
         """容量上限只淘汰**已取回终态**者;未取回终态永不驱逐(满则拒绝)。"""
@@ -406,10 +442,13 @@ class CommandSessions:
         if entry is not None:
             return entry
         # marker 存在但本进程没有会话/终态 = 崩溃前登记过、here 无从得知结果。
-        try:
-            registered = (self._jobs_dir / f"{session_id}.json").exists()
-        except OSError:
-            registered = False
+        # R-T15-9:session_id 必须先通过形状校验才允许拼进路径。
+        registered = False
+        if _SESSION_ID_PATTERN.fullmatch(session_id):
+            try:
+                registered = (self._jobs_dir / f"{session_id}.json").exists()
+            except OSError:
+                registered = False
         if registered:
             raise CommandSessionError(
                 "command_session_lost",
@@ -447,19 +486,38 @@ class CommandSessions:
     def _write_marker(
         self,
         session_id: str,
+        host_pid: int,
         pid: int,
         pgid: int,
         command_prefix: str,
         created_at: float,
     ) -> Path:
-        """宿主进程写 marker(0600;目录 0700)。沙箱子进程无权写此目录(R-T15-1)。"""
+        """宿主进程写 marker(0600;目录 0700),拒绝 symlink 并校验属主(R-T15-9)。
+
+        与 ``adapters/config/credentials.py`` 同一纪律:目录先拒 symlink 再
+        mkdir/stat(uid + 目录类型),marker 用 ``O_NOFOLLOW`` 打开后 fstat 校验
+        (普通文件、当前用户、组/其他无权限、``st_nlink == 1``)并 fchmod 0600。
+        沙箱子进程无权写此目录(R-T15-1)。
+        """
+        if not _SESSION_ID_PATTERN.fullmatch(session_id):
+            raise OSError(f"invalid command session id: {session_id!r}")
         directory = self._jobs_dir
+        if directory.is_symlink():
+            raise OSError(f"command jobs directory is a symlink: {directory}")
         directory.mkdir(parents=True, exist_ok=True, mode=_JOBS_DIR_MODE)
+        metadata = directory.stat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+        ):
+            raise OSError(f"unsafe command jobs directory: {directory}")
         os.chmod(directory, _JOBS_DIR_MODE)
+
         marker = directory / f"{session_id}.json"
         payload = json.dumps(
             {
                 "session_id": session_id,
+                "host_pid": host_pid,
                 "pid": pid,
                 "pgid": pgid,
                 "command_prefix": command_prefix,
@@ -467,10 +525,27 @@ class CommandSessions:
             },
             ensure_ascii=False,
         )
-        descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _MARKER_MODE)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        descriptor = os.open(
+            marker,
+            os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_TRUNC,
+            _MARKER_MODE,
+        )
+        try:
+            handle = os.fdopen(descriptor, "w", encoding="utf-8")
+        except OSError:
+            os.close(descriptor)
+            raise
+        with handle:
+            file_metadata = os.fstat(handle.fileno())
+            if (
+                not stat.S_ISREG(file_metadata.st_mode)
+                or file_metadata.st_uid != os.getuid()
+                or file_metadata.st_mode & 0o077
+                or file_metadata.st_nlink != 1
+            ):
+                raise OSError(f"unsafe command job marker: {marker}")
+            os.fchmod(handle.fileno(), _MARKER_MODE)
             handle.write(payload)
-        os.chmod(marker, _MARKER_MODE)
         return marker
 
     @staticmethod
@@ -523,17 +598,55 @@ def _view_result(view: CommandSessionView) -> ToolResult:
     )
 
 
+def _read_result(view: CommandSessionView, chunk: CommandLogChunk) -> ToolResult:
+    """action=read 的结果:文本是本次字节窗口,metadata 带续读游标。"""
+    text = chunk.data or (
+        f"no data at offset {chunk.next_offset} "
+        f"(end_offset={chunk.end_offset}, stream truncated={chunk.truncated})"
+    )
+    return ToolResult(
+        tool_call_id=PENDING_TOOL_CALL_ID,
+        tool_name="manage_command",
+        content=(ToolContentBlock(type="text", data={"text": text}),),
+        status=ResultStatus.OK,
+        metadata={
+            "session_id": view.session_id,
+            "pid": view.pid,
+            "pgid": view.pgid,
+            "status": view.status,
+            "exit_code": view.exit_code,
+            "truncated": chunk.truncated,
+            "next_offset": chunk.next_offset,
+            "end_offset": chunk.end_offset,
+        },
+    )
+
+
 def create_manage_command_tool(sessions: CommandSessions) -> Tool:
     validate_input = json_schema_input(
         {
             "type": "object",
             "properties": {
                 "session_id": {"type": "string", "minLength": 1, "maxLength": 100},
-                "action": {"type": "string", "enum": ("status", "wait", "cancel")},
-                "wait_seconds": {"type": "number", "minimum": 0, "maximum": 60},
-                "stream": {"type": "string", "enum": ("stdout", "stderr")},
-                "offset": {"type": "integer", "minimum": 0},
-                "max_bytes": {"type": "integer", "minimum": 1, "maximum": _MAX_READ_BYTES},
+                "action": {
+                    "type": "string",
+                    "enum": ("status", "wait", "cancel", "read"),
+                    "default": "wait",
+                },
+                "wait_seconds": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 60,
+                    "default": 10,
+                },
+                "stream": {"type": "string", "enum": ("stdout", "stderr"), "default": "stdout"},
+                "offset": {"type": "integer", "minimum": 0, "default": 0},
+                "max_bytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": _MAX_READ_BYTES,
+                    "default": 16_000,
+                },
             },
             "required": ("session_id",),
             "additionalProperties": False,
@@ -553,6 +666,21 @@ def create_manage_command_tool(sessions: CommandSessions) -> Tool:
                 view = sessions.get(session_id)
             elif action == "cancel":
                 view = await sessions.cancel(session_id)
+            elif action == "read":
+                stream = cast("Literal['stdout', 'stderr']", args.get("stream", "stdout"))
+                chunk = sessions.read(
+                    session_id,
+                    stream=stream,
+                    offset=cast("int", args.get("offset", 0)),
+                    max_bytes=cast("int", args.get("max_bytes", 16_000)),
+                )
+                view = sessions.get(session_id)
+                if view.status == "lost":
+                    return _error_result(
+                        "command_session_lost",
+                        f"command session {session_id!r} lost its process before completion",
+                    )
+                return _read_result(view, chunk)
             else:
                 view = await sessions.wait(session_id, wait_seconds)
         except CommandSessionError as exc:
@@ -577,7 +705,8 @@ def create_manage_command_tool(sessions: CommandSessions) -> Tool:
                 "Manage a background command session started by bash with "
                 "yield_time_seconds. action=status returns immediately; wait returns after "
                 "the command completes or wait_seconds, and an expired wait leaves it "
-                "running; cancel terminates and reaps its process group. This tool grants "
+                "running; cancel terminates and reaps its process group; read returns a "
+                "bounded byte window of the retained stdout/stderr head. This tool grants "
                 "no new path or network access and cannot alter the original command."
             ),
             input_schema={
@@ -589,25 +718,40 @@ def create_manage_command_tool(sessions: CommandSessions) -> Tool:
                     },
                     "action": {
                         "type": "string",
-                        "enum": ("status", "wait", "cancel"),
-                        "description": "Query immediately, wait for completion, or cancel. Default wait.",
+                        "enum": ("status", "wait", "cancel", "read"),
+                        "default": "wait",
+                        "description": (
+                            "Query immediately, wait for completion, cancel, or read a log "
+                            "window. Default wait."
+                        ),
                     },
                     "wait_seconds": {
                         "type": "number",
+                        "minimum": 0,
+                        "maximum": 60,
+                        "default": 10,
                         "description": "Response wait for action=wait, 0..60 (default 10).",
                     },
                     "stream": {
                         "type": "string",
                         "enum": ("stdout", "stderr"),
-                        "description": "Reserved for log reads; accepted for schema compatibility.",
+                        "default": "stdout",
+                        "description": "Log stream for action=read.",
                     },
                     "offset": {
                         "type": "integer",
-                        "description": "Reserved for log reads (byte offset, >= 0).",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Byte offset in the retained log, for action=read.",
                     },
                     "max_bytes": {
                         "type": "integer",
-                        "description": "Reserved for log reads, 1..64000 (default 16000).",
+                        "minimum": 1,
+                        "maximum": _MAX_READ_BYTES,
+                        "default": 16_000,
+                        "description": (
+                            "Maximum bytes returned by action=read, 1..64000 (default 16000)."
+                        ),
                     },
                 },
                 "required": ("session_id",),
