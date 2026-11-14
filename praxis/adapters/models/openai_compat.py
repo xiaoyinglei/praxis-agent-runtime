@@ -152,7 +152,10 @@ class OpenAICompatAdapter:
         upstream_id: str | None = None
         usage = Usage(0, 0, source="estimated")
         finish_reason = ""
+        saw_chunk = False
+        saw_choice = False
         async for chunk in result:
+            saw_chunk = True
             chunk_id = getattr(chunk, "id", None)
             if chunk_id is not None:
                 if upstream_id is None:
@@ -162,6 +165,7 @@ class OpenAICompatAdapter:
             if chunk.usage is not None:
                 usage = _usage_from_provider(chunk.usage)
             for choice in chunk.choices:
+                saw_choice = True
                 delta = choice.delta
                 reasoning = _reasoning_text(delta)
                 if reasoning:
@@ -182,6 +186,12 @@ class OpenAICompatAdapter:
                     )
                 if choice.finish_reason:
                     finish_reason = choice.finish_reason
+        # 流开了却一帧未产出(典型:provider 忽略 stream 返回普通 JSON,SDK 解析
+        # 0 个 SSE 事件):必须响亮失败,绝不能静默退化成"成功空回复"。
+        if not saw_chunk:
+            raise ValueError("provider returned no stream events; it may not support streaming")
+        if not saw_choice:
+            raise ValueError(f"provider returned no choices for model {req.model!r}")
         yield ModelStreamFinished(usage=usage, finish_reason=finish_reason)
 
     async def complete(self, req: WireRequest) -> ModelResponse:

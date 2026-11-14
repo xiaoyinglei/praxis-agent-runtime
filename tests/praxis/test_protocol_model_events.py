@@ -173,3 +173,21 @@ def test_tiktoken_failure_falls_back_single_entry(monkeypatch: pytest.MonkeyPatc
     measurement = count_text_tokens("a" * 400)
     assert measurement.source == "heuristic"
     assert measurement.count == 400 // 4 + 1
+
+
+def test_encoder_failure_is_negatively_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    """离线时不得每次估算都重试网络:失败按 encoder key 记住,直接用启发式。"""
+    calls: list[str | None] = []
+
+    def boom(tokenizer_model: str | None) -> object:
+        calls.append(tokenizer_model)
+        raise RuntimeError("offline")
+
+    tokenization._UNAVAILABLE_ENCODERS.clear()
+    monkeypatch.setattr(tokenization, "_load_encoder", boom)
+
+    first = count_text_tokens("hello", tokenizer_model="offline-probe")
+    second = count_text_tokens("hello", tokenizer_model="offline-probe")
+
+    assert (first.source, second.source) == ("heuristic", "heuristic")
+    assert calls == ["offline-probe"]

@@ -35,8 +35,9 @@ WIRE_OWNED_FIELDS: frozenset[str] = frozenset(
 )
 
 # SDK 原生认识的顶层扩展参数;其余未知键统一进 extra_body(合并、键序稳定)。
+# temperature 已在 WIRE_OWNED_FIELDS,不重复列出(否则这一项永不可达)。
 _TOP_LEVEL_PROVIDER_OPTION_KEYS: frozenset[str] = frozenset(
-    {"temperature", "top_p", "seed", "parallel_tool_calls", "reasoning_effort"}
+    {"top_p", "seed", "parallel_tool_calls", "reasoning_effort"}
 )
 
 
@@ -87,10 +88,17 @@ def openai_payload(req: WireRequest, *, stream: bool) -> dict[str, Any]:
 
     ``provider_options`` 逐项落位:
     - 命中 ``WIRE_OWNED_FIELDS`` → ``ValueError``(不得覆盖真实请求字段);
+    - ``extra_body`` 键是受支持形状:其内容**合并**进顶层 ``extra_body``,
+      不会产生 ``extra_body={"extra_body": ...}`` 双层嵌套;
     - SDK 认识的顶层键直落;
     - 其余键合并进 ``extra_body``,保持 provider_options 的插入顺序。
     ``stream=True`` 时加 ``stream_options={"include_usage": True}``——usage 是
     finish 事件的事实来源。
+
+    注意:返回的是 **SDK kwargs 形状**;``extra_body`` 会被 SDK 展平进真实
+    HTTP body,所以 ``serialized_json`` 与线上 body 仅在这一处不逐字节相同
+    (结构可无损还原)。本阶段 ``build_request`` 固定以 ``stream=True`` 定型
+    记账文本:core 只走 ``stream()``,``complete()`` 也由它派生(R-T2-1)。
     """
     payload: dict[str, Any] = {
         "model": req.model,
@@ -106,10 +114,15 @@ def openai_payload(req: WireRequest, *, stream: bool) -> dict[str, Any]:
     for key, value in req.provider_options.items():
         if key in WIRE_OWNED_FIELDS:
             raise ValueError(f"provider option cannot override wire-owned field: {key}")
-        if key in _TOP_LEVEL_PROVIDER_OPTION_KEYS:
-            payload[key] = thaw_json(value)
+        thawed = thaw_json(value)
+        if key == "extra_body":
+            if not isinstance(thawed, dict):
+                raise ValueError("provider option 'extra_body' must be an object")
+            extra_body.update(thawed)
+        elif key in _TOP_LEVEL_PROVIDER_OPTION_KEYS:
+            payload[key] = thawed
         else:
-            extra_body[key] = thaw_json(value)
+            extra_body[key] = thawed
     if extra_body:
         payload["extra_body"] = extra_body
 

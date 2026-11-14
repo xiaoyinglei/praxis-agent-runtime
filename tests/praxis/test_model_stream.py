@@ -313,6 +313,54 @@ def test_stream_converts_whole_completion_to_single_delta_plus_finish() -> None:
     ]
 
 
+def test_non_sse_provider_response_fails_loudly() -> None:
+    """provider 不产 SSE 帧时不得静默变成成功空回复:响亮失败,而非空 content。"""
+    payload = {
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "m",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "ok"},
+            }
+        ],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+    }
+    adapter = _stream_adapter(
+        httpx.MockTransport(lambda request: httpx.Response(200, json=payload))
+    )
+    with pytest.raises(ValueError, match="provider returned no stream events"):
+        asyncio.run(collect_events(adapter.stream(_request(adapter))))
+
+
+def test_empty_text_with_tool_call_is_not_an_error() -> None:
+    """正常空文本(只有 tool_calls)绝不能被当成"没有流事件"。"""
+    frames = [
+        _chunk(
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+            }
+        ),
+        _chunk({}, finish="tool_calls"),
+        b"data: [DONE]\n\n",
+    ]
+    adapter = _stream_adapter(sse_transport(frames))
+    response = assemble_model_events(asyncio.run(collect_events(adapter.stream(_request(adapter)))))
+    assert response.content == ""
+    assert [call.name for call in response.tool_calls] == ["read_file"]
+
+
 # --- B6/B24:唯一出站 body 构造 -------------------------------------------------
 
 
@@ -342,6 +390,25 @@ def test_extra_body_catches_unknown_provider_options() -> None:
     assert payload["extra_body"] == {"thinking": {"type": "enabled"}}
 
 
+def test_provider_option_extra_body_merges_instead_of_nesting() -> None:
+    # provider_options 里显式写 extra_body 是受支持形状:合并进顶层 extra_body。
+    payload = openai_payload(
+        _wire_request(
+            provider_options={
+                "extra_body": {"thinking": {"type": "enabled"}},
+                "x": 1,
+            }
+        ),
+        stream=False,
+    )
+    assert payload["extra_body"] == {"thinking": {"type": "enabled"}, "x": 1}
+
+
+def test_provider_option_extra_body_must_be_an_object() -> None:
+    with pytest.raises(ValueError, match="extra_body"):
+        openai_payload(_wire_request(provider_options={"extra_body": [1, 2]}), stream=False)
+
+
 def test_known_sdk_options_land_top_level() -> None:
     payload = openai_payload(
         _wire_request(
@@ -368,13 +435,44 @@ def test_stream_flag_adds_include_usage_once() -> None:
     assert "stream" not in non_stream and "stream_options" not in non_stream
 
 
-def test_build_request_pins_the_streamed_body_as_the_accounting_text() -> None:
-    # R-T2-1:全站只有"实际发出去的那一份"进 serialized_json;core 只走 stream()。
-    adapter = OpenAICompatAdapter(ModelSpec(model_id="m"), api_key="k")
-    req = adapter.build_request([ModelMessage(role="user", content="hi")], (), ModelSettings())
-    body = json.loads(req.serialized_json)
-    assert body["stream"] is True and body["stream_options"] == {"include_usage": True}
-    assert req.serialized_json == wire_json(openai_payload(req, stream=True))
+def test_build_request_accounting_text_matches_the_recorded_request_body() -> None:
+    """D2 真钉子:serialized_json 与真正发出的 HTTP body 结构一致。
+
+    ``extra_body`` 是 SDK kwargs 形状,SDK 会把它展平进 body;因此比较时把
+    记账文本里的 ``extra_body`` 展平后再对照(唯一允许的字节差异,见
+    ``openai_payload`` docstring)。
+    """
+    seen: list[httpx.Request] = []
+    frames = [_chunk({"role": "assistant", "content": "ok"}, finish="stop"), b"data: [DONE]\n\n"]
+    body = b"".join(frames)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, content=body, headers=_SSE_HEADERS)
+
+    adapter = OpenAICompatAdapter(
+        ModelSpec(
+            model_id="alias",
+            remote_model_id="real/model",
+            base_url="https://unit.test/v1",
+            provider_options={"extra_body": {"thinking": {"type": "enabled"}}, "x": 1},
+        ),
+        api_key="k",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    req = adapter.build_request(
+        [ModelMessage(role="user", content="hi")], (), ModelSettings(temperature=0.2)
+    )
+    asyncio.run(collect_events(adapter.stream(req)))
+
+    accounted = json.loads(req.serialized_json)
+    recorded = json.loads(seen[0].content)
+    extra = accounted.pop("extra_body")
+    assert accounted["stream"] is True
+    assert accounted["stream_options"] == {"include_usage": True}
+    assert extra == {"thinking": {"type": "enabled"}, "x": 1}
+    assert "extra_body" not in recorded
+    assert recorded == {**accounted, **extra}
 
 
 def test_wire_json_is_deterministic_and_rejects_non_json_values() -> None:

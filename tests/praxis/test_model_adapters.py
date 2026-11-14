@@ -252,7 +252,7 @@ def test_complete_passes_provider_options_to_sdk_once() -> None:
     spec = ModelSpec(
         model_id="m",
         base_url="https://unit.test/v1",
-        provider_options={"x": 1},
+        provider_options={"extra_body": {"x": 1}},
         max_output_tokens=77,
     )
     adapter = OpenAICompatAdapter(spec, api_key="k", http_client=client)
