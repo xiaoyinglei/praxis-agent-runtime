@@ -6,7 +6,8 @@
 ``ENTRIES`` 注册表是扩展位:阶段 4 子代理入口复用同一 execute,注册即纳入本属性。
 
 观测口径(brief 钉死):比较**首次 execute 的决策类别 + reason**——
-- executed = tool_call item + status=ok 的 tool_result;
+- executed = tool_call item(管道已 dispatch;工具自身业务错误如
+  manage_command 的未知 session 不改变决策类别);
 - denied   = tool_result status=denied,或 error_code ∈ {permission_denied,
   sandbox_refused},或 error_message 以 "floor" 开头;
 - asked    = approval_request 且无 matching approval_decision。
@@ -61,9 +62,24 @@ from praxis.protocol.policy import NetworkPolicy, PathRule, PermissionPolicy, To
 from praxis.protocol.tools import Tool
 from praxis.store.log import Store
 from praxis.tools.builtins.command import create_bash_tool
+from praxis.tools.builtins.command_sessions import CommandSessions, create_manage_command_tool
 from praxis.tools.builtins.filesystem import create_read_tool, create_write_tool
+from praxis.tools.builtins.patch import create_apply_patch_tool
+from praxis.tools.builtins.planning import create_update_plan_tool
+from praxis.tools.builtins.python_tool import create_run_python_tool
+from praxis.tools.builtins.search import create_search_text_tool
 
 CALL_ID = "c1"
+_TOOL_NAMES = (
+    "read",
+    "write",
+    "bash",
+    "search_text",
+    "apply_patch",
+    "update_plan",
+    "manage_command",
+    "run_python",
+)
 _FAKE_SANDBOX = SandboxAvailability(backend="seatbelt", available=True)
 _AVAILABLE = probe_backend()
 _CLEAN_ENV = {"PRAXIS_MODEL": None, "PRAXIS_BASE_URL": None, "PRAXIS_API_KEY": None, "OPENAI_API_KEY": None}
@@ -108,16 +124,30 @@ _WRITE_PATHS = (
     "locked/file.txt", "granted/file.txt", "sub/new.txt",
 )
 _BASH_COMMANDS = ("echo praxis-ok", "true", "printf hello")
+_SEARCH_PATHS = (".", "note.txt", ".praxis", "sub")
+_CMD_ID = "cmd_" + "0" * 32
+_PATCH_NOTE = "*** Begin Patch\n*** Update File: note.txt\n@@\n-seed note\n+patched\n*** End Patch\n"
+_PATCH_GIT = "*** Begin Patch\n*** Update File: .git/config\n@@\n-orig\n+pwned\n*** End Patch\n"
 
 
 @st.composite
 def call_strategy(draw: st.DrawFn) -> Call:
-    tool = draw(st.sampled_from(("read", "write", "bash")))
+    tool = draw(st.sampled_from(_TOOL_NAMES))
     if tool == "read":
         return Call(tool, {"path": draw(st.sampled_from(_READ_PATHS))})
     if tool == "write":
         return Call(tool, {"path": draw(st.sampled_from(_WRITE_PATHS)), "content": "praxis property\n"})
-    return Call(tool, {"command": draw(st.sampled_from(_BASH_COMMANDS))})
+    if tool == "bash":
+        return Call(tool, {"command": draw(st.sampled_from(_BASH_COMMANDS))})
+    if tool == "search_text":
+        return Call(tool, {"pattern": "seed", "path": draw(st.sampled_from(_SEARCH_PATHS))})
+    if tool == "apply_patch":
+        return Call(tool, {"patch": draw(st.sampled_from((_PATCH_NOTE, _PATCH_GIT)))})
+    if tool == "update_plan":
+        return Call(tool, {"plan": [{"step": "check state", "status": "in_progress"}]})
+    if tool == "manage_command":
+        return Call(tool, {"session_id": _CMD_ID, "action": "status"})
+    return Call(tool, {"code": "print('praxis property')"})
 
 
 @st.composite
@@ -132,7 +162,7 @@ def policy_strategy(draw: st.DrawFn) -> Scenario:
     if draw(st.booleans()):
         filesystem.append(PathRule(path="sub", access="read"))
     tools: list[ToolRule] = []
-    for name in ("read", "write", "bash"):
+    for name in _TOOL_NAMES:
         verdict = draw(st.sampled_from((None, "allow", "ask", "deny")))
         if verdict is not None:
             tools.append(ToolRule(pattern=name, decision=verdict))
@@ -170,10 +200,13 @@ def observe_first_decision(items: list[Item], call_id: str, workspace: Path) -> 
         status = result.get("status")
         error_code = result.get("error_code")
         message = result.get("error_message") or ""
-        if status == "ok" and calls:
-            return Observation("executed", "executed")
         if status == "denied" or error_code in {"permission_denied", "sandbox_refused"} or message.startswith("floor"):
             return Observation("denied", _normalize_reason(str(message), workspace))
+        if calls:
+            # executed = decide 放行且管道已 dispatch(存在 tool_call item)。
+            # 工具自身的业务错误(manage_command 的未知 session、run_python 的
+            # 非零退出)不改变**决策类别**——目标正是三入口同一 decide。
+            return Observation("executed", "executed")
         raise AssertionError(f"unexpected first result shape: {result!r}")
     if requests and not decisions:
         return Observation("asked", "approval_required")
@@ -184,7 +217,8 @@ def _assert_reentry_outcome(items: list[Item], call_id: str, policy: PermissionP
     """resume 重入断言:审批 args_digest/policy_revision 绑定 + 重入结局正确。
 
     重入两途皆合法:
-    - 一般 ask 批准 → 执行(tool_call + ok,digest 绑定到执行参数);
+    - 一般 ask 批准 → 执行(tool_call + 非 denied 结果,digest 绑定到执行参数);
+      工具自身业务错误(如 manage_command 的未知 session)仍算已执行;
     - 地板目标经 ask 规则(decide 第 2 步先于第 4 步地板)被批准 → 执行时地板守卫
       (R5c)deny——地板在任何入口都不可批准,无 tool_call、error_message 以 floor 开头。
     """
@@ -198,7 +232,9 @@ def _assert_reentry_outcome(items: list[Item], call_id: str, policy: PermissionP
     assert results, "reentry must produce a result"
     result = results[-1]
     if calls:
-        assert result.get("status") == "ok", "approved non-floor call must execute"
+        # 批准后的非地板调用必须被 dispatch(存在 tool_call item)。工具自身业务
+        # 失败(如 manage_command 的未知 session)不算决策层面的 deny。
+        assert result.get("status") != "denied", "approved non-floor call must execute"
         assert decisions[-1].get("args_digest") == calls[-1].get("args_digest"), "approval digest binds executed args"
     else:
         assert result.get("status") == "denied", "floor target must be denied at execution guard"
@@ -299,10 +335,16 @@ ENTRIES: dict[str, Callable[[Path, Call, Scenario, Path], Observation]] = {
 
 
 def _reference_decision(workspace: Path, call: Call, scenario: Scenario, sandbox: SandboxAvailability) -> permission.Decision:
+    sessions = CommandSessions(workspace)
     tools: dict[str, Tool] = {
         "read": create_read_tool(workspace),
         "write": create_write_tool(workspace),
         "bash": create_bash_tool(workspace),
+        "search_text": create_search_text_tool(workspace),
+        "apply_patch": create_apply_patch_tool(workspace),
+        "update_plan": create_update_plan_tool(),
+        "manage_command": create_manage_command_tool(sessions),
+        "run_python": create_run_python_tool(workspace),
     }
     tool = tools[call.tool]
     args = tool.validate_input(dict(call.arguments))
@@ -401,6 +443,18 @@ _NET_DENY = PermissionPolicy(network=NetworkPolicy(decision="deny"))
         ("never-ask-to-deny", Call("bash", {"command": "echo ok"}), Scenario(PermissionPolicy(), "never"), "denied"),
         # ask 规则(decide 第2步)先于地板(第4步)→ 首次 asked;resume 批准后执行时地板守卫 deny(R5c)。
         ("ask-rule-before-floor", Call("read", {"path": ".praxis/state.json"}), Scenario(PermissionPolicy(tools=(ToolRule(pattern="read", decision="ask"),)), None), "asked"),
+        # Task 18 Step 5:新增五个工具也走同一 decide(每类至少一例)。
+        ("allow-search-text", Call("search_text", {"pattern": "seed"}), Scenario(PermissionPolicy(), None), "executed"),
+        ("deny-floor-search-praxis", Call("search_text", {"pattern": "x", "path": ".praxis"}), Scenario(PermissionPolicy(), None), "denied"),
+        ("allow-apply-patch", Call("apply_patch", {"patch": _PATCH_NOTE}), Scenario(PermissionPolicy(), None), "executed"),
+        ("deny-floor-patch-git", Call("apply_patch", {"patch": _PATCH_GIT}), Scenario(PermissionPolicy(), None), "denied"),
+        ("ask-tool-rule-apply-patch", Call("apply_patch", {"patch": _PATCH_NOTE}), Scenario(PermissionPolicy(tools=(ToolRule(pattern="apply_patch", decision="ask"),)), None), "asked"),
+        ("allow-update-plan", Call("update_plan", {"plan": [{"step": "check state", "status": "in_progress"}]}), Scenario(PermissionPolicy(), None), "executed"),
+        ("allow-manage-command", Call("manage_command", {"session_id": _CMD_ID, "action": "status"}), Scenario(PermissionPolicy(), None), "executed"),
+        ("ask-manage-command", Call("manage_command", {"session_id": _CMD_ID, "action": "status"}), Scenario(PermissionPolicy(tools=(ToolRule(pattern="manage_command", decision="ask"),)), None), "asked"),
+        ("allow-run-python", Call("run_python", {"code": "print('ok')"}), Scenario(_NET_ALLOW, None), "executed"),
+        ("ask-run-python-default-network", Call("run_python", {"code": "print('ok')"}), Scenario(PermissionPolicy(), None), "asked"),
+        ("deny-tool-rule-run-python", Call("run_python", {"code": "print('ok')"}), Scenario(PermissionPolicy(tools=(ToolRule(pattern="run_python", decision="deny"),)), None), "denied"),
     ],
 )
 def test_decision_matrix_all_entries(
