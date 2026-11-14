@@ -6,14 +6,20 @@
 ``/bin/bash`` 或 Python 脚本,``printenv``/``os.environ`` 就能把密钥写进
 tool_result、item 日志与模型上下文,文件层的地板/私有目录 deny 随即被绕过。
 
-白名单语义(移植旧 ``agent_runtime/tools/builtins/shell.py::_command_environment``):
+白名单语义(**有意最小化**,不是旧 ``_command_environment`` 的逐字移植):
 - ``PATH`` 为固定列表(工作区 venv/node_modules → 常见系统工具链目录),
   **不读取宿主 PATH**;
 - ``HOME``/``TMPDIR``/``TEMP``/``TMP`` 全部指向 ``scratch_dir``——沙箱内
   唯一可写临时区(无沙箱的单测路径用进程私有临时目录,见
   ``scratch_dir_for``);
 - ``GIT_CONFIG_GLOBAL=/dev/null``、``GIT_CONFIG_NOSYSTEM=1``:git 读不到
-  宿主全局/系统配置;``LC_ALL=C`` 固定输出编码语义;
+  宿主全局/系统配置;``LC_ALL=C`` 固定输出编码语义。
+
+已知取舍(与旧沙箱 bash 相同,不是回归):旧 ``_command_environment`` 还会
+传 ``LANG``/``PIP_CACHE_DIR``/``PYTHONDONTWRITEBYTECODE``/``SHELL``/
+``UV_CACHE_DIR``/``XDG_CACHE_HOME``;这里一律不带。因此 ``uv``/``cargo`` 等
+装在用户目录的工具在沙箱内通常不可解析——需要时用 ``run_python``/绝对路径,
+或由运维把工作区工具链放进 ``.venv/bin``。
 
 除此之外没有任何键。本模块从不读取 ``os.environ``——"最小环境"不是调用方
 的选择,而是构造出的字典必然缺少宿主变量这一事实。
@@ -30,7 +36,15 @@ from pathlib import Path
 
 from praxis.protocol.sandbox import SandboxSpec
 
-_FIXED_PATH_TAIL = ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin")
+_FIXED_PATH_TAIL = (
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+    "/Library/Developer/CommandLineTools/usr/bin",
+)
 
 _fallback_scratch: Path | None = None
 _fallback_lock = threading.Lock()

@@ -31,7 +31,7 @@ import pytest
 from praxis.adapters.sandbox.base import probe_backend
 from praxis.adapters.sandbox.compile import compile_sandbox, finalize_sandbox
 from praxis.protocol.permission import PermissionContext
-from praxis.protocol.policy import PathRule, PermissionPolicy
+from praxis.protocol.policy import PermissionPolicy
 from praxis.protocol.sandbox import SandboxSpec, ToolExecContext
 from praxis.protocol.tools import (
     CancellationMode,
@@ -42,6 +42,7 @@ from praxis.protocol.tools import (
     ToolTarget,
     ToolValidationError,
 )
+from praxis.tools.builtins import python_tool as python_tool_module
 from praxis.tools.builtins.child_env import child_env
 from praxis.tools.builtins.command import create_bash_tool
 from praxis.tools.builtins.python_tool import create_run_python_tool
@@ -56,27 +57,16 @@ def run(tool: Any, arguments: Mapping[str, Any], *, spec: SandboxSpec | None = N
 
 
 def sandbox_spec(workspace: Path) -> SandboxSpec:
-    """编译一份真实 seatbelt spec;临时 workspace 需显式提供受信解释器链接。
+    """编译一份真实 seatbelt spec(生产形状:工作区没有 .venv、无额外授权)。
 
-    ``_trusted_toolchain_roots`` 只从 ``<workspace>/.venv/bin/python`` 解析
-    受信 CPython;测试 workspace 是 tmp_path,不链接则 sys.executable 在
-    seatbelt 中不可读(生产工作区本就有 .venv)。
+    R-T17-4:运行解释器本身(`sys.executable` 的解析目录与 `sys.base_prefix`)
+    必须由后端内置为只读受信根;测试**不**再人工添加 PathRule 或伪造
+    ``<workspace>/.venv``,否则会遮住"praxis 装在 uv tool/pipx 且工作区无
+    .venv"时 run_python 恒失败的缺口。
     """
-    venv_bin = workspace / ".venv" / "bin"
-    venv_bin.mkdir(parents=True, exist_ok=True)
-    link = venv_bin / "python"
-    if not link.exists():
-        link.symlink_to(Path(sys.executable).resolve())
     context = PermissionContext(
         workspace=str(workspace),
-        # 测试 workspace 位于 tmp_path,而实现按契约执行 sys.executable(本项目
-        # venv 的解释器)。生产工作区自带 .venv 因而天然可读;测试显式授予
-        # 解释器目录只读访问,模拟同一形态。
-        policy=PermissionPolicy(
-            filesystem=(
-                PathRule(path=str(Path(sys.executable).parent), access="read"),
-            )
-        ),
+        policy=PermissionPolicy(),
         mode="bypass",
     )
     use = ResolvedUse(
@@ -254,6 +244,29 @@ def test_timeout_kills_process_group(tmp_path: Path) -> None:
     assert_dead(pidfile)
 
 
+def test_spawn_pipe_invariant_failure_reaps_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C5:spawn 半路失败(管道不变量)走有界回收,异常干净透传。"""
+
+    class _NoPipes:
+        pid = 4_194_304  # 不在任何真实进程组里:signal_group 只吞 ESRCH
+        returncode = 0
+        stdout = None
+        stderr = None
+
+    async def fake_exec(*args: Any, **kwargs: Any) -> Any:
+        return _NoPipes()
+
+    monkeypatch.setattr(python_tool_module.asyncio, "create_subprocess_exec", fake_exec)
+    with pytest.raises(RuntimeError, match="pipes were not created"):
+        asyncio.run(
+            python_tool_module._execute(  # noqa: SLF001 — 收尸分支的定向测试
+                argv=("unused",), cwd=tmp_path, env={}, timeout=1.0
+            )
+        )
+
+
 def test_temporary_script_is_removed(tmp_path: Path) -> None:
     scratch = tmp_path / "scratch"
     scratch.mkdir()
@@ -283,6 +296,16 @@ def test_child_env_is_allowlist_only(tmp_path: Path, monkeypatch: pytest.MonkeyP
     scratch = tmp_path / "scratch"
     scratch.mkdir()
     env = child_env(scratch, tmp_path)
+    assert set(env) == {
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_NOSYSTEM",
+        "LC_ALL",
+    }
     assert _SECRET_VAR not in env
     assert env["HOME"] == os.path.realpath(scratch)
     assert env["TMPDIR"] == os.path.realpath(scratch)
@@ -299,6 +322,9 @@ def test_child_env_is_allowlist_only(tmp_path: Path, monkeypatch: pytest.MonkeyP
         "/usr/local/bin",
         "/usr/bin",
         "/bin",
+        "/usr/sbin",
+        "/sbin",
+        "/Library/Developer/CommandLineTools/usr/bin",
     ]
 
 
@@ -360,6 +386,50 @@ def test_sandboxed_minimal_path_keeps_toolchain(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(not _AVAILABLE.available, reason="no sandbox backend")
+def test_run_python_without_workspace_venv_under_real_sandbox(tmp_path: Path) -> None:
+    """R-T17-4 production shape: no workspace .venv and no extra grants.
+
+    The backend must admit the interpreter that is running Praxis itself
+    (``sys.executable`` realpath + ``sys.base_prefix``) as read-only trusted
+    roots; otherwise ``run_python`` fails with rc 71 for uv tool/pipx installs
+    whose interpreter lives outside the workspace.
+    """
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    assert not (workspace / ".venv").exists()
+    spec = sandbox_spec(workspace)
+    try:
+        result = run(
+            create_run_python_tool(workspace),
+            {"code": "import sys; print(sys.executable)"},
+            spec=spec,
+        )
+        assert result.metadata["exit_code"] == 0, result.text
+        assert Path(result.text.strip()).resolve() == Path(sys.executable).resolve()
+    finally:
+        finalize_sandbox(spec, workspace)
+
+
+@pytest.mark.skipif(not _AVAILABLE.available, reason="no sandbox backend")
+def test_script_path_under_real_sandbox(tmp_path: Path) -> None:
+    """script_path mode inside the real seatbelt (not just the direct path)."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "show.py").write_text("import sys; print(sys.executable)\n", encoding="utf-8")
+    spec = sandbox_spec(workspace)
+    try:
+        result = run(
+            create_run_python_tool(workspace),
+            {"script_path": "show.py"},
+            spec=spec,
+        )
+        assert result.metadata["exit_code"] == 0, result.text
+        assert Path(result.text.strip()).resolve() == Path(sys.executable).resolve()
+    finally:
+        finalize_sandbox(spec, workspace)
+
+
+@pytest.mark.skipif(not _AVAILABLE.available, reason="no sandbox backend")
 def test_sandboxed_git_cannot_read_host_global_config(tmp_path: Path) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()
@@ -378,8 +448,10 @@ def test_sandboxed_git_cannot_read_host_global_config(tmp_path: Path) -> None:
         text = result.text
         lines = [line for line in text.splitlines() if line]
         assert "GIT_CONFIG_GLOBAL=/dev/null" in lines
-        # 宿主 ~/.gitconfig 存在(user.name 等),沙箱内 --list 必须为空:
-        # GIT_CONFIG_GLOBAL=/dev/null 生效,宿主全局配置不可见。
+        # HOME=scratch already prevents reading the host ~/.gitconfig; the
+        # GIT_CONFIG_* keys are defense in depth for any HOME override. The
+        # host's global config has user.name etc., so an empty --list proves
+        # no host config leaked.
         assert not any(
             line.startswith(("user.", "color.", "core.", "init.")) for line in lines
         )

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Literal
 
@@ -278,6 +279,33 @@ def _private_path_rules(private_paths: tuple[str, ...]) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _runtime_interpreter_roots() -> tuple[Path, ...]:
+    """Read-only roots for the interpreter running Praxis itself (R-T17-4).
+
+    ``sys.executable`` is chosen by host operations, not by the agent; admitting
+    its resolved directory (plus ``sys.base_prefix``, which carries the stdlib
+    for uv-managed CPythons) read-only cannot widen what the agent controls.
+    Without this, uv tool/pipx installs whose interpreter lives outside the
+    workspace fail closed (rc 71) whenever the workspace has no ``.venv``.
+
+    ``sys.prefix`` (the venv root when running from a venv) is also admitted:
+    exec follows the lexical ``.venv/bin/python`` symlink, which Seatbelt checks
+    before resolving it, and the venv root carries ``pyvenv.cfg``. Like the
+    other two, it is operator-chosen and read-only.
+    """
+    roots: set[Path] = set()
+    try:
+        roots.add(Path(sys.executable).resolve().parent)
+    except (OSError, RuntimeError):
+        pass
+    for candidate in (sys.prefix, sys.base_prefix):
+        try:
+            roots.add(Path(candidate).resolve())
+        except (OSError, RuntimeError):
+            continue
+    return tuple(sorted(roots, key=str))
+
+
 def _trusted_toolchain_roots(workspace_root: Path) -> tuple[Path, ...]:
     """Resolve recognized read-only toolchains used by a workspace venv.
 
@@ -286,6 +314,10 @@ def _trusted_toolchain_roots(workspace_root: Path) -> tuple[Path, ...]:
     that symlink before applying path rules, so the interpreter must be
     readable explicitly. Only the one referenced CPython distribution is
     admitted, and only when it lives below a standard uv-managed Python root.
+
+    R-T17-4 always adds the interpreter running Praxis itself (see
+    ``_runtime_interpreter_roots``): workspaces without ``.venv`` must still be
+    able to execute ``run_python``.
     """
     workspace = Path(workspace_root).resolve()
     uv_python_roots = tuple(
@@ -296,7 +328,7 @@ def _trusted_toolchain_roots(workspace_root: Path) -> tuple[Path, ...]:
         )
         if path.is_dir()
     )
-    trusted: set[Path] = set()
+    trusted: set[Path] = set(_runtime_interpreter_roots())
     for name in ("python", "python3"):
         executable = workspace / ".venv" / "bin" / name
         if not executable.exists():

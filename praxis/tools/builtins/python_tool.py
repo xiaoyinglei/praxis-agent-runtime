@@ -181,7 +181,13 @@ async def _execute(
     env: Mapping[str, str],
     timeout: float,
 ) -> _Outcome:
-    """spawn → 等主进程退出/超时收敛 → 收尾读取;取消路径不留孤儿进程组。"""
+    """spawn → 等主进程退出/超时收敛 → 收尾读取;取消路径不留孤儿进程组。
+
+    spawn 半路失败(管道不变量或 create_task 失败)复用 ``CommandExecution.spawn``
+    的同一收尸纪律:整组 SIGKILL → 取消已建任务 → 有界回收主进程 → 透传异常。
+    不直接复用 ``CommandExecution`` 是因为它的 ``drain_stream`` 只保留头部
+    (超出即丢弃),而 run_python 必须头尾都保留(``_HeadTailBuffer``)。
+    """
     started = time.monotonic()
     proc = await asyncio.create_subprocess_exec(
         *argv,
@@ -192,17 +198,24 @@ async def _execute(
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
     )
-    stdout = proc.stdout
-    stderr = proc.stderr
-    if stdout is None or stderr is None:
-        signal_group(proc.pid, signal.SIGKILL)
-        raise RuntimeError("run_python process pipes were not created")
     out_buffer = _HeadTailBuffer()
     err_buffer = _HeadTailBuffer()
-    tasks = (
-        asyncio.create_task(_read_stream(stdout, out_buffer)),
-        asyncio.create_task(_read_stream(stderr, err_buffer)),
-    )
+    tasks: list[asyncio.Task[None]] = []
+    try:
+        if proc.stdout is None or proc.stderr is None:
+            raise RuntimeError("run_python process pipes were not created")
+        tasks.append(asyncio.create_task(_read_stream(proc.stdout, out_buffer)))
+        tasks.append(asyncio.create_task(_read_stream(proc.stderr, err_buffer)))
+    except BaseException:
+        signal_group(proc.pid, signal.SIGKILL)
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(BaseException):
+                await task
+        with contextlib.suppress(TimeoutError):
+            await await_main_exit(proc, _POST_KILL_WAIT_SECONDS)
+        raise
     timed_out = False
     try:
         try:
@@ -213,7 +226,7 @@ async def _execute(
         await _finish_drain(tasks[0])
         await _finish_drain(tasks[1])
     except asyncio.CancelledError:
-        await _cancel_execution(proc, tasks)
+        await _cancel_execution(proc, tuple(tasks))
         raise
     out_text, out_truncated = _bounded_stream(out_buffer.value())
     err_text, err_truncated = _bounded_stream(err_buffer.value())
@@ -386,16 +399,18 @@ def create_run_python_tool(workspace: Path) -> Tool:
         definition=ToolDefinition(
             name="run_python",
             description=(
-                "Run Python code with the workspace interpreter and return combined "
-                "stdout/stderr plus exit_code. Supply exactly one of code (run as a "
-                "temporary script inside the sandbox scratch area) or script_path "
-                "(a workspace-relative Python file). working_dir must be a directory "
-                "inside the workspace. The subprocess receives only a minimal "
-                "environment: host environment variables and credentials are not "
-                "visible to it. Syntax errors are rejected before execution. Write "
-                "access and network are decided by the permission policy; this tool "
-                "has no workspace_write or network flags, so permissions cannot be "
-                "widened from tool arguments. Use the read/write tools for file edits."
+                "Run Python code with the interpreter that is running Praxis "
+                "(sys.executable), isolated with -I from the host PYTHONPATH and "
+                "sitecustomize, and return combined stdout/stderr plus exit_code. "
+                "Supply exactly one of code (run as a temporary script inside the "
+                "sandbox scratch area) or script_path (a workspace-relative Python "
+                "file). working_dir must be a directory inside the workspace. The "
+                "subprocess receives only a minimal environment: host environment "
+                "variables and credentials are not visible to it. Syntax errors are "
+                "rejected before execution. Write access and network are decided by "
+                "the permission policy; this tool has no workspace_write or network "
+                "flags, so permissions cannot be widened from tool arguments. Use "
+                "the read/write tools for file edits."
             ),
             input_schema={
                 "type": "object",

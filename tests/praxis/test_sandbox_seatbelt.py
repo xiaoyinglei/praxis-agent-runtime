@@ -120,9 +120,11 @@ def test_floor_section_matches_floor_entries(tmp_path: Path):
             assert any(line.startswith("(deny file-read* file-write* (regex") for line in regex_denies)
         else:
             assert any(line.startswith("(deny file-write* (regex") for line in regex_denies)
-    # 旧 runtime 的第二份地板清单不得出现
+    # 旧 runtime 的第二份地板清单不得出现在**地板段**;受信解释器只读根
+    # (R-T17-4)可以合法包含开发 venv 的 ".venv" 路径,那不是地板。
+    floor_text = "\n".join(regex_denies)
     for legacy in (".venv", "node_modules", ".codex", ".aws", ".agents"):
-        assert legacy not in text
+        assert legacy not in floor_text
 
 
 def test_floor_identical_across_profiles(tmp_path: Path):
