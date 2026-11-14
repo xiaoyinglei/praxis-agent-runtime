@@ -34,6 +34,16 @@ def test_model_spec_defaults() -> None:
     assert dict(spec.provider_options) == {}
 
 
+def test_model_spec_new_fields_have_inert_defaults() -> None:
+    # 全部新字段带默认:旧构造零改动(阶段 1/2 调用点不动)。
+    spec = ModelSpec(model_id="gpt-x")
+    assert spec.remote_model_id is None and spec.base_url is None and spec.api_key_env is None
+    assert spec.context_window_tokens == 8192 and spec.supports_tools is True
+    assert spec.tokenizer_model is None and spec.timeout_seconds == 120.0
+    assert spec.auto_compact_token_limit is None and spec.cost.is_zero
+    assert spec.wire_model_id == "gpt-x"
+
+
 def test_model_dataclasses_are_frozen() -> None:
     call = ModelToolCall(call_id="c1", name="read_file", arguments={"path": "a"})
     message = ModelMessage(role="user", content="hi", tool_calls=(call,))
@@ -69,15 +79,20 @@ def test_wire_request_shape() -> None:
     )
     assert request.tools[0].name == "read_file"
     assert request.temperature is None
+    # 旧构造不传新字段时保持空串;build_request 负责填充(单一来源)。
+    assert request.serialized_json == "" and request.wire_revision == ""
 
 
 class _PlaceholderAdapter:
-    """占位对象:Task 9 用 ScriptedAdapter 替换真实实现断言。"""
+    """占位对象:完整的 ModelAdapter 协议(含流式),断言 isinstance 为真。"""
 
     def build_request(self, messages, tools, settings):
         raise NotImplementedError
 
     async def complete(self, req):
+        raise NotImplementedError
+
+    def stream(self, req):
         raise NotImplementedError
 
 

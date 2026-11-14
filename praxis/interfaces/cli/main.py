@@ -234,7 +234,9 @@ def _open_from_options(
     if not api_key:
         raise typer.BadParameter("missing API key: set PRAXIS_API_KEY (or OPENAI_API_KEY), or use --scripted")
     resolved_base_url = base_url or os.environ.get("PRAXIS_BASE_URL") or None
-    adapter = OpenAICompatAdapter(ModelSpec(model_id=resolved_model), api_key=api_key, base_url=resolved_base_url)
+    # base_url 单一来源:只经 ModelSpec 进入 adapter,构造器不再接受第二个地址。
+    spec = ModelSpec(model_id=resolved_model, base_url=resolved_base_url)
+    adapter = OpenAICompatAdapter(spec, api_key=api_key)
     return _open_session_guarded(
         _resolve_workspace(workspace),
         adapter,

@@ -13,7 +13,7 @@ from typing import Any
 import httpx
 import pytest
 
-from praxis.adapters.models.base import to_openai_messages, to_openai_tools
+from praxis.adapters.models.base import collect_events, to_openai_messages, to_openai_tools
 from praxis.adapters.models.openai_compat import OpenAICompatAdapter
 from praxis.adapters.models.scripted import ScriptedAdapter, ScriptExhausted
 from praxis.protocol.models import (
@@ -22,8 +22,12 @@ from praxis.protocol.models import (
     ModelResponse,
     ModelSettings,
     ModelSpec,
+    ModelStreamFinished,
+    ModelTextDelta,
     ModelToolCall,
+    ModelToolCallDelta,
     Usage,
+    assemble_model_events,
 )
 from praxis.protocol.tools import ToolDefinition
 
@@ -125,6 +129,36 @@ def test_build_request_copies_provider_options() -> None:
     assert req.provider_options == {"extra_body": {"x": 1}}
 
 
+def test_build_request_pins_canonical_serialized_json() -> None:
+    # D2 前置:真正出站文本一次定型,键序稳定、无空白(记账只测这一份)。
+    spec = ModelSpec(
+        model_id="alias", remote_model_id="real/model", base_url="https://unit.test/v1"
+    )
+    adapter = OpenAICompatAdapter(spec, api_key="k")
+    req = adapter.build_request(
+        [ModelMessage(role="user", content="hi")], [], ModelSettings(temperature=0.2)
+    )
+    assert req.model == "real/model"  # wire 名,不是本地别名
+    assert req.wire_revision == "praxis-openai-wire-v1"
+    body = json.loads(req.serialized_json)
+    assert body["model"] == "real/model"
+    assert body["messages"] == [{"role": "user", "content": "hi"}]
+    assert body["max_tokens"] == 4096 and body["temperature"] == 0.2
+    assert req.serialized_json == json.dumps(body, sort_keys=True, separators=(",", ":"))
+
+
+def test_adapter_base_url_comes_only_from_spec() -> None:
+    # 单一来源:构造器不再接受 base_url 参数,地址只从 ModelSpec 进入。
+    adapter = OpenAICompatAdapter(
+        ModelSpec(model_id="m", base_url="https://unit.test/v1"), api_key="k"
+    )
+    assert str(adapter._client.base_url).rstrip("/") == "https://unit.test/v1"
+    with pytest.raises(TypeError):
+        OpenAICompatAdapter(  # type: ignore[call-arg]
+            ModelSpec(model_id="m"), api_key="k", base_url="https://second.test/v1"
+        )
+
+
 # --- complete:非流式解析(MockTransport,离线) ----------------------------------
 
 
@@ -132,7 +166,9 @@ def test_complete_parses_tool_calls() -> None:
     transport, seen = _mock_transport(_openai_payload())
     client = httpx.AsyncClient(transport=transport)
     adapter = OpenAICompatAdapter(
-        ModelSpec(model_id="m"), api_key="k", base_url="https://unit.test/v1", http_client=client
+        ModelSpec(model_id="m", base_url="https://unit.test/v1"),
+        api_key="k",
+        http_client=client,
     )
     assert isinstance(adapter, ModelAdapter)
     req = adapter.build_request([ModelMessage(role="user", content="hi")], [], ModelSettings())
@@ -163,10 +199,13 @@ def test_complete_passes_provider_options_to_sdk_once() -> None:
     )
     transport, seen = _mock_transport(payload)
     client = httpx.AsyncClient(transport=transport)
-    spec = ModelSpec(model_id="m", provider_options={"extra_body": {"x": 1}}, max_output_tokens=77)
-    adapter = OpenAICompatAdapter(
-        spec, api_key="k", base_url="https://unit.test/v1", http_client=client
+    spec = ModelSpec(
+        model_id="m",
+        base_url="https://unit.test/v1",
+        provider_options={"extra_body": {"x": 1}},
+        max_output_tokens=77,
     )
+    adapter = OpenAICompatAdapter(spec, api_key="k", http_client=client)
     tool = ToolDefinition(name="read_file", description="read", input_schema={"type": "object"})
     req = adapter.build_request(
         [ModelMessage(role="user", content="hi")], [tool], ModelSettings(temperature=0.5)
@@ -208,11 +247,12 @@ def test_complete_settings_win_over_colliding_provider_options() -> None:
     transport, seen = _mock_transport(_text_payload())
     client = httpx.AsyncClient(transport=transport)
     spec = ModelSpec(
-        model_id="m", provider_options={"temperature": 0.9, "max_tokens": 5}, max_output_tokens=50
+        model_id="m",
+        base_url="https://unit.test/v1",
+        provider_options={"temperature": 0.9, "max_tokens": 5},
+        max_output_tokens=50,
     )
-    adapter = OpenAICompatAdapter(
-        spec, api_key="k", base_url="https://unit.test/v1", http_client=client
-    )
+    adapter = OpenAICompatAdapter(spec, api_key="k", http_client=client)
     req = adapter.build_request(
         [ModelMessage(role="user", content="hi")],
         [],
@@ -228,10 +268,13 @@ def test_complete_provider_temperature_survives_when_settings_none() -> None:
     # settings.temperature=None 时,provider_options 的 temperature 默认值仍生效。
     transport, seen = _mock_transport(_text_payload())
     client = httpx.AsyncClient(transport=transport)
-    spec = ModelSpec(model_id="m", provider_options={"temperature": 0.7}, max_output_tokens=400)
-    adapter = OpenAICompatAdapter(
-        spec, api_key="k", base_url="https://unit.test/v1", http_client=client
+    spec = ModelSpec(
+        model_id="m",
+        base_url="https://unit.test/v1",
+        provider_options={"temperature": 0.7},
+        max_output_tokens=400,
     )
+    adapter = OpenAICompatAdapter(spec, api_key="k", http_client=client)
     req = adapter.build_request([], [], ModelSettings())
     asyncio.run(adapter.complete(req))
     body = json.loads(seen[0].content)
@@ -239,17 +282,23 @@ def test_complete_provider_temperature_survives_when_settings_none() -> None:
     assert body["max_tokens"] == 400
 
 
-def test_complete_rejects_malformed_tool_call_arguments() -> None:
+def test_complete_drops_malformed_tool_call_arguments_without_raising() -> None:
+    # 畸形 arguments 由唯一装配点丢弃并留提示,不抛穿 turn(设计 §5.9)。
     payload = _openai_payload()
     payload["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] = "not-json{"
     transport, _ = _mock_transport(payload)
     client = httpx.AsyncClient(transport=transport)
     adapter = OpenAICompatAdapter(
-        ModelSpec(model_id="m"), api_key="k", base_url="https://unit.test/v1", http_client=client
+        ModelSpec(model_id="m", base_url="https://unit.test/v1"),
+        api_key="k",
+        http_client=client,
     )
     req = adapter.build_request([ModelMessage(role="user", content="hi")], [], ModelSettings())
-    with pytest.raises(ValueError, match="tool_calls\\[0\\]"):
-        asyncio.run(adapter.complete(req))
+    response = asyncio.run(adapter.complete(req))
+    assert response.tool_calls == (
+        ModelToolCall(call_id="call_2", name="list_dir", arguments={}),
+    )
+    assert "[invalid tool call arguments dropped: 1]" in response.content
 
 
 def test_complete_missing_usage_yields_zero_usage() -> None:
@@ -266,7 +315,9 @@ def test_complete_missing_usage_yields_zero_usage() -> None:
     transport, _ = _mock_transport(payload)
     client = httpx.AsyncClient(transport=transport)
     adapter = OpenAICompatAdapter(
-        ModelSpec(model_id="m"), api_key="k", base_url="https://unit.test/v1", http_client=client
+        ModelSpec(model_id="m", base_url="https://unit.test/v1"),
+        api_key="k",
+        http_client=client,
     )
     req = adapter.build_request([ModelMessage(role="user", content="hi")], [], ModelSettings())
     response = asyncio.run(adapter.complete(req))
@@ -290,10 +341,31 @@ def test_scripted_adapter_order_and_exhaustion() -> None:
         )
         assert adapter.last_request is req
         assert req.max_output_tokens == 64
-        assert await adapter.complete(req) is r1
-        assert await adapter.complete(req) is r2
+        # complete 是唯一装配点的薄门面,不再返回剧本对象本体但内容等价。
+        assert await adapter.complete(req) == r1
+        assert await adapter.complete(req) == r2
         with pytest.raises(ScriptExhausted):
             await adapter.complete(req)
+
+    asyncio.run(drive())
+
+
+def test_scripted_stream_round_trips_through_assembly() -> None:
+    """剧本 → 事件帧 → 同一 assemble:脚本驱动的验收与生产共享装配路径。"""
+    original = _tool_response(
+        "hello", (("c1", "read_file", {"path": "a"}),), usage=(3, 4), finish="tool_calls"
+    )
+    adapter = ScriptedAdapter([original])
+    req = adapter.build_request([], [], ModelSettings())
+
+    async def drive() -> None:
+        events = await collect_events(adapter.stream(req))
+        assert [type(event) for event in events] == [
+            ModelTextDelta,
+            ModelToolCallDelta,
+            ModelStreamFinished,
+        ]
+        assert assemble_model_events(events) == original
 
     asyncio.run(drive())
 

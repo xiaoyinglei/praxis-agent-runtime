@@ -7,11 +7,11 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 from praxis.protocol.json import thaw_json
-from praxis.protocol.models import ModelMessage
+from praxis.protocol.models import ModelEvent, ModelMessage
 from praxis.protocol.tools import ToolDefinition
 
 
@@ -55,3 +55,11 @@ def to_openai_tools(tools: Sequence[ToolDefinition]) -> list[dict[str, Any]]:
         }
         for tool in tools
     ]
+
+
+async def collect_events(stream: AsyncIterator[ModelEvent]) -> list[ModelEvent]:
+    """把一个 adapter 的流收成事件列表,供 ``assemble_model_events`` 装配。
+
+    ``complete()`` 与探针/CLI 共用这一条路径——没有并行的第二聚合实现。
+    """
+    return [event async for event in stream]

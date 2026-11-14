@@ -2,18 +2,30 @@
 
 测试与验收的确定性引擎,不触网;``delay_seconds`` 提供 kill -9 窗口
 控制(恢复路径测试用)。剧本耗尽即抛 ScriptExhausted——绝不静默循环。
+
+``stream()`` 把剧本切成真实的事件序列,``complete()`` 与生产适配器一样
+走 ``assemble_model_events(await collect_events(...))``:验收测试因此驱动的
+是**同一条**装配路径,而不是脚本专属的旁路。
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+import json
+from collections.abc import AsyncIterator, Sequence
 
+from praxis.adapters.models.base import collect_events
+from praxis.protocol.json import thaw_json
 from praxis.protocol.models import (
+    ModelEvent,
     ModelMessage,
     ModelResponse,
     ModelSettings,
+    ModelStreamFinished,
+    ModelTextDelta,
+    ModelToolCallDelta,
     WireRequest,
+    assemble_model_events,
 )
 from praxis.protocol.tools import ToolDefinition
 
@@ -56,7 +68,8 @@ class ScriptedAdapter:
         self.last_request = request
         return request
 
-    async def complete(self, req: WireRequest) -> ModelResponse:
+    async def stream(self, req: WireRequest) -> AsyncIterator[ModelEvent]:
+        """消费下一条剧本,按内容/工具调用/finish 切成事件帧。"""
         if self._delay_seconds > 0:
             await asyncio.sleep(self._delay_seconds)
         if self._next_index >= len(self._responses):
@@ -66,4 +79,16 @@ class ScriptedAdapter:
             )
         response = self._responses[self._next_index]
         self._next_index += 1
-        return response
+        if response.content:
+            yield ModelTextDelta(response.content)
+        for index, call in enumerate(response.tool_calls):
+            yield ModelToolCallDelta(
+                index=index,
+                call_id=call.call_id,
+                name_fragment=call.name,
+                arguments_fragment=json.dumps(thaw_json(call.arguments), ensure_ascii=False),
+            )
+        yield ModelStreamFinished(response.usage, response.finish_reason)
+
+    async def complete(self, req: WireRequest) -> ModelResponse:
+        return assemble_model_events(await collect_events(self.stream(req)))
