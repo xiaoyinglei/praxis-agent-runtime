@@ -151,11 +151,23 @@ def _scripted_entry(index: int, entry: object) -> ModelResponse:
     finish_reason = entry.get("finish_reason")
     if not isinstance(finish_reason, str) or not finish_reason:
         finish_reason = "tool_calls" if calls else "stop"
-    return ModelResponse(content=content, tool_calls=tuple(calls), usage=Usage(0, 0), finish_reason=finish_reason)
+    reasoning = entry.get("reasoning", "")
+    if not isinstance(reasoning, str):
+        raise typer.BadParameter(f"scripted entry [{index}] 'reasoning' must be a string")
+    return ModelResponse(
+        content=content,
+        tool_calls=tuple(calls),
+        usage=Usage(0, 0),
+        finish_reason=finish_reason,
+        reasoning=reasoning,
+    )
 
 
 def _load_scripted(path: Path) -> list[ModelResponse]:
-    """剧本格式:``[{content, tool_calls?: [{call_id, name, arguments?}], finish_reason?}]``。"""
+    """剧本格式:``[{content, tool_calls?: [{call_id, name, arguments?}], reasoning?, finish_reason?}]``。
+
+    ``reasoning`` 可选(缺省空串),用于端到端驱动思考通道(R-T2-6)。
+    """
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:

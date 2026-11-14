@@ -1,34 +1,31 @@
-"""OpenAI 兼容 provider 适配器(设计 §5.9:一个构造器 + 一条流式装配路径)。
+"""OpenAI 兼容 provider 适配器(设计 §5.7/§5.9:一条流式装配路径)。
 
-provider_options 与 max_output_tokens 只在 ``build_request`` 合并一次,
-``complete`` 只消费不可变的 WireRequest——探针/直调等旁路路径无从泄漏
-provider_options(旧 B6 根因在此结构下消亡)。``base_url`` 单一来源是
-``spec.base_url``,调用方不再能传第二个地址。
+出站 body 的唯一构造是 ``base.openai_payload``;``stream()`` 真实消费 SSE 帧
+并逐帧产出 ModelEvent(不缓冲、不冻结首帧)。``complete()`` 只是
+``assemble_model_events(await collect_events(stream(req)))``,因此流式与非流式
+不存在两套记账/聚合路径(B9/B24/B25 根因在此结构下消亡)。
 
-``build_request`` 同时定型 ``serialized_json``(canonical JSON),供后续
-token 估算/记账只测这一份出站文本(D2)。本阶段 ``stream()`` 仍以非流式
-补全产出等价事件帧;真正的增量流式由后续 adapters 任务替换,事件形状不变。
-SDK 错误原样抛出,交由 turn 循环的错误边界处置。
+``build_request`` 定型的 ``serialized_json`` 是**实际发出去的那一份** body:
+core 只走 ``stream()``,``complete()`` 也经由它派生,所以固定用
+``openai_payload(req, stream=True)`` 定型(R-T2-1)。``base_url`` 单一来源是
+``spec.base_url``;SDK 自带重试关闭(max_retries=0),重试归上层。
 """
 
 from __future__ import annotations
 
-import json
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import replace
 from typing import Any
 
 import httpx
 from openai import AsyncOpenAI
+from openai.types.chat import ChatCompletion
 
-from praxis.adapters.models.base import (
-    collect_events,
-    to_openai_messages,
-    to_openai_tools,
-)
+from praxis.adapters.models.base import openai_payload, wire_json
 from praxis.protocol.models import (
     ModelEvent,
     ModelMessage,
+    ModelReasoningDelta,
     ModelResponse,
     ModelSettings,
     ModelSpec,
@@ -38,33 +35,65 @@ from praxis.protocol.models import (
     Usage,
     WireRequest,
     assemble_model_events,
+    collect_events,
 )
 from praxis.protocol.tools import ToolDefinition
 
 _WIRE_REVISION = "praxis-openai-wire-v1"
 
 
-def _completion_payload(req: WireRequest) -> dict[str, Any]:
-    """WireRequest → chat.completions.create 的 SDK kwargs(唯一合并点)。"""
-    payload: dict[str, Any] = {
-        "model": req.model,
-        "messages": to_openai_messages(req.messages),
-    }
-    if req.tools:
-        payload["tools"] = to_openai_tools(req.tools)
-    payload.update(req.provider_options)
-    # 标准字段最后落位:与 provider_options 冲突时 settings 显式值胜出
-    # (max_tokens 恒胜;temperature 仅在 settings 给了值时覆盖,
-    # 否则 provider_options 可继续提供默认值)。
-    payload["max_tokens"] = req.max_output_tokens
-    if req.temperature is not None:
-        payload["temperature"] = req.temperature
-    return payload
+def _reasoning_text(delta: Any) -> str:
+    """provider 怪癖:思考文本可能叫 ``reasoning_content`` 或 ``reasoning``。"""
+    value = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+    return value if isinstance(value, str) else ""
 
 
-def _canonical_json(payload: dict[str, Any]) -> str:
-    """稳定键序/无空白的出站文本:同一请求必得同一字符串(D2 的测量对象)。"""
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+def _usage_from_provider(usage: Any) -> Usage:
+    """provider usage → 协议 Usage;cache/reasoning 是 input/output 的子集。"""
+    prompt_details = getattr(usage, "prompt_tokens_details", None)
+    completion_details = getattr(usage, "completion_tokens_details", None)
+    return Usage(
+        input_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
+        output_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
+        cached_input_tokens=int(getattr(prompt_details, "cached_tokens", 0) or 0),
+        reasoning_tokens=int(getattr(completion_details, "reasoning_tokens", 0) or 0),
+        source="provider",
+    )
+
+
+def _whole_completion_events(completion: ChatCompletion, *, model: str) -> list[ModelEvent]:
+    """provider 忽略 stream 时的诚实整体转换:一条 text delta + finish。"""
+    if not completion.choices:
+        raise ValueError(f"provider returned no choices for model {model!r}")
+    choice = completion.choices[0]
+    message = choice.message
+    events: list[ModelEvent] = []
+    reasoning = _reasoning_text(message)
+    if reasoning:
+        events.append(ModelReasoningDelta(reasoning))
+    if message.content:
+        events.append(ModelTextDelta(message.content))
+    for index, call in enumerate(message.tool_calls or ()):
+        function = getattr(call, "function", None)
+        events.append(
+            ModelToolCallDelta(
+                index=index,
+                call_id=call.id,
+                name_fragment=(function.name or "") if function is not None else "",
+                arguments_fragment=(function.arguments or "") if function is not None else "",
+            )
+        )
+    events.append(
+        ModelStreamFinished(
+            usage=(
+                _usage_from_provider(completion.usage)
+                if completion.usage is not None
+                else Usage(0, 0, source="estimated")
+            ),
+            finish_reason=choice.finish_reason or "",
+        )
+    )
+    return events
 
 
 class OpenAICompatAdapter:
@@ -79,7 +108,11 @@ class OpenAICompatAdapter:
     ) -> None:
         self._spec = spec
         self._client = AsyncOpenAI(
-            api_key=api_key, base_url=spec.base_url, http_client=http_client
+            api_key=api_key,
+            base_url=spec.base_url,
+            http_client=http_client,
+            max_retries=0,
+            timeout=spec.timeout_seconds,
         )
 
     def build_request(
@@ -88,7 +121,7 @@ class OpenAICompatAdapter:
         tools: Sequence[ToolDefinition],
         settings: ModelSettings,
     ) -> WireRequest:
-        """唯一的合并点:spec 为底,settings 覆盖采样可调项;出站文本一并定型。"""
+        """唯一的合并点;出站文本按真正走 stream() 的那一份定型(R-T2-1)。"""
         request = WireRequest(
             model=self._spec.wire_model_id,
             messages=tuple(messages),
@@ -101,35 +134,55 @@ class OpenAICompatAdapter:
             provider_options=dict(self._spec.provider_options),
             temperature=settings.temperature,
             wire_revision=_WIRE_REVISION,
+            tokenizer_model=self._spec.tokenizer_model,
         )
-        return replace(request, serialized_json=_canonical_json(_completion_payload(request)))
+        return replace(request, serialized_json=wire_json(openai_payload(request, stream=True)))
 
     async def stream(self, req: WireRequest) -> AsyncIterator[ModelEvent]:
-        """把一次补全转成事件帧:text → tool-call 分片 → finish。"""
-        completion = await self._client.chat.completions.create(**_completion_payload(req))
-        if not completion.choices:
-            raise ValueError(f"provider returned no choices for model {req.model!r}")
-        choice = completion.choices[0]
-        message = choice.message
-        content = message.content or ""
-        if content:
-            yield ModelTextDelta(content)
-        for index, call in enumerate(message.tool_calls or ()):
-            yield ModelToolCallDelta(
-                index=index,
-                call_id=call.id,
-                name_fragment=call.function.name or "",
-                arguments_fragment=call.function.arguments or "",
-            )
-        usage = completion.usage
-        yield ModelStreamFinished(
-            usage=(
-                Usage(usage.prompt_tokens or 0, usage.completion_tokens or 0)
-                if usage is not None
-                else Usage(0, 0)
-            ),
-            finish_reason=choice.finish_reason or "",
+        """真实增量流:逐 chunk 产出 text/reasoning/tool 分片,末尾 finish。"""
+        result = await self._client.chat.completions.create(
+            **openai_payload(req, stream=True)
         )
+        if isinstance(result, ChatCompletion):
+            # provider 忽略 stream=True,返回完整对象:按"诚实整体"转换。
+            for event in _whole_completion_events(result, model=req.model):
+                yield event
+            return
+
+        upstream_id: str | None = None
+        usage = Usage(0, 0, source="estimated")
+        finish_reason = ""
+        async for chunk in result:
+            chunk_id = getattr(chunk, "id", None)
+            if chunk_id is not None:
+                if upstream_id is None:
+                    upstream_id = chunk_id
+                elif chunk_id != upstream_id:
+                    raise ValueError("provider changed response identity during stream")
+            if chunk.usage is not None:
+                usage = _usage_from_provider(chunk.usage)
+            for choice in chunk.choices:
+                delta = choice.delta
+                reasoning = _reasoning_text(delta)
+                if reasoning:
+                    yield ModelReasoningDelta(reasoning)
+                if delta.content:
+                    yield ModelTextDelta(delta.content)
+                for call in delta.tool_calls or ():
+                    function = getattr(call, "function", None)
+                    yield ModelToolCallDelta(
+                        index=call.index,
+                        call_id=call.id,
+                        name_fragment=(
+                            (function.name or "") if function is not None else ""
+                        ),
+                        arguments_fragment=(
+                            (function.arguments or "") if function is not None else ""
+                        ),
+                    )
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
+        yield ModelStreamFinished(usage=usage, finish_reason=finish_reason)
 
     async def complete(self, req: WireRequest) -> ModelResponse:
         return assemble_model_events(await collect_events(self.stream(req)))

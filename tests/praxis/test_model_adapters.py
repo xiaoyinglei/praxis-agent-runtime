@@ -16,6 +16,7 @@ import pytest
 from praxis.adapters.models.base import collect_events, to_openai_messages, to_openai_tools
 from praxis.adapters.models.openai_compat import OpenAICompatAdapter
 from praxis.adapters.models.scripted import ScriptedAdapter, ScriptExhausted
+from praxis.adapters.models.tokenization import measure_request
 from praxis.protocol.models import (
     ModelAdapter,
     ModelMessage,
@@ -50,14 +51,62 @@ def _tool_response(
     )
 
 
+def _sse_chunk(
+    chunk_id: str,
+    delta: dict[str, Any],
+    *,
+    finish: str | None = None,
+    usage: dict[str, Any] | None = None,
+) -> bytes:
+    entry: dict[str, Any] = {
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": "m",
+        "choices": [],
+    }
+    if usage is not None:
+        entry["usage"] = usage
+    else:
+        entry["choices"] = [{"index": 0, "delta": delta, "finish_reason": finish}]
+    return f"data: {json.dumps(entry)}\n\n".encode()
+
+
+def _sse_body(payload: dict[str, Any]) -> bytes:
+    """把非流式 fixture 转成等价 SSE 帧:旧行为断言仍走真实流式路径。"""
+    chunk_id = payload.get("id", "chatcmpl-1")
+    frames: list[bytes] = []
+    choices = payload.get("choices") or []
+    if choices:
+        choice = choices[0]
+        message = choice.get("message") or {}
+        delta: dict[str, Any] = {"role": "assistant"}
+        if message.get("content") is not None:
+            delta["content"] = message["content"]
+        for key in ("reasoning_content", "reasoning"):
+            if message.get(key):
+                delta[key] = message[key]
+        if message.get("tool_calls"):
+            delta["tool_calls"] = [
+                {"index": index, **call} for index, call in enumerate(message["tool_calls"])
+            ]
+        frames.append(_sse_chunk(chunk_id, delta))
+        frames.append(_sse_chunk(chunk_id, {}, finish=choice.get("finish_reason")))
+    if "usage" in payload:
+        frames.append(_sse_chunk(chunk_id, {}, usage=payload["usage"]))
+    frames.append(b"data: [DONE]\n\n")
+    return b"".join(frames)
+
+
 def _mock_transport(
     payload: dict[str, Any],
 ) -> tuple[httpx.MockTransport, list[httpx.Request]]:
     seen: list[httpx.Request] = []
+    body = _sse_body(payload)
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
-        return httpx.Response(200, json=payload)
+        return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
 
     return httpx.MockTransport(handler), seen
 
@@ -100,12 +149,12 @@ def _openai_payload(**overrides: Any) -> dict[str, Any]:
 
 
 def test_build_request_merges_provider_options_once() -> None:
-    spec = ModelSpec(model_id="m", provider_options={"extra_body": {"x": 1}}, max_output_tokens=100)
+    spec = ModelSpec(model_id="m", provider_options={"x": 1}, max_output_tokens=100)
     adapter = OpenAICompatAdapter(spec, api_key="k")
     req = adapter.build_request(
         [ModelMessage(role="user", content="hi")], [], ModelSettings(max_output_tokens=200)
     )
-    assert req.provider_options == {"extra_body": {"x": 1}} and req.max_output_tokens == 200
+    assert req.provider_options == {"x": 1} and req.max_output_tokens == 200
     assert req.model == "m"
     assert req.temperature is None
     assert len(req.messages) == 1 and req.tools == ()
@@ -203,7 +252,7 @@ def test_complete_passes_provider_options_to_sdk_once() -> None:
     spec = ModelSpec(
         model_id="m",
         base_url="https://unit.test/v1",
-        provider_options={"extra_body": {"x": 1}},
+        provider_options={"x": 1},
         max_output_tokens=77,
     )
     adapter = OpenAICompatAdapter(spec, api_key="k", http_client=client)
@@ -243,43 +292,34 @@ def _text_payload() -> dict[str, Any]:
     )
 
 
-def test_complete_settings_win_over_colliding_provider_options() -> None:
-    # 冲突键的优先级:settings 显式值覆盖 spec.provider_options 中的裸 SDK kwarg。
-    transport, seen = _mock_transport(_text_payload())
-    client = httpx.AsyncClient(transport=transport)
+def test_build_request_rejects_wire_owned_provider_options() -> None:
+    # B6 根因面:provider_options 不得覆盖 wire-owned 字段(不再有"谁赢"第二口径)。
     spec = ModelSpec(
         model_id="m",
         base_url="https://unit.test/v1",
         provider_options={"temperature": 0.9, "max_tokens": 5},
-        max_output_tokens=50,
     )
-    adapter = OpenAICompatAdapter(spec, api_key="k", http_client=client)
-    req = adapter.build_request(
-        [ModelMessage(role="user", content="hi")],
-        [],
-        ModelSettings(temperature=0.2, max_output_tokens=100),
-    )
-    asyncio.run(adapter.complete(req))
-    body = json.loads(seen[0].content)
-    assert body["temperature"] == 0.2
-    assert body["max_tokens"] == 100
+    adapter = OpenAICompatAdapter(spec, api_key="k")
+    with pytest.raises(ValueError, match="wire-owned field"):
+        adapter.build_request(
+            [ModelMessage(role="user", content="hi")],
+            [],
+            ModelSettings(temperature=0.2, max_output_tokens=100),
+        )
 
 
-def test_complete_provider_temperature_survives_when_settings_none() -> None:
-    # settings.temperature=None 时,provider_options 的 temperature 默认值仍生效。
+def test_complete_omits_temperature_when_settings_none() -> None:
+    # temperature 只来自 ModelSettings;None 时请求体不含该键。
     transport, seen = _mock_transport(_text_payload())
     client = httpx.AsyncClient(transport=transport)
     spec = ModelSpec(
-        model_id="m",
-        base_url="https://unit.test/v1",
-        provider_options={"temperature": 0.7},
-        max_output_tokens=400,
+        model_id="m", base_url="https://unit.test/v1", max_output_tokens=400
     )
     adapter = OpenAICompatAdapter(spec, api_key="k", http_client=client)
     req = adapter.build_request([], [], ModelSettings())
     asyncio.run(adapter.complete(req))
     body = json.loads(seen[0].content)
-    assert body["temperature"] == 0.7
+    assert "temperature" not in body
     assert body["max_tokens"] == 400
 
 
@@ -322,7 +362,8 @@ def test_complete_missing_usage_yields_zero_usage() -> None:
     )
     req = adapter.build_request([ModelMessage(role="user", content="hi")], [], ModelSettings())
     response = asyncio.run(adapter.complete(req))
-    assert response.usage == Usage(0, 0)
+    # provider 未给 usage:如实标注估算来源,而不是伪装成 provider 记账。
+    assert response.usage == Usage(0, 0, source="estimated")
     assert response.content == "hello"
     assert response.tool_calls == ()
 
@@ -374,6 +415,20 @@ def test_scripted_stream_round_trips_through_assembly() -> None:
         assert assemble_model_events(events) == original
 
     asyncio.run(drive())
+
+
+def test_scripted_build_request_pins_deterministic_wire_json() -> None:
+    """R-T2-3:scripted 也能被测量——同一输入必得同一份非空出站文本。"""
+    adapter = ScriptedAdapter([_tool_response("go")])
+    call = ModelToolCall(call_id="c1", name="read_file", arguments={"path": "a"})
+    messages = [ModelMessage(role="assistant", content="", tool_calls=(call,))]
+    tool = ToolDefinition(name="read_file", description="read", input_schema={"type": "object"})
+    first = adapter.build_request(messages, [tool], ModelSettings())
+    second = adapter.build_request(messages, [tool], ModelSettings())
+    assert first.serialized_json and first.serialized_json == second.serialized_json
+    assert first.wire_revision == "praxis-scripted-wire-v1"
+    assert '"tool_calls"' in first.serialized_json
+    assert measure_request(first).count > 0
 
 
 def test_scripted_adapter_delay_paces_completion() -> None:

@@ -9,7 +9,7 @@ B11 回归 = FAILED 的 reason 携带真实异常文本而非笼统标签。
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +24,14 @@ from praxis.core.turn import TurnDeps, TurnState, run_turn
 from praxis.protocol.events import Event, ModelResponseReceived, TurnStatusChanged
 from praxis.protocol.items import ItemKind
 from praxis.protocol.json import JsonValue
-from praxis.protocol.models import ModelResponse, ModelToolCall, Usage, WireRequest
+from praxis.protocol.models import (
+    ModelEvent,
+    ModelResponse,
+    ModelTextDelta,
+    ModelToolCall,
+    Usage,
+    WireRequest,
+)
 from praxis.protocol.permission import Decision, PermissionContext
 from praxis.protocol.policy import PermissionPolicy
 from praxis.protocol.sandbox import ToolExecContext
@@ -230,10 +237,11 @@ def test_cancelled_is_not_failed(store: Store, bus: Any, workspace: Path) -> Non
 
 
 class _BrokenAdapter(ScriptedAdapter):
-    """complete 永远抛 provider 异常:真实 provider 故障的替身。"""
+    """stream 永远抛 provider 异常:真实 provider 故障的替身(core 只走流式)。"""
 
-    async def complete(self, req: WireRequest) -> ModelResponse:
+    async def stream(self, req: WireRequest) -> AsyncIterator[ModelEvent]:
         raise RuntimeError("provider 503")
+        yield ModelTextDelta("")  # pragma: no cover — 让函数成为 async generator
 
 
 def test_model_error_fails_with_real_reason(store: Store, bus: Any, workspace: Path) -> None:

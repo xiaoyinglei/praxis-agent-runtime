@@ -12,16 +12,23 @@ import dataclasses
 
 import pytest
 
+from praxis.adapters.models import tokenization
+from praxis.adapters.models.openai_compat import OpenAICompatAdapter
+from praxis.adapters.models.tokenization import count_text_tokens, measure_request
 from praxis.protocol.models import (
     CostMicros,
+    ModelMessage,
     ModelReasoningDelta,
+    ModelSettings,
     ModelSpec,
     ModelStreamFinished,
     ModelTextDelta,
+    ModelToolCall,
     ModelToolCallDelta,
     Usage,
     assemble_model_events,
 )
+from praxis.protocol.tools import ToolDefinition
 
 
 def test_assemble_accumulates_tool_name_fragments() -> None:
@@ -134,3 +141,35 @@ def test_usage_total_tokens_and_cost_micros_validation() -> None:
     assert CostMicros().is_zero and not CostMicros(output_per_1m=1).is_zero
     with pytest.raises(ValueError):
         CostMicros(input_per_1m=-1)
+
+
+# ---------------------------------------------------------------------------
+# 测量口径(B24):只测 build_request 一次定型的出站文本,没有第二个口径
+# ---------------------------------------------------------------------------
+
+
+def test_measure_request_uses_serialized_json() -> None:
+    adapter = OpenAICompatAdapter(ModelSpec(model_id="m"), api_key="k")
+    call = ModelToolCall(call_id="c1", name="read_file", arguments={"path": "a.txt"})
+    tool = ToolDefinition(name="read_file", description="read", input_schema={"type": "object"})
+    req = adapter.build_request(
+        [ModelMessage(role="assistant", content="", tool_calls=(call,))],
+        [tool],
+        ModelSettings(),
+    )
+    measurement = measure_request(req)
+    assert measurement == count_text_tokens(
+        req.serialized_json, tokenizer_model=req.tokenizer_model
+    )
+    assert measurement.count > 0
+    assert '"tool_calls"' in req.serialized_json
+
+
+def test_tiktoken_failure_falls_back_single_entry(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(tokenizer_model: str | None) -> object:
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr(tokenization, "_get_encoder", boom)
+    measurement = count_text_tokens("a" * 400)
+    assert measurement.source == "heuristic"
+    assert measurement.count == 400 // 4 + 1

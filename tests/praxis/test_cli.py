@@ -301,6 +301,13 @@ def test_run_scripted_missing_entry_exit_3(workspace: Path, tmp_path: Path) -> N
     assert result.exit_code == 3, result.output
 
 
+def test_scripted_entry_accepts_optional_reasoning() -> None:
+    # R-T2-6:reasoning 可选,缺省空串;既有剧本 JSON 零改动。
+    with_reasoning = cli_main._scripted_entry(0, {"content": "hi", "reasoning": "why"})
+    assert with_reasoning.reasoning == "why"
+    assert cli_main._scripted_entry(0, {"content": "hi"}).reasoning == ""
+
+
 def test_usage_errors_exit_3(workspace: Path) -> None:
     """C8:click 原生用法错误(缺参数/未知命令/未知选项)统一退出码 3,非默认 2。"""
     missing_arg = runner.invoke(app, ["run", "--workspace", str(workspace)], env=_CLEAN_ENV)

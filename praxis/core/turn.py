@@ -9,8 +9,10 @@
    保证回合已 RUNNING——Task 14 的 resume 负责先转换再重入),PAUSED 同步序 5;
 2. 每轮重读 thread items → ``build_context`` 折叠 → ``to_messages`` 投影 →
    前置 system 消息;steering item 在步边界自然进入上下文(它已在日志里);
-3. ``adapter.build_request`` + ``await adapter.complete`` → 落 model_response
-   item → emit ``ModelResponseReceived``(预览 ≤200 字符);
+3. ``adapter.build_request`` + ``collect_events(adapter.stream(req))`` →
+   ``assemble_model_events`` → 落 model_response item → emit
+   ``ModelResponseReceived``(预览 ≤200 字符);core 只走流式,complete 只是
+   同一路径的薄门面(设计 D1);
 4. 无 tool_calls → ``transition(COMPLETED, "model_finished")``;
 5. 有 tool_calls → 逐个 ``execute``;任一 PAUSED → 管道已完成 RUNNING→PAUSED
    转换,直接返回并附未批摘要;
@@ -45,6 +47,8 @@ from praxis.protocol.models import (
     ModelResponse,
     ModelSettings,
     ModelToolCall,
+    assemble_model_events,
+    collect_events,
 )
 from praxis.protocol.permission import PermissionContext
 from praxis.protocol.tools import ResultStatus, Tool, ToolCall, ToolResult
@@ -251,7 +255,9 @@ async def run_turn(
             definitions = [tool.definition for tool in deps.tools.values()]
             # 步序 3:构建请求 → 补全 → 落 model_response item → emit 预览事件。
             req = deps.adapter.build_request(messages, definitions, ModelSettings())
-            resp = await deps.adapter.complete(req)
+            # core 只走流式(D1);complete() 也由同一条 stream 装配派生。
+            events = await collect_events(deps.adapter.stream(req))
+            resp = assemble_model_events(events)
             last_content = resp.content
             deps.store.append_items(state.thread_id, state.turn_id, [_model_response_entry(resp)])
             deps.bus.emit(

@@ -6,6 +6,9 @@
 ``stream()`` 把剧本切成真实的事件序列,``complete()`` 与生产适配器一样
 走 ``assemble_model_events(await collect_events(...))``:验收测试因此驱动的
 是**同一条**装配路径,而不是脚本专属的旁路。
+
+``build_request`` 也用 ``openai_payload`` 定型确定性 ``serialized_json``:
+scripted 路径的 token 测量不是空转,压缩阈值测试才能真的被驱动(R-T2-3)。
 """
 
 from __future__ import annotations
@@ -13,8 +16,9 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Sequence
+from dataclasses import replace
 
-from praxis.adapters.models.base import collect_events
+from praxis.adapters.models.base import openai_payload, wire_json
 from praxis.protocol.json import thaw_json
 from praxis.protocol.models import (
     ModelEvent,
@@ -27,11 +31,13 @@ from praxis.protocol.models import (
     ModelToolCallDelta,
     WireRequest,
     assemble_model_events,
+    collect_events,
 )
 from praxis.protocol.tools import ToolDefinition
 
 _SCRIPTED_MODEL_ID = "scripted"
 _SCRIPTED_MAX_OUTPUT_TOKENS = 4096
+_SCRIPTED_WIRE_REVISION = "praxis-scripted-wire-v1"
 
 
 class ScriptExhausted(RuntimeError):  # noqa: N818 — 名称由 Task 9 brief 契约固定
@@ -65,9 +71,12 @@ class ScriptedAdapter:
             ),
             provider_options={},
             temperature=settings.temperature,
+            wire_revision=_SCRIPTED_WIRE_REVISION,
         )
-        self.last_request = request
-        return request
+        self.last_request = replace(
+            request, serialized_json=wire_json(openai_payload(request, stream=True))
+        )
+        return self.last_request
 
     async def stream(self, req: WireRequest) -> AsyncIterator[ModelEvent]:
         """消费下一条剧本,按内容/工具调用/finish 切成事件帧。"""

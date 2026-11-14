@@ -1,18 +1,43 @@
-"""模型适配层的唯一序列化点:协议消息/工具 → OpenAI 兼容 wire 结构。
+"""模型适配层的唯一出站序列化点:协议消息/工具 → OpenAI 兼容 wire body。
 
-纯函数,无 provider 状态;所有 adapter 的出站消息/工具格式都从这里出去,
-保证 wire 形状只有一处定义(设计 §5.9)。
+纯函数,无 provider 状态;所有 adapter 的出站 body 都经由 ``openai_payload``,
+wire 形状只有一处定义(设计 §5.7/§5.9)。``provider_options`` 在这里一次性
+分流:命中 wire-owned 字段直接拒绝(B6 根因:不允许第二口径覆盖真实请求),
+SDK 认识的顶层参数直落,其余合并进 ``extra_body``。
+
+``wire_json`` 是 build_request 定型的记账文本来源:同一 payload 必得同一字符串;
+非 JSON 兼容值在这里失败(有界 ValueError),不许静默字符串化后混进测量文本。
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import Sequence
 from typing import Any
 
 from praxis.protocol.json import thaw_json
-from praxis.protocol.models import ModelEvent, ModelMessage
+from praxis.protocol.models import ModelMessage, WireRequest, collect_events
 from praxis.protocol.tools import ToolDefinition
+
+# serializer 独占的字段:provider_options 不得覆盖,否则"实际发出去的"与
+# "记账/测量文本"会出现第二口径(B6/B24)。
+WIRE_OWNED_FIELDS: frozenset[str] = frozenset(
+    {
+        "model",
+        "messages",
+        "tools",
+        "tool_choice",
+        "max_tokens",
+        "temperature",
+        "stream",
+        "stream_options",
+    }
+)
+
+# SDK 原生认识的顶层扩展参数;其余未知键统一进 extra_body(合并、键序稳定)。
+_TOP_LEVEL_PROVIDER_OPTION_KEYS: frozenset[str] = frozenset(
+    {"temperature", "top_p", "seed", "parallel_tool_calls", "reasoning_effort"}
+)
 
 
 def to_openai_messages(messages: Sequence[ModelMessage]) -> list[dict[str, Any]]:
@@ -57,9 +82,61 @@ def to_openai_tools(tools: Sequence[ToolDefinition]) -> list[dict[str, Any]]:
     ]
 
 
-async def collect_events(stream: AsyncIterator[ModelEvent]) -> list[ModelEvent]:
-    """把一个 adapter 的流收成事件列表,供 ``assemble_model_events`` 装配。
+def openai_payload(req: WireRequest, *, stream: bool) -> dict[str, Any]:
+    """WireRequest → chat.completions.create 的完整 body(唯一构造点)。
 
-    ``complete()`` 与探针/CLI 共用这一条路径——没有并行的第二聚合实现。
+    ``provider_options`` 逐项落位:
+    - 命中 ``WIRE_OWNED_FIELDS`` → ``ValueError``(不得覆盖真实请求字段);
+    - SDK 认识的顶层键直落;
+    - 其余键合并进 ``extra_body``,保持 provider_options 的插入顺序。
+    ``stream=True`` 时加 ``stream_options={"include_usage": True}``——usage 是
+    finish 事件的事实来源。
     """
-    return [event async for event in stream]
+    payload: dict[str, Any] = {
+        "model": req.model,
+        "messages": to_openai_messages(req.messages),
+    }
+    if req.tools:
+        payload["tools"] = to_openai_tools(req.tools)
+    payload["max_tokens"] = req.max_output_tokens
+    if req.temperature is not None:
+        payload["temperature"] = req.temperature
+
+    extra_body: dict[str, Any] = {}
+    for key, value in req.provider_options.items():
+        if key in WIRE_OWNED_FIELDS:
+            raise ValueError(f"provider option cannot override wire-owned field: {key}")
+        if key in _TOP_LEVEL_PROVIDER_OPTION_KEYS:
+            payload[key] = thaw_json(value)
+        else:
+            extra_body[key] = thaw_json(value)
+    if extra_body:
+        payload["extra_body"] = extra_body
+
+    if stream:
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
+    return payload
+
+
+def wire_json(payload: dict[str, Any]) -> str:
+    """稳定键序/无空白的出站文本:同一请求必得同一字符串(记账测量对象)。
+
+    非 JSON 兼容值必须在 build 期失败——静默 ``default=str`` 会把无法发送的
+    值变成"看起来能记账"的文本(B24 口径分叉的温床)。错误消息只带类型,
+    不回显整个值。
+    """
+    try:
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"request payload is not JSON-serializable: {exc}") from None
+
+
+__all__ = [
+    "WIRE_OWNED_FIELDS",
+    "collect_events",
+    "openai_payload",
+    "to_openai_messages",
+    "to_openai_tools",
+    "wire_json",
+]

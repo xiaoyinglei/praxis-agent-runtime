@@ -190,6 +190,15 @@ type ModelEvent = (
 )
 
 
+async def collect_events(stream: AsyncIterator[ModelEvent]) -> list[ModelEvent]:
+    """把一个 adapter 的流收成事件列表,供 ``assemble_model_events`` 装配。
+
+    core 与 ``complete()`` 共用这一条路径——没有并行的第二聚合实现;
+    放在 protocol 层是因为 core 只认识协议,不得 import adapters。
+    """
+    return [event async for event in stream]
+
+
 @dataclass
 class _PartialToolCall:
     """装配期的可变累积器;不对外暴露,只是 index → 分片缓冲。"""
@@ -293,7 +302,8 @@ class WireRequest:
 
     ``serialized_json`` 是 build_request 内一次定型的真正出站 JSON 文本
     (记账/token 估算只测这一份,杜绝第二口径);``wire_revision`` 标记
-    wire 形状版本。旧构造不传两者时保持空串。
+    wire 形状版本;``tokenizer_model`` 供估算挑选同一模型的 BPE,None 用
+    默认编码。旧构造不传这些字段时保持空串/None。
     """
 
     model: str
@@ -304,6 +314,7 @@ class WireRequest:
     temperature: float | None
     serialized_json: str = ""
     wire_revision: str = ""
+    tokenizer_model: str | None = None
 
 
 @runtime_checkable
