@@ -1194,3 +1194,70 @@ def test_patch_metadata_key_set_is_exact(tmp_path: Path) -> None:
     for result in (success, failure, invalid):
         assert set(result.metadata) == _PATCH_METADATA_KEYS
     assert success.metadata["move_incomplete"] is False
+
+
+# ---------------------------------------------------------------------------
+# 复审 round 2 N-1:匹配走归一化行,写回逐行原始终止符(混合换行/单 \r 可打补丁)
+# ---------------------------------------------------------------------------
+
+
+def test_update_preserves_lf_line_endings(tmp_path: Path) -> None:
+    path = tmp_path / "lf.py"
+    path.write_bytes(b"one\ntwo\n")
+    r = run_patch(tmp_path, _patch("*** Update File: lf.py\n@@\n-two\n+TWO"))
+    assert r.status is ResultStatus.OK
+    assert path.read_bytes() == b"one\nTWO\n"
+
+
+def test_update_preserves_mixed_line_endings(tmp_path: Path) -> None:
+    path = tmp_path / "mixed.py"
+    path.write_bytes(b"one\r\ntwo\r\nthree\nfour\n")
+    # 改 CRLF 行
+    r = run_patch(tmp_path, _patch("*** Update File: mixed.py\n@@\n-two\n+TWO"))
+    assert r.status is ResultStatus.OK
+    assert path.read_bytes() == b"one\r\nTWO\r\nthree\nfour\n"
+    # 再改 LF 行:其它行逐字节不变
+    r = run_patch(tmp_path, _patch("*** Update File: mixed.py\n@@\n-three\n+THREE"))
+    assert r.status is ResultStatus.OK
+    assert path.read_bytes() == b"one\r\nTWO\r\nTHREE\nfour\n"
+
+
+def test_update_preserves_lone_cr_line_endings(tmp_path: Path) -> None:
+    path = tmp_path / "classic.py"
+    path.write_bytes(b"one\rtwo\r")
+    r = run_patch(tmp_path, _patch("*** Update File: classic.py\n@@\n-two\n+TWO"))
+    assert r.status is ResultStatus.OK
+    assert path.read_bytes() == b"one\rTWO\r"
+
+
+def test_update_preserves_no_trailing_newline(tmp_path: Path) -> None:
+    path = tmp_path / "notail.py"
+    path.write_bytes(b"one\ntwo")
+    r = run_patch(tmp_path, _patch("*** Update File: notail.py\n@@\n-two\n+TWO"))
+    assert r.status is ResultStatus.OK
+    assert path.read_bytes() == b"one\nTWO"
+
+
+# ---------------------------------------------------------------------------
+# 复审 round 2 N-2:已经开始写之后的校验失败归 patch_failed(不是 invalid_input)
+# ---------------------------------------------------------------------------
+
+
+def test_post_write_validation_failure_is_patch_failed(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("x\n", encoding="utf-8")
+    patch = _patch(
+        "*** Add File: b.py\n+new",
+        "*** Update File: a.py\n*** Move to: b.py\n@@\n-x\n+y",
+    )
+    tool = create_apply_patch_tool(tmp_path)
+    use = tool.resolve_use({"patch": patch})  # 此刻 b.py 尚不存在 → use 形成
+    assert len(use.targets) == 2
+    r = run_patch(tmp_path, patch)
+    assert r.status is ResultStatus.ERROR
+    assert r.error_code == "patch_failed"
+    assert r.retryable is True
+    assert _FAILURE_MESSAGE in r.text
+    # Add 已生效并被如实记录;Move 因 b.py 已存在被拒,源文件未被移动
+    assert r.metadata["applied_files"] == (_abs(tmp_path, "b.py"),)
+    assert (tmp_path / "b.py").read_text(encoding="utf-8") == "new\n"
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "x\n"

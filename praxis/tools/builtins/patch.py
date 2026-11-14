@@ -384,52 +384,111 @@ def _find_lines(lines: Sequence[str], needle: Sequence[str], *, start: int) -> i
     return None
 
 
+def _split_terminated(text: str) -> list[tuple[str, str]]:
+    """切成 (行内容, 原始终止符) 对;终止符为 ``\\r\\n`` / ``\\n`` / ``\\r`` / ``""``。
+
+    只认这三种换行,Unicode 的其它行分隔符不是文本文件换行约定,按内容保留。
+    """
+    entries: list[tuple[str, str]] = []
+    start = 0
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char == "\r":
+            if index + 1 < length and text[index + 1] == "\n":
+                entries.append((text[start:index], "\r\n"))
+                index += 2
+            else:
+                entries.append((text[start:index], "\r"))
+                index += 1
+            start = index
+        elif char == "\n":
+            entries.append((text[start:index], "\n"))
+            index += 1
+            start = index
+        else:
+            index += 1
+    if start < length:
+        entries.append((text[start:], ""))
+    return entries
+
+
+def _default_ending(endings: Sequence[str]) -> str:
+    for candidate in ("\r\n", "\n", "\r"):
+        if candidate in endings:
+            return candidate
+    return "\n"
+
+
+def _insert_ending(
+    entries: Sequence[tuple[str, str]], position: int, old_length: int
+) -> str:
+    """新增行沿用匹配位置/前一行/后一行的终止符,都不适用时取全文最常见者。"""
+    endings = [ending for _, ending in entries]
+    if old_length and endings[position]:
+        return endings[position]
+    if position > 0 and endings[position - 1]:
+        return endings[position - 1]
+    after = position + old_length
+    if after < len(endings) and endings[after]:
+        return endings[after]
+    return _default_ending(endings)
+
+
 def _apply_hunks(text: str, hunks: Sequence[Hunk]) -> str:
-    """顺序应用同一文件的全部 hunk;不匹配抛 ``_HunkMismatchError``(不改动文件)。"""
-    if text:
-        lines = text.split("\n")
-        final_newline = text.endswith("\n")
-        if final_newline:
-            lines.pop()
-    else:
-        lines = []
-        final_newline = False
+    """顺序应用同一文件的全部 hunk;不匹配抛 ``_HunkMismatchError``(不改动文件)。
+
+    匹配在**归一化行内容**上进行(逐行剥掉自己的终止符),落盘时逐行还原
+    ``\\r\\n`` / ``\\n`` / ``\\r`` / 无尾终止符:未触及的行逐字节不变,混合换行
+    文件只改 hunk 所在行,纯 CRLF 文件不会被整文件改写。
+    """
+    entries = _split_terminated(text)
+    had_final_newline = bool(entries) and entries[-1][1] != ""
     cursor = 0
     for hunk_index, hunk in enumerate(hunks):
+        contents = [content for content, _ in entries]
         old = [line.text for line in hunk.lines if line.kind != "+"]
-        new = [line.text for line in hunk.lines if line.kind != "-"]
         if old:
-            position = _find_lines(lines, old, start=cursor)
+            position = _find_lines(contents, old, start=cursor)
             if position is None:
                 raise _HunkMismatchError(hunk_index=hunk_index, expected=old[0])
         else:
-            position = len(lines)  # 无上下文的纯追加:落在文件末尾
-        lines[position : position + len(old)] = new
-        cursor = position + len(new)
-    result = "\n".join(lines)
-    if final_newline:
-        result += "\n"
-    return result
+            position = len(entries)  # 无上下文的纯追加:落在文件末尾
+        old_endings = [entries[i][1] for i in range(position, position + len(old))]
+        insert_ending = _insert_ending(entries, position, len(old))
+        rebuilt: list[tuple[str, str]] = []
+        old_index = 0
+        for line in hunk.lines:
+            if line.kind == "+":
+                rebuilt.append((line.text, insert_ending))
+            elif line.kind == " ":
+                # 上下文行保留它自己的原始终止符
+                rebuilt.append((line.text, old_endings[old_index]))
+                old_index += 1
+            else:  # "-":删除,消费一个旧行
+                old_index += 1
+        entries[position : position + len(old)] = rebuilt
+        cursor = position + len(rebuilt)
+
+    if entries:
+        default = _default_ending([ending for _, ending in entries])
+        # 非末行必须有终止符(否则拼接会黏行);末行沿用原文件"有无尾换行"。
+        for index in range(len(entries) - 1):
+            if not entries[index][1]:
+                entries[index] = (entries[index][0], default)
+        last_content, last_ending = entries[-1]
+        if had_final_newline and not last_ending:
+            entries[-1] = (last_content, default)
+        elif not had_final_newline and last_ending:
+            entries[-1] = (last_content, "")
+    return "".join(content + ending for content, ending in entries)
 
 
 def _add_content(lines: Sequence[str]) -> str:
     if not lines:
         return ""
     return "\n".join(lines) + "\n"
-
-
-def _newline_style(text: str) -> str:
-    """纯 CRLF 文件识别:所有 ``\\n`` 都是某个 ``\\r\\n`` 的一部分。"""
-    crlf = text.count("\r\n")
-    return "\r\n" if crlf and crlf == text.count("\n") else "\n"
-
-
-def _apply_hunks_preserving_newlines(text: str, hunks: Sequence[Hunk]) -> str:
-    """按文件原有换行风格应用 hunk:只改内容,不把整文件换行换掉。"""
-    style = _newline_style(text)
-    working = text.replace("\r\n", "\n") if style == "\r\n" else text
-    after = _apply_hunks(working, hunks)
-    return after.replace("\n", "\r\n") if style == "\r\n" else after
 
 
 def _read_update_text(target: Path) -> str:
@@ -457,7 +516,7 @@ def _apply_one(workspace: Path, op: PatchOp) -> tuple[str, tuple[str, ...]]:
     target = _fence_target(workspace, op.path)
     _assert_regular_path(workspace, target, must_exist=True)  # 写前复核(TOCTOU)
     before = _read_update_text(target)
-    after = _apply_hunks_preserving_newlines(before, op.hunks)
+    after = _apply_hunks(before, op.hunks)
     if op.move_to is None:
         atomic_write_text(target, after)
         return f"updated {op.path} ({len(op.hunks)} hunks)", (str(target),)
@@ -599,6 +658,15 @@ def _apply_ops(workspace: Path, ops: tuple[PatchOp, ...]) -> ToolResult:
                 move_incomplete=True,
             )
         except ToolValidationError as exc:
+            if applied:
+                # 已经有文件落盘:此时任何校验失败都是"改了一半",不是纯输入拒绝
+                return _failure_result(
+                    applied,
+                    failed_file=_op_path(workspace, op),
+                    hunk_index=None,
+                    expected_context_line=None,
+                    detail=exc.message,
+                )
             return _invalid_result(exc.message, applied=applied)
         except UnicodeError:
             return _failure_result(
