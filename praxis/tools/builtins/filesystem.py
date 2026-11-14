@@ -14,6 +14,9 @@ ToolResult 占位符约定(供 Task 12 管道):run() 返回的 ``tool_call_id`` 
 替换为真实 call id。
 
 Controller ruling R1:三个工具的 run 均为 async(旧注释"read/write 同步"作废)。
+
+R-T11-2:list_files 在输出每个具体条目前用 ``read_access`` 做执行侧 deny 过滤
+(deny 子树整棵不进结果);read 的 target 就是该文件,``decide`` 已拦,行为不变。
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ import os
 import stat
 import tempfile
 import unicodedata
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, BinaryIO, cast
 
@@ -46,6 +49,7 @@ from praxis.protocol.tools import (
     json_schema_input,
 )
 from praxis.tools.builtins.paths import checked_path
+from praxis.tools.builtins.read_access import is_read_denied, permission_sources
 
 PENDING_TOOL_CALL_ID = "pending"
 
@@ -507,7 +511,10 @@ def _sorted_children(directory: Path) -> tuple[Path, ...]:
 
 
 def _iter_listed_entries(
-    directory: Path, *, include_hidden: bool
+    directory: Path,
+    *,
+    include_hidden: bool,
+    denied: Callable[[Path], bool] | None = None,
 ) -> Iterator[tuple[Path, os.stat_result]]:
     """前序深搜清单条目:每层名字排序,符号链接只产出自身、绝不进入。
 
@@ -515,6 +522,8 @@ def _iter_listed_entries(
     ``max_entries`` 的截断/游标判定只看真正可列出的条目。
     地板目录(``FLOOR_ENTRIES`` 派生的 ``.git``/``.praxis``/``.agent_memory``)
     整棵子树跳过;``include_hidden=False`` 时跳过所有点开头条目。
+    ``denied``(R-T11-2)对每个具体条目做执行侧 deny 过滤:命中者**连名字都不
+    输出**,目录被拒时整棵子树不进入——deny 规则不能因目录级入口而失效。
     """
     stack: list[Iterator[Path]] = [iter(_sorted_children(directory))]
     while stack:
@@ -527,6 +536,8 @@ def _iter_listed_entries(
         if _is_floor_directory_name(name):
             continue
         if not include_hidden and name.startswith("."):
+            continue
+        if denied is not None and denied(child):
             continue
         try:
             info = child.lstat()
@@ -572,10 +583,14 @@ def create_list_files_tool(workspace: Path) -> Tool:
                 error_code="not_found",
             )
         root = workspace.resolve()
+        sources = permission_sources(exec_ctx.permissions, workspace)
+        denied = (lambda path: is_read_denied(sources, path)) if sources else None
         lines: list[str] = []
         next_cursor: str | None = None
         truncated = False
-        for child, info in _iter_listed_entries(target, include_hidden=include_hidden):
+        for child, info in _iter_listed_entries(
+            target, include_hidden=include_hidden, denied=denied
+        ):
             relative = child.relative_to(root).as_posix()
             # 截断/游标只在真正可列出的条目上判定(不可列条目已在迭代器里跳过)
             if len(lines) == max_entries:

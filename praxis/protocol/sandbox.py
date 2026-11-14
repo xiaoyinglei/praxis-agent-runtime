@@ -14,6 +14,10 @@ core.sandbox(Task 6/7 落地);本模块只定义跨层传递的不可变形状�
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from praxis.protocol.permission import PermissionContext
 
 _MAX_REFUSAL_REASON_CHARS = 512
 
@@ -57,6 +61,13 @@ class ToolExecContext:
 
     阶段 2 Task 1:仅 sandbox 字段(无沙箱即 None,阶段 1 行为不变);
     后续字段(审批通道、取消令牌等)按需在后续任务扩展,只增不改。
+
+    ``permissions``(R-T11-2):该次调用的权限快照。目录型读取工具(search_text/
+    list_files)在触达**每一个具体文件**时用它做执行侧 deny 过滤:``decide`` 仍
+    是唯一裁决函数,这里只是把已由 ``decide`` 授权的目录级 target 细化为逐条目
+    检查(规则代数复用 ``protocol.policy.path_access``,不是第二套决策入口)。
+    None = 无快照(单测直跑路径),不做逐条目过滤。
     """
 
     sandbox: SandboxSpec | None = None
+    permissions: PermissionContext | None = None

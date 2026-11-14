@@ -22,7 +22,8 @@ execute 步骤序(与代码一一对应):
    **先编译沙箱**再写 tool_call item(SandboxRefusal → ERROR/sandbox_refused,
    不写 tool_call,未 dispatch 语义同 invalid_input;read/write 进程内工具不编译);
 7. ``run_with_timeout``(移植旧 executor 超时/取消语义,任务全程被持有;
-   透传 ``ToolExecContext(sandbox=spec)``)→ **finally: finalize_sandbox**
+   透传 ``ToolExecContext(sandbox=spec, permissions=ctx.permissions)``)→
+   **finally: finalize_sandbox**
    (commit/清理;超时/取消路径也执行;finalize 异常归一 tool_error,不炸穿);
 8. 占位符替换 + 超 ``max_model_output_bytes`` 的**写时外部化**(注入
    ``artifacts`` 时:全文进内容寻址 artifact,item 只留头部+指针+摘要;
@@ -460,7 +461,10 @@ async def execute(call: ToolCall, ctx: ExecCtx) -> ToolResult:
 
     finalize_failure: str | None = None
     try:
-        raw = await run_with_timeout(tool, args, ToolExecContext(sandbox=spec))
+        # R-T11-2:权限快照随执行上下文进入工具,供目录型读取工具逐条目过滤 deny。
+        raw = await run_with_timeout(
+            tool, args, ToolExecContext(sandbox=spec, permissions=ctx.permissions)
+        )
     finally:
         # commit/清理在超时/取消路径也执行;异常归一为 tool_error,绝不炸穿管道。
         if spec is not None and ctx.finalize_sandbox is not None:

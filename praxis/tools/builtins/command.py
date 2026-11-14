@@ -56,6 +56,7 @@ from praxis.protocol.tools import (
     json_schema_input,
 )
 from praxis.tools.builtins.filesystem import PENDING_TOOL_CALL_ID
+from praxis.tools.builtins.process import await_main_exit, drain_stream, signal_group
 
 _DEFAULT_TIMEOUT_SECONDS = 120.0
 _MAX_TIMEOUT_SECONDS = 600.0
@@ -64,52 +65,6 @@ _POST_KILL_WAIT_SECONDS = 2.0
 _DRAIN_DEADLINE_SECONDS = 0.5
 _MAX_OUTPUT_BYTES = 30_000
 _MAX_STREAM_BUFFER_BYTES = 16_000
-
-
-def _signal_group(pgid: int, sig: signal.Signals) -> bool:
-    """start_new_session=True ⇒ 子进程组 id == 主进程 pid;整组收发信号。
-
-    返回"组内可能仍有活体":False 仅当 ESRCH(组已空,持管道者必在组外)。
-    """
-    try:
-        os.killpg(pgid, sig)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-
-
-async def _await_main_exit(proc: asyncio.subprocess.Process, timeout: float | None) -> int:
-    """等主进程"退出"这一事件(returncode 由子进程回收线程置位),不等管道 EOF。"""
-    async def poll() -> int:
-        while proc.returncode is None:
-            await asyncio.sleep(0.02)
-        return proc.returncode
-
-    return await asyncio.wait_for(poll(), timeout)
-
-
-async def _drain_to(stream: asyncio.StreamReader, buffer: list[bytes], discarded: list[int]) -> None:
-    """读到 EOF;已收字节留在 buffer,任务被取消也不丢。
-
-    buffer 至多 ``_MAX_STREAM_BUFFER_BYTES``;超限字节仍继续读但只计入 discarded
-    ——停止读取会让管道灌满、阻塞子进程,那是另一种绑架。
-    """
-    buffered = 0
-    while True:
-        chunk = await stream.read(65536)
-        if not chunk:
-            return
-        room = _MAX_STREAM_BUFFER_BYTES - buffered
-        if room >= len(chunk):
-            buffer.append(chunk)
-        elif room > 0:
-            buffer.append(chunk[:room])
-            discarded[0] += len(chunk) - room
-        else:
-            discarded[0] += len(chunk)
-        buffered += len(chunk)
 
 
 async def _finish_drain(task: asyncio.Task[None]) -> None:
@@ -129,12 +84,12 @@ async def _finish_drain(task: asyncio.Task[None]) -> None:
 
 async def _reap_main_exit(proc: asyncio.subprocess.Process) -> None:
     """超时收敛:SIGTERM 整组 → 5s 宽限 → SIGKILL 整组 → 等主进程回收。"""
-    _signal_group(proc.pid, signal.SIGTERM)
+    signal_group(proc.pid, signal.SIGTERM)
     try:
-        await _await_main_exit(proc, _TERM_GRACE_SECONDS)
+        await await_main_exit(proc, _TERM_GRACE_SECONDS)
     except TimeoutError:
-        _signal_group(proc.pid, signal.SIGKILL)
-        await _await_main_exit(proc, None)
+        signal_group(proc.pid, signal.SIGKILL)
+        await await_main_exit(proc, None)
 
 
 async def _abandon_wait(wait_task: asyncio.Task[int]) -> None:
@@ -155,7 +110,7 @@ async def _converge_pipes(proc: asyncio.subprocess.Process, wait_task: asyncio.T
     必为 setsid 逃逸的组外进程)则跳过 TERM 宽限,只做 2s 短探;短探落空
     → 放弃等待(逃逸孙进程 Phase 1 不追杀)。
     """
-    signaled = _signal_group(proc.pid, signal.SIGTERM)
+    signaled = signal_group(proc.pid, signal.SIGTERM)
     killed = False
     window = _TERM_GRACE_SECONDS if signaled else _POST_KILL_WAIT_SECONDS
     while True:
@@ -166,7 +121,7 @@ async def _converge_pipes(proc: asyncio.subprocess.Process, wait_task: asyncio.T
             pass
         if signaled and not killed:
             killed = True
-            _signal_group(proc.pid, signal.SIGKILL)
+            signal_group(proc.pid, signal.SIGKILL)
             window = _POST_KILL_WAIT_SECONDS
             continue
         await _abandon_wait(wait_task)
@@ -177,20 +132,20 @@ async def _cancel_cleanup(proc: asyncio.subprocess.Process, tasks: tuple[asyncio
     """任何阶段被取消的统一收敛(Finding 3):不留悬空任务/孤儿进程组。"""
     killed = False
     try:
-        _signal_group(proc.pid, signal.SIGTERM)
+        signal_group(proc.pid, signal.SIGTERM)
         try:
-            await _await_main_exit(proc, _TERM_GRACE_SECONDS)
+            await await_main_exit(proc, _TERM_GRACE_SECONDS)
         except TimeoutError:
             pass
-        _signal_group(proc.pid, signal.SIGKILL)
+        signal_group(proc.pid, signal.SIGKILL)
         killed = True
         try:
-            await _await_main_exit(proc, _POST_KILL_WAIT_SECONDS)
+            await await_main_exit(proc, _POST_KILL_WAIT_SECONDS)
         except TimeoutError:
             pass
     except asyncio.CancelledError:
         if not killed:
-            _signal_group(proc.pid, signal.SIGKILL)
+            signal_group(proc.pid, signal.SIGKILL)
         raise
     finally:
         for task in tasks:
@@ -248,14 +203,18 @@ def create_bash_tool(workspace: Path) -> Tool:
         err_buf: list[bytes] = []
         out_discarded: list[int] = [0]
         err_discarded: list[int] = [0]
-        out_task = asyncio.create_task(_drain_to(proc.stdout, out_buf, out_discarded))
-        err_task = asyncio.create_task(_drain_to(proc.stderr, err_buf, err_discarded))
+        out_task = asyncio.create_task(
+            drain_stream(proc.stdout, out_buf, out_discarded, limit=_MAX_STREAM_BUFFER_BYTES)
+        )
+        err_task = asyncio.create_task(
+            drain_stream(proc.stderr, err_buf, err_discarded, limit=_MAX_STREAM_BUFFER_BYTES)
+        )
         wait_task = asyncio.create_task(proc.wait())
         tasks = (out_task, err_task, wait_task)
         timed_out = False
         try:
             try:
-                await _await_main_exit(proc, timeout)
+                await await_main_exit(proc, timeout)
             except TimeoutError:
                 timed_out = True
                 await _reap_main_exit(proc)

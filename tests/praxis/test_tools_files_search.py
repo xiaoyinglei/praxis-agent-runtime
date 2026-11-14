@@ -1,8 +1,9 @@
-"""Task 10:read 行模式与 list_files 内置工具(Task 11 追加 search_text)。
+"""Task 10/11:read 行模式、list_files 与 search_text 内置工具。
 
-阶段 1 的 read 只做字节分页;本任务按设计 §6 移植清单补齐行模式,并移植
-list_files 的确定性目录清单语义。read 既有字节模式用例自 test_tools_builtin.py
-迁移至此(断言逐条保留,不弱化)。
+阶段 1 的 read 只做字节分页;Task 10 按设计 §6 移植清单补齐行模式与
+list_files 的确定性目录清单语义。Task 11 追加 search_text(打包 ripgrep +
+隔离 worker)与 R-T11-2 的逐条目 deny 过滤。read 既有字节模式用例自
+test_tools_builtin.py 迁移至此(断言逐条保留,不弱化)。
 
 仓库无 pytest-asyncio:与 test_tools_builtin.py 同风格,asyncio.run 包装。
 """
@@ -17,23 +18,44 @@ from typing import Any
 
 import pytest
 
+from praxis.core import permission
+from praxis.core.pipeline import ExecCtx, execute
+from praxis.protocol.permission import PermissionContext
+from praxis.protocol.policy import PathRule, PermissionPolicy, path_access, resolve_policy
 from praxis.protocol.sandbox import ToolExecContext
 from praxis.protocol.tools import (
     CancellationMode,
     InterruptBehavior,
     ResultStatus,
+    ToolCall,
     ToolEffect,
     ToolValidationError,
 )
+from praxis.store.turns import create_turn
+from praxis.tools.builtins import search as search_module
 from praxis.tools.builtins.filesystem import (
     create_list_files_tool,
     create_read_tool,
     create_write_tool,
 )
+from praxis.tools.builtins.search import create_search_text_tool
+from praxis.tools.builtins.search_worker import LIMITS
 
 
 def run(tool: Any, arguments: dict[str, Any]) -> Any:
     return asyncio.run(tool.run(arguments, ToolExecContext()))
+
+
+def run_with(tool: Any, arguments: dict[str, Any], exec_ctx: ToolExecContext) -> Any:
+    return asyncio.run(tool.run(arguments, exec_ctx))
+
+
+def _permission_ctx(workspace: Path, *rules: PathRule) -> PermissionContext:
+    return PermissionContext(
+        workspace=str(workspace),
+        policy=PermissionPolicy(filesystem=tuple(rules)),
+        mode="on-request",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -485,3 +507,267 @@ def test_read_and_write_still_shared_workspace_guards(tmp_path: Path) -> None:
         run(create_read_tool(tmp_path), {"path": "."})
     with pytest.raises(ToolValidationError):
         run(create_write_tool(tmp_path), {"path": ".", "content": "x"})
+
+
+# ---------------------------------------------------------------------------
+# search_text(Task 11:打包 ripgrep + 隔离 worker)
+# ---------------------------------------------------------------------------
+
+
+def test_search_finds_literal_and_regex(tmp_path: Path) -> None:
+    (tmp_path / "f.txt").write_text("a.b literal\naxb regex\n", encoding="utf-8")
+    tool = create_search_text_tool(tmp_path)
+    literal = run(tool, {"pattern": "a.b", "regex": False})
+    assert literal.status is ResultStatus.OK
+    assert "f.txt:1: a.b literal" in literal.text
+    assert "f.txt:2: axb regex" not in literal.text
+    regex = run(tool, {"pattern": "a.b", "regex": True})
+    assert "f.txt:1: a.b literal" in regex.text
+    assert "f.txt:2: axb regex" in regex.text
+
+
+def test_context_lines_and_max_results(tmp_path: Path) -> None:
+    (tmp_path / "f.txt").write_text(
+        "one\nMATCH-a\ntwo\nthree\nMATCH-b\nfour\n", encoding="utf-8"
+    )
+    r = run(create_search_text_tool(tmp_path), {"pattern": "MATCH", "context_lines": 1, "max_results": 1})
+    assert r.status is ResultStatus.OK
+    # 上下文行以 "- " 前缀;匹配行是 "<相对路径>:<行号>: <行内容>"
+    assert r.text == "- one\nf.txt:2: MATCH-a\n- two"
+    assert r.metadata["total_matches"] == 1
+    assert r.truncated
+
+
+def test_line_char_cap_marks_truncated(tmp_path: Path) -> None:
+    (tmp_path / "f.txt").write_text("x" * 600 + " needle\n", encoding="utf-8")
+    r = run(create_search_text_tool(tmp_path), {"pattern": "needle"})
+    assert r.status is ResultStatus.OK
+    assert r.truncated
+    assert r.metadata["truncated"] is True
+    assert r.text == "f.txt:1: " + "x" * LIMITS["max_line_chars"]
+
+
+def test_symlink_and_agent_memory_skipped(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "o.txt").write_text("needle outside", encoding="utf-8")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "real.txt").write_text("needle real", encoding="utf-8")
+    (workspace / "link.txt").symlink_to(outside / "o.txt")
+    (workspace / "link_dir").symlink_to(outside)
+    (workspace / ".agent_memory").mkdir()
+    (workspace / ".agent_memory" / "secret.txt").write_text("needle memory", encoding="utf-8")
+
+    r = run(create_search_text_tool(workspace), {"pattern": "needle"})
+    assert "needle real" in r.text
+    assert "outside" not in r.text
+    assert "memory" not in r.text
+    assert r.metadata["total_matches"] == 1
+
+
+def test_backend_missing_error_code(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def missing() -> Path:
+        raise FileNotFoundError("no packaged rg")
+
+    monkeypatch.setattr(search_module, "rg_path", missing)
+    r = run(create_search_text_tool(tmp_path), {"pattern": "x"})
+    assert r.status is ResultStatus.ERROR
+    assert r.is_error
+    assert r.error_code == "search_backend_unavailable"
+
+
+def test_worker_isolated_env_and_flags(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # worker 必须 -I + 空白 env + cwd="/" + 独立进程组:不继承宿主 PYTHONPATH。
+    (tmp_path / "f.txt").write_text("needle\n", encoding="utf-8")
+    captured: dict[str, Any] = {}
+    real = asyncio.create_subprocess_exec
+
+    async def spy(*args: Any, **kwargs: Any) -> Any:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return await real(*args, **kwargs)
+
+    monkeypatch.setenv("PYTHONPATH", "/tmp/host-only-path")
+    monkeypatch.setattr(search_module.asyncio, "create_subprocess_exec", spy)
+    r = run(create_search_text_tool(tmp_path), {"pattern": "needle"})
+    assert r.status is ResultStatus.OK
+    assert captured["args"][1:3] == ("-I", "-c")
+    assert captured["kwargs"]["env"] == {"PATH": os.defpath}
+    assert "PYTHONPATH" not in captured["kwargs"]["env"]
+    assert captured["kwargs"]["cwd"] == "/"
+    assert captured["kwargs"]["start_new_session"] is True
+
+
+def test_invalid_regex_goes_to_metadata_not_content(tmp_path: Path) -> None:
+    (tmp_path / "f.txt").write_text("x\n", encoding="utf-8")
+    r = run(create_search_text_tool(tmp_path), {"pattern": "(", "regex": True})
+    assert r.status is ResultStatus.ERROR
+    assert r.error_code == "invalid_input"
+    # rg 的 stderr 只进 metadata(前 2000 字符),模型可见内容保持简短
+    stderr = r.metadata["stderr"]
+    assert isinstance(stderr, str) and stderr
+    assert len(stderr) <= 2_000
+    assert "(" not in r.text
+
+
+def test_search_metadata_limits_matrix(tmp_path: Path) -> None:
+    (tmp_path / "f.txt").write_text("needle\n", encoding="utf-8")
+    r = run(create_search_text_tool(tmp_path), {"pattern": "needle"})
+    assert r.metadata["backend"] == "ripgrep-bin"
+    assert dict(r.metadata["limits"]) == LIMITS
+    assert set(LIMITS) == {
+        "max_file_bytes",
+        "max_total_bytes",
+        "max_files",
+        "max_output_bytes",
+        "max_backend_bytes",
+        "max_line_chars",
+    }
+
+
+def test_search_exact_file_reports_searched_file_path(tmp_path: Path) -> None:
+    (tmp_path / "f.txt").write_text("needle\n", encoding="utf-8")
+    r = run(create_search_text_tool(tmp_path), {"pattern": "needle", "path": "f.txt"})
+    assert r.metadata["searched_file_path"] == "f.txt"
+
+
+def test_search_policy_and_resolve_use(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    tool = create_search_text_tool(workspace)
+    assert tool.definition.name == "search_text"
+    assert tool.static_effects == frozenset({ToolEffect.READ_WORKSPACE})
+    assert tool.idempotent and tool.concurrency_safe
+    assert tool.cancellation_mode is CancellationMode.COOPERATIVE
+    assert tool.interrupt_behavior is InterruptBehavior.CANCEL
+    assert tool.timeout_seconds == 15
+    assert tool.max_model_output_bytes == 2_000_000
+    root_use = tool.resolve_use({})
+    assert root_use.effects == frozenset({ToolEffect.READ_WORKSPACE})
+    assert root_use.targets[0].value == str(workspace.resolve())
+    sub = workspace / "sub"
+    sub.mkdir()
+    assert tool.resolve_use({"path": "sub"}).targets[0].value == str(sub.resolve())
+
+
+def test_search_schema_bounds(tmp_path: Path) -> None:
+    tool = create_search_text_tool(tmp_path)
+    with pytest.raises(ToolValidationError):
+        tool.validate_input({"pattern": ""})
+    with pytest.raises(ToolValidationError):
+        tool.validate_input({"pattern": "x" * 2_001})
+    with pytest.raises(ToolValidationError):
+        tool.validate_input({"pattern": "x", "context_lines": 51})
+    with pytest.raises(ToolValidationError):
+        tool.validate_input({"pattern": "x", "max_results": 0})
+    with pytest.raises(ToolValidationError):
+        tool.validate_input({"pattern": "x", "max_results": 201})
+    with pytest.raises(ToolValidationError):
+        tool.validate_input({"pattern": "x", "glob": "g" * 513})
+    with pytest.raises(ToolValidationError):
+        tool.validate_input({"pattern": "x", "path": "p" * 4_097})
+    with pytest.raises(ToolValidationError):
+        tool.validate_input({"pattern": "x", "regex": "yes"})
+    tool.validate_input({"pattern": "x", "regex": None, "context_lines": 50, "max_results": 200})
+
+
+def test_search_rejects_escape_path(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    with pytest.raises(ToolValidationError):
+        run(create_search_text_tool(workspace), {"pattern": "x", "path": "../outside"})
+
+
+# ---------------------------------------------------------------------------
+# R-T11-2:目录型读取工具逐条目执行 deny(decide 仍是唯一裁决函数)
+# ---------------------------------------------------------------------------
+
+
+def test_search_skips_denied_file(tmp_path: Path) -> None:
+    (tmp_path / "public.txt").write_text("needle public", encoding="utf-8")
+    (tmp_path / "secret.txt").write_text("needle secret", encoding="utf-8")
+    ctx = _permission_ctx(tmp_path, PathRule(path="secret.txt", access="deny"))
+    r = run_with(
+        create_search_text_tool(tmp_path),
+        {"pattern": "needle"},
+        ToolExecContext(permissions=ctx),
+    )
+    assert "needle public" in r.text
+    assert "needle secret" not in r.text
+    assert r.metadata["skipped_denied"] >= 1
+
+
+def test_list_files_denied_subtree_is_invisible(tmp_path: Path) -> None:
+    private = tmp_path / "private"
+    private.mkdir()
+    (private / "secret.txt").write_text("s", encoding="utf-8")
+    (tmp_path / "public.txt").write_text("p", encoding="utf-8")
+    ctx = _permission_ctx(tmp_path, PathRule(path="private", access="deny"))
+    r = run_with(
+        create_list_files_tool(tmp_path),
+        {"path": "."},
+        ToolExecContext(permissions=ctx),
+    )
+    relative = [line.split("\t")[2] for line in r.text.split("\n")]
+    assert relative == ["public.txt"]
+
+
+def test_denied_file_does_not_leak_and_decide_stays_denied(tmp_path: Path) -> None:
+    (tmp_path / "secret.txt").write_text("TOPSECRET", encoding="utf-8")
+    (tmp_path / "public.txt").write_text("public", encoding="utf-8")
+    ctx = _permission_ctx(tmp_path, PathRule(path="secret.txt", access="deny"))
+    exec_ctx = ToolExecContext(permissions=ctx)
+
+    # 执行侧:目录级搜索把 denied 文件排除,内容原文不泄露
+    searched = run_with(
+        create_search_text_tool(tmp_path), {"pattern": "TOPSECRET"}, exec_ctx
+    )
+    assert "TOPSECRET" not in searched.text
+    assert searched.metadata["skipped_denied"] >= 1
+
+    # decide 仍是唯一裁决函数:read/search 的精确 target 都被 denied——
+    # 执行侧过滤没有、也不能把决策翻成 allow。
+    read_tool = create_read_tool(tmp_path)
+    search_tool = create_search_text_tool(tmp_path)
+    assert permission.decide(read_tool, read_tool.resolve_use({"path": "secret.txt"}), ctx).is_deny
+    assert permission.decide(search_tool, search_tool.resolve_use({"path": "secret.txt"}), ctx).is_deny
+
+    # 过滤复用同一份规则代数(不是第二套合并器)
+    resolved = resolve_policy(ctx.policy, tmp_path)
+    assert path_access(resolved, tmp_path / "secret.txt", write=False) is False
+
+
+def test_pipeline_forwards_permissions_to_search(
+    store: Any, bus: Any, workspace: Path
+) -> None:
+    # R-T11-2 接线:execute 必须把 ctx.permissions 放进 ToolExecContext,
+    # 否则目录级搜索在真实管道里仍会读穿 deny 子路径。
+    (workspace / "secret.txt").write_text("TOPSECRET", encoding="utf-8")
+    (workspace / "public.txt").write_text("needle public", encoding="utf-8")
+    policy = PermissionPolicy(filesystem=(PathRule(path="secret.txt", access="deny"),))
+    permissions = PermissionContext(workspace=str(workspace), policy=policy, mode="on-request")
+    created = create_turn(store, turn_id="turn-search", thread_id="thread-search", binding={})
+    ctx = ExecCtx(
+        store=store,
+        bus=bus,
+        workspace=workspace,
+        tools={"search_text": create_search_text_tool(workspace)},
+        permissions=permissions,
+        turn_id=created.turn_id,
+        thread_id=created.thread_id,
+        policy_revision=policy.revision,
+    )
+    result = asyncio.run(
+        execute(
+            ToolCall(
+                tool_call_id="c1",
+                tool_name="search_text",
+                arguments={"pattern": "TOPSECRET"},
+            ),
+            ctx,
+        )
+    )
+    assert result.status is ResultStatus.OK
+    assert "TOPSECRET" not in result.text
+    assert result.metadata["skipped_denied"] >= 1

@@ -62,6 +62,7 @@ from praxis.tools.builtins.filesystem import (
     create_read_tool,
     create_write_tool,
 )
+from praxis.tools.builtins.search import create_search_text_tool
 
 _VALID_MODES: tuple[PermissionMode, ...] = ("on-request", "never", "bypass")
 
@@ -284,6 +285,7 @@ def build_session(
                 create_write_tool(root),
                 create_bash_tool(root),
                 create_list_files_tool(root),
+                create_search_text_tool(root),
                 create_read_artifact_tool(artifact_store),
             )
         )
