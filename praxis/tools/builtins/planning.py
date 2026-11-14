@@ -9,7 +9,12 @@ from collections.abc import Mapping
 from typing import Any, cast, get_args
 
 from praxis.protocol.json import JsonValue, thaw_json
-from praxis.protocol.plan import MAX_PLAN_STEPS, MAX_STEP_TITLE_CHARS, PlanStatus
+from praxis.protocol.plan import (
+    MAX_PLAN_STEPS,
+    MAX_PLAN_SUMMARY_CHARS,
+    MAX_STEP_TITLE_CHARS,
+    PlanStatus,
+)
 from praxis.protocol.sandbox import ToolExecContext
 from praxis.protocol.tools import (
     CancellationMode,
@@ -23,6 +28,7 @@ from praxis.protocol.tools import (
     ToolValidationError,
     json_schema_input,
 )
+from praxis.tools.builtins.filesystem import PENDING_TOOL_CALL_ID
 
 # Derive status enum for JSON Schema — single source of truth with read side.
 _STATUS_VALUES = list(get_args(PlanStatus))
@@ -56,7 +62,7 @@ _UPDATE_INPUT_SCHEMA: dict[str, Any] = {
         },
         "explanation": {
             "type": "string",
-            "maxLength": 800,
+            "maxLength": MAX_PLAN_SUMMARY_CHARS,
         },
     },
     "required": ["plan"],
@@ -144,7 +150,7 @@ def create_update_plan_tool() -> Tool:
         text = "\n".join(content_lines)
 
         return ToolResult(
-            tool_call_id="pending",
+            tool_call_id=PENDING_TOOL_CALL_ID,
             tool_name="update_plan",
             content=(ToolContentBlock(type="text", data={"text": text}),),
             status=ResultStatus.OK,

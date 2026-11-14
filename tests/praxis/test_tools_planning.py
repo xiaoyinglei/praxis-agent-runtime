@@ -9,7 +9,10 @@ step_id 自动补齐确定性、畸形 payload 不抛。
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import json
+import time
 from pathlib import Path
 
 import pytest
@@ -17,13 +20,11 @@ import pytest
 from praxis.core.events import EventBus
 from praxis.core.pipeline import ExecCtx, execute
 from praxis.core.planning import latest_plan
-from praxis.protocol.items import Item
 from praxis.protocol.permission import PermissionContext
 from praxis.protocol.policy import PermissionPolicy
 from praxis.protocol.tools import ToolCall
 from praxis.store.log import Store
 from praxis.tools.builtins.planning import create_update_plan_tool
-
 
 # --- Fixture helpers (parallel to test_pipeline.py pattern) -----------------
 
@@ -198,13 +199,53 @@ def test_error_does_not_change_existing_plan(workspace: Path) -> None:
         store.close()
 
 
+def test_authoritative_malformed_plan_does_not_fall_back(workspace: Path) -> None:
+    """最后一条成功的 update_plan 项畸形 → None，不回落到更旧的计划。"""
+    store = Store(workspace / "db.db")
+    try:
+        tool = create_update_plan_tool()
+        cctx = make_ctx(store, EventBus(), workspace, {"update_plan": tool})
+
+        # First: a valid 3-step plan exists and is readable.
+        steps = [{"step": f"a{i}", "status": "pending"} for i in range(3)]
+        r1 = asyncio.run(execute(ToolCall("c1", "update_plan", {"plan": steps}), cctx))
+        assert r1.status.value == "ok"
+        assert latest_plan(store.read_items("thread-plan")) is not None
+
+        # Second: an ok update_plan result whose payload is malformed, at a newer seq.
+        def _write_bad(conn):
+            conn.execute(
+                "INSERT INTO items VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "bad-0", "thread-plan", "turn-bad", 999, "tool_result",
+                    json.dumps({
+                        "call_id": "c9",
+                        "content": [],
+                        "error_code": None,
+                        "error_message": None,
+                        "is_error": False,
+                        "metadata": {"plan": "not-a-list", "revision": 3},
+                        "status": "ok",
+                        "tool_name": "update_plan",
+                        "truncated": False,
+                    }, sort_keys=True),
+                    time.time(),
+                ),
+            )
+
+        store.transact(_write_bad)
+
+        # The newest success is authoritative; malformed → None, no old-plan fallback.
+        assert latest_plan(store.read_items("thread-plan")) is None
+    finally:
+        store.close()
+
+
 def test_malformed_store_payload_is_fail_open(workspace: Path) -> None:
     """通过真 store 往返后的畸形 payload → latest_plan 返回 None，永不抛。
 
     绕过手搓 Item 直达 freeze/thaw 层（已知坑）。
     """
-    import json  # noqa: PLC0415
-
     store = Store(workspace / "db.db")
     try:
         # Manually append malformed tool_result entries via execute pipeline path
@@ -212,7 +253,7 @@ def test_malformed_store_payload_is_fail_open(workspace: Path) -> None:
         # Actually simplest: use store transact + raw SQL for exact control.
         def _write_malware(conn):
             """Write a raw tool_result with known bad metadata into sqlite."""
-            now = __import__("time").time()
+            now = time.time()
             conn.execute(
                 "INSERT INTO items VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
@@ -284,25 +325,36 @@ def test_no_second_plan_ledger() -> None:
     """结构钉子：不存在第二份计划账本。
 
     - `plan_state` 不在 items.py 中；
-    - MAX_PLAN_STEPS 在 praxis/ 里只有一处定义。
+    - MAX_PLAN_STEPS 在 praxis/ 里只有一处模块级定义，且字面值为 20。
     """
-    from pathlib import Path as _P  # noqa: PLC0415
-
-    items_text = _P(__file__).parent.parent.parent / "praxis" / "protocol" / "items.py"
+    repo_root = Path(__file__).parent.parent.parent
+    items_text = repo_root / "praxis" / "protocol" / "items.py"
     assert "plan_state" not in items_text.read_text(), (
         "No second plan ledger in items.py"
     )
 
-    # Pure-Python scan: count lines defining MAX_PLAN_STEPS across praxis/**/*.py
-    praxis_dir = _P(__file__).parent.parent.parent / "praxis"
-    count = 0
-    for py_file in sorted(praxis_dir.rglob("*.py")):
-        content = py_file.read_text()
-        for line in content.splitlines():
-            stripped = line.strip()
-            # Only match actual assignment lines (skip comments/docstrings)
-            if stripped.startswith("#"):
+    # AST scan: module-level Assign/AnnAssign targeting MAX_PLAN_STEPS.
+    definitions: list[ast.expr | None] = []
+    for py_file in sorted((repo_root / "praxis").rglob("*.py")):
+        tree = ast.parse(py_file.read_text(), filename=str(py_file))
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, ast.AnnAssign):
+                targets = [node.target]
+            else:
                 continue
-            if "MAX_PLAN_STEPS" in stripped and "=" in stripped:
-                count += 1
-    assert count >= 1, "MAX_PLAN_STEPS must be defined at least once"
+            if any(
+                isinstance(t, ast.Name) and t.id == "MAX_PLAN_STEPS" for t in targets
+            ):
+                definitions.append(node.value)
+
+    assert len(definitions) == 1, (
+        f"MAX_PLAN_STEPS must be defined exactly once under praxis/, "
+        f"found {len(definitions)} definitions"
+    )
+    value = definitions[0]
+    assert isinstance(value, ast.Constant) and type(value.value) is int, (
+        f"MAX_PLAN_STEPS must be an int literal, got {ast.dump(value) if value else None}"
+    )
+    assert value.value == 20, f"MAX_PLAN_STEPS must be 20, got {value.value}"
