@@ -2,10 +2,16 @@
 
 解析相对/绝对路径后 ``resolve()``,结果必须严格位于 workspace 内(含符号链接解析),
 越界一律 ``ToolValidationError``。阶段 2 的地板规则在此之前拦截。
+
+另提供 ``atomic_write_text``:同目录 tmp + ``os.replace`` 的原子落盘语义。
+filesystem 的 write 与 patch 的逐文件写入共用这一份实现(计划裁决 R-P1,
+禁止复制第二份)。
 """
 
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
 
 from praxis.protocol.tools import ToolValidationError
@@ -36,3 +42,20 @@ def checked_path(
             message=f"path is outside the workspace: {value!r}",
         )
     return target
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    """同目录 tmp + os.replace(移植旧 _atomic_write_text/atomic_bytes 的原子语义)。"""
+    encoded = content.encode("utf-8")
+    directory = path.parent
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(directory))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise

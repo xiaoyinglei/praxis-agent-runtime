@@ -25,7 +25,6 @@ import codecs
 import hashlib
 import os
 import stat
-import tempfile
 import unicodedata
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
@@ -48,7 +47,7 @@ from praxis.protocol.tools import (
     ToolValidationError,
     json_schema_input,
 )
-from praxis.tools.builtins.paths import checked_path
+from praxis.tools.builtins.paths import atomic_write_text, checked_path
 from praxis.tools.builtins.read_access import is_read_denied, permission_sources
 
 PENDING_TOOL_CALL_ID = "pending"
@@ -414,23 +413,6 @@ def create_read_tool(workspace: Path) -> Tool:
     )
 
 
-def _atomic_write_text(path: Path, content: str) -> None:
-    """同目录 tmp + os.replace(移植旧 _atomic_write_text/atomic_bytes 的原子语义)。"""
-    encoded = content.encode("utf-8")
-    directory = path.parent
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(directory))
-    tmp = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(encoded)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
-
-
 def create_write_tool(workspace: Path) -> Tool:
     validate_input = json_schema_input(
         {
@@ -451,7 +433,7 @@ def create_write_tool(workspace: Path) -> Tool:
         content = cast("str", args["content"])
         target = checked_path(workspace, cast("str", args["path"]), write=True)
         target.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write_text(target, content)
+        atomic_write_text(target, content)
         return _result(
             "write",
             content=f"wrote {target.name}",

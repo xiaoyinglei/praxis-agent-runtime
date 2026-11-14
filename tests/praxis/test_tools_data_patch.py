@@ -22,6 +22,9 @@ from typing import Any
 
 import pytest
 
+from praxis.core import permission
+from praxis.protocol.permission import PermissionContext
+from praxis.protocol.policy import PermissionPolicy, ToolRule
 from praxis.protocol.sandbox import ToolExecContext
 from praxis.protocol.tools import (
     CancellationMode,
@@ -32,6 +35,13 @@ from praxis.protocol.tools import (
 )
 from praxis.tools.builtins import data as data_module
 from praxis.tools.builtins.data import _MAX_INSPECTABLE_BYTES, create_inspect_data_file_tool
+from praxis.tools.builtins.patch import (
+    AddFile,
+    DeleteFile,
+    UpdateFile,
+    create_apply_patch_tool,
+    parse_patch,
+)
 
 _METADATA_KEYS = {
     "format",
@@ -254,13 +264,15 @@ def test_column_truncated_table_owns_the_sheet_cursor(tmp_path: Path) -> None:
     assert first.metadata["next_sheet_offset"] == 1
     assert "a1" in first.text
     assert "b1" in first.text
-    assert "b2" not in first.text
+    # 行形态断言:裸 "b2" 会随机命中 sha256(openpyxl 造包时间戳使哈希每次不同)
+    assert "1 | b2" not in first.text
     second = inspect(tmp_path, "t.xlsx", sheet_offset=1, start_column=2, max_columns=1)
     assert second.status is ResultStatus.OK
     assert second.metadata["next_column"] is None
     assert second.metadata["next_sheet_offset"] is None
     assert "b2" in second.text
-    assert "b1" not in second.text
+    # 用行形态断言:裸 "b1" 会随机命中 sha256 子串(openpyxl 造包时间戳使哈希每次不同)
+    assert "1 | b1" not in second.text
 
 
 def test_multi_sheet_row_truncation_never_skips_rows(tmp_path: Path) -> None:
@@ -668,3 +680,306 @@ def test_success_metadata_has_exactly_the_contract_keys(tmp_path: Path) -> None:
     assert r.metadata["valid"] is True
     assert len(r.metadata["sha256"]) == 64
     assert r.metadata["size_bytes"] == (tmp_path / "t.csv").stat().st_size
+
+
+# ===========================================================================
+# Task 13: apply_patch(codex 多文件 hunk 格式的进程内实现)
+#
+# R-T13-1 effects 动态化;R-T13-2 逐文件 target;R-T13-3 跨文件非事务 +
+# 单文件原子;R-T13-4 完整性检查留在工具内,权限/地板一概交给管道。
+# ===========================================================================
+
+_FAILURE_MESSAGE = (
+    "patch failed. Earlier hunks may already have changed files; "
+    "inspect the workspace before retrying."
+)
+
+
+def _patch(*sections: str) -> str:
+    return "*** Begin Patch\n" + "\n".join(sections) + "\n*** End Patch\n"
+
+
+def run_patch(workspace: Path, patch: str) -> Any:
+    return run(create_apply_patch_tool(workspace), {"patch": patch})
+
+
+def _abs(workspace: Path, *parts: str) -> str:
+    return str((workspace / Path(*parts)).resolve())
+
+
+def _permission_ctx(
+    workspace: Path,
+    *,
+    mode: str = "on-request",
+    tools: tuple[ToolRule, ...] = (),
+) -> PermissionContext:
+    return PermissionContext(
+        workspace=str(workspace),
+        policy=PermissionPolicy(tools=tools),
+        mode=mode,  # type: ignore[arg-type]
+    )
+
+
+# ---------------------------------------------------------------------------
+# R-T13-2:逐个涉及路径(含 Move to 目标)都是 kind="path" 的 target
+# ---------------------------------------------------------------------------
+
+
+def test_apply_patch_targets_are_per_file_for_permission(tmp_path: Path) -> None:
+    patch = _patch(
+        "*** Update File: a.py\n@@\n-old-a\n+new-a",
+        "*** Update File: b.py\n@@\n-old-b\n+new-b",
+    )
+    use = create_apply_patch_tool(tmp_path).resolve_use({"patch": patch})
+    assert sorted(t.value for t in use.targets) == sorted(_abs(tmp_path, name) for name in ("a.py", "b.py"))
+    # R-T13-1:纯 Update 只声明读写,不声明 DESTRUCTIVE
+    assert use.effects == frozenset({ToolEffect.READ_WORKSPACE, ToolEffect.WRITE_WORKSPACE})
+
+
+def test_move_destination_is_also_a_target(tmp_path: Path) -> None:
+    patch = _patch("*** Update File: old.py\n*** Move to: moved/new.py\n@@\n-a\n+b")
+    use = create_apply_patch_tool(tmp_path).resolve_use({"patch": patch})
+    assert sorted(t.value for t in use.targets) == sorted(
+        (_abs(tmp_path, "old.py"), _abs(tmp_path, "moved", "new.py"))
+    )
+
+
+# ---------------------------------------------------------------------------
+# R-T13-1:effects 动态化——Delete 才追加 DESTRUCTIVE(S5 强制审批)
+# ---------------------------------------------------------------------------
+
+
+def test_update_only_patch_is_allowed_by_workspace_write_grant(tmp_path: Path) -> None:
+    tool = create_apply_patch_tool(tmp_path)
+    use = tool.resolve_use({"patch": _patch("*** Update File: a.py\n@@\n-old\n+new")})
+    decision = permission.decide(tool, use, _permission_ctx(tmp_path))
+    assert decision.is_allow
+    assert decision.reason == "policy-grant"
+
+
+def test_update_only_patch_is_allowed_by_star_rule(tmp_path: Path) -> None:
+    tool = create_apply_patch_tool(tmp_path)
+    use = tool.resolve_use({"patch": _patch("*** Add File: a.py\n+new")})
+    decision = permission.decide(
+        tool, use, _permission_ctx(tmp_path, tools=(ToolRule(pattern="*", decision="allow"),))
+    )
+    assert decision.is_allow
+    assert decision.reason == "rule"
+
+
+def test_delete_patch_asks_even_with_star_allow_rule(tmp_path: Path) -> None:
+    tool = create_apply_patch_tool(tmp_path)
+    use = tool.resolve_use({"patch": _patch("*** Delete File: a.py")})
+    assert use.effects == frozenset(
+        {ToolEffect.READ_WORKSPACE, ToolEffect.WRITE_WORKSPACE, ToolEffect.DESTRUCTIVE}
+    )
+    ctx = _permission_ctx(tmp_path, tools=(ToolRule(pattern="*", decision="allow"),))
+    assert permission.decide(tool, use, ctx).is_ask
+
+
+def test_bypass_allows_delete_but_floor_still_denies(tmp_path: Path) -> None:
+    tool = create_apply_patch_tool(tmp_path)
+    ordinary = tool.resolve_use({"patch": _patch("*** Delete File: a.py")})
+    assert permission.decide(tool, ordinary, _permission_ctx(tmp_path, mode="bypass")).is_allow
+    protected = tool.resolve_use({"patch": _patch("*** Delete File: .git/config")})
+    decision = permission.decide(tool, protected, _permission_ctx(tmp_path, mode="bypass"))
+    assert decision.is_deny
+    assert decision.reason.startswith("floor:")
+
+
+# ---------------------------------------------------------------------------
+# 应用语义:多文件/多 hunk、Add/Delete/Move、摘要与 metadata
+# ---------------------------------------------------------------------------
+
+
+def test_hunks_apply_and_report_applied_files(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
+    patch = _patch(
+        "*** Update File: a.py\n@@\n one\n-two\n+TWO\n@@\n four\n+five",
+    )
+    r = run_patch(tmp_path, patch)
+    assert r.status is ResultStatus.OK
+    assert not r.is_error
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "one\nTWO\nthree\nfour\nfive\n"
+    assert r.metadata["applied_files"] == (_abs(tmp_path, "a.py"),)
+    assert "updated a.py" in r.text
+
+
+def test_add_delete_move(tmp_path: Path) -> None:
+    (tmp_path / "old.py").write_text("alpha\nbeta\n", encoding="utf-8")
+    (tmp_path / "gone.py").write_text("bye\n", encoding="utf-8")
+    patch = _patch(
+        "*** Add File: new.py\n+line1\n+line2",
+        "*** Update File: old.py\n*** Move to: moved.py\n@@\n-alpha\n+ALPHA",
+        "*** Delete File: gone.py",
+    )
+    r = run_patch(tmp_path, patch)
+    assert r.status is ResultStatus.OK
+    assert (tmp_path / "new.py").read_text(encoding="utf-8") == "line1\nline2\n"
+    assert not (tmp_path / "old.py").exists()
+    assert (tmp_path / "moved.py").read_text(encoding="utf-8") == "ALPHA\nbeta\n"
+    assert not (tmp_path / "gone.py").exists()
+    assert set(r.metadata["applied_files"]) == {
+        _abs(tmp_path, "new.py"),
+        _abs(tmp_path, "old.py"),
+        _abs(tmp_path, "moved.py"),
+        _abs(tmp_path, "gone.py"),
+    }
+    assert "moved old.py -> moved.py" in r.text
+
+
+# ---------------------------------------------------------------------------
+# R-T13-3:跨文件非事务(不回滚、不残留),单文件原子(tmp + replace)
+# ---------------------------------------------------------------------------
+
+
+def test_failure_is_not_transactional_and_says_so(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("a-old\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("b-old\n", encoding="utf-8")
+    patch = _patch(
+        "*** Update File: a.py\n@@\n-a-old\n+a-new",
+        "*** Update File: b.py\n@@\n-wrong\n+b-new",
+    )
+    r = run_patch(tmp_path, patch)
+    assert r.status is ResultStatus.ERROR
+    assert r.is_error
+    assert r.error_code == "patch_failed"
+    assert r.retryable is True
+    assert r.error_message == _FAILURE_MESSAGE
+    assert _FAILURE_MESSAGE in r.text
+    # 已改的不回滚;失败文件保持完整原样(绝不出现半个文件)
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "a-new\n"
+    assert (tmp_path / "b.py").read_text(encoding="utf-8") == "b-old\n"
+    assert r.metadata["applied_files"] == (_abs(tmp_path, "a.py"),)
+    assert r.metadata["failed_file"] == _abs(tmp_path, "b.py")
+    assert r.metadata["hunk_index"] == 0
+    assert r.metadata["expected_context_line"] == "wrong"
+    # tmp 文件已清理(os.replace 消费);目录里不残留隐藏临时文件
+    assert [child.name for child in tmp_path.iterdir() if child.name.startswith(".")] == []
+
+
+# ---------------------------------------------------------------------------
+# R-T13-4:完整性拒绝(与权限无关),权限判定不在这里
+# ---------------------------------------------------------------------------
+
+
+def test_symlink_target_is_rejected(tmp_path: Path) -> None:
+    (tmp_path / "real.py").write_text("hello\n", encoding="utf-8")
+    (tmp_path / "link.py").symlink_to(tmp_path / "real.py")
+    r = run_patch(tmp_path, _patch("*** Update File: link.py\n@@\n-hello\n+bye"))
+    assert r.status is ResultStatus.ERROR
+    assert r.error_code == "invalid_input"
+    assert "patch target is a symlink" in r.text
+    assert (tmp_path / "real.py").read_text(encoding="utf-8") == "hello\n"
+
+
+def test_escape_targets_are_rejected_before_use(tmp_path: Path) -> None:
+    tool = create_apply_patch_tool(tmp_path)
+    # tmp_path.parent 在同一 pytest session 内被多个用例共享:用本用例唯一的名字避免碰撞
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir(exist_ok=True)
+    (tmp_path / "dirlink").symlink_to(outside, target_is_directory=True)
+    for bad in ("../escape.py", str(outside / "abs.py"), "dirlink/x.py"):
+        with pytest.raises(ToolValidationError):
+            tool.resolve_use({"patch": _patch(f"*** Add File: {bad}\n+x")})
+
+
+def test_directory_target_is_rejected(tmp_path: Path) -> None:
+    (tmp_path / "adir").mkdir()
+    r = run_patch(tmp_path, _patch("*** Update File: adir\n@@\n-x\n+y"))
+    assert r.status is ResultStatus.ERROR
+    assert r.error_code == "invalid_input"
+    assert "not a regular file" in r.text
+
+
+def test_malformed_patch_becomes_invalid_input_result(tmp_path: Path) -> None:
+    r = run_patch(tmp_path, "not a patch")
+    assert r.status is ResultStatus.ERROR
+    assert r.error_code == "invalid_input"
+    assert r.metadata["failed_file"] is None
+
+
+def test_patch_over_30000_chars_is_invalid_input(tmp_path: Path) -> None:
+    tool = create_apply_patch_tool(tmp_path)
+    with pytest.raises(ToolValidationError):
+        tool.validate_input({"patch": "x" * 30_001})
+
+
+# ---------------------------------------------------------------------------
+# 解析器为纯函数:畸形输入穷举
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("text", ["", "\n\n", "   \n\t\n"])
+def test_empty_or_whitespace_patch_is_rejected(text: str) -> None:
+    with pytest.raises(ToolValidationError):
+        parse_patch(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # 缺 Begin/End
+        "*** Update File: a.py\n@@\n-a\n+b\n",
+        # 未知头
+        "*** Begin Patch\n*** Frobnicate: a.py\n*** End Patch\n",
+        # 缺 @@
+        "*** Begin Patch\n*** Update File: a.py\n-old\n+new\n*** End Patch\n",
+        # 裸 *** Move to: 没有所属 Update
+        "*** Begin Patch\n*** Move to: b.py\n*** End Patch\n",
+        # 只有 Begin/End,没有操作
+        "*** Begin Patch\n*** End Patch\n",
+    ],
+)
+def test_structural_malformations_are_rejected(text: str) -> None:
+    with pytest.raises(ToolValidationError):
+        parse_patch(text)
+
+
+def test_hunk_line_count_mismatch_is_rejected() -> None:
+    # 头声明 old=2/new=2,实际 old=1/new=1
+    with pytest.raises(ToolValidationError):
+        parse_patch("*** Begin Patch\n*** Update File: a.py\n@@ -2,2 +2,2 @@\n-a\n+b\n*** End Patch\n")
+
+
+def test_parse_patch_returns_typed_operations() -> None:
+    ops = parse_patch(
+        _patch(
+            "*** Add File: a.py\n+x",
+            "*** Delete File: b.py",
+            "*** Update File: c.py\n*** Move to: d.py\n@@\n-y\n+z",
+        )
+    )
+    assert isinstance(ops[0], AddFile)
+    assert ops[0].lines == ("x",)
+    assert isinstance(ops[1], DeleteFile)
+    assert isinstance(ops[2], UpdateFile)
+    assert ops[2].move_to == "d.py"
+
+
+def test_heredoc_wrapper_is_stripped(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("x\n", encoding="utf-8")
+    wrapped = (
+        "<<EOF\n*** Begin Patch\n*** Update File: a.py\n@@\n-x\n+y\n*** End Patch\nEOF"
+    )
+    ops = parse_patch(wrapped)
+    assert len(ops) == 1
+    assert isinstance(ops[0], UpdateFile)
+    assert ops[0].path == "a.py"
+    r = run_patch(tmp_path, wrapped)
+    assert r.status is ResultStatus.OK
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "y\n"
+
+
+def test_apply_patch_tool_contract(tmp_path: Path) -> None:
+    tool = create_apply_patch_tool(tmp_path)
+    assert tool.definition.name == "apply_patch"
+    assert tool.idempotent is False
+    assert tool.concurrency_safe is False
+    assert tool.cancellation_mode is CancellationMode.MANAGED_PROCESS
+    assert tool.interrupt_behavior is InterruptBehavior.CANCEL
+    assert tool.timeout_seconds == 35
+    assert tool.max_model_output_bytes == 50_000
+    assert tool.static_effects == frozenset(
+        {ToolEffect.READ_WORKSPACE, ToolEffect.WRITE_WORKSPACE, ToolEffect.DESTRUCTIVE}
+    )
