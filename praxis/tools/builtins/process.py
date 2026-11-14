@@ -6,7 +6,9 @@ SIGTERM → 有界宽限 → SIGKILL 整组 → 收尾读取。信号发送、�
 管道排空逻辑只在这里实现一次;消费者只组合这些原语,不得另写 os.killpg。
 
 原语边界(刻意保持最小):
-- ``signal_group``:整组发信号,只吞 ProcessLookupError/PermissionError;
+- ``signal_group``:整组发信号,只吞 ProcessLookupError/PermissionError。
+  实现放在 ``praxis/protocol/process.py``(Task 15:R-T15-2 的 core 清扫也要用,
+  而 core 不得 import tools),这里 re-export,保证全仓库唯一一份 ``os.killpg``;
 - ``await_main_exit``:等主进程回收事件(returncode),不等管道 EOF——
   CPython 的 ``Process.wait()`` 把"进程退出"与"所有管道 EOF"混为一谈,
   后台孙进程持写端时会拖到孙进程自然退出(B20);
@@ -20,24 +22,10 @@ SIGTERM → 有界宽限 → SIGKILL 整组 → 收尾读取。信号发送、�
 from __future__ import annotations
 
 import asyncio
-import os
-import signal
 
+from praxis.protocol.process import signal_group as signal_group
 
-def signal_group(pgid: int, sig: signal.Signals) -> bool:
-    """向整个进程组发信号。
-
-    ``start_new_session=True`` ⇒ 子进程组 id == 主进程 pid;整组收发信号。
-    返回"组内可能仍有活体":False 仅当 ESRCH(组已空,持管道者必在组外)。
-    EPERM 视为仍有活体(信号未送达不是"组为空"的证据)。
-    """
-    try:
-        os.killpg(pgid, sig)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
+__all__ = ["await_main_exit", "drain_stream", "signal_group"]
 
 
 async def await_main_exit(proc: asyncio.subprocess.Process, timeout: float | None) -> int:

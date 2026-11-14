@@ -21,21 +21,37 @@ tool_call item"(可能已有副作用)与"工具是否幂等"(能否安全重放
 "最后一条 model_response 的声明窗口",不是裸 call_id——同 turn 跨轮复用
 call_id 时,第一轮的结果绝不能把第二轮尚未执行的同 id 调用判为已解决
 (R-T7-1,否则 resume 静默丢掉一次调用)。
+
+sweep_orphan_command_jobs(Task 15,findings B20/D13):宿主崩溃后,后台 bash
+会话的 marker(``command_jobs_dir()/<session_id>.json``)还在,进程组可能还活着。
+打开会话时清扫:marker 是**宿主进程**写的,记录 pid/pgid/命令行前缀;清扫
+先 ``ps -p <pid> -o pgid=,args=`` 实测,**仅当 pgid 与记录一致且命令行前缀匹配**
+才整组 SIGTERM → 1s → SIGKILL(防 PID 复用误杀,Review Focus 5),随后删 marker。
+损坏 marker 直接删并记 corrupt;不匹配/进程已死记 stale 并删 marker;探测或
+信号自身失败记 untouchable 并保留 marker(留给下次清扫)。**任何情况下不抛**
+(它挂在打开会话的关键路径上)。进程组信号走 ``protocol.process.signal_group``
+(core 不得 import tools;实现仍只有一份)。
 """
 
 from __future__ import annotations
 
+import json
+import signal
+import subprocess
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from praxis.core.context import pair_tool_results
 from praxis.core.locks import ThreadBusy, thread_execution_lock
 from praxis.core.statemachine import IllegalTransition, TurnStatus, transition
+from praxis.protocol.floor import command_jobs_dir
 from praxis.protocol.items import Item, ItemKind
 from praxis.protocol.json import JsonValue
 from praxis.protocol.models import ModelToolCall
+from praxis.protocol.process import signal_group
 from praxis.store.turns import list_turns
 
 if TYPE_CHECKING:
@@ -71,6 +87,165 @@ def sweep(store: Store, bus: EventBus, workspace: Path) -> list[str]:
             continue
         marked.append(turn.turn_id)
     return marked
+
+
+# ---------------------------------------------------------------------------
+# 后台命令会话的崩溃遗留清扫(Task 15;B20/D13)
+# ---------------------------------------------------------------------------
+
+_ORPHAN_PROBE_TIMEOUT_SECONDS = 5.0
+_ORPHAN_TERM_GRACE_SECONDS = 1.0
+_MARKER_SUFFIX = ".json"
+
+
+@dataclass(frozen=True, slots=True)
+class OrphanSummary:
+    """一个 marker 的清扫结局(killed/stale/corrupt/untouchable)。"""
+
+    session_id: str
+    pid: int | None
+    state: Literal["killed", "stale", "corrupt", "untouchable"]
+    detail: str = ""
+    age_seconds: float | None = None
+
+
+def _probe_process(pid: int) -> tuple[int, str] | None:
+    """``ps -p <pid> -o pgid=,args=`` 实测;进程不存在 → None;ps 自身失败抛 OSError。
+
+    返回 ``(pgid, args)``。不吞 ps 的失败:调用方必须把"探不到"和"进程死了"
+    区分开——前者不能当 stale 删 marker。
+    """
+    completed = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "pgid=,args="],
+        capture_output=True,
+        text=True,
+        timeout=_ORPHAN_PROBE_TIMEOUT_SECONDS,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return None
+    line = completed.stdout.strip()
+    if not line:
+        return None
+    parts = line.split(maxsplit=1)
+    if len(parts) != 2:
+        return None
+    try:
+        observed_pgid = int(parts[0])
+    except ValueError:
+        return None
+    return observed_pgid, parts[1]
+
+
+def _kill_group(pgid: int, sig: signal.Signals) -> None:
+    """孤儿清扫的唯一信号出口(测试可 monkeypatch;实现是 process.py 原语)。"""
+    signal_group(pgid, sig)
+
+
+def _command_matches(command_prefix: str, observed: str) -> bool:
+    """命令行匹配:折叠空白后,实测 args 以空格边界包含记录的命令前缀。
+
+    命令是 ``bash -lc <command>`` 的最后一个 argv 元素(sandbox-exec 也保留完整
+    argv),简单命令被 bash tail-exec 后 ps 的 args 直接就是命令文本。用
+    "空格边界包含"而不是裸子串,避免 ``true`` 命中 ``/usr/bin/true`` 之类误杀;
+    pgid 一致仍是第一道守卫(PID 复用防线,Review Focus 5)。
+    """
+    expected = " ".join(command_prefix.split())
+    if not expected:
+        return False
+    return f" {expected}" in f" {' '.join(observed.split())}"
+
+
+def _read_marker(path: Path) -> dict[str, JsonValue] | None:
+    """读 marker;任何畸形(坏 JSON/缺字段/类型不符)返回 None(→ corrupt)。"""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    fields = ("session_id", "pid", "pgid", "command_prefix", "created_at")
+    if not all(field in raw for field in fields):
+        return None
+    if not isinstance(raw["session_id"], str) or not raw["session_id"]:
+        return None
+    if type(raw["pid"]) is not int or type(raw["pgid"]) is not int:
+        return None
+    if not isinstance(raw["command_prefix"], str):
+        return None
+    if isinstance(raw["created_at"], bool) or not isinstance(raw["created_at"], (int, float)):
+        return None
+    return raw
+
+
+def _unlink_marker(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _sweep_one_marker(marker: Path, now: float) -> OrphanSummary:
+    session_id = marker.stem
+    record = _read_marker(marker)
+    if record is None:
+        _unlink_marker(marker)
+        return OrphanSummary(session_id, None, "corrupt", "malformed marker removed")
+    pid = int(record["pid"])  # type: ignore[arg-type]
+    pgid = int(record["pgid"])  # type: ignore[arg-type]
+    prefix = str(record["command_prefix"])
+    created_at = float(record["created_at"])  # type: ignore[arg-type]
+    age = max(0.0, now - created_at)
+
+    try:
+        probe = _probe_process(pid)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        # marker 保留:下次清扫可重试,丢失登记会让活进程永久脱管。
+        return OrphanSummary(session_id, pid, "untouchable", f"probe failed: {exc}", age)
+    if probe is None:
+        _unlink_marker(marker)
+        return OrphanSummary(session_id, pid, "stale", "process is gone", age)
+    observed_pgid, args = probe
+    if observed_pgid != pgid or not _command_matches(prefix, args):
+        # PID 已复用(或命令不符):绝不向陌生进程组发信号(Review Focus 5)。
+        _unlink_marker(marker)
+        return OrphanSummary(
+            session_id, pid, "stale", "pid reused or command line mismatch", age
+        )
+
+    try:
+        _kill_group(pgid, signal.SIGTERM)
+        time.sleep(_ORPHAN_TERM_GRACE_SECONDS)
+        _kill_group(pgid, signal.SIGKILL)
+    except (OSError, ValueError) as exc:
+        return OrphanSummary(session_id, pid, "untouchable", f"signal failed: {exc}", age)
+    _unlink_marker(marker)
+    return OrphanSummary(session_id, pid, "killed", "process group terminated", age)
+
+
+def sweep_orphan_command_jobs(
+    jobs_dir: Path | None = None, *, now: float | None = None
+) -> tuple[OrphanSummary, ...]:
+    """清扫后台命令会话的崩溃遗留 marker(见模块 docstring;**绝不抛**)。
+
+    ``now`` 只影响 summary 的 ``age_seconds``(默认 ``time.time()``),不改变
+    清扫判定:marker 存在即登记,年龄不是安全条件(有 pid/pgid/命令行三重守卫)。
+    """
+    directory = Path(jobs_dir) if jobs_dir is not None else command_jobs_dir()
+    try:
+        markers = sorted(directory.glob(f"*{_MARKER_SUFFIX}"))
+    except OSError:
+        return ()
+    clock = time.time() if now is None else now
+    summaries: list[OrphanSummary] = []
+    for marker in markers:
+        try:
+            summaries.append(_sweep_one_marker(marker, clock))
+        except Exception as exc:  # noqa: BLE001 — 关键路径:单条意外绝不中断清扫
+            summaries.append(
+                OrphanSummary(marker.stem, None, "untouchable", f"unexpected: {exc}")
+            )
+    return tuple(summaries)
 
 
 @dataclass(frozen=True, slots=True)

@@ -3,10 +3,12 @@
 build_session 把分层组件装配成一个可用会话,顺序即依赖序:
 建 ``.praxis/`` 目录 → Store(单写者线程) → EventBus → **sweep**(打开即收编
 崩溃遗留的 running turn → interrupted,§5.8;活执行者持锁,Sweep 跳过,绝不误伤)
-→ 默认五内置工具(read/write/bash/list_files/read_artifact,可由 tools 参数整体替换)→ PermissionContext
-(``probe_backend()`` 真实沙箱探测)→ 线程 ensure/create → Session(注入
-``compile_sandbox``/``finalize_sandbox`` 与唯一重试机制 ``retry_stream``——
-core 经结构签名消费,不 import adapters)。
+→ **CommandSessions + 孤儿命令进程组清扫**(Task 15:同一实例注入 bash 与
+manage_command;marker 清扫结果只记日志) → 默认内置工具(read/write/bash/
+manage_command/list_files/search_text/read_artifact,可由 tools 参数整体替换)
+→ PermissionContext(``probe_backend()`` 真实沙箱探测)→ 线程 ensure/create →
+Session(注入 ``compile_sandbox``/``finalize_sandbox``、后台会话收尾面与唯一
+重试机制 ``retry_stream``——core 经结构签名消费,不 import adapters)。
 
 thread_id 是外部输入且直接参与 lockfile 命名:在这里(边界)先验拒绝空串、路径
 分隔符、NUL 与 ``..`` 成分——locks.py 会再拦一次,但边界拒绝让错误在碰文件系统
@@ -18,6 +20,7 @@ thread_id 是外部输入且直接参与 lockfile 命名:在这里(边界)先验
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from collections.abc import Sequence
@@ -40,7 +43,7 @@ from praxis.core.compaction import (
     default_summary_max_output_tokens,
 )
 from praxis.core.events import EventBus
-from praxis.core.recovery import sweep
+from praxis.core.recovery import sweep, sweep_orphan_command_jobs
 from praxis.core.session import Session
 from praxis.protocol.models import (
     ModelAdapter,
@@ -57,6 +60,10 @@ from praxis.store.artifacts import ArtifactStore
 from praxis.store.log import Store
 from praxis.tools.builtins.artifacts_tool import create_read_artifact_tool
 from praxis.tools.builtins.command import create_bash_tool
+from praxis.tools.builtins.command_sessions import (
+    CommandSessions,
+    create_manage_command_tool,
+)
 from praxis.tools.builtins.filesystem import (
     create_list_files_tool,
     create_read_tool,
@@ -65,6 +72,8 @@ from praxis.tools.builtins.filesystem import (
 from praxis.tools.builtins.search import create_search_text_tool
 
 _VALID_MODES: tuple[PermissionMode, ...] = ("on-request", "never", "bypass")
+
+logger = logging.getLogger(__name__)
 
 
 def _validate_thread_id(thread_id: str) -> None:
@@ -275,6 +284,21 @@ def build_session(
     try:
         bus = EventBus()
         sweep(store, bus, root)
+        # Task 15:后台命令会话注册表(一次实例化,注入 bash 与 manage_command)。
+        sessions = CommandSessions(root)
+        # 崩溃遗留的命令进程组清扫:结果只记日志,不影响会话可用性(函数自身不抛,
+        # 这里再加一层边界围栏,保证任何清扫意外都不会让会话打不开)。
+        try:
+            orphan_summaries = sweep_orphan_command_jobs()
+        except Exception:  # noqa: BLE001 — 清扫不是会话可用性的前置条件
+            logger.warning("orphan command job sweep failed", exc_info=True)
+            orphan_summaries = ()
+        if orphan_summaries:
+            logger.info(
+                "swept %d orphan command job marker(s): %s",
+                len(orphan_summaries),
+                ", ".join(f"{s.session_id}={s.state}" for s in orphan_summaries),
+            )
         # 内容寻址 artifact 目录(D10):.praxis 是地板,模型只能经 read_artifact 回读。
         artifact_store = ArtifactStore(praxis_dir / "artifacts")
         tool_seq = (
@@ -283,7 +307,8 @@ def build_session(
             else (
                 create_read_tool(root),
                 create_write_tool(root),
-                create_bash_tool(root),
+                create_bash_tool(root, sessions=sessions),
+                create_manage_command_tool(sessions),
                 create_list_files_tool(root),
                 create_search_text_tool(root),
                 create_read_artifact_tool(artifact_store),
@@ -324,6 +349,7 @@ def build_session(
             compact_limit_tokens=compact_limit_tokens,
             measure_tokens=_measure_request_tokens,
             summary_max_output_tokens=summary_max_output_tokens,
+            command_sessions=sessions,
         )
     except BaseException:
         store.close()

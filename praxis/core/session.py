@@ -40,11 +40,12 @@ Session 构造只允许 praxis/composition.py(CI 规则 7,设计 §4.1 唯一组
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 from uuid import uuid4
 
 from praxis.core.compaction import SUMMARY_MAX_OUTPUT_TOKENS
@@ -84,6 +85,16 @@ class ConversationBusy(RuntimeError):  # noqa: N818 — 设计 §5.8/plan 钉死
 
 class ResumeNotConfirmed(RuntimeError):  # noqa: N818 — 设计 §5.2 守卫钉死的名字
     """interrupted turn 未经人工确认(confirm=True)不得续跑(§5.2 守卫)。"""
+
+
+class CommandSessionsCloser(Protocol):
+    """composition 注入的后台会话收尾面(Task 15;core 不 import tools)。
+
+    ``CommandSessions.aclose()`` 结构匹配。Session.close 只经这个协议触达
+    后台命令会话:取消所有在跑命令、删除 marker,不留活口。
+    """
+
+    async def aclose(self) -> None: ...
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +311,7 @@ class Session:
         compact_limit_tokens: int | None = None,
         measure_tokens: Callable[[WireRequest], int] | None = None,
         summary_max_output_tokens: int = SUMMARY_MAX_OUTPUT_TOKENS,
+        command_sessions: CommandSessionsCloser | None = None,
     ) -> None:
         self._store = store
         self._bus = bus
@@ -325,6 +337,7 @@ class Session:
         self._compact_limit_tokens = compact_limit_tokens
         self._measure_tokens = measure_tokens
         self._summary_max_output_tokens = summary_max_output_tokens
+        self._command_sessions = command_sessions
 
     # -- 身份与生命周期 -------------------------------------------------------
 
@@ -337,8 +350,22 @@ class Session:
         return self._bus.subscribe()
 
     def close(self) -> None:
-        """关闭 store(写者线程收尾);EventBus 无持久资源,不另设关闭。"""
-        self._store.close()
+        """关闭 store(写者线程收尾);EventBus 无持久资源,不另设关闭。
+
+        Task 15:先走后台命令会话收尾(取消所有在跑会话、删 marker)。同步 API
+        在无运行中事件循环时用 ``asyncio.run``;若被异步宿主调用,交给当前循环。
+        """
+        sessions = self._command_sessions
+        try:
+            if sessions is not None:
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    asyncio.run(sessions.aclose())
+                else:
+                    asyncio.ensure_future(sessions.aclose())
+        finally:
+            self._store.close()
 
     # -- 权限更新(Task 8:once/session/always;设计 §5.3/§5.12;裁决 R6)-----
 
