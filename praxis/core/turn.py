@@ -141,7 +141,8 @@ def _model_call(call: ModelToolCall) -> ToolCall:
 
 def _model_response_entry(resp: ModelResponse) -> ItemEntry:
     """payload 约定(Task 14/recovery 消费,勿漂移):tool_calls 条目为
-    {call_id, name, arguments},arguments 缺席即 {}——to_messages 按同一形状重建。"""
+    {call_id, name, arguments},arguments 缺席即 {}——to_messages 按同一形状重建。
+    reasoning 是独立键:思考文本可审计,但投影不回灌(见 context.to_messages)。"""
     calls: tuple[JsonValue, ...] = tuple(
         {"call_id": c.call_id, "name": c.name, "arguments": c.arguments} for c in resp.tool_calls
     )
@@ -154,6 +155,7 @@ def _model_response_entry(resp: ModelResponse) -> ItemEntry:
         "tool_calls": calls,
         "usage": usage,
         "finish_reason": resp.finish_reason,
+        "reasoning": resp.reasoning,
     }
     return ItemEntry(kind=ItemKind.MODEL_RESPONSE, payload=payload)
 

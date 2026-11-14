@@ -55,7 +55,8 @@ def to_messages(items: Sequence[Item]) -> list[ModelMessage]:
 
     - user_message/steering → user(payload["text"])
     - model_response → assistant(payload["content"] + tool_calls 重建);content 缺失/非 str
-      但 tool_calls 可重建时投 content=""(R7 读端 fail-open,保住配对 tool_result)
+      但 tool_calls 可重建时投 content=""(R7 读端 fail-open,保住配对 tool_result)。
+      payload["reasoning"] 永不读取:思考文本一旦进助手历史就会被回灌 provider。
     - tool_result → tool(文本口径与 protocol.tools.ToolResult.text 一致,tool_call_id=payload["call_id"])
     - summary → user,前缀 "[conversation summary]\\n"
     - 其余 kind(turn_status/approval_*/tool_call/未知)→ 跳过

@@ -75,7 +75,8 @@ def test_spec_validation_and_wire_model_id() -> None:
         ModelSpec(model_id="m", api_key_env="bad-name!")
 
 
-def test_assemble_text_and_reasoning_accumulate_in_arrival_order() -> None:
+def test_assemble_keeps_reasoning_separate_from_content() -> None:
+    # 思考文本单独累积:content 只含正文,绝不混拼(会作为助手历史回灌)。
     resp = assemble_model_events(
         [
             ModelReasoningDelta("think "),
@@ -84,8 +85,19 @@ def test_assemble_text_and_reasoning_accumulate_in_arrival_order() -> None:
             ModelStreamFinished(Usage(1, 2), "stop"),
         ]
     )
-    assert resp.content == "think himore"
+    assert resp.content == "hi"
+    assert resp.reasoning == "think more"
     assert resp.tool_calls == () and resp.finish_reason == "stop"
+
+
+def test_assemble_reasoning_only_leaves_content_empty() -> None:
+    resp = assemble_model_events(
+        [
+            ModelReasoningDelta("only thinking"),
+            ModelStreamFinished(Usage(1, 2), "stop"),
+        ]
+    )
+    assert resp.content == "" and resp.reasoning == "only thinking"
 
 
 def test_assemble_keeps_first_call_id_and_orders_calls_by_index() -> None:

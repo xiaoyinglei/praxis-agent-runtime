@@ -141,10 +141,17 @@ class Usage:
 
 @dataclass(frozen=True, slots=True)
 class ModelResponse:
+    """一次补全的装配结果;``reasoning`` 是思考文本,绝不并入 ``content``。
+
+    两者分离是硬约束:``content`` 会作为 assistant 历史回灌 provider,
+    思考文本一旦混入就会被当成正文重复发送。
+    """
+
     content: str
     tool_calls: tuple[ModelToolCall, ...]
     usage: Usage
     finish_reason: str
+    reasoning: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +216,8 @@ def assemble_model_events(events: Sequence[ModelEvent]) -> ModelResponse:
     """把流式事件装配成 ModelResponse——流式/非流式共用的唯一实现。
 
     语义(设计 §5.9;B9):
-    - text/reasoning 按到达顺序累加进 content(混排 provider 也不丢内容);
+    - text 分片累加进 ``content``;reasoning 分片**单独**累加进 ``reasoning``,
+      两者绝不混拼(``content`` 会作为 assistant 历史回灌 provider);
     - tool-call 按 ``index`` 累积:``call_id`` 首个非 None 定值,``name``/
       ``arguments`` 分片一直拼到 finish,不冻结首帧;
     - 空 arguments 视作 ``{}``;非 JSON 或非 object 的调用**丢弃**并在 content
@@ -218,6 +226,7 @@ def assemble_model_events(events: Sequence[ModelEvent]) -> ModelResponse:
       且 ``finish_reason=""``,如实标注估算来源。
     """
     content_parts: list[str] = []
+    reasoning_parts: list[str] = []
     partials: dict[int, _PartialToolCall] = {}
     usage = Usage(0, 0, source="estimated")
     finish_reason = ""
@@ -226,7 +235,7 @@ def assemble_model_events(events: Sequence[ModelEvent]) -> ModelResponse:
         if isinstance(event, ModelTextDelta):
             content_parts.append(event.text)
         elif isinstance(event, ModelReasoningDelta):
-            content_parts.append(event.text)
+            reasoning_parts.append(event.text)
         elif isinstance(event, ModelToolCallDelta):
             partial = partials.setdefault(event.index, _PartialToolCall())
             if partial.call_id is None and event.call_id is not None:
@@ -262,7 +271,11 @@ def assemble_model_events(events: Sequence[ModelEvent]) -> ModelResponse:
         content = f"{content} {hint}" if content else hint
 
     return ModelResponse(
-        content=content, tool_calls=tuple(calls), usage=usage, finish_reason=finish_reason
+        content=content,
+        tool_calls=tuple(calls),
+        usage=usage,
+        finish_reason=finish_reason,
+        reasoning="".join(reasoning_parts),
     )
 
 

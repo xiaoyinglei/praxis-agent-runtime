@@ -19,6 +19,7 @@ from praxis.adapters.models.scripted import ScriptedAdapter, ScriptExhausted
 from praxis.protocol.models import (
     ModelAdapter,
     ModelMessage,
+    ModelReasoningDelta,
     ModelResponse,
     ModelSettings,
     ModelSpec,
@@ -352,8 +353,12 @@ def test_scripted_adapter_order_and_exhaustion() -> None:
 
 def test_scripted_stream_round_trips_through_assembly() -> None:
     """剧本 → 事件帧 → 同一 assemble:脚本驱动的验收与生产共享装配路径。"""
-    original = _tool_response(
-        "hello", (("c1", "read_file", {"path": "a"}),), usage=(3, 4), finish="tool_calls"
+    original = ModelResponse(
+        content="hello",
+        tool_calls=(ModelToolCall(call_id="c1", name="read_file", arguments={"path": "a"}),),
+        usage=Usage(3, 4),
+        finish_reason="tool_calls",
+        reasoning="thinking",
     )
     adapter = ScriptedAdapter([original])
     req = adapter.build_request([], [], ModelSettings())
@@ -361,6 +366,7 @@ def test_scripted_stream_round_trips_through_assembly() -> None:
     async def drive() -> None:
         events = await collect_events(adapter.stream(req))
         assert [type(event) for event in events] == [
+            ModelReasoningDelta,
             ModelTextDelta,
             ModelToolCallDelta,
             ModelStreamFinished,

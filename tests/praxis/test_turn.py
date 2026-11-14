@@ -17,6 +17,7 @@ import pytest
 
 from praxis.adapters.models.scripted import ScriptedAdapter
 from praxis.core import permission
+from praxis.core.context import build_context, to_messages
 from praxis.core.events import Subscription
 from praxis.core.statemachine import TurnStatus, transition
 from praxis.core.turn import TurnDeps, TurnState, run_turn
@@ -59,12 +60,18 @@ def _turn(store: Store) -> None:
     create_turn(store, turn_id=TURN, thread_id=THREAD, binding={})
 
 
-def _resp(content: str, calls: tuple[tuple[str, str, dict[str, Any]], ...] = ()) -> ModelResponse:
+def _resp(
+    content: str,
+    calls: tuple[tuple[str, str, dict[str, Any]], ...] = (),
+    *,
+    reasoning: str = "",
+) -> ModelResponse:
     return ModelResponse(
         content=content,
         tool_calls=tuple(ModelToolCall(call_id=c, name=n, arguments=a) for c, n, a in calls),
         usage=Usage(input_tokens=3, output_tokens=5),
         finish_reason="tool_calls" if calls else "stop",
+        reasoning=reasoning,
     )
 
 
@@ -174,6 +181,29 @@ def test_multitool_turn_completes(store: Store, bus: Any, workspace: Path) -> No
     assert (workspace / "note.txt").read_text() == "hello multitool"
     turn = get_turn(store, TURN)
     assert turn is not None and turn.status == "completed"
+
+
+def test_model_response_item_keeps_reasoning_separate_from_content(
+    store: Store, bus: Any, workspace: Path
+) -> None:
+    """reasoning 独立入 item payload;content 只有正文,投影绝不回灌思考文本。"""
+    _turn(store)
+    store.append_items(
+        THREAD, TURN, [ItemEntry(kind=ItemKind.USER_MESSAGE, payload={"text": "hi"})]
+    )
+    adapter = ScriptedAdapter([_resp("answer", reasoning="chain of thought")])
+    deps = _deps(store, bus, workspace, adapter, {})
+
+    result = asyncio.run(run_turn(deps, TurnState(TURN, THREAD)))
+
+    assert result.status is TurnStatus.COMPLETED and result.output == "answer"
+    response_item = next(
+        item for item in store.read_items(THREAD) if item.kind == ItemKind.MODEL_RESPONSE
+    )
+    assert response_item.payload["content"] == "answer"
+    assert response_item.payload["reasoning"] == "chain of thought"
+    projected = to_messages(build_context(store.read_items(THREAD)))
+    assert [m.content for m in projected if m.role == "assistant"] == ["answer"]
 
 
 def test_cancelled_is_not_failed(store: Store, bus: Any, workspace: Path) -> None:

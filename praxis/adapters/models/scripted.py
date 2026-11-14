@@ -19,6 +19,7 @@ from praxis.protocol.json import thaw_json
 from praxis.protocol.models import (
     ModelEvent,
     ModelMessage,
+    ModelReasoningDelta,
     ModelResponse,
     ModelSettings,
     ModelStreamFinished,
@@ -79,6 +80,8 @@ class ScriptedAdapter:
             )
         response = self._responses[self._next_index]
         self._next_index += 1
+        if response.reasoning:
+            yield ModelReasoningDelta(response.reasoning)
         if response.content:
             yield ModelTextDelta(response.content)
         for index, call in enumerate(response.tool_calls):
