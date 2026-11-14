@@ -540,6 +540,80 @@ def test_resume_approval_stamps_current_revision_not_request_revision(
 
 
 # ---------------------------------------------------------------------------
+# K-2(B32 同族):策略修订后 re-ask 的待批项必须可见
+# ---------------------------------------------------------------------------
+
+
+def test_stale_revision_reask_pending_visible_and_approvable(
+    workspace: Path, open_ws: Callable[..., Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """批准 → 崩溃(dispatch 前)→ 策略修订变化 → resume:待批项不得被陈旧的
+    request/decision 抑制(K-2)。
+
+    复现路径:未 started 的调用携带 rev1 的 request+decision;新 revision 的
+    session resume(confirm) → 管道判陈旧批准无效并 re-ask。若 request 去重与
+    pending 抑制不看 revision,既不会写新 request,旧 decision 又会吞掉展示 →
+    PAUSED 且 pending_approvals == (),人类无从批准。
+    """
+    monkeypatch.setattr(permission, "decide", lambda *a: Decision.ask("test"))
+    new_policy = PermissionPolicy(filesystem=(PathRule(path="extra", access="read"),))
+    assert new_policy.revision != PermissionPolicy().revision
+    session = open_ws(ScriptedAdapter([_resp("all done")]), policy=new_policy)
+    args = {"path": "f.txt", "content": "revision reask"}
+    digest = args_digest(args)
+    call = ("c1", "write", args)
+    old_policy = PermissionPolicy()
+    turn_id = _dead_turn(
+        workspace,
+        session.thread_id,
+        [
+            _model_response_entry("write it", (call,)),
+            ItemEntry(
+                kind=ItemKind.APPROVAL_REQUEST,
+                payload={
+                    "call_id": "c1",
+                    "tool_name": "write",
+                    "arguments": args,
+                    "effects": ("write_workspace",),
+                    "targets": (),
+                    "args_digest": digest,
+                    "policy_revision": old_policy.revision,
+                },
+            ),
+            ItemEntry(
+                kind=ItemKind.APPROVAL_DECISION,
+                payload={
+                    "call_id": "c1",
+                    "verdict": "allow",
+                    "args_digest": digest,
+                    "destination": "once",
+                    "policy_revision": old_policy.revision,
+                },
+            ),
+        ],
+    )
+
+    paused = asyncio.run(session.resume(turn_id, confirm=True))
+    assert paused.status is TurnStatus.PAUSED
+    # K-2 核心:陈旧 decision 不得抑制 re-ask,新 request 必须呈现。
+    assert [(p.call_id, p.args_digest) for p in paused.pending_approvals] == [("c1", digest)]
+    requests = [
+        i.payload
+        for i in _with_other_store(
+            workspace,
+            lambda other: other.read_turn_items(turn_id),
+        )
+        if i.kind == ItemKind.APPROVAL_REQUEST
+    ]
+    assert len(requests) == 2  # rev1 旧请求 + rev2 新请求(去重键含 revision)
+    assert requests[-1]["policy_revision"] == new_policy.revision
+
+    done = asyncio.run(session.resume(turn_id, approval={"c1": "allow"}))
+    assert done.status is TurnStatus.COMPLETED and done.output == "all done"
+    assert (workspace / "f.txt").read_text(encoding="utf-8") == "revision reask"
+
+
+# ---------------------------------------------------------------------------
 # 守卫与错误面
 # ---------------------------------------------------------------------------
 

@@ -270,8 +270,10 @@ def _latest_approval_decision(items: list[Item], call_id: str) -> Item | None:
 
     R-T7-2:绑定键是 call_id + args_digest + policy_revision,不含"声明窗口"。
     同 turn 跨轮复用 call_id 时,参数与策略修订都相同的旧批准会被视为同一动作
-    而沿用(语义可接受);参数不同则 digest 不匹配,必然重新 ask。真正按声明
-    窗口绑定属阶段 4 子代理审批面统一处理,本函数保持窗口无关语义。
+    而沿用(窗口化批准属阶段 4;本阶段把它作为**已知且被测试钉住的**语义:
+    同 revision 下同 id 同参数的重复调用沿用 once 批准)。参数不同则 digest
+    不匹配,必然重新 ask。真正按声明窗口绑定属阶段 4 子代理审批面统一处理,
+    本函数保持窗口无关语义。
     """
     for item in reversed(items):
         if item.kind == ItemKind.APPROVAL_DECISION and item.payload.get("call_id") == call_id:
@@ -334,9 +336,13 @@ def _pause_for_approval(
         item.kind == ItemKind.APPROVAL_REQUEST
         and item.payload.get("call_id") == call.tool_call_id
         and item.payload.get("args_digest") == digest
+        # K-2:revision 也是去重键的一部分。策略修订后重入的 re-ask 必须写入
+        # 新 revision 的 request,否则展示面按陈旧 revision 抑制既有 request
+        # ⇒ PAUSED 且 pending_approvals 为空(B32 同族)。
+        and item.payload.get("policy_revision") == ctx.policy_revision
         for item in items
     )
-    if not duplicate:  # 幂等重入:同 call_id + 同 digest 不重复写请求
+    if not duplicate:  # 幂等重入:同 call_id + digest + revision 不重复写请求
         payload: dict[str, JsonValue] = {
             "call_id": call.tool_call_id,
             "tool_name": tool.definition.name,

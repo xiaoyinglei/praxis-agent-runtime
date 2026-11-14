@@ -21,6 +21,7 @@ R-T11-2:list_files 在输出每个具体条目前用 ``read_access`` 做执行�
 
 from __future__ import annotations
 
+import asyncio
 import codecs
 import hashlib
 import os
@@ -61,6 +62,11 @@ _READ_MAX_LINES = 2_000
 # 在 async run 里无界阻塞事件循环(超时/取消都送不进去)。超预算时在整行边界收口。
 _READ_LINE_MAX_BYTES = 1_000_000
 _READ_LINE_CHUNK_BYTES = 65_536
+# K-5:start_line 的合法上限(行模式的跳行循环也必须可推进/可取消)。
+# 没有上限时一次调用可以在多 GB 文件上循环数分钟;上限与每 N 行让出事件循环
+# 一起,保证超大 start_line 下 ticker/取消/超时仍有机会运行。
+_READ_MAX_START_LINE = 10_000_000
+_SKIP_LINES_YIELD_INTERVAL = 256
 # 页首超预算单行的可见提示:预览必须显式说明"只看到开头",并指向字节模式。
 _LINE_BUDGET_HINT = (
     "[line exceeds the line-mode byte budget; preview only — "
@@ -131,7 +137,11 @@ _read_schema_validator = json_schema_input(
                 "minimum": 1,
                 "maximum": _READ_MAX_LIMIT,
             },
-            "start_line": {"type": "integer", "minimum": 1},
+            "start_line": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": _READ_MAX_START_LINE,
+            },
             "max_lines": {
                 "type": "integer",
                 "minimum": 1,
@@ -209,7 +219,7 @@ def _binary_result(path_value: str, size: int) -> ToolResult:
     )
 
 
-def _read_line_page(
+async def _read_line_page(
     workspace: Path,
     path_value: str,
     *,
@@ -237,7 +247,7 @@ def _read_line_page(
             return _binary_result(path_value, size)
         # 嗅探消耗了前缀,行模式从文件头重新开始(等价于字节模式的 seek(offset))
         stream.seek(0)
-        _skip_lines(stream, start_line - 1)
+        await _skip_lines(stream, start_line - 1)
         lines: list[str] = []
         bytes_used = 0
         truncated = False
@@ -286,15 +296,22 @@ def _read_line_page(
     )
 
 
-def _skip_lines(stream: BinaryIO, count: int) -> None:
-    """跳过 ``count`` 行;按固定块 readline,超长行不会一次性读进内存。"""
-    for _ in range(count):
+async def _skip_lines(stream: BinaryIO, count: int) -> None:
+    """跳过 ``count`` 行;按固定块 readline,超长行不会一次性读进内存。
+
+    K-5:每 ``_SKIP_LINES_YIELD_INTERVAL`` 行 ``await asyncio.sleep(0)`` 一次。
+    没有让出点时,``start_line`` 很大的一次 ``read`` 会把事件循环占死数分钟,
+    超时定时器、取消与其它任务都得不到执行——这正与 Task 10 已裁过的形态同族。
+    """
+    for index in range(count):
         while True:
             chunk = stream.readline(_READ_LINE_CHUNK_BYTES)
             if not chunk:
                 return
             if chunk.endswith(b"\n"):
                 break
+        if index % _SKIP_LINES_YIELD_INTERVAL == _SKIP_LINES_YIELD_INTERVAL - 1:
+            await asyncio.sleep(0)
 
 
 def create_read_tool(workspace: Path) -> Tool:
@@ -306,7 +323,7 @@ def create_read_tool(workspace: Path) -> Tool:
         args = validate_input(arguments)
         path_value = cast("str", args["path"])
         if args.get("start_line") is not None or args.get("max_lines") is not None:
-            return _read_line_page(
+            return await _read_line_page(
                 workspace,
                 path_value,
                 start_line=cast("int", args.get("start_line", 1)),
@@ -386,7 +403,10 @@ def create_read_tool(workspace: Path) -> Tool:
                     },
                     "start_line": {
                         "type": "integer",
-                        "description": "One-based line to start reading (line mode).",
+                        "description": (
+                            "One-based line to start reading (line mode), "
+                            f"1..{_READ_MAX_START_LINE}."
+                        ),
                     },
                     "max_lines": {
                         "type": "integer",

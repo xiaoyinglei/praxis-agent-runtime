@@ -40,7 +40,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-from praxis.core.compaction import SUMMARY_MAX_OUTPUT_TOKENS, maybe_compact
+from praxis.core.compaction import (
+    SUMMARY_MAX_OUTPUT_TOKENS,
+    SUMMARY_PROMPT_MAX_CHARS,
+    CompactionOutcome,
+    maybe_compact,
+)
 from praxis.core.context import build_context, elide_old_tool_outputs, to_messages
 from praxis.core.events import EventBus
 from praxis.core.pipeline import ExecCtx, SandboxCompiler, SandboxFinalizer, execute
@@ -61,6 +66,7 @@ from praxis.protocol.models import (
     WireRequest,
     assemble_model_events,
     collect_events,
+    usage_payload,
 )
 from praxis.protocol.permission import PermissionContext
 from praxis.protocol.retry import (
@@ -114,6 +120,8 @@ class TurnDeps:
     measure_tokens: Callable[[WireRequest], int] | None = None
     # 摘要请求输出预算;composition 按 min(2048, spec.max_output_tokens) 注入。
     summary_max_output_tokens: int = SUMMARY_MAX_OUTPUT_TOKENS
+    # 摘要请求正文上限(K-4);composition 按上下文窗口推导后注入。
+    summary_prompt_max_chars: int = SUMMARY_PROMPT_MAX_CHARS
 
 
 @dataclass
@@ -184,14 +192,11 @@ def _model_response_entry(resp: ModelResponse) -> ItemEntry:
     calls: tuple[JsonValue, ...] = tuple(
         {"call_id": c.call_id, "name": c.name, "arguments": c.arguments} for c in resp.tool_calls
     )
-    usage: dict[str, JsonValue] = {
-        "input_tokens": resp.usage.input_tokens,
-        "output_tokens": resp.usage.output_tokens,
-    }
     payload: dict[str, JsonValue] = {
         "content": resp.content,
         "tool_calls": calls,
-        "usage": usage,
+        # H-1:D2 契约的完整 usage(source/cached/reasoning 不再丢)。
+        "usage": usage_payload(resp.usage),
         "finish_reason": resp.finish_reason,
         "reasoning": resp.reasoning,
     }
@@ -317,28 +322,34 @@ def _note_unknown(result: ToolResult, unknown_calls: list[str]) -> None:
         unknown_calls.append(result.tool_call_id)
 
 
-def _collect_pending_approvals(deps: TurnDeps, turn_id: str) -> tuple[ApprovalSummary, ...]:
-    """本 turn 内没有 matching 决策的 approval_request。
+def pending_approval_summaries(
+    items: Sequence[Item], *, policy_revision: str
+) -> tuple[ApprovalSummary, ...]:
+    """本 turn 内没有**当前 revision 有效**决策的 approval_request。
 
-    读 item 而非缓存内存状态:item 日志是唯一事实源;同 call_id 多条请求取最新
-    一条(re-ask 的摘要用新参数 digest)。
+    turn 层与 Session 层共用这一个判据(K-2:不再各写一份)。读 item 而非缓存
+    内存状态:item 日志是唯一事实源;同 call_id 多条请求取最新一条(re-ask 的
+    摘要用新参数 digest)。
 
-    抑制条件(C-1,与管道 R5(b) 参数绑定同口径):一个请求只有在**同
-    ``(call_id, args_digest)``** 已有 approval_decision 时才算已决策。旧的
-    "该 call_id 出现过任意决策即抑制"在同一 turn 跨轮复用 call_id、第二轮以
-    不同参数 re-ask 时会把新一轮请求藏起来——turn 停在 PAUSED 却
-    ``pending_approvals == ()``,人类没有任何可批项。digest 不同即新动作,
-    必须呈现(policy_revision 只影响管道重入是否沿用旧批准,不影响"这是另一
-    个参数动作"的事实)。
+    抑制条件(C-1 + K-2):一个请求只有在**同** ``(call_id, args_digest)`` 且
+    决策的 ``policy_revision`` 等于当前 revision 时才算已决策。与管道
+    ``_bound_decision_valid`` 同口径——陈旧 revision 的批准在重入时作废并
+    re-ask,若展示面仍按裸 digest 抑制,就会停在 PAUSED 且
+    ``pending_approvals == ()``(B32 同族卡死)。digest 不同即另一个动作,
+    必须呈现。
     """
-    items = deps.store.read_turn_items(turn_id)
     decided: set[tuple[str, str]] = set()
     for item in items:
         if item.kind != ItemKind.APPROVAL_DECISION:
             continue
         call_id = item.payload.get("call_id")
         digest = item.payload.get("args_digest")
-        if isinstance(call_id, str) and isinstance(digest, str):
+        revision = item.payload.get("policy_revision")
+        if (
+            isinstance(call_id, str)
+            and isinstance(digest, str)
+            and revision == policy_revision
+        ):
             decided.add((call_id, digest))
     latest_requests: dict[str, Mapping[str, JsonValue]] = {}
     for item in items:
@@ -357,12 +368,20 @@ def _collect_pending_approvals(deps: TurnDeps, turn_id: str) -> tuple[ApprovalSu
             continue
         effects: tuple[str, ...] = ()
         raw_effects = payload.get("effects")
-        if isinstance(raw_effects, tuple):
+        if isinstance(raw_effects, (list, tuple)):
             effects = tuple(e for e in raw_effects if isinstance(e, str))
         pending[call_id] = ApprovalSummary(
             call_id=call_id, tool_name=tool_name, args_digest=digest, effects=effects
         )
     return tuple(pending.values())
+
+
+def _collect_pending_approvals(deps: TurnDeps, turn_id: str) -> tuple[ApprovalSummary, ...]:
+    """turn 层包装:以 deps 的当前策略 revision 判定有效性。"""
+    return pending_approval_summaries(
+        deps.store.read_turn_items(turn_id),
+        policy_revision=deps.permissions.policy.revision,
+    )
 
 
 def _paused_result(
@@ -398,7 +417,8 @@ async def run_turn(
     ctx = _exec_ctx(deps, state)
     unknown_calls: list[str] = []
     last_content = ""
-    compacted = False  # R-P4:本 turn 已尝试过压缩(最多一次)
+    compacted = False  # 本 turn 是否真的写入过 summary/boundary(K-1)
+    compaction_attempted = False  # R-P4:每 turn 最多尝试一次(含"无可覆盖区间")
     try:
         # 步序 1:审批重入——先重放已批准的调用,再进模型循环。
         for call in resume_calls:
@@ -418,26 +438,35 @@ async def run_turn(
             # 步序 3:构建请求 → 补全 → 落 model_response item → emit 预览事件。
             req = deps.adapter.build_request(messages, definitions, ModelSettings())
             # 步边界自动压缩(设计 §5.7 / D11):只在实际出站请求超阈值时触发,
-            # 摘要由同一 adapter 完成;下一轮重建上下文。每 turn 最多一次(R-P4):
-            # 即使压缩后仍超阈值也不重试,避免本地小模型摘要不够短时的 livelock。
+            # 摘要由同一 adapter 完成;下一轮重建上下文。每 turn 最多尝试一次
+            # (R-P4:即使压缩后仍超阈值也不重试,避免本地小模型摘要不够短时
+            # 的 livelock)。K-1:物化判定与压缩共用 turn 已算出的同一次测量
+            # (req 含 system + tools),不再让 maybe_compact 用另一份无 tools
+            # 的请求重测;只有真的写了 summary/boundary 才重建上下文。
             if (
-                not compacted
+                not compaction_attempted
                 and deps.compact_limit_tokens
                 and deps.measure_tokens is not None
-                and deps.measure_tokens(req) > deps.compact_limit_tokens
             ):
-                compacted = True
-                await maybe_compact(
-                    store=deps.store,
-                    adapter=deps.adapter,
-                    thread_id=state.thread_id,
-                    turn_id=state.turn_id,
-                    items=items,
-                    limit_tokens=deps.compact_limit_tokens,
-                    summary_max_output_tokens=deps.summary_max_output_tokens,
-                    measure_tokens=deps.measure_tokens,
-                )
-                continue
+                measured_tokens = deps.measure_tokens(req)
+                if measured_tokens > deps.compact_limit_tokens:
+                    compaction_attempted = True
+                    outcome = await maybe_compact(
+                        store=deps.store,
+                        adapter=deps.adapter,
+                        thread_id=state.thread_id,
+                        turn_id=state.turn_id,
+                        items=items,
+                        limit_tokens=deps.compact_limit_tokens,
+                        summary_max_output_tokens=deps.summary_max_output_tokens,
+                        summary_prompt_max_chars=deps.summary_prompt_max_chars,
+                        measure_tokens=deps.measure_tokens,
+                        request=req,
+                        measured_tokens=measured_tokens,
+                    )
+                    compacted = isinstance(outcome, CompactionOutcome) and outcome.compacted
+                    if compacted:
+                        continue
             # core 只走流式(D1);complete() 也由同一条 stream 装配派生。
             # 重试机制由 composition 以结构签名注入(R-T3-1):core 不认识
             # openai/httpx,只认识"给工厂、已有尝试、clock floor,拿回事件"。

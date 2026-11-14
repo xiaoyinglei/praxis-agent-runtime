@@ -397,6 +397,27 @@ def test_reentry_with_stale_revision_reasks(ctx: ExecCtx, monkeypatch: pytest.Mo
     assert len(reqs) == 1  # 同 call_id+digest 幂等,不重复写请求
 
 
+def test_same_revision_repeated_call_reuses_once_approval(
+    ctx: ExecCtx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R-T7-2(K-3):同 revision 下同 id 同参数的重复调用沿用 once 批准。
+
+    这是本阶段的**已知语义**(窗口化批准属阶段 4):绑定键是
+    call_id + args_digest + policy_revision,不含声明窗口。测试钉住它,避免
+    后续重构静默改变安全面而不被发现。
+    """
+    monkeypatch.setattr(permission, "decide", lambda *a: Decision.ask("test"))
+    assert asyncio.run(execute(ToolCall("c1", "read", dict(ARGS_A)), ctx)).status is ResultStatus.PAUSED
+    _decision_item(ctx, "allow", args_digest(ARGS_A))  # 当前 revision
+    _resume(ctx)
+    assert asyncio.run(execute(ToolCall("c1", "read", dict(ARGS_A)), ctx)).status is ResultStatus.OK
+    # 同 turn 同 revision 同 id 同参数的第二次调用:沿用同一 once 批准。
+    assert asyncio.run(execute(ToolCall("c1", "read", dict(ARGS_A)), ctx)).status is ResultStatus.OK
+    items = ctx.store.read_turn_items(ctx.turn_id)
+    assert [i.kind for i in items].count(ItemKind.TOOL_CALL) == 2
+    assert [i.kind for i in items].count(ItemKind.APPROVAL_REQUEST) == 1
+
+
 def test_reentry_with_legacy_missing_revision_reasks(ctx: ExecCtx, monkeypatch: pytest.MonkeyPatch) -> None:
     """R5(b):legacy 决策 item 缺 policy_revision → fail-closed 作废,re-ask。"""
     monkeypatch.setattr(permission, "decide", lambda *a: Decision.ask("test"))

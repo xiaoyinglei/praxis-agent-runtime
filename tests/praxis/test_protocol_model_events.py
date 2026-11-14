@@ -61,6 +61,19 @@ def test_assemble_invalid_arguments_drops_without_raising() -> None:
     assert resp.tool_calls == () and "invalid tool call arguments" in resp.content
 
 
+def test_assemble_missing_call_id_leaves_bounded_hint() -> None:
+    """K-3/R16-2:无 call_id 的调用不再静默跳过,留同形态的有界计数提示。"""
+    resp = assemble_model_events(
+        [
+            ModelToolCallDelta(0, None, "orphan", "{}"),
+            ModelToolCallDelta(1, "c1", "kept", "{}"),
+            ModelStreamFinished(Usage(1, 1), "tool_calls"),
+        ]
+    )
+    assert [c.call_id for c in resp.tool_calls] == ["c1"]
+    assert "[tool call without id dropped: 1]" in resp.content
+
+
 def test_assemble_without_finish_is_estimated_zero_usage() -> None:
     usage = assemble_model_events([ModelTextDelta("hi")]).usage
     assert usage.source == "estimated"

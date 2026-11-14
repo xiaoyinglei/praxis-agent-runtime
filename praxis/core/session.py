@@ -48,14 +48,21 @@ from pathlib import Path
 from typing import Literal, Protocol
 from uuid import uuid4
 
-from praxis.core.compaction import SUMMARY_MAX_OUTPUT_TOKENS
+from praxis.core.compaction import SUMMARY_MAX_OUTPUT_TOKENS, SUMMARY_PROMPT_MAX_CHARS
 from praxis.core.events import EventBus, Subscription
 from praxis.core.locks import ThreadBusy, thread_execution_lock
 from praxis.core.permission import apply_update, extend_policy
 from praxis.core.pipeline import SandboxCompiler, SandboxFinalizer
 from praxis.core.recovery import classify_pending
 from praxis.core.statemachine import TurnStatus, transition
-from praxis.core.turn import ApprovalSummary, TurnDeps, TurnResult, TurnState, run_turn
+from praxis.core.turn import (
+    ApprovalSummary,
+    TurnDeps,
+    TurnResult,
+    TurnState,
+    pending_approval_summaries,
+    run_turn,
+)
 from praxis.protocol.items import Item, ItemKind
 from praxis.protocol.json import JsonValue
 from praxis.protocol.models import ModelAdapter, ModelSettings, ModelToolCall, WireRequest
@@ -137,10 +144,11 @@ def _latest_payloads(items: Sequence[Item], kind: str) -> dict[str, Mapping[str,
       ``_write_approval_decisions`` 取最近一条 approval_request 的 digest——裸
       call_id 重入只可能指向最近声明窗口,与管道 ``_latest_approval_decision``
       的窗口无关绑定同口径;取最新正是重入要绑定/执行的动作。
-    - ``_pending_approvals`` 的哈希键仍是裸 call_id,但抑制条件已收口到
-      ``(call_id, args_digest)``(C-1):同 turn 跨轮复用 id、第二轮不同参数
-      re-ask 时,旧决策不再吞掉新请求。裸 id 审批映射在"同 id 两轮同时待批"
-      时仍只能呈现一条(取最新),这是 resume API 的固有边界,窗口化属阶段 4。
+    - ``_pending_approvals`` 的哈希键仍是裸 call_id,但抑制判据由
+      ``turn.pending_approval_summaries`` 单点实现(C-1 + K-2):
+      ``(call_id, args_digest)`` 且决策 revision 等于当前 revision。裸 id
+      审批映射在"同 id 两轮同时待批"时仍只能呈现一条(取最新),这是 resume
+      API 的固有边界,窗口化属阶段 4。
     """
     latest: dict[str, Mapping[str, JsonValue]] = {}
     for item in items:
@@ -152,35 +160,18 @@ def _latest_payloads(items: Sequence[Item], kind: str) -> dict[str, Mapping[str,
     return latest
 
 
-def _pending_approvals(items: Sequence[Item]) -> tuple[ApprovalSummary, ...]:
-    """本 turn 内没有 matching 决策的 approval_request(镜像 turn 层口径)。
+def _pending_approvals(
+    items: Sequence[Item], *, policy_revision: str
+) -> tuple[ApprovalSummary, ...]:
+    """本 turn 内没有**当前 revision 有效**决策的 approval_request(镜像 turn 层口径)。
 
-    C-1:抑制条件 = 同 ``(call_id, args_digest)`` 已有 decision(不是"该
-    call_id 出现过任何决策")。否则同 turn 跨轮复用 call_id、第二轮不同参数
-    re-ask 时,第一轮决策会把新一轮请求藏掉,PAUSED 的 pending_approvals 为空
-    → 人类无可批项。digest 不同即另一个动作,必须呈现。
+    K-2:判据集中在 ``turn.pending_approval_summaries``——两处不再各写一份。
+    C-1:抑制条件 = 同 ``(call_id, args_digest)`` **且决策 revision 等于当前
+    revision**。否则同 turn 跨轮复用 call_id、第二轮不同参数 re-ask 时(或
+    批准后策略修订使旧批准作废、管道 re-ask 时),旧决策会把新一轮请求藏掉,
+    PAUSED 的 pending_approvals 为空 → 人类无可批项(B32 同族)。
     """
-    decided: set[tuple[str, str]] = set()
-    for call_id, payload in _latest_payloads(items, ItemKind.APPROVAL_DECISION).items():
-        digest = payload.get("args_digest")
-        if isinstance(digest, str):
-            decided.add((call_id, digest))
-    pending: dict[str, ApprovalSummary] = {}
-    for call_id, payload in _latest_payloads(items, ItemKind.APPROVAL_REQUEST).items():
-        tool_name = payload.get("tool_name")
-        digest = payload.get("args_digest")
-        if not isinstance(tool_name, str) or not isinstance(digest, str):
-            continue
-        if (call_id, digest) in decided:
-            continue
-        effects: tuple[str, ...] = ()
-        raw_effects = payload.get("effects")
-        if isinstance(raw_effects, (list, tuple)):
-            effects = tuple(e for e in raw_effects if isinstance(e, str))
-        pending[call_id] = ApprovalSummary(
-            call_id=call_id, tool_name=tool_name, args_digest=digest, effects=effects
-        )
-    return tuple(pending.values())
+    return pending_approval_summaries(items, policy_revision=policy_revision)
 
 
 def _last_model_response_text(items: Sequence[Item]) -> str:
@@ -311,6 +302,7 @@ class Session:
         compact_limit_tokens: int | None = None,
         measure_tokens: Callable[[WireRequest], int] | None = None,
         summary_max_output_tokens: int = SUMMARY_MAX_OUTPUT_TOKENS,
+        summary_prompt_max_chars: int = SUMMARY_PROMPT_MAX_CHARS,
         command_sessions: CommandSessionsCloser | None = None,
     ) -> None:
         self._store = store
@@ -337,6 +329,7 @@ class Session:
         self._compact_limit_tokens = compact_limit_tokens
         self._measure_tokens = measure_tokens
         self._summary_max_output_tokens = summary_max_output_tokens
+        self._summary_prompt_max_chars = summary_prompt_max_chars
         self._command_sessions = command_sessions
 
     # -- 身份与生命周期 -------------------------------------------------------
@@ -488,7 +481,9 @@ class Session:
                 status=TurnStatus.PAUSED,
                 output=_last_model_response_text(items),
                 reason="outcome_unknown",
-                pending_approvals=_pending_approvals(items),
+                pending_approvals=_pending_approvals(
+                    items, policy_revision=self._permissions.policy.revision
+                ),
                 unknown_calls=tuple(unknown_ids),
             )
         return await self._execute(turn_id, resume_calls)
@@ -602,7 +597,9 @@ class Session:
             status=TurnStatus(turn.status),
             output=_last_model_response_text(items),
             reason=_last_status_reason(items),
-            pending_approvals=_pending_approvals(items),
+            pending_approvals=_pending_approvals(
+                items, policy_revision=self._permissions.policy.revision
+            ),
             unknown_calls=_unresolved_unknown_calls(items),
         )
 
@@ -640,6 +637,7 @@ class Session:
             compact_limit_tokens=self._compact_limit_tokens,
             measure_tokens=self._measure_tokens,
             summary_max_output_tokens=self._summary_max_output_tokens,
+            summary_prompt_max_chars=self._summary_prompt_max_chars,
         )
         try:
             with thread_execution_lock(self._workspace, self._thread_id):

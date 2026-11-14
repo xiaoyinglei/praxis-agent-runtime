@@ -36,6 +36,7 @@ from praxis.protocol.models import (
     ModelSpec,
     Usage,
     WireRequest,
+    usage_payload,
 )
 from praxis.store.log import ItemEntry, Store
 
@@ -69,12 +70,19 @@ _SUMMARY_INSTRUCTION: Final = (
 
 @dataclass(frozen=True, slots=True)
 class CompactionOutcome:
-    """一次成功压缩的事实:被覆盖的 seq 区间、摘要长度与本次摘要调用的 usage。"""
+    """一次压缩尝试的事实。
 
-    covered_from: int
-    covered_to: int
-    summary_chars: int
-    usage: Usage | None
+    K-1:``compacted=False`` 表示"已判定超限但无可覆盖区间"(没有写任何
+    item);turn 层仍把本轮记为已尝试,避免同一 turn 反复空转。成功时
+    ``compacted=True`` 且 covered_* 有值;摘要调用 usage 也随摘要 item 落库
+    (H-1)。
+    """
+
+    compacted: bool
+    covered_from: int | None = None
+    covered_to: int | None = None
+    summary_chars: int = 0
+    usage: Usage | None = None
 
 
 def default_compact_limit(spec: ModelSpec, reserve_output: int = _DEFAULT_RESERVE_OUTPUT) -> int:
@@ -98,6 +106,17 @@ def default_summary_max_output_tokens(spec: ModelSpec) -> int:
     return min(SUMMARY_MAX_OUTPUT_TOKENS, spec.max_output_tokens)
 
 
+def default_summary_prompt_max_chars(spec: ModelSpec) -> int:
+    """摘要请求正文上限 = ``min(安全上界, context_window_tokens // 4)``。
+
+    K-4:16k 字符的常量硬顶在小窗口本地模型(本阶段目标场景)上远超 4096
+    token 窗口,摘要请求会被 provider 拒收 → 静默不压缩(Task 9 I-1 复发)。
+    按窗口的四分之一推导,仍受 ``SUMMARY_PROMPT_MAX_CHARS`` 安全上界约束;
+    最小保证 1 字符(不产生空 prompt 的第二个诡异路径)。
+    """
+    return max(1, min(SUMMARY_PROMPT_MAX_CHARS, spec.context_window_tokens // 4))
+
+
 async def maybe_compact(
     *,
     store: Store,
@@ -108,45 +127,63 @@ async def maybe_compact(
     limit_tokens: int,
     keep_tail_items: int = _DEFAULT_KEEP_TAIL_ITEMS,
     summary_max_output_tokens: int = SUMMARY_MAX_OUTPUT_TOKENS,
+    summary_prompt_max_chars: int = SUMMARY_PROMPT_MAX_CHARS,
     measure_tokens: Callable[[WireRequest], int] | None = None,
+    request: WireRequest | None = None,
+    measured_tokens: int | None = None,
 ) -> CompactionOutcome | None:
-    """超阈值时压缩 ``items`` 的较旧部分;未超阈值/区间为空/失败 → ``None``。
+    """超阈值时压缩 ``items`` 的较旧部分;未超阈值/失败 → ``None``。
 
     1. 按 D11 读侧链 ``build_context`` → ``elide_old_tool_outputs`` → ``to_messages``
        构建与 turn 真实请求一致的投影,经 ``adapter.build_request`` 定型的字节测量;
        ``<= limit_tokens`` 直接返回 ``None``(不写任何东西);
     2. 覆盖区间 = 可见对话中除最后 ``keep_tail_items`` 条可压缩 item 之外的部分;
-       上界按 R-T9-2 回退到不切断声明窗口的位置;为空 → ``None``;
+       上界按 R-T9-2 回退到不切断声明窗口的位置;为空 → ``compacted=False`` 的
+       ``CompactionOutcome``(K-1:区分"无覆盖区间"与失败;turn 据此避免空转);
     3. 用**同一个** ``adapter.complete()`` 请求摘要(单次调用,不再递归压缩);
-       摘要投影同样经过 elide,并有 ``SUMMARY_PROMPT_MAX_CHARS`` 硬上限;
-    4. 一次批量追加 ``SUMMARY`` + ``COMPACTION_BOUNDARY`` 两条 item;
+       摘要投影同样经过 elide,并有 ``summary_prompt_max_chars`` 硬上限
+       (K-4:composition 按 ModelSpec 上下文窗口注入);
+    4. 一次批量追加 ``SUMMARY`` + ``COMPACTION_BOUNDARY`` 两条 item,摘要 usage
+       随摘要 item 落库(H-1);
     5. 任何失败 → ``logger.warning`` + ``None``。
 
     ``measure_tokens`` 是 D2 的唯一测量入口(``measure_request``)的注入形式:
     ``praxis_core_purity`` 禁止 core import adapters,由 composition 注入。
-    ``summary_max_output_tokens`` 同样由 composition 按 ModelSpec 注入。
+    ``request``/``measured_tokens``(K-1):turn 已按**真实出站请求**(含 system
+    与 tools)算出的测量结果直接传入,压缩判定与 turn 共用同一次口径;仅当
+    两者都未给出时才在本函数内重建投影请求(直连测试路径)。
     """
     if measure_tokens is None:
         logger.warning("compaction skipped: no token measurement injected")
         return None
     try:
         visible = build_context(items)
-        measured = adapter.build_request(
-            # 与 turn 的真实请求同一条读侧链(D11):折叠 → 省略 → 投影。
-            to_messages(elide_old_tool_outputs(visible)),
-            (),
-            ModelSettings(max_output_tokens=summary_max_output_tokens),
-        )
-        if measure_tokens(measured) <= limit_tokens:
+        if request is None or measured_tokens is None:
+            request = adapter.build_request(
+                # 与 turn 的真实请求同一条读侧链(D11):折叠 → 省略 → 投影。
+                to_messages(elide_old_tool_outputs(visible)),
+                (),
+                ModelSettings(max_output_tokens=summary_max_output_tokens),
+            )
+            measured_tokens = measure_tokens(request)
+        if measured_tokens <= limit_tokens:
             return None
 
         coverage = _coverage_range(visible, keep_tail_items)
         if coverage is None:
-            return None
+            # K-1:超限但没有任何可覆盖区间。不是失败,也不写 item;调用方
+            # 仍需把本轮标记为"已尝试"以免同一 turn 无限重试。
+            logger.info("compaction skipped: no coverable range")
+            return CompactionOutcome(compacted=False)
         covered_from, covered_to, covered_items = coverage
 
         summary_req = adapter.build_request(
-            [ModelMessage(role="user", content=_summary_prompt(covered_items))],
+            [
+                ModelMessage(
+                    role="user",
+                    content=_summary_prompt(covered_items, summary_prompt_max_chars),
+                )
+            ],
             (),
             ModelSettings(max_output_tokens=summary_max_output_tokens),
         )
@@ -168,6 +205,8 @@ async def maybe_compact(
                         "covered_to": covered_to,
                         "compact_version": COMPACT_VERSION,
                         "model_id": summary_req.model,
+                        # H-1:摘要调用的 usage 不再丢弃。
+                        "usage": usage_payload(response.usage),
                     },
                 ),
                 ItemEntry(
@@ -181,6 +220,7 @@ async def maybe_compact(
             ],
         )
         return CompactionOutcome(
+            compacted=True,
             covered_from=covered_from,
             covered_to=covered_to,
             summary_chars=len(summary_text),
@@ -270,21 +310,22 @@ def _declaration_call_ids(item: Item) -> list[str] | None:
     return call_ids
 
 
-def _summary_prompt(covered_items: Sequence[Item]) -> str:
+def _summary_prompt(covered_items: Sequence[Item], max_chars: int = SUMMARY_PROMPT_MAX_CHARS) -> str:
     """固定中文指令 + 有界的覆盖区间投影文本(只进请求,不落库)。
 
     压缩恰恰在"旧工具输出很多"时触发,所以这里必须再过一层
     ``elide_old_tool_outputs(keep_last=0)``(R-T9-1 保证 artifact 指针行原样
-    保留);用户/助手正文本身无界,再由 ``SUMMARY_PROMPT_MAX_CHARS`` 硬截断。
+    保留);用户/助手正文本身无界,再由 ``max_chars`` 硬截断(K-4:该上限
+    由 composition 按上下文窗口注入)。
     """
     projection = "\n".join(
         _render_message(message)
         for message in to_messages(elide_old_tool_outputs(covered_items, keep_last=0))
     )
     header = f"{_SUMMARY_INSTRUCTION}\n\n"
-    budget = SUMMARY_PROMPT_MAX_CHARS - len(header)
+    budget = max_chars - len(header)
     if budget <= 0:
-        return header[:SUMMARY_PROMPT_MAX_CHARS]
+        return header[:max_chars]
     if len(projection) <= budget:
         return header + projection
     keep = max(0, budget - len(_TRUNCATION_NOTE))

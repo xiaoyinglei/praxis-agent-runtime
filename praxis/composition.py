@@ -40,8 +40,10 @@ from praxis.adapters.sandbox.base import probe_backend
 from praxis.adapters.sandbox.compile import compile_sandbox, finalize_sandbox
 from praxis.core.compaction import (
     SUMMARY_MAX_OUTPUT_TOKENS,
+    SUMMARY_PROMPT_MAX_CHARS,
     default_compact_limit,
     default_summary_max_output_tokens,
+    default_summary_prompt_max_chars,
 )
 from praxis.core.events import EventBus
 from praxis.core.recovery import sweep, sweep_orphan_command_jobs
@@ -283,6 +285,13 @@ def build_session(
         if resolved_spec is not None
         else SUMMARY_MAX_OUTPUT_TOKENS
     )
+    # K-4:摘要请求正文上限也按模型上下文窗口推导——小窗口本地模型上 16k
+    # 字符的常量上限会让摘要请求被 provider 拒收(静默不压缩)。
+    summary_prompt_max_chars = (
+        default_summary_prompt_max_chars(resolved_spec)
+        if resolved_spec is not None
+        else SUMMARY_PROMPT_MAX_CHARS
+    )
     root = Path(workspace)
     praxis_dir = root / ".praxis"
     praxis_dir.mkdir(parents=True, exist_ok=True)
@@ -359,6 +368,7 @@ def build_session(
             compact_limit_tokens=compact_limit_tokens,
             measure_tokens=_measure_request_tokens,
             summary_max_output_tokens=summary_max_output_tokens,
+            summary_prompt_max_chars=summary_prompt_max_chars,
             command_sessions=sessions,
         )
     except BaseException:

@@ -26,22 +26,27 @@ from praxis.core.compaction import (
     CompactionOutcome,
     default_compact_limit,
     default_summary_max_output_tokens,
+    default_summary_prompt_max_chars,
     maybe_compact,
 )
-from praxis.core.context import build_context, to_messages
+from praxis.core.context import build_context, elide_old_tool_outputs, to_messages
 from praxis.core.events import EventBus
 from praxis.core.recovery import classify_pending
 from praxis.core.statemachine import TurnStatus
 from praxis.core.turn import TurnDeps, TurnState, run_turn
 from praxis.protocol.items import Item, ItemKind
+from praxis.protocol.json import thaw_json
 from praxis.protocol.models import (
+    ModelMessage,
     ModelResponse,
+    ModelSettings,
     ModelSpec,
     Usage,
     WireRequest,
 )
 from praxis.protocol.permission import PermissionContext
 from praxis.protocol.policy import PermissionPolicy
+from praxis.protocol.tools import ToolDefinition
 from praxis.store.log import ItemEntry, Store
 from praxis.store.turns import create_turn
 
@@ -171,6 +176,14 @@ def test_writes_summary_and_boundary_only_and_never_copies_body(
         "covered_to": 6,
         "compact_version": COMPACT_VERSION,
         "model_id": "scripted",
+        # H-1:摘要调用的 usage 随摘要 item 落库(D2 完整形状)。
+        "usage": {
+            "input_tokens": 11,
+            "output_tokens": 7,
+            "cached_input_tokens": 0,
+            "reasoning_tokens": 0,
+            "source": "provider",
+        },
     }
     assert boundary.payload == {
         "algorithm_version": "v1",
@@ -180,7 +193,7 @@ def test_writes_summary_and_boundary_only_and_never_copies_body(
 
     # B22:压缩只新增 summary + boundary;长正文只留在原 item,绝不复制进新条目。
     new_payloads = json.dumps(
-        [dict(summary.payload), dict(boundary.payload)], ensure_ascii=False
+        [thaw_json(summary.payload), thaw_json(boundary.payload)], ensure_ascii=False
     )
     assert "LONG-TOOL-OUTPUT-BODY" not in new_payloads
     assert before[2].payload["content"][0]["data"]["text"] == LONG_BODY  # 原 item 未改
@@ -218,6 +231,117 @@ def test_default_summary_max_output_tokens_respects_small_windows() -> None:
     assert default_summary_max_output_tokens(big) == SUMMARY_MAX_OUTPUT_TOKENS
     small = ModelSpec(model_id="m", context_window_tokens=4_000, max_output_tokens=1_024)
     assert default_summary_max_output_tokens(small) == 1_024
+
+
+def test_default_summary_prompt_max_chars_follows_context_window() -> None:
+    """K-4:摘要提示词上限按窗口推导,小窗口模型不再被 16k 常量撑爆。"""
+    big = ModelSpec(model_id="m", context_window_tokens=200_000, max_output_tokens=8_000)
+    assert default_summary_prompt_max_chars(big) == SUMMARY_PROMPT_MAX_CHARS
+    small = ModelSpec(model_id="m", context_window_tokens=4_000, max_output_tokens=1_024)
+    assert default_summary_prompt_max_chars(small) == 1_000
+    tiny = ModelSpec(model_id="m", context_window_tokens=3, max_output_tokens=2)
+    assert default_summary_prompt_max_chars(tiny) == 1  # 不产生空 prompt
+
+
+def test_shared_measurement_uses_turn_request_with_tools(store: Store) -> None:
+    """K-1:turn 已测得的真实请求(含 tools)必须与压缩判定同口径。
+
+    构造一个只有 tools 才超限的请求:旧实现内部重测"无 tools、无 system"的
+    投影 → 判不超限 → 返回 None,而真实出站请求照发。现在传入 request 后必须
+    在同一口径下压缩。
+    """
+    before = _seed(store, _basic_history())
+    adapter = _summary_adapter("SUMMARY-TEXT")
+    huge_tool = ToolDefinition(
+        name="huge",
+        description="x" * 60_000,  # 单凭 tools 就把请求撑过 limit
+        input_schema={"type": "object", "properties": {}},
+    )
+    request = adapter.build_request(
+        [ModelMessage(role="user", content="hi")], [huge_tool], ModelSettings()
+    )
+    measured = _measure(request)
+
+    async def run() -> CompactionOutcome | None:
+        return await maybe_compact(
+            store=store,
+            adapter=adapter,
+            thread_id=THREAD,
+            turn_id=TURN,
+            items=before,
+            limit_tokens=1_000,
+            keep_tail_items=2,
+            measure_tokens=_measure,
+            request=request,
+            measured_tokens=measured,
+        )
+
+    outcome = asyncio.run(run())
+    assert outcome is not None and outcome.compacted
+    assert [i.kind for i in store.read_items(THREAD)].count(ItemKind.SUMMARY) == 1
+    # 内部无 tools 的投影并未超限:证明判定确实用了传入的 request 口径。
+    projection = adapter.build_request(
+        to_messages(elide_old_tool_outputs(build_context(before))), (), ModelSettings()
+    )
+    assert _measure(projection) <= 1_000
+
+
+def test_no_coverable_range_reports_skipped_without_writing(store: Store) -> None:
+    """K-1:超限但无可覆盖区间 → compacted=False 的 outcome(不是 None),不写 item。"""
+    before = _seed(
+        store, [ItemEntry(kind=ItemKind.USER_MESSAGE, payload={"text": "only"})]
+    )
+    adapter = _summary_adapter("UNUSED")
+    request = adapter.build_request(
+        [ModelMessage(role="user", content="x" * 100)], (), ModelSettings()
+    )
+
+    async def run() -> CompactionOutcome | None:
+        return await maybe_compact(
+            store=store,
+            adapter=adapter,
+            thread_id=THREAD,
+            turn_id=TURN,
+            items=before,
+            limit_tokens=1,
+            keep_tail_items=8,  # 唯一 item 在保留尾部 → 无候选
+            measure_tokens=_measure,
+            request=request,
+            measured_tokens=_measure(request),
+        )
+
+    outcome = asyncio.run(run())
+    assert outcome is not None and outcome.compacted is False
+    assert store.read_items(THREAD) == before
+
+
+def test_summary_prompt_respects_injected_char_limit(store: Store) -> None:
+    """K-4:composition 注入的字符上限原样生效(小窗口模型)。"""
+    before = _seed(
+        store,
+        [
+            ItemEntry(kind=ItemKind.USER_MESSAGE, payload={"text": "Z" * 50_000}),
+            ItemEntry(kind=ItemKind.USER_MESSAGE, payload={"text": "after"}),
+        ],
+    )
+    adapter = _summary_adapter()
+
+    async def run() -> CompactionOutcome | None:
+        return await maybe_compact(
+            store=store,
+            adapter=adapter,
+            thread_id=THREAD,
+            turn_id=TURN,
+            items=before,
+            limit_tokens=10,
+            keep_tail_items=0,
+            summary_prompt_max_chars=256,
+            measure_tokens=_measure,
+        )
+
+    assert asyncio.run(run()) is not None
+    assert adapter.last_request is not None
+    assert len(adapter.last_request.messages[0].content) <= 256
 
 
 def test_summary_request_is_bounded_and_elides_old_tool_bodies(store: Store) -> None:

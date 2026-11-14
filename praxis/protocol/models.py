@@ -29,6 +29,9 @@ _API_KEY_ENV_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # 公开 marker 供探针识别"装配期丢弃过调用"(不得从私有常量跨模块 import)。
 DROPPED_TOOL_ARGUMENTS_MARKER = "[invalid tool call arguments dropped:"
 _DROPPED_ARGUMENTS_HINT = DROPPED_TOOL_ARGUMENTS_MARKER + " {count}]"
+# K-3/R16-2:无 call_id 的装配期丢弃同样留计数提示(此前是静默 skip)。
+DROPPED_TOOL_CALL_NO_ID_MARKER = "[tool call without id dropped:"
+_DROPPED_NO_ID_HINT = DROPPED_TOOL_CALL_NO_ID_MARKER + " {count}]"
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +159,22 @@ class ModelResponse:
     reasoning: str = ""
 
 
+def usage_payload(usage: Usage) -> dict[str, JsonValue]:
+    """D2 契约的完整 usage 形状(持久化用;读侧只消费需要的前两项)。
+
+    H-1:此前 ``model_response`` item 只落 input/output,丢掉 source
+    (provider/estimated)与 cache/reasoning 子集;压缩摘要的 usage 也随之丢失。
+    单一形状在这里定义,turn 与 compaction 共用。
+    """
+    return {
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cached_input_tokens": usage.cached_input_tokens,
+        "reasoning_tokens": usage.reasoning_tokens,
+        "source": usage.source,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 流式事件:adapter 的唯一产出形状,assemble_model_events 的唯一输入
 # ---------------------------------------------------------------------------
@@ -233,6 +252,8 @@ def assemble_model_events(events: Sequence[ModelEvent]) -> ModelResponse:
       ``arguments`` 分片一直拼到 finish,不冻结首帧;
     - 空 arguments 视作 ``{}``;非 JSON 或非 object 的调用**丢弃**并在 content
       尾部留下有界计数提示,绝不抛穿 turn(畸形 provider 响应是常态);
+    - 无 ``call_id`` 的调用同样丢弃并留下 ``[tool call without id dropped: n]``
+      有界提示(K-3/R16-2:不再静默跳过);
     - 未收到 ``ModelStreamFinished`` → ``Usage(0, 0, source="estimated")``
       且 ``finish_reason=""``,如实标注估算来源。
     """
@@ -259,10 +280,13 @@ def assemble_model_events(events: Sequence[ModelEvent]) -> ModelResponse:
 
     calls: list[ModelToolCall] = []
     dropped = 0
+    dropped_without_id = 0
     for index in sorted(partials):
         partial = partials[index]
         if partial.call_id is None:
-            # 无 id 的调用无法与 tool 结果配对,不装配(也不计入 arguments 提示)。
+            # 无 id 的调用无法与 tool 结果配对,不装配;K-3/R16-2:不能再静默
+            # 跳过——留下与 invalid-arguments 同形态的有界计数提示。
+            dropped_without_id += 1
             continue
         arguments = _parse_arguments("".join(partial.argument_fragments))
         if arguments is None:
@@ -276,9 +300,14 @@ def assemble_model_events(events: Sequence[ModelEvent]) -> ModelResponse:
             )
         )
 
-    content = "".join(content_parts)
+    hints: list[str] = []
     if dropped:
-        hint = _DROPPED_ARGUMENTS_HINT.format(count=dropped)
+        hints.append(_DROPPED_ARGUMENTS_HINT.format(count=dropped))
+    if dropped_without_id:
+        hints.append(_DROPPED_NO_ID_HINT.format(count=dropped_without_id))
+    content = "".join(content_parts)
+    if hints:
+        hint = " ".join(hints)
         content = f"{content} {hint}" if content else hint
 
     return ModelResponse(
