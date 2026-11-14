@@ -390,10 +390,11 @@ async def execute(call: ToolCall, ctx: ExecCtx) -> ToolResult:
         # 未形成 use 就不存在"已决策未执行"的中间态,直接落 result。
         # checked_path 对嵌入 NUL / ENAMETOOLONG 等畸形路径抛的是 ValueError/OSError;
         # 这里统一收口,否则单个畸形参数就能炸穿 turn(B10 家族)。
+        # 非校验异常带类型名前缀:工具实现里的编码 bug 不伪装成用户输入错误。
         message = (
             f"{exc.path}: {exc.message}"
             if isinstance(exc, ToolValidationError)
-            else _bounded(str(exc))
+            else f"{type(exc).__name__}: {_bounded(str(exc))}"
         )
         result = _error_result(
             call, status=ResultStatus.ERROR, error_code="invalid_input",

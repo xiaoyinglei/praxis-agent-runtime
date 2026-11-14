@@ -197,17 +197,39 @@ def test_read_lines_binary_file_is_result(tmp_path: Path) -> None:
 
 
 def test_read_lines_huge_single_line_is_bounded(tmp_path: Path) -> None:
-    # I-1:8MB 单行不得无界阻塞;整行放不进内部字节预算 → 空内容 + truncated,
-    # next_start_line 指向该行(不返回撕裂行,也不切多字节)。
+    # I-1:8MB 单行不得无界阻塞;页首超预算单行 → 有界预览 + 可见提示 + 游标前进。
     (tmp_path / "huge.txt").write_bytes(b"x" * 8_000_000 + b"\n")
     started = time.monotonic()
     r = run(create_read_tool(tmp_path), {"path": "huge.txt", "start_line": 1, "max_lines": 200})
     assert time.monotonic() - started < 3
     assert r.status is ResultStatus.OK
-    assert r.text == ""
-    assert r.metadata["line_count"] == 0
-    assert r.metadata["next_start_line"] == 1
+    assert not (r.truncated and r.metadata["next_start_line"] == r.metadata["start_line"] and r.text == "")
+    assert r.metadata["line_exceeds_budget"] is True
+    assert r.metadata["line_count"] == 1
+    assert r.metadata["next_start_line"] == 2
     assert r.truncated
+    assert "�" not in r.text
+    assert r.text.startswith("x")
+    assert "line exceeds the line-mode byte budget" in r.text
+    # 预览仍受页预算约束(提示行不计入预算)
+    assert len(r.text.encode("utf-8")) < 1_000_000 + 200
+
+
+def test_read_lines_over_budget_line_advances_cursor(tmp_path: Path) -> None:
+    # 复审 fix round 2:超预算单行不是无前进死路——游标推进后同一文件能继续读
+    (tmp_path / "f.txt").write_bytes(b"y" * 2_000_000 + b"\nsecond\n")
+    tool = create_read_tool(tmp_path)
+    first = run(tool, {"path": "f.txt", "start_line": 1, "max_lines": 200})
+    assert first.metadata["line_exceeds_budget"] is True
+    start = first.metadata["start_line"]
+    next_start = first.metadata["next_start_line"]
+    assert next_start == start + 1  # 游标真的前进,不是自循环
+    assert not (first.truncated and next_start == start and first.text == "")
+    second = run(tool, {"path": "f.txt", "start_line": next_start, "max_lines": 200})
+    assert second.text == "second"
+    assert second.metadata["line_exceeds_budget"] is False
+    assert second.metadata["next_start_line"] is None
+    assert not second.truncated
 
 
 def test_read_lines_million_line_file_is_bounded(tmp_path: Path) -> None:

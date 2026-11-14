@@ -3,7 +3,8 @@
 read 支持两种**互斥**模式:字节分页(``offset``/``max_bytes``)与行分页
 (``start_line``/``max_lines``,1-based,按 ``\\n`` 切行)。行模式只在行边界切分,
 跨 UTF-8 多字节边界不产出替换字符;内部另有字节预算(``_READ_LINE_MAX_BYTES``),
-超长单行整行不返回,避免无界阻塞事件循环。二进制探测沿用首块空字节启发式。
+页首超预算单行返回保码点边界的有界预览并把游标推进过该行,避免无前进死路。
+二进制探测沿用首块空字节启发式。
 list_files 输出确定序的 ``<kind>\\t<bytes>\\t<相对路径>`` 清单:目录 ``d``、文件 ``f``、
 符号链接 ``l`` 且一律不跟随;地板目录子树从 ``FLOOR_ENTRIES`` 派生后跳过。
 write 用同目录 tmp + os.replace 原子落盘。
@@ -57,6 +58,11 @@ _READ_MAX_LINES = 2_000
 # 在 async run 里无界阻塞事件循环(超时/取消都送不进去)。超预算时在整行边界收口。
 _READ_LINE_MAX_BYTES = 1_000_000
 _READ_LINE_CHUNK_BYTES = 65_536
+# 页首超预算单行的可见提示:预览必须显式说明"只看到开头",并指向字节模式。
+_LINE_BUDGET_HINT = (
+    "[line exceeds the line-mode byte budget; preview only — "
+    "use read with offset/max_bytes for the remainder]"
+)
 
 _LIST_DEFAULT_MAX_ENTRIES = 200
 _LIST_MAX_ENTRIES = 2_000
@@ -165,7 +171,12 @@ def _decode_line(raw: bytes) -> str:
 
 
 def _line_metadata(
-    size: int, *, start_line: int, lines: Sequence[str], truncated: bool
+    size: int,
+    *,
+    start_line: int,
+    lines: Sequence[str],
+    truncated: bool,
+    line_exceeds_budget: bool = False,
 ) -> dict[str, Any]:
     line_count = len(lines)
     return {
@@ -175,6 +186,7 @@ def _line_metadata(
         "end_line": start_line + line_count - 1 if line_count else None,
         "next_start_line": start_line + line_count if truncated else None,
         "line_count": line_count,
+        "line_exceeds_budget": line_exceeds_budget,
         "truncated": truncated,
     }
 
@@ -226,20 +238,26 @@ def _read_line_page(
         lines: list[str] = []
         bytes_used = 0
         truncated = False
+        line_exceeds_budget = False
         while len(lines) < max_lines:
             remaining = _READ_LINE_MAX_BYTES - bytes_used
             if remaining <= 0:
                 # 页内字节预算用尽:是否还有后续内容决定 truncated
                 truncated = bool(stream.read(1))
                 break
-            # 有界读行:最多读 remaining+1 字节;整行放不下就收口,
-            # 绝不返回被撕裂的行(也不按字节切,保住码点完整)。
+            # 有界读行:最多读 remaining+1 字节。
             raw = stream.readline(remaining + 1)
             if not raw:
                 break
             if len(raw) > remaining:
-                # 单行超过页内预算:整行不返回(保住"整行"契约),游标停在它上面;
-                # 该行只能改用字节模式读取。
+                if not lines:
+                    # 页首即超预算单行(remaining 此时是完整预算):返回保代码点边界的
+                    # 有界预览 + 可见提示,并**把游标推进过这一行**——绝不出现
+                    # truncated=True 且 next_start_line==start_line 的无前进死路。
+                    preview = _complete_text_page(raw, remaining)
+                    lines.append(f"{_decode_line(preview)}\n{_LINE_BUDGET_HINT}")
+                    line_exceeds_budget = True
+                # 已有整行时停在当前行之前:下一页以完整预算重新开始,可完整返回该行。
                 truncated = True
                 break
             lines.append(_decode_line(raw))
@@ -254,7 +272,13 @@ def _read_line_page(
         "read",
         content="\n".join(lines),
         status=ResultStatus.OK,
-        metadata=_line_metadata(size, start_line=start_line, lines=lines, truncated=truncated),
+        metadata=_line_metadata(
+            size,
+            start_line=start_line,
+            lines=lines,
+            truncated=truncated,
+            line_exceeds_budget=line_exceeds_budget,
+        ),
         truncated=truncated,
     )
 
@@ -340,8 +364,9 @@ def create_read_tool(workspace: Path) -> Tool:
                 "Read a workspace text file in byte pages (offset/max_bytes, returns "
                 "next_offset when truncated) or line pages (start_line/max_lines, returns "
                 "next_start_line when truncated). The two modes are mutually exclusive; "
-                "line pages are also bounded by an internal byte budget, and a single line "
-                "larger than that budget is not returned (use byte pages for it). Binary "
+                "line pages are also bounded by an internal byte budget, and a line "
+                "larger than that budget is returned as a bounded preview with the "
+                "cursor advanced past it (use byte pages for the remainder). Binary "
                 "files are reported without their bytes."
             ),
             input_schema={
