@@ -1,0 +1,284 @@
+"""模型凭据的唯一落点(设计 §5.15;D6):env 优先、macOS Keychain、POSIX 0600 文件。
+
+凭据值**绝不**进入任何 SQLite 库、YAML、item payload 或 argv:全局配置库只存
+``api_key_env``(变量名),本模块按 ``sha256(config_dir\\nname\\nendpoint)`` 的
+identity 绑定读写。macOS 走 ``security -i`` 的 stdin(值不进进程参数表),POSIX
+走 ``host_config_dir()/credentials/models.json``(0700 目录 + 0600 文件,排他锁下
+read-merge-atomic-write)。
+
+失败一律固定文案且 ``raise ... from None``:损坏文件/畸形 JSON/越权权限都不得把
+body 或原异常文本带进错误消息。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shlex
+import stat
+import subprocess
+import sys
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
+
+from praxis.protocol.floor import host_config_dir
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - win32 在入口就拒绝,不会走到文件分支
+    fcntl = None  # type: ignore[assignment]
+
+_PLATFORM = sys.platform
+
+_KEYCHAIN_ACCOUNT = "praxis"
+_SERVICE_PREFIX = "praxis.model."
+_MAX_FILE_BYTES = 1_048_576
+
+_FILE_ERROR = "Credential file must be private, bounded, and owned by the current user"
+_DIRECTORY_ERROR = "Credential directory must be private and owned by the current user"
+_KEYCHAIN_READ_ERROR = "Unable to read model credential from Keychain"
+_KEYCHAIN_WRITE_ERROR = "Unable to save model credential in Keychain"
+_KEYCHAIN_DELETE_ERROR = "Unable to remove model credential from Keychain"
+_KEYCHAIN_VERIFY_ERROR = "Model credential storage verification failed"
+_UNSUPPORTED_PLATFORM = (
+    "Saved model credentials require macOS or POSIX; provide the named environment variable"
+)
+
+
+def credential_identity(name: str, endpoint: str) -> str:
+    """凭据 identity:目录 + 环境变量名 + 规范化 endpoint 的 sha256。
+
+    endpoint 末尾斜杠被折叠,因此同一端点的两种写法命中同一条凭据。
+    """
+    value = f"{host_config_dir()}\n{name}\n{endpoint.rstrip('/')}"
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _service(identity: str) -> str:
+    return _SERVICE_PREFIX + identity
+
+
+def _validate_key(key: object) -> str:
+    if (
+        not isinstance(key, str)
+        or not key.strip()
+        or any(ord(char) < 32 for char in key)
+    ):
+        raise ValueError("API Key must be nonempty and contain no control characters")
+    return key.strip()
+
+
+def _credential_directory() -> Path:
+    return host_config_dir() / "credentials"
+
+
+def _private_directory() -> Path:
+    directory = _credential_directory()
+    if directory.is_symlink():
+        raise ValueError(_DIRECTORY_ERROR) from None
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        metadata = directory.stat()
+    except OSError:
+        raise ValueError(_DIRECTORY_ERROR) from None
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_mode & 0o077
+    ):
+        raise ValueError(_DIRECTORY_ERROR) from None
+    return directory
+
+
+def _read_keys(path: Path) -> dict[str, str]:
+    """读取并校验凭据文件;任何失败都收敛到固定文案(不回显 body/异常)。"""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        raise ValueError(_FILE_ERROR) from None
+    with os.fdopen(fd, "rb") as handle:
+        metadata = os.fstat(handle.fileno())
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_mode & 0o077
+            or metadata.st_nlink != 1
+            or metadata.st_size > _MAX_FILE_BYTES
+        ):
+            raise ValueError(_FILE_ERROR) from None
+        try:
+            data = json.loads(handle.read())
+            if (
+                not isinstance(data, dict)
+                or set(data) != {"version", "keys"}
+                or data["version"] != 1
+            ):
+                raise ValueError
+            keys = data["keys"]
+            if not isinstance(keys, dict):
+                raise ValueError
+            parsed: dict[str, str] = {}
+            for name, value in keys.items():
+                if not isinstance(name, str):
+                    raise ValueError
+                parsed[name] = _validate_key(value)
+            return parsed
+        except (TypeError, UnicodeError, ValueError):
+            raise ValueError(_FILE_ERROR) from None
+
+
+@contextmanager
+def _exclusive(directory: Path) -> Iterator[None]:
+    """排他锁:进程内/跨进程的 read-merge-atomic-write 必须串行。"""
+    if fcntl is None:  # pragma: no cover - 平台入口已拒绝
+        raise ValueError(_UNSUPPORTED_PLATFORM) from None
+    lock_path = directory / "models.lock"
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _atomic_write_keys(path: Path, keys: dict[str, str]) -> None:
+    directory = path.parent
+    fd, temporary = tempfile.mkstemp(prefix=".models.json.", dir=str(directory))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"version": 1, "keys": keys}, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def load_model_credential(api_key_env: str, endpoint: str) -> str | None:
+    """读取已保存的凭据值;未保存返回 None。"""
+    identity = credential_identity(api_key_env, endpoint)
+    if _PLATFORM == "darwin":
+        result = subprocess.run(
+            [
+                "/usr/bin/security",
+                "find-generic-password",
+                "-a",
+                _KEYCHAIN_ACCOUNT,
+                "-s",
+                _service(identity),
+                "-w",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if result.returncode == 44:
+            return None
+        if result.returncode != 0:
+            raise ValueError(_KEYCHAIN_READ_ERROR) from None
+        return _validate_key(result.stdout.strip())
+    if _PLATFORM == "win32":
+        raise ValueError(_UNSUPPORTED_PLATFORM) from None
+    directory = _credential_directory()
+    if not directory.exists() and not directory.is_symlink():
+        return None
+    return _read_keys(_private_directory() / "models.json").get(identity)
+
+
+def resolve_model_credential(api_key_env: str, endpoint: str) -> str | None:
+    """解析运行期凭据:非空环境变量优先,其次已保存的 Keychain/0600 文件。"""
+    value = os.environ.get(api_key_env)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return load_model_credential(api_key_env, endpoint)
+
+
+def save_model_credential(api_key_env: str, endpoint: str, value: str) -> None:
+    """保存凭据值并回读校验;值绝不进入 argv。"""
+    identity = credential_identity(api_key_env, endpoint)
+    key = _validate_key(value)
+    if _PLATFORM == "darwin":
+        # security 的交互输入把密钥留在 stdin,不进进程参数表。
+        command = (
+            "add-generic-password -U -a "
+            + shlex.quote(_KEYCHAIN_ACCOUNT)
+            + " -s "
+            + shlex.quote(_service(identity))
+            + " -w "
+            + shlex.quote(key)
+            + "\n"
+        )
+        result = subprocess.run(
+            ["/usr/bin/security", "-i"],
+            input=command,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if result.returncode != 0 or "SecKeychain" in result.stderr:
+            raise ValueError(_KEYCHAIN_WRITE_ERROR) from None
+        if load_model_credential(api_key_env, endpoint) != key:
+            raise ValueError(_KEYCHAIN_VERIFY_ERROR) from None
+        return
+    if _PLATFORM == "win32":
+        raise ValueError(_UNSUPPORTED_PLATFORM) from None
+    path = _private_directory() / "models.json"
+    with _exclusive(path.parent):
+        keys = _read_keys(path)
+        keys[identity] = key
+        _atomic_write_keys(path, keys)
+
+
+def delete_model_credential(api_key_env: str, endpoint: str) -> None:
+    """删除已保存的凭据;不存在是 no-op。"""
+    identity = credential_identity(api_key_env, endpoint)
+    if _PLATFORM == "darwin":
+        result = subprocess.run(
+            [
+                "/usr/bin/security",
+                "delete-generic-password",
+                "-a",
+                _KEYCHAIN_ACCOUNT,
+                "-s",
+                _service(identity),
+            ],
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+        if result.returncode not in {0, 44}:
+            raise ValueError(_KEYCHAIN_DELETE_ERROR) from None
+        return
+    if _PLATFORM == "win32":
+        raise ValueError(_UNSUPPORTED_PLATFORM) from None
+    directory = _credential_directory()
+    if not directory.exists() and not directory.is_symlink():
+        return
+    private = _private_directory()
+    path = private / "models.json"
+    with _exclusive(private):
+        keys = _read_keys(path)
+        if keys.pop(identity, None) is None:
+            return
+        _atomic_write_keys(path, keys)
+
+
+__all__ = [
+    "credential_identity",
+    "delete_model_credential",
+    "load_model_credential",
+    "resolve_model_credential",
+    "save_model_credential",
+]

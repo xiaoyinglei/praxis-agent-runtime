@@ -238,6 +238,50 @@ def test_cache_bounded_and_not_dirty_after_write(store: ModelConfigStore) -> Non
     assert "m199" in store._cache
 
 
+def test_conflict_path_invalidates_cache(tmp_path: Path) -> None:
+    """R-T6-3:外部写后触发 CAS 冲突,本实例也不得继续服务陈旧缓存条目。"""
+    db = tmp_path / "config.sqlite"
+    a = ModelConfigStore(db)
+    b = ModelConfigStore(db)
+    try:
+        a.upsert_connection(_CONNECTION)
+        ra = a.upsert_model(_model("alpha", max_output_tokens=4096))
+        cached = a.get("alpha")
+        assert cached is not None and cached.spec.max_output_tokens == 4096
+        assert "alpha" in a._cache
+
+        b.upsert_model(_model("alpha", max_output_tokens=1024))
+
+        with pytest.raises(ConfigVersionConflict):
+            a.upsert_model(_model("alpha", max_output_tokens=2048), expected_revision=ra)
+        # 冲突事务回滚 + 缓存失效:下一次读必须看到 B 的外部写,而不是 4096。
+        fresh = a.get("alpha")
+        assert fresh is not None and fresh.spec.max_output_tokens == 1024
+    finally:
+        a.close()
+        b.close()
+
+
+def test_refresh_drops_external_staleness(tmp_path: Path) -> None:
+    """R-T6-5:跨实例缓存契约——失效只发生在写者实例;观察外部写需 refresh()。"""
+    db = tmp_path / "config.sqlite"
+    a = ModelConfigStore(db)
+    b = ModelConfigStore(db)
+    try:
+        a.upsert_connection(_CONNECTION)
+        a.upsert_model(_model("alpha", max_output_tokens=4096))
+        assert a.get("alpha") is not None  # 缓存住
+        b.upsert_model(_model("alpha", max_output_tokens=1024))
+        stale = a.get("alpha")
+        assert stale is not None and stale.spec.max_output_tokens == 4096
+        a.refresh()
+        refreshed = a.get("alpha")
+        assert refreshed is not None and refreshed.spec.max_output_tokens == 1024
+    finally:
+        a.close()
+        b.close()
+
+
 # ---------------------------------------------------------------------------
 # 并发:有界线程数,不丢行、CAS 不死循环
 # ---------------------------------------------------------------------------
@@ -375,20 +419,32 @@ def test_config_db_denied_by_floor_via_decide(
 def test_real_sandbox_denies_config_store_read_and_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config_dir = tmp_path / "praxis-config"
+    # R-T6-4:显式授予配置目录读写,使失败只能归因于 private-path 规则本身;
+    # 同时加阳性对照(workspace 内写 control 必须成功),排除"整个沙箱都写不了"。
+    config_dir = (tmp_path / "praxis-config").resolve()
     config_dir.mkdir()
     db = config_dir / "config.sqlite"
     db.write_text("orig\n", encoding="utf-8")
     monkeypatch.setenv("PRAXIS_CONFIG_DIR", str(config_dir))
-    workspace = tmp_path / "ws"
+    workspace = (tmp_path / "ws").resolve()
     workspace.mkdir()
-    ctx = PermissionContext(workspace=str(workspace), policy=PermissionPolicy(), mode="on-request")
+    policy = PermissionPolicy(
+        filesystem=(PathRule(path=str(config_dir), access="write"),)
+    )
+    ctx = PermissionContext(workspace=str(workspace), policy=policy, mode="on-request")
     use = ResolvedUse(
         effects=frozenset({ToolEffect.EXECUTE_PROCESS}),
         targets=(ToolTarget(kind="path", value=str(workspace)),),
     )
     spec = compile_sandbox(ctx, use, workspace)
     try:
+        control = subprocess.run(
+            [*spec.argv_prefix, "/bin/bash", "-lc", f"echo ok > {workspace / 'control'}"],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
         write = subprocess.run(
             [*spec.argv_prefix, "/bin/bash", "-lc", f"echo hacked > {db}"],
             cwd=workspace,
@@ -405,6 +461,9 @@ def test_real_sandbox_denies_config_store_read_and_write(
         )
     finally:
         finalize_sandbox(spec, workspace)
+    # 阳性对照:沙箱本身可写 workspace;失败不可能来自"沙箱全禁写"。
+    assert control.returncode == 0, control
+    assert (workspace / "control").read_text(encoding="utf-8").strip() == "ok"
     assert write.returncode != 0, write
     assert read.returncode != 0, read
     assert db.read_text(encoding="utf-8") == "orig\n"

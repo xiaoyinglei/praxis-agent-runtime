@@ -144,6 +144,34 @@ def test_ollama_rejects_unknown_provider_options_instead_of_a_second_merge_rule(
         adapter.build_request([ModelMessage(role="user", content="hi")], (), ModelSettings())
 
 
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("num_ctx", 8192),
+        ("format", "json"),
+        ("mirostat", 2),
+        ("mirostat_eta", 0.1),
+        ("mirostat_tau", 5.0),
+        ("repeat_penalty", 1.1),
+        ("repeat_last_n", 64),
+        ("stop", ["</s>"]),
+        ("num_gpu", 1),
+        ("num_thread", 4),
+    ],
+)
+def test_ollama_accepts_useful_sampling_options(key: str, value: Any) -> None:
+    """R-T6-1:允许集扩到实际有用的采样键,但仍是响亮 allowlist。"""
+    adapter = OllamaAdapter(_spec(provider_options={key: value}))
+    req = adapter.build_request([ModelMessage(role="user", content="hi")], (), ModelSettings())
+    assert json.loads(req.serialized_json)["options"][key] == value
+
+
+def test_ollama_temperature_remains_wire_owned() -> None:
+    adapter = OllamaAdapter(_spec(provider_options={"temperature": 0.3}))
+    with pytest.raises(ValueError, match="wire-owned field"):
+        adapter.build_request([ModelMessage(role="user", content="hi")], (), ModelSettings())
+
+
 def test_ollama_messages_use_object_arguments_not_json_strings() -> None:
     call = ModelToolCall(call_id="c1", name="read_file", arguments={"path": "a.txt"})
     adapter = OllamaAdapter(_spec())
@@ -435,5 +463,9 @@ def test_composition_dispatches_adapters_by_provider() -> None:
     assert isinstance(compat, OpenAICompatAdapter)
     with pytest.raises(ValueError, match="requires an API key"):
         _adapter_for(ModelSpec(model_id="m", base_url="https://unit.test/v1"))
+    with pytest.raises(ValueError, match="base_url"):
+        _adapter_for(ModelSpec(model_id="m"), "k")
+    with pytest.raises(ValueError, match="absolute http"):
+        _adapter_for(ModelSpec(model_id="m", base_url="unit.test"), "k")
     with pytest.raises(ValueError, match="scripted"):
         _adapter_for(ModelSpec(model_id="m", provider="scripted"))

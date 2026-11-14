@@ -92,8 +92,10 @@ def _is_under(candidate: Path, root_str: str) -> bool:
 def host_config_dir() -> Path:
     """宿主全局配置目录(唯一来源;adapters 只消费,分层不破)。
 
-    ``PRAXIS_CONFIG_DIR`` 若给出则原样展开(expandvars + expanduser),否则
-    ``~/.config/praxis``。返回值语义与阶段 2 的 host_private_paths()[0] 逐字一致。
+    ``PRAXIS_CONFIG_DIR`` 给出时先 expandvars + expanduser,再经 ``Path()``
+    归一化——尾斜杠、重复的 ``//`` 与 ``.`` 成分会被折叠,因此返回值不保证与
+    环境变量字符串逐字相同(也不 resolve symlink);未给出时
+    ``~/.config/praxis``。其下固定为 ``config.sqlite`` 与 ``credentials/``。
     """
     config_env = os.environ.get("PRAXIS_CONFIG_DIR")
     if config_env:

@@ -12,6 +12,10 @@ Task 8(R6-7)扩展:权限更新面 re-export PermissionUpdate/PathRule/ToolRule/
 NetworkRule/PermissionMode/apply_update——宿主/UI 构造与合并更新只经此出口。
 D9 提醒:session/always 的 NetworkRule 授权放行 URL 级工具,但 bash
 (EXECUTE_PROCESS)的命令网络因规则在场一律 deny(阶段 3 web 前无命令网络授权)。
+Task 6 扩展:全局模型注册表与凭据面 re-export——ModelConfigStore/ModelEntry/
+ConnectionEntry/CostMicros/ConfigVersionConflict、resolve/save_model_credential、
+model_adapter_for/validate_model_spec/probe_model/ProbeOutcome。CLI 的
+``praxis models`` 因此不直依 adapters(provider 分派仍只有 composition 一处)。
 
 ``ConversationBusy``/``ResumeNotConfirmed`` 定义在 core.session 并由这里
 re-export:core 不得 import interfaces(import-linter praxis_core_purity),
@@ -20,9 +24,20 @@ re-export:core 不得 import interfaces(import-linter praxis_core_purity),
 
 from __future__ import annotations
 
+from praxis.adapters.config.credentials import (
+    resolve_model_credential,
+    save_model_credential,
+)
+from praxis.adapters.config.store import (
+    ConfigVersionConflict,
+    ConnectionEntry,
+    ModelConfigStore,
+    ModelEntry,
+)
 from praxis.adapters.models.openai_compat import OpenAICompatAdapter
+from praxis.adapters.models.probe import ProbeOutcome, probe_model
 from praxis.adapters.models.scripted import ScriptedAdapter
-from praxis.composition import build_session
+from praxis.composition import build_session, model_adapter_for, validate_model_spec
 from praxis.core.events import Subscription
 from praxis.core.locks import ThreadBusy
 from praxis.core.permission import apply_update
@@ -30,7 +45,7 @@ from praxis.core.session import ConversationBusy, ResumeNotConfirmed, Session
 from praxis.core.statemachine import TurnStatus
 from praxis.core.turn import ApprovalSummary, TurnResult
 from praxis.protocol.items import Item, ItemKind
-from praxis.protocol.models import ModelResponse, ModelSpec, ModelToolCall, Usage
+from praxis.protocol.models import CostMicros, ModelResponse, ModelSpec, ModelToolCall, Usage
 from praxis.protocol.permission import PermissionMode, PermissionUpdate
 from praxis.protocol.policy import NetworkRule, PathRule, PermissionPolicy, ToolRule
 from praxis.store.turns import Turn
@@ -40,9 +55,14 @@ open_session = build_session
 
 __all__ = [
     "ApprovalSummary",
+    "ConfigVersionConflict",
+    "ConnectionEntry",
     "ConversationBusy",
+    "CostMicros",
     "Item",
     "ItemKind",
+    "ModelConfigStore",
+    "ModelEntry",
     "ModelResponse",
     "ModelSpec",
     "ModelToolCall",
@@ -52,6 +72,7 @@ __all__ = [
     "PermissionMode",
     "PermissionPolicy",
     "PermissionUpdate",
+    "ProbeOutcome",
     "ResumeNotConfirmed",
     "ScriptedAdapter",
     "Session",
@@ -64,5 +85,10 @@ __all__ = [
     "Usage",
     "VerifyReport",
     "apply_update",
+    "model_adapter_for",
     "open_session",
+    "probe_model",
+    "resolve_model_credential",
+    "save_model_credential",
+    "validate_model_spec",
 ]

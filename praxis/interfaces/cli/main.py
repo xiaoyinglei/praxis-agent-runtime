@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -25,14 +24,13 @@ import click
 import typer
 from typer.core import TyperGroup
 
+from praxis.interfaces.cli.models_cli import app as models_app
 from praxis.interfaces.cli.render import render_item
 from praxis.interfaces.cli.slash import REGISTRY, ExitChat
 from praxis.interfaces.sdk import (
     ConversationBusy,
     ModelResponse,
-    ModelSpec,
     ModelToolCall,
-    OpenAICompatAdapter,
     PermissionMode,
     PermissionPolicy,
     ResumeNotConfirmed,
@@ -52,8 +50,11 @@ EXIT_USAGE = 3
 _DEFAULT_THREAD = "default"
 
 _WORKSPACE_OPT = typer.Option(None, "--workspace", help="Workspace directory (default: cwd).")
-_MODEL_OPT = typer.Option(None, "--model", help="Model id (else env PRAXIS_MODEL).")
-_BASE_URL_OPT = typer.Option(None, "--base-url", help="OpenAI-compatible base URL (else env PRAXIS_BASE_URL).")
+_MODEL_OPT = typer.Option(
+    None,
+    "--model",
+    help="Registered model id (else the default; PRAXIS_MODEL_ID is the unregistered escape hatch).",
+)
 _SCRIPTED_OPT = typer.Option(None, "--scripted", help="Scripted responses JSON path (offline/acceptance).")
 _THREAD_OPT = typer.Option(None, "--thread", help='Thread id (default: "default"; R15 stable across commands).')
 _CONFIRM_OPT = typer.Option(False, "--confirm", help="Resume an interrupted turn (human guard, §5.2).")
@@ -110,10 +111,11 @@ class _UsageExit3Group(TyperGroup):
 app = typer.Typer(
     cls=_UsageExit3Group,
     name="praxis",
-    help="Praxis workspace agent — minimal console (run/chat/resume/status/log/steer/verify).",
+    help="Praxis workspace agent — minimal console (run/chat/resume/status/log/steer/verify/models).",
     add_completion=False,
     no_args_is_help=True,
 )
+app.add_typer(models_app, name="models")
 
 
 # ---------------------------------------------------------------------------
@@ -203,15 +205,28 @@ def _open_session_guarded(
     workspace: Path,
     adapter: Any,
     *,
+    model: str | None = None,
     policy: PermissionPolicy | None,
     mode: PermissionMode | None,
     thread_id: str,
 ) -> Session:
     """R12:open_session 的 ValueError(损坏的既有状态,如 .praxis/permissions.json
     无法解析)是运行时失败 → 干净错误消息 + EXIT_FAILED(1),绝不裸 traceback(C4)。
+    KeyError 来自模型注册表(未注册/无默认),属于显式配置选择错误 → EXIT_USAGE(3)。
     用法错误(--policy/--scripted 坏参)在此之前已以 BadParameter 抛出,保持退出码 3。"""
     try:
-        return open_session(workspace, adapter, policy=policy, mode=mode, thread_id=thread_id)
+        return open_session(
+            workspace,
+            adapter,
+            model=model,
+            policy=policy,
+            mode=mode,
+            thread_id=thread_id,
+        )
+    except KeyError as exc:
+        message = exc.args[0] if exc.args else str(exc)
+        typer.echo(f"error: {message}", err=True)
+        raise typer.Exit(EXIT_USAGE) from None
     except ValueError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(EXIT_FAILED) from None
@@ -220,7 +235,6 @@ def _open_session_guarded(
 def _open_from_options(
     workspace: Path | None,
     model: str | None,
-    base_url: str | None,
     scripted: Path | None,
     thread: str | None,
     policy: Path | None = None,
@@ -239,19 +253,12 @@ def _open_from_options(
             mode=resolved_mode,
             thread_id=_resolve_thread(thread),
         )
-    resolved_model = model or os.environ.get("PRAXIS_MODEL", "")
-    if not resolved_model:
-        raise typer.BadParameter("no model configured: pass --model, set PRAXIS_MODEL, or use --scripted")
-    api_key = os.environ.get("PRAXIS_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
-    if not api_key:
-        raise typer.BadParameter("missing API key: set PRAXIS_API_KEY (or OPENAI_API_KEY), or use --scripted")
-    resolved_base_url = base_url or os.environ.get("PRAXIS_BASE_URL") or None
-    # base_url 单一来源:只经 ModelSpec 进入 adapter,构造器不再接受第二个地址。
-    spec = ModelSpec(model_id=resolved_model, base_url=resolved_base_url)
-    adapter = OpenAICompatAdapter(spec, api_key=api_key)
+    # R-T6-2:CLI 不再直接构造 provider adapter;模型解析与唯一分派都在
+    # composition(_adapter_from_registry → _adapter_for)。
     return _open_session_guarded(
         _resolve_workspace(workspace),
-        adapter,
+        None,
+        model=model,
         policy=resolved_policy,
         mode=resolved_mode,
         thread_id=_resolve_thread(thread),
@@ -325,14 +332,13 @@ def run(
     prompt: str,
     workspace: Path | None = _WORKSPACE_OPT,
     model: str | None = _MODEL_OPT,
-    base_url: str | None = _BASE_URL_OPT,
     scripted: Path | None = _SCRIPTED_OPT,
     thread: str | None = _THREAD_OPT,
     policy: Path | None = _POLICY_OPT,
     mode: str | None = _MODE_OPT,
 ) -> None:
     """一次性 turn:提交 prompt,打印结果,按 turn 终态决定退出码。"""
-    session = _open_from_options(workspace, model, base_url, scripted, thread, policy, mode)
+    session = _open_from_options(workspace, model, scripted, thread, policy, mode)
     try:
         result = asyncio.run(session.submit(prompt))
     except ConversationBusy as exc:
@@ -372,7 +378,6 @@ def resume(
     turn_id: str,
     workspace: Path | None = _WORKSPACE_OPT,
     model: str | None = _MODEL_OPT,
-    base_url: str | None = _BASE_URL_OPT,
     scripted: Path | None = _SCRIPTED_OPT,
     thread: str | None = _THREAD_OPT,
     policy: Path | None = _POLICY_OPT,
@@ -385,7 +390,7 @@ def resume(
     """续跑 paused/interrupted turn:--confirm 人工确认,--allow/--deny 审批,--reconcile 对账。"""
     approval_map = _parse_approval(allow, deny)
     reconcile_map = _parse_reconcile(reconcile)
-    session = _open_from_options(workspace, model, base_url, scripted, thread, policy, mode)
+    session = _open_from_options(workspace, model, scripted, thread, policy, mode)
     try:
         result = asyncio.run(
             session.resume(
@@ -522,14 +527,13 @@ def _chat_loop(session: Session) -> None:
 def chat(
     workspace: Path | None = _WORKSPACE_OPT,
     model: str | None = _MODEL_OPT,
-    base_url: str | None = _BASE_URL_OPT,
     scripted: Path | None = _SCRIPTED_OPT,
     thread: str | None = _THREAD_OPT,
     policy: Path | None = _POLICY_OPT,
     mode: str | None = _MODE_OPT,
 ) -> None:
     """交互式 REPL:每 turn 错误边界(C1);/help /status /exit 查表分派。"""
-    session = _open_from_options(workspace, model, base_url, scripted, thread, policy, mode)
+    session = _open_from_options(workspace, model, scripted, thread, policy, mode)
     typer.echo(f"praxis chat — thread {session.thread_id} — /help for commands, /exit to leave")
     try:
         _chat_loop(session)

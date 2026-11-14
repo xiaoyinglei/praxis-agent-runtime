@@ -18,12 +18,16 @@ thread_id 是外部输入且直接参与 lockfile 命名:在这里(边界)先验
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from collections.abc import Sequence
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 
+from praxis.adapters.config.credentials import resolve_model_credential
+from praxis.adapters.config.store import ModelConfigStore
 from praxis.adapters.models.ollama import OllamaAdapter
 from praxis.adapters.models.openai_compat import OpenAICompatAdapter
 from praxis.adapters.models.retry import make_retry_stream
@@ -32,7 +36,12 @@ from praxis.adapters.sandbox.compile import compile_sandbox, finalize_sandbox
 from praxis.core.events import EventBus
 from praxis.core.recovery import sweep
 from praxis.core.session import Session
-from praxis.protocol.models import ModelAdapter, ModelSpec
+from praxis.protocol.models import (
+    ModelAdapter,
+    ModelMessage,
+    ModelSettings,
+    ModelSpec,
+)
 from praxis.protocol.permission import PermissionContext, PermissionMode
 from praxis.protocol.policy import PermissionPolicy
 from praxis.protocol.retry import RetryPolicy
@@ -65,10 +74,21 @@ def _adapter_for(
 
     ``scripted`` 永远由 CLI/测试显式注入(它没有远端配置可解析),这里明确拒绝;
     openai-compatible 缺 key 属于边界错误——凭据只经参数进入,适配器不回读环境。
+    ``base_url`` 必须在构造期绝对化:注册表里的模型不允许悄悄回落到 SDK 默认端点。
     """
     if spec.provider == "ollama":
         return OllamaAdapter(spec, http_client=http_client)
     if spec.provider == "openai-compatible":
+        if not spec.base_url:
+            raise ValueError(
+                f"provider openai-compatible requires base_url for model {spec.model_id!r}"
+            )
+        parsed = urlsplit(spec.base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError(
+                "provider openai-compatible requires an absolute http(s) base_url, "
+                f"got {spec.base_url!r}"
+            )
         if api_key is None:
             raise ValueError(
                 f"provider openai-compatible requires an API key for model {spec.model_id!r}"
@@ -78,6 +98,90 @@ def _adapter_for(
         f"provider {spec.provider!r} must be injected explicitly (scripted), "
         "not constructed via composition"
     )
+
+
+def model_adapter_for(
+    spec: ModelSpec,
+    api_key: str | None = None,
+    *,
+    http_client: httpx.AsyncClient | None = None,
+) -> ModelAdapter:
+    """公开的 provider 分派入口(R-T6-2):cli/sdk 只经这里构造模型适配器。
+
+    唯一实现在 ``_adapter_for``;本函数只是可被 sdk re-export 的稳定名字,
+    不引入第二条分派路径。
+    """
+    return _adapter_for(spec, api_key, http_client=http_client)
+
+
+def validate_model_spec(spec: ModelSpec, api_key: str | None = None) -> None:
+    """``praxis models add`` 的写前干跑(R-T6-1):只 build_request,不发网络。
+
+    走与运行期完全相同的 adapter 构造 + ``build_request``,因此越界
+    ``provider_options``、坏 ``base_url``、缺凭据等问题在写库之前暴露;
+    ``ollama`` 无凭据是正常形态(provider 本身没有凭据概念)。
+    """
+    adapter = _adapter_for(spec, api_key)
+    adapter.build_request(
+        [ModelMessage(role="user", content="praxis model registration dry run")],
+        (),
+        ModelSettings(),
+    )
+
+
+def _temporary_spec_from_env(base_url: str | None) -> ModelSpec | None:
+    """未注册临时模型逃生门(仅构造一个 ModelSpec,不是第二装配入口)。
+
+    ``PRAXIS_MODEL_ID`` 是开关,``PRAXIS_BASE_URL`` 提供端点;凭据值由
+    ``PRAXIS_API_KEY`` 在调用方直接交给 ``_adapter_for``。只要注册库里有模型,
+    就不会走到这里——逃生门只服务"零注册"的临时运行。
+    """
+    model_id = os.environ.get("PRAXIS_MODEL_ID")
+    if not model_id:
+        return None
+    return ModelSpec(
+        model_id=model_id,
+        provider="openai-compatible",
+        base_url=base_url or os.environ.get("PRAXIS_BASE_URL") or None,
+    )
+
+
+def _adapter_from_registry(
+    model: str | None,
+    config_store: ModelConfigStore | None,
+) -> ModelAdapter:
+    """从全局配置库解析 ModelSpec 并交给唯一分派点(R-T6-2)。
+
+    自建的 store 在解析完即关闭(CLI 单次调用);调用方注入的 store 由其自己
+    管理生命周期。
+    """
+    owned = config_store is None
+    store = config_store if config_store is not None else ModelConfigStore()
+    try:
+        if model is None:
+            try:
+                spec = store.resolve_spec(None)
+            except KeyError:
+                # 只有"库里一个模型都没有"才允许逃生门;有模型但缺默认模型时
+                # 继续报错(set-default),绝不静默改用环境变量。
+                if store.list_models():
+                    raise
+                temporary = _temporary_spec_from_env(None)
+                if temporary is None:
+                    raise
+                api_key = os.environ.get("PRAXIS_API_KEY") or None
+                return _adapter_for(temporary, api_key)
+        else:
+            spec = store.resolve_spec(model)
+    finally:
+        if owned:
+            store.close()
+    api_key = (
+        resolve_model_credential(spec.api_key_env, spec.base_url or "")
+        if spec.api_key_env is not None
+        else None
+    )
+    return _adapter_for(spec, api_key)
 
 
 def _resolve_policy(root: Path, explicit: PermissionPolicy | None) -> PermissionPolicy:
@@ -100,8 +204,10 @@ def _resolve_policy(root: Path, explicit: PermissionPolicy | None) -> Permission
 
 def build_session(
     workspace: Path,
-    adapter: ModelAdapter,
+    adapter: ModelAdapter | None = None,
     *,
+    model: str | None = None,
+    config_store: ModelConfigStore | None = None,
     policy: PermissionPolicy | None = None,
     mode: PermissionMode | None = None,
     thread_id: str | None = None,
@@ -109,6 +215,12 @@ def build_session(
     max_steps: int = 50,
 ) -> Session:
     """装配一个 Session:唯一组合根。CLI/TUI/host 一律经 sdk.open_session 走到这里。
+
+    ``adapter is None`` 时从全局配置库解析:``ModelConfigStore.resolve_spec`` →
+    ``resolve_model_credential`` → ``_adapter_for``(设计 §5.15;R-T6-2)。显式
+    ``adapter``(测试/``--scripted``)完全绕过注册库。未注册临时模型只能经
+    ``PRAXIS_MODEL_ID/PRAXIS_API_KEY/PRAXIS_BASE_URL`` 构造一个 ModelSpec,
+    适配器仍然只由 ``_adapter_for`` 装配——不是第二装配入口。
 
     Task 8 入口:policy 见 _resolve_policy 来源序;mode 来源序 = 显式参数 >
     policy.approval,正交于策略(C5:bypass 只活在运行上下文,永不进 policy、
@@ -118,6 +230,8 @@ def build_session(
         _validate_thread_id(thread_id)
     if mode is not None and mode not in _VALID_MODES:
         raise ValueError(f"unknown permission mode: {mode!r} (expected on-request/never/bypass)")
+    if adapter is None:
+        adapter = _adapter_from_registry(model, config_store)
     root = Path(workspace)
     praxis_dir = root / ".praxis"
     praxis_dir.mkdir(parents=True, exist_ok=True)

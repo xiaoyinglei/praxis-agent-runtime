@@ -56,7 +56,23 @@ _OLLAMA_WIRE_OWNED_FIELDS: frozenset[str] = WIRE_OWNED_FIELDS | frozenset(
     {"num_predict", "options"}
 )
 # 允许进入 options 的采样键;其余未知键明确拒绝,不生长第二套合并规则。
-_OLLAMA_OPTION_KEYS: frozenset[str] = frozenset({"top_p", "seed"})
+# temperature 仍归 wire-owned(由 ModelSettings 提供),num_predict/options 亦然。
+_OLLAMA_OPTION_KEYS: frozenset[str] = frozenset(
+    {
+        "top_p",
+        "seed",
+        "num_ctx",
+        "format",
+        "mirostat",
+        "mirostat_eta",
+        "mirostat_tau",
+        "repeat_penalty",
+        "repeat_last_n",
+        "stop",
+        "num_gpu",
+        "num_thread",
+    }
+)
 
 
 class ToolsNotSupportedError(ValueError):
@@ -96,9 +112,10 @@ def to_ollama_messages(messages: Sequence[ModelMessage]) -> list[dict[str, Any]]
 def ollama_payload(req: WireRequest) -> dict[str, Any]:
     """WireRequest → ``/api/chat`` body(本 provider 的唯一构造点)。
 
-    ``provider_options`` 只接受 ``top_p`` / ``seed`` 并落入 ``options``;命中
-    wire-owned 字段或未知键一律 ``ValueError``——宁可边界失败,也不生长第二套
-    与真实请求不一致的合并规则。
+    ``provider_options`` 只接受 ``_OLLAMA_OPTION_KEYS`` 里的采样键(``top_p``/
+    ``seed``/``num_ctx``/``format``/``mirostat*``/``repeat_*``/``stop``/``num_gpu``/
+    ``num_thread``)并落入 ``options``;命中 wire-owned 字段或未知键一律
+    ``ValueError``——宁可边界失败,也不生长第二套与真实请求不一致的合并规则。
     """
     options: dict[str, Any] = {"num_predict": req.max_output_tokens}
     if req.temperature is not None:

@@ -17,8 +17,13 @@ credential 层保存,表结构由测试钉死。
   (B26:外部写不再造成永久冲突)。
 - 写事务只做最小 SQL;序列化/校验一律在 BEGIN 之前完成(会话库"写事务只
   INSERT"纪律的等价物:事务里不做哈希/重活)。
-- 读经 ``OrderedDict`` LRU 缓存(``_CACHE_MAX = 64``)+ 同一把锁;任何写成功
-  后清空缓存,保证同实例不脏读(B28:缓存有锁、有界)。
+- 读经 ``OrderedDict`` LRU 缓存(``_CACHE_MAX = 64``)+ 同一把锁;任何写**尝试**
+  (成功或 CAS 冲突)后清空缓存,保证同实例不脏读(B28:缓存有锁、有界;
+  R-T6-3:冲突路径也必须失效,否则冲突后仍会服务陈旧条目)。
+- **跨实例缓存契约**:缓存失效只发生在执行写的实例上。另一个进程/实例的外部写
+  不会让本实例的缓存条目失效;必须观察外部写的进程应新建 ``ModelConfigStore``
+  (或调用 ``refresh()``)。这是有意的取舍——CLI 的典型生命周期是单次调用,
+  有界缓存只服务于单次调用内的重复读,不承担跨进程一致性。
 
 ``definition`` 存的是 ModelSpec 去掉 ``cost`` 后的 JSON;``cost`` 单独存
 CostMicros 的 JSON。``base_url``/``api_key_env``/``provider`` 只以
@@ -201,6 +206,16 @@ class ModelConfigStore:
             self._cache.clear()
             self._conn.close()
 
+    def refresh(self) -> None:
+        """清空本实例的读缓存,迫使下一次读回源。
+
+        只清缓存,不重开连接、不改变 revision 视角;用于同一实例在外部写之后
+        主动放弃陈旧条目(Task 9 中途重解析模型时使用)。
+        """
+        with self._lock:
+            self._ensure_open()
+            self._cache.clear()
+
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError(f"model config store closed: {self._path}")
@@ -221,8 +236,9 @@ class ModelConfigStore:
             try:
                 stored = _read_revision(conn)
                 if expected_revision is not None and stored != expected_revision:
-                    # 同一 IMMEDIATE 事务内 re-read(刷新观察值)并重放校验一次;
-                    # 第二次仍不符才报冲突——至多一次,避免 livelock(B26)。
+                    # 故意的 no-op 守卫:同一 IMMEDIATE 事务内第二次 re-read 必得
+                    # 同一值,它不是"可观测的第二状态",也不给调用方重放机会。
+                    # 保留它只让拒绝路径与"已读过存储真值"的结构一致。
                     stored = _read_revision(conn)
                     if stored != expected_revision:
                         raise ConfigVersionConflict(observed_revision=stored)
@@ -239,7 +255,10 @@ class ModelConfigStore:
                 except BaseException:
                     pass
                 raise
-            self._cache.clear()
+            finally:
+                # R-T6-3:冲突/失败路径同样失效缓存——外部写之后本实例绝不能
+                # 继续用陈旧条目服务 get/list_models/resolve_spec。
+                self._cache.clear()
             return new_revision
 
     # -- connections -------------------------------------------------------------

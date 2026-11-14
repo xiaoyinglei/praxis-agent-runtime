@@ -41,7 +41,25 @@ from praxis.protocol.permission import Decision
 runner = CliRunner()
 
 # 运行态环境变量隔离:None = click 测试隔离里"删除该变量"
-_CLEAN_ENV = {"PRAXIS_MODEL": None, "PRAXIS_BASE_URL": None, "PRAXIS_API_KEY": None, "OPENAI_API_KEY": None}
+_CLEAN_ENV = {
+    "PRAXIS_MODEL_ID": None,
+    "PRAXIS_MODEL": None,
+    "PRAXIS_BASE_URL": None,
+    "PRAXIS_API_KEY": None,
+    "OPENAI_API_KEY": None,
+}
+
+
+@pytest.fixture(autouse=True)
+def _never_touch_real_keychain(monkeypatch: pytest.MonkeyPatch) -> None:
+    """所有 CLI 用例走 POSIX 文件分支:不读/写开发者真钥匙串。"""
+    import praxis.adapters.config.credentials as credentials_module
+
+    monkeypatch.setattr(credentials_module, "_PLATFORM", "linux")
+
+
+def _env(config_dir: Path, **extra: str | None) -> dict[str, str | None]:
+    return {**_CLEAN_ENV, "PRAXIS_CONFIG_DIR": str(config_dir), **extra}
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +109,26 @@ def _item(kind: str, payload: dict[str, Any], seq: int = 7) -> Item:
 
 def test_r14_sdk_reexports_names() -> None:
     for name in ("Item", "ItemKind", "Turn", "VerifyReport"):
+        assert name in sdk_pkg.__all__, f"sdk.__all__ missing {name}"
+        assert hasattr(sdk_pkg, name), f"sdk missing attribute {name}"
+
+
+def test_sdk_reexports_model_registry_names() -> None:
+    """Task 6:CLI 的 models 子命令只经 sdk 触达注册表与凭据面。"""
+    for name in (
+        "ModelConfigStore",
+        "ModelEntry",
+        "ConnectionEntry",
+        "CostMicros",
+        "ConfigVersionConflict",
+        "ModelSpec",
+        "resolve_model_credential",
+        "save_model_credential",
+        "model_adapter_for",
+        "validate_model_spec",
+        "probe_model",
+        "ProbeOutcome",
+    ):
         assert name in sdk_pkg.__all__, f"sdk.__all__ missing {name}"
         assert hasattr(sdk_pkg, name), f"sdk missing attribute {name}"
 
@@ -258,30 +296,40 @@ def test_run_paused_exit_2(workspace: Path, tmp_path: Path, monkeypatch: pytest.
     assert not (workspace / "f.txt").exists()
 
 
-def test_run_missing_model_exit_3(workspace: Path) -> None:
-    result = runner.invoke(app, ["run", "hi", "--workspace", str(workspace)], env=_CLEAN_ENV)
-    assert result.exit_code == 3, result.output
-    assert "PRAXIS_MODEL" in result.output
-
-
-def test_run_missing_api_key_exit_3(workspace: Path) -> None:
+def test_run_missing_model_exit_3(workspace: Path, tmp_path: Path) -> None:
+    """Task 6:无注册模型且无逃生门 → 指向 praxis models add,不再猜 OPENAI_API_KEY。"""
     result = runner.invoke(
-        app, ["run", "hi", "--workspace", str(workspace), "--model", "gpt-sim"], env=_CLEAN_ENV
+        app, ["run", "hi", "--workspace", str(workspace)], env=_env(tmp_path)
     )
     assert result.exit_code == 3, result.output
-    assert "PRAXIS_API_KEY" in result.output or "OPENAI_API_KEY" in result.output
+    assert "praxis models add" in result.output
 
 
-def test_run_model_from_env(workspace: Path, tmp_path: Path) -> None:
-    """PRAXIS_MODEL 有值但缺 key:错误文案必须指向凭据而非模型(证明 env 生效)。"""
+def test_run_unregistered_model_exit_3(workspace: Path, tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        ["run", "hi", "--workspace", str(workspace), "--model", "gpt-sim"],
+        env=_env(tmp_path),
+    )
+    assert result.exit_code == 3, result.output
+    assert "not registered" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_run_model_id_escape_hatch_reports_missing_key(workspace: Path, tmp_path: Path) -> None:
+    """PRAXIS_MODEL_ID 逃生门只构造 ModelSpec;缺 PRAXIS_API_KEY 时干净失败(退出码 1)。"""
     result = runner.invoke(
         app,
         ["run", "hi", "--workspace", str(workspace)],
-        env={**_CLEAN_ENV, "PRAXIS_MODEL": "gpt-from-env"},
+        env={
+            **_env(tmp_path),
+            "PRAXIS_MODEL_ID": "gpt-from-env",
+            "PRAXIS_BASE_URL": "https://escape.test/v1",
+        },
     )
-    assert result.exit_code == 3, result.output
-    assert "PRAXIS_MODEL" not in result.output
-    assert "API_KEY" in result.output
+    assert result.exit_code == 1, result.output
+    assert "API key" in result.output
+    assert "Traceback" not in result.output
 
 
 def test_run_bad_script_json_exit_3(workspace: Path, tmp_path: Path) -> None:
@@ -1013,3 +1061,406 @@ def test_cli_policy_bad_json_still_exit_3_not_1(workspace: Path, tmp_path: Path)
         env=_CLEAN_ENV,
     )
     assert result.exit_code == 3, result.output
+
+
+# ---------------------------------------------------------------------------
+# Task 6:praxis models(全局模型库 + 凭据卫生)+ composition 单一构造路径
+# ---------------------------------------------------------------------------
+
+
+def _invoke_models(args: list[str], env: dict[str, str | None]) -> Any:
+    return runner.invoke(app, ["models", *args], env=env)
+
+
+def _add_openai(tmp_path: Path, **extra: str | None) -> Any:
+    env = _env(tmp_path, REGISTRY_KEY="sk-test")
+    env.update(extra)
+    return _invoke_models(
+        [
+            "add",
+            "ds",
+            "--provider",
+            "openai-compatible",
+            "--base-url",
+            "https://api.deepseek.com/v1",
+            "--api-key-env",
+            "REGISTRY_KEY",
+            "--remote-model-id",
+            "deepseek-chat",
+            "--price-in-per-1m",
+            "0.27",
+            "--price-out-per-1m",
+            "1.1",
+        ],
+        env,
+    )
+
+
+def test_models_price_conversion_is_dollars_per_1m() -> None:
+    from praxis.interfaces.cli.models_cli import dollars_per_1m_to_micros
+
+    assert dollars_per_1m_to_micros("0.27") == 270_000
+    assert dollars_per_1m_to_micros(1.1) == 1_100_000
+    assert dollars_per_1m_to_micros("0") == 0
+
+
+def test_models_add_list_show_roundtrip(tmp_path: Path) -> None:
+    added = _add_openai(tmp_path)
+    assert added.exit_code == 0, added.output
+    assert "ok: registered ds" in added.output
+
+    listed = _invoke_models(["list"], _env(tmp_path))
+    assert listed.exit_code == 0, listed.output
+    assert "ds\topenai-compatible" in listed.output
+
+    shown = _invoke_models(["show", "ds"], _env(tmp_path))
+    assert shown.exit_code == 0, shown.output
+    assert "remote_model_id: deepseek-chat" in shown.output
+    assert "api_key_env: REGISTRY_KEY" in shown.output
+    assert "input=0.27" in shown.output
+    assert "sk-test" not in shown.output  # 凭据值绝不显示
+
+    defaulted = _invoke_models(["set-default", "ds"], _env(tmp_path))
+    assert defaulted.exit_code == 0, defaulted.output
+    marked = _invoke_models(["list"], _env(tmp_path))
+    assert "* ds" in marked.output
+
+
+def test_models_add_rejects_unresolvable_credential(tmp_path: Path) -> None:
+    result = _invoke_models(
+        [
+            "add",
+            "ds",
+            "--provider",
+            "openai-compatible",
+            "--base-url",
+            "https://api.deepseek.com/v1",
+            "--api-key-env",
+            "REGISTRY_KEY",
+        ],
+        _env(tmp_path),
+    )
+    assert result.exit_code == 3, result.output
+    assert "praxis models login" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_models_add_ollama_without_credential_is_normal(tmp_path: Path) -> None:
+    result = _invoke_models(
+        [
+            "add",
+            "local",
+            "--provider",
+            "ollama",
+            "--base-url",
+            "http://127.0.0.1:11434",
+            "--remote-model-id",
+            "qwen2.5:7b",
+        ],
+        _env(tmp_path),
+    )
+    assert result.exit_code == 0, result.output
+    assert "ok: registered local" in result.output
+
+
+def test_models_add_rejects_public_ollama_base_url(tmp_path: Path) -> None:
+    result = _invoke_models(
+        [
+            "add",
+            "remote-ollama",
+            "--provider",
+            "ollama",
+            "--base-url",
+            "https://ollama.example.com",
+        ],
+        _env(tmp_path),
+    )
+    assert result.exit_code == 3, result.output
+    assert "loopback or private" in result.output
+
+
+def test_models_add_rejects_unknown_ollama_provider_option(tmp_path: Path) -> None:
+    result = _invoke_models(
+        [
+            "add",
+            "local",
+            "--provider",
+            "ollama",
+            "--base-url",
+            "http://127.0.0.1:11434",
+            "--option",
+            "mystery=1",
+        ],
+        _env(tmp_path),
+    )
+    assert result.exit_code == 3, result.output
+    assert "unsupported ollama provider option: mystery" in result.output
+
+
+def test_models_add_accepts_extended_ollama_options(tmp_path: Path) -> None:
+    result = _invoke_models(
+        [
+            "add",
+            "local",
+            "--provider",
+            "ollama",
+            "--base-url",
+            "http://127.0.0.1:11434",
+            "--option",
+            "num_ctx=8192",
+            "--option",
+            "repeat_penalty=1.1",
+            "--option",
+            "format=json",
+        ],
+        _env(tmp_path),
+    )
+    assert result.exit_code == 0, result.output
+
+
+def test_models_add_rejects_invalid_context_window(tmp_path: Path) -> None:
+    result = _invoke_models(
+        [
+            "add",
+            "local",
+            "--provider",
+            "ollama",
+            "--base-url",
+            "http://127.0.0.1:11434",
+            "--context-window",
+            "1024",
+            "--max-output",
+            "4096",
+        ],
+        _env(tmp_path),
+    )
+    assert result.exit_code == 3, result.output
+
+
+def test_models_remove_unknown_is_clean_exit_1(tmp_path: Path) -> None:
+    result = _invoke_models(["remove", "nope"], _env(tmp_path))
+    assert result.exit_code == 1, result.output
+    assert "not registered" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_models_remove_cas_conflict_is_clean_exit_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert _add_openai(tmp_path).exit_code == 0
+    from praxis.adapters.config.store import ConfigVersionConflict, ModelConfigStore
+
+    def conflict(self: Any, model_id: str, *, expected_revision: int) -> None:
+        raise ConfigVersionConflict(observed_revision=7)
+
+    monkeypatch.setattr(ModelConfigStore, "remove_model", conflict)
+    result = _invoke_models(["remove", "ds"], _env(tmp_path))
+    assert result.exit_code == 1, result.output
+    assert "revision conflict" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_models_connection_add_and_list(tmp_path: Path) -> None:
+    added = _invoke_models(
+        [
+            "connection",
+            "add",
+            "local-ollama",
+            "--provider",
+            "ollama",
+            "--base-url",
+            "http://127.0.0.1:11434",
+            "--location",
+            "local",
+        ],
+        _env(tmp_path),
+    )
+    assert added.exit_code == 0, added.output
+    listed = _invoke_models(["connection", "list"], _env(tmp_path))
+    assert listed.exit_code == 0, listed.output
+    assert "local-ollama\tollama\thttp://127.0.0.1:11434" in listed.output
+
+
+def test_models_login_keeps_secret_out_of_sqlite_and_output(tmp_path: Path) -> None:
+    """硬测试①:login 之后全表扫描 config.sqlite,任何字段都不得含密钥值。"""
+    secret = "sk-super-secret-value-123"
+    assert _add_openai(tmp_path, REGISTRY_KEY=secret).exit_code == 0
+
+    # login 时环境变量不存在 → 必须由隐藏 prompt 提供并写入 0600 文件。
+    logged = runner.invoke(
+        app,
+        ["models", "login", "ds"],
+        input=secret + "\n",
+        env=_env(tmp_path, REGISTRY_KEY=None),
+    )
+    assert logged.exit_code == 0, logged.output
+    assert secret not in logged.output
+
+    credential_file = tmp_path / "credentials" / "models.json"
+    assert credential_file.exists()
+    assert credential_file.stat().st_mode & 0o777 == 0o600
+    assert secret in credential_file.read_text(encoding="utf-8")  # 确实保存了
+
+    connection = sqlite3.connect(tmp_path / "config.sqlite")
+    try:
+        tables = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        ]
+        assert tables
+        scanned = 0
+        for table in tables:
+            for row in connection.execute(f'SELECT * FROM "{table}"').fetchall():
+                scanned += 1
+                for value in row:
+                    assert secret not in str(value)
+        assert scanned > 0
+    finally:
+        connection.close()
+
+
+def test_models_login_requires_api_key_env(tmp_path: Path) -> None:
+    assert (
+        _invoke_models(
+            ["add", "local", "--provider", "ollama", "--base-url", "http://127.0.0.1:11434"],
+            _env(tmp_path),
+        ).exit_code
+        == 0
+    )
+    result = _invoke_models(["login", "local"], _env(tmp_path))
+    assert result.exit_code == 1, result.output
+    assert "api_key_env" in result.output
+
+
+def test_models_check_exit_codes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert _add_openai(tmp_path).exit_code == 0
+    import praxis.interfaces.cli.models_cli as models_cli
+    from praxis.interfaces.sdk import ProbeOutcome
+
+    async def fake_ok(adapter: Any, *, tool_name: str = "__probe_noop") -> ProbeOutcome:
+        return ProbeOutcome(ok=True, steps=("text",), detail=None, usage=None)
+
+    monkeypatch.setattr(models_cli, "probe_model", fake_ok)
+    passed = _invoke_models(["check", "ds"], _env(tmp_path, REGISTRY_KEY="sk-test"))
+    assert passed.exit_code == 0, passed.output
+    assert "ok: ds" in passed.output
+
+    async def fake_fail(adapter: Any, *, tool_name: str = "__probe_noop") -> ProbeOutcome:
+        return ProbeOutcome(
+            ok=False,
+            steps=("text",),
+            detail="text step failed: boom (authentication)",
+            usage=None,
+        )
+
+    monkeypatch.setattr(models_cli, "probe_model", fake_fail)
+    failed = _invoke_models(["check", "ds"], _env(tmp_path, REGISTRY_KEY="sk-test"))
+    assert failed.exit_code == 1, failed.output
+    assert "text step failed: boom" in failed.output
+
+
+def test_cli_run_forwards_model_and_no_adapter(
+    workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R-T6-2:main.py 不再构造 adapter;模型 id 原样交给 composition。"""
+    captured: dict[str, Any] = {}
+
+    def fake_open(root: Any, adapter: Any, **kwargs: Any) -> Any:
+        captured["adapter"] = adapter
+        captured.update(kwargs)
+        return _FlakySession([], ["forwarded"])
+
+    monkeypatch.setattr(cli_main, "open_session", fake_open)
+    result = runner.invoke(
+        app,
+        ["run", "hi", "--workspace", str(workspace), "--model", "ds"],
+        env=_env(tmp_path),
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["adapter"] is None
+    assert captured["model"] == "ds"
+    assert "forwarded" in result.output
+
+
+def test_build_session_resolves_registered_model_spec(
+    workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import praxis.composition as composition
+    from praxis.adapters.config.store import ConnectionEntry, ModelConfigStore, ModelEntry
+    from praxis.protocol.models import ModelSpec
+
+    monkeypatch.setenv("PRAXIS_CONFIG_DIR", str(tmp_path))
+    store = ModelConfigStore()
+    try:
+        connection = ConnectionEntry(
+            "c", "openai-compatible", "https://unit.test/v1", "UNIT_KEY"
+        )
+        store.upsert_connection(connection)
+        store.upsert_model(ModelEntry(ModelSpec(model_id="m"), connection, 0))
+        monkeypatch.setenv("UNIT_KEY", "unit-secret")
+
+        captured: dict[str, Any] = {}
+
+        def fake_adapter(spec: Any, api_key: Any = None, *, http_client: Any = None) -> Any:
+            captured["spec"] = spec
+            captured["api_key"] = api_key
+            return ScriptedAdapter([])
+
+        monkeypatch.setattr(composition, "_adapter_for", fake_adapter)
+        session = composition.build_session(workspace, model="m", config_store=store)
+        session.close()
+    finally:
+        store.close()
+
+    assert captured["spec"].model_id == "m"
+    assert captured["spec"].base_url == "https://unit.test/v1"
+    assert captured["api_key"] == "unit-secret"
+
+
+def test_build_session_escape_hatch_only_builds_a_spec(
+    workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import praxis.composition as composition
+    from praxis.adapters.config.store import ModelConfigStore
+
+    monkeypatch.setenv("PRAXIS_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("PRAXIS_MODEL_ID", "temporary-model")
+    monkeypatch.setenv("PRAXIS_BASE_URL", "https://temporary.test/v1")
+    monkeypatch.setenv("PRAXIS_API_KEY", "temporary-secret")
+    store = ModelConfigStore()
+    try:
+        captured: dict[str, Any] = {}
+
+        def fake_adapter(spec: Any, api_key: Any = None, *, http_client: Any = None) -> Any:
+            captured["spec"] = spec
+            captured["api_key"] = api_key
+            return ScriptedAdapter([])
+
+        monkeypatch.setattr(composition, "_adapter_for", fake_adapter)
+        session = composition.build_session(workspace, config_store=store)
+        session.close()
+    finally:
+        store.close()
+
+    assert captured["spec"].model_id == "temporary-model"
+    assert captured["spec"].base_url == "https://temporary.test/v1"
+    assert captured["api_key"] == "temporary-secret"
+
+
+def test_build_session_without_registry_is_actionable(
+    workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import praxis.composition as composition
+    from praxis.adapters.config.store import ModelConfigStore
+
+    monkeypatch.setenv("PRAXIS_CONFIG_DIR", str(tmp_path))
+    store = ModelConfigStore()
+    try:
+        with pytest.raises(KeyError, match="praxis models add"):
+            composition.build_session(workspace, config_store=store)
+    finally:
+        store.close()
