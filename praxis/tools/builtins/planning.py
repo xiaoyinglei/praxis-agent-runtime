@@ -1,19 +1,15 @@
 """update_plan 内置工具（B16：无截断计划投影）。
 
-写侧规范化工具；读侧投影 praxis.protocol.plan.latest_plan。
+写侧规范化工具；读侧投影 praxis.core.planning.latest_plan。
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, cast
+from typing import Any, cast, get_args
 
 from praxis.protocol.json import JsonValue, thaw_json
-from praxis.protocol.plan import (
-    MAX_PLAN_STEPS,
-    MAX_PLAN_SUMMARY_CHARS,
-    MAX_STEP_TITLE_CHARS,
-)
+from praxis.protocol.plan import MAX_PLAN_STEPS, MAX_STEP_TITLE_CHARS, PlanStatus
 from praxis.protocol.sandbox import ToolExecContext
 from praxis.protocol.tools import (
     CancellationMode,
@@ -28,8 +24,8 @@ from praxis.protocol.tools import (
     json_schema_input,
 )
 
-# Status values for JSON Schema enum (statically known).
-_STATUS_VALUES = ("pending", "in_progress", "completed")
+# Derive status enum for JSON Schema — single source of truth with read side.
+_STATUS_VALUES = list(get_args(PlanStatus))
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +56,7 @@ _UPDATE_INPUT_SCHEMA: dict[str, Any] = {
         },
         "explanation": {
             "type": "string",
-            "maxLength": MAX_PLAN_SUMMARY_CHARS,
+            "maxLength": 800,
         },
     },
     "required": ["plan"],
@@ -106,15 +102,12 @@ def _validate_plan_input(
 # 工具构造
 # ---------------------------------------------------------------------------
 
-def create_update_plan_tool(workspace: object) -> Tool:
-    """创建 update_plan 内置工具。
-
-    workspace 参数保留以匹配现有工具工厂签名，本工具本身不使用文件系统。
-    """
+def create_update_plan_tool() -> Tool:
+    """创建 update_plan 内置工具。"""
 
     async def run(
         arguments: Mapping[str, JsonValue],
-        exec_ctx: ToolExecContext,  # noqa: ARG001 — unused, in-progress tool
+        exec_ctx: ToolExecContext,  # noqa: ARG001 — unused, advisory-only tool
     ) -> ToolResult:
         validated = _validate_plan_input(arguments)
         plan = cast("list[dict[str, Any]]", validated["plan"])
@@ -137,7 +130,8 @@ def create_update_plan_tool(workspace: object) -> Tool:
         }
         explanation = validated.get("explanation")
         if isinstance(explanation, str) and explanation.strip():
-            metadata["explanation"] = explanation[:MAX_PLAN_SUMMARY_CHARS]
+            # Schema already enforces ≤800 chars; no truncation needed.
+            metadata["explanation"] = explanation
 
         content_lines = [f"[update_plan] plan v{metadata['revision']} ({metadata['step_count']} steps):"]
         for i, step in enumerate(plan, 1):
@@ -163,7 +157,8 @@ def create_update_plan_tool(workspace: object) -> Tool:
             description=(
                 "Update the current execution plan: record progress, "
                 "mark steps as completed, and set at most one step to in_progress. "
-                "Returns an advisory snapshot; revision equals step count."
+                "Returns an advisory snapshot; ``revision`` is the step count of this "
+                "submission (recency judgement uses item seq, not revision)."
             ),
             input_schema=_UPDATE_INPUT_SCHEMA,
         ),
