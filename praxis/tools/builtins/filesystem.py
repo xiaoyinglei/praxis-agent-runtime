@@ -2,7 +2,8 @@
 
 read 支持两种**互斥**模式:字节分页(``offset``/``max_bytes``)与行分页
 (``start_line``/``max_lines``,1-based,按 ``\\n`` 切行)。行模式只在行边界切分,
-跨 UTF-8 多字节边界不产出替换字符;二进制探测沿用首块空字节启发式。
+跨 UTF-8 多字节边界不产出替换字符;内部另有字节预算(``_READ_LINE_MAX_BYTES``),
+超长单行整行不返回,避免无界阻塞事件循环。二进制探测沿用首块空字节启发式。
 list_files 输出确定序的 ``<kind>\\t<bytes>\\t<相对路径>`` 清单:目录 ``d``、文件 ``f``、
 符号链接 ``l`` 且一律不跟随;地板目录子树从 ``FLOOR_ENTRIES`` 派生后跳过。
 write 用同目录 tmp + os.replace 原子落盘。
@@ -52,6 +53,10 @@ _READ_DEFAULT_MAX_BYTES = 16_000
 _READ_MAX_LIMIT = 1_000_000
 _READ_DEFAULT_MAX_LINES = 200
 _READ_MAX_LINES = 2_000
+# 行模式内部字节预算(不暴露为参数):与 max_lines 同时生效,防止巨大文件/超长单行
+# 在 async run 里无界阻塞事件循环(超时/取消都送不进去)。超预算时在整行边界收口。
+_READ_LINE_MAX_BYTES = 1_000_000
+_READ_LINE_CHUNK_BYTES = 65_536
 
 _LIST_DEFAULT_MAX_ENTRIES = 200
 _LIST_MAX_ENTRIES = 2_000
@@ -219,12 +224,29 @@ def _read_line_page(
         stream.seek(0)
         _skip_lines(stream, start_line - 1)
         lines: list[str] = []
+        bytes_used = 0
+        truncated = False
         while len(lines) < max_lines:
-            raw = stream.readline()
+            remaining = _READ_LINE_MAX_BYTES - bytes_used
+            if remaining <= 0:
+                # 页内字节预算用尽:是否还有后续内容决定 truncated
+                truncated = bool(stream.read(1))
+                break
+            # 有界读行:最多读 remaining+1 字节;整行放不下就收口,
+            # 绝不返回被撕裂的行(也不按字节切,保住码点完整)。
+            raw = stream.readline(remaining + 1)
             if not raw:
                 break
+            if len(raw) > remaining:
+                # 单行超过页内预算:整行不返回(保住"整行"契约),游标停在它上面;
+                # 该行只能改用字节模式读取。
+                truncated = True
+                break
             lines.append(_decode_line(raw))
-        truncated = bool(stream.read(1))
+            bytes_used += len(raw)
+        else:
+            # 达到 max_lines:多读 1 字节判断是否还有下一行
+            truncated = bool(stream.read(1))
     if any("\x00" in line for line in lines):
         return _binary_result(path_value, size)
     # start_line 超界:空内容 + next_start_line=None,是结果不是错误。
@@ -238,9 +260,14 @@ def _read_line_page(
 
 
 def _skip_lines(stream: BinaryIO, count: int) -> None:
+    """跳过 ``count`` 行;按固定块 readline,超长行不会一次性读进内存。"""
     for _ in range(count):
-        if not stream.readline():
-            return
+        while True:
+            chunk = stream.readline(_READ_LINE_CHUNK_BYTES)
+            if not chunk:
+                return
+            if chunk.endswith(b"\n"):
+                break
 
 
 def create_read_tool(workspace: Path) -> Tool:
@@ -283,18 +310,7 @@ def create_read_tool(workspace: Path) -> Tool:
         truncated = len(raw) > len(bounded)
         is_binary = b"\x00" in prefix or b"\x00" in bounded
         if is_binary:
-            return _result(
-                "read",
-                content=f"binary file, not returned as text: {path_value}",
-                status=ResultStatus.ERROR,
-                metadata={
-                    "is_binary": True,
-                    "size_bytes": size,
-                    "next_offset": None,
-                    "truncated": False,
-                },
-                error_code="binary_file",
-            )
+            return _binary_result(path_value, size)
         content = bounded.decode("utf-8", errors="replace")
         next_offset = offset + len(bounded) if truncated else None
         return _result(
@@ -324,7 +340,9 @@ def create_read_tool(workspace: Path) -> Tool:
                 "Read a workspace text file in byte pages (offset/max_bytes, returns "
                 "next_offset when truncated) or line pages (start_line/max_lines, returns "
                 "next_start_line when truncated). The two modes are mutually exclusive; "
-                "binary files are reported without their bytes."
+                "line pages are also bounded by an internal byte budget, and a single line "
+                "larger than that budget is not returned (use byte pages for it). Binary "
+                "files are reported without their bytes."
             ),
             input_schema={
                 "type": "object",
@@ -463,9 +481,13 @@ def _sorted_children(directory: Path) -> tuple[Path, ...]:
         return ()
 
 
-def _iter_listed_entries(directory: Path, *, include_hidden: bool) -> Iterator[Path]:
+def _iter_listed_entries(
+    directory: Path, *, include_hidden: bool
+) -> Iterator[tuple[Path, os.stat_result]]:
     """前序深搜清单条目:每层名字排序,符号链接只产出自身、绝不进入。
 
+    每条目只 ``lstat`` 一次(与下降判定共用);不可列条目直接跳过,因此
+    ``max_entries`` 的截断/游标判定只看真正可列出的条目。
     地板目录(``FLOOR_ENTRIES`` 派生的 ``.git``/``.praxis``/``.agent_memory``)
     整棵子树跳过;``include_hidden=False`` 时跳过所有点开头条目。
     """
@@ -481,11 +503,11 @@ def _iter_listed_entries(directory: Path, *, include_hidden: bool) -> Iterator[P
             continue
         if not include_hidden and name.startswith("."):
             continue
-        yield child
         try:
             info = child.lstat()
         except OSError:
             continue
+        yield child, info
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
             continue
         stack.append(iter(_sorted_children(child)))
@@ -496,7 +518,7 @@ def create_list_files_tool(workspace: Path) -> Tool:
         {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "maxLength": 4_096},
+                "path": {"type": "string", "minLength": 1, "maxLength": 4_096},
                 "max_entries": {
                     "type": "integer",
                     "minimum": 1,
@@ -528,16 +550,13 @@ def create_list_files_tool(workspace: Path) -> Tool:
         lines: list[str] = []
         next_cursor: str | None = None
         truncated = False
-        for child in _iter_listed_entries(target, include_hidden=include_hidden):
+        for child, info in _iter_listed_entries(target, include_hidden=include_hidden):
             relative = child.relative_to(root).as_posix()
+            # 截断/游标只在真正可列出的条目上判定(不可列条目已在迭代器里跳过)
             if len(lines) == max_entries:
                 truncated = True
                 next_cursor = relative
                 break
-            try:
-                info = child.lstat()
-            except OSError:
-                continue
             if stat.S_ISLNK(info.st_mode):
                 kind = "l"
             elif stat.S_ISDIR(info.st_mode):
@@ -581,6 +600,8 @@ def create_list_files_tool(workspace: Path) -> Tool:
                 "properties": {
                     "path": {
                         "type": "string",
+                        "minLength": 1,
+                        "maxLength": 4_096,
                         "description": "Directory path relative to the workspace (default '.').",
                     },
                     "max_entries": {

@@ -264,6 +264,14 @@ def test_read_mixed_line_and_byte_modes_is_invalid_input(ctx: ExecCtx) -> None:
     assert [i.kind for i in ctx.store.read_turn_items(ctx.turn_id)] == [ItemKind.TOOL_RESULT]
 
 
+def test_malformed_path_is_invalid_input_result(ctx: ExecCtx) -> None:
+    # checked_path 对嵌入 NUL 的畸形路径抛 ValueError;管道必须归一为结果(B10 家族)
+    r = asyncio.run(execute(ToolCall("c1", "read", {"path": "bad\x00name"}), ctx))
+    assert r.status is ResultStatus.ERROR and r.error_code == "invalid_input"
+    assert r.is_error and isinstance(r.error_message, str) and r.error_message
+    assert [i.kind for i in ctx.store.read_turn_items(ctx.turn_id)] == [ItemKind.TOOL_RESULT]
+
+
 def test_unknown_tool_is_result_not_exception(ctx: ExecCtx) -> None:
     r = asyncio.run(execute(ToolCall("c1", "nope", {}), ctx))
     assert r.status is ResultStatus.ERROR and r.error_code == "unknown_tool"

@@ -10,6 +10,8 @@ list_files 的确定性目录清单语义。read 既有字节模式用例自 tes
 from __future__ import annotations
 
 import asyncio
+import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -144,6 +146,20 @@ def test_read_lines_without_trailing_newline_keeps_last_line(tmp_path: Path) -> 
     assert not r.truncated
 
 
+def test_read_lines_trailing_newline_has_no_phantom_line(tmp_path: Path) -> None:
+    # EOF 换行不是额外一行;真正的空行("one\n\n")才计一行
+    tool = create_read_tool(tmp_path)
+    (tmp_path / "one.txt").write_text("one\n")
+    r = run(tool, {"path": "one.txt", "start_line": 1})
+    assert r.text == "one"
+    assert r.metadata["line_count"] == 1
+    assert r.metadata["next_start_line"] is None
+    (tmp_path / "blank.txt").write_text("one\n\n")
+    r = run(tool, {"path": "blank.txt", "start_line": 1})
+    assert r.text == "one\n"
+    assert r.metadata["line_count"] == 2
+
+
 def test_read_lines_beyond_eof_is_empty_result(tmp_path: Path) -> None:
     # 超界不是错误:空内容 + next_start_line=None
     (tmp_path / "f.txt").write_text("one\ntwo\n")
@@ -178,6 +194,55 @@ def test_read_lines_binary_file_is_result(tmp_path: Path) -> None:
     assert r.status is ResultStatus.ERROR
     assert r.error_code == "binary_file"
     assert r.metadata["size_bytes"] == 64
+
+
+def test_read_lines_huge_single_line_is_bounded(tmp_path: Path) -> None:
+    # I-1:8MB 单行不得无界阻塞;整行放不进内部字节预算 → 空内容 + truncated,
+    # next_start_line 指向该行(不返回撕裂行,也不切多字节)。
+    (tmp_path / "huge.txt").write_bytes(b"x" * 8_000_000 + b"\n")
+    started = time.monotonic()
+    r = run(create_read_tool(tmp_path), {"path": "huge.txt", "start_line": 1, "max_lines": 200})
+    assert time.monotonic() - started < 3
+    assert r.status is ResultStatus.OK
+    assert r.text == ""
+    assert r.metadata["line_count"] == 0
+    assert r.metadata["next_start_line"] == 1
+    assert r.truncated
+
+
+def test_read_lines_million_line_file_is_bounded(tmp_path: Path) -> None:
+    (tmp_path / "many.txt").write_text("x\n" * 1_000_000)
+    started = time.monotonic()
+    r = run(create_read_tool(tmp_path), {"path": "many.txt", "start_line": 1, "max_lines": 200})
+    assert time.monotonic() - started < 3
+    assert r.metadata["line_count"] == 200
+    assert r.metadata["next_start_line"] == 201
+    assert r.truncated
+    # 翻到文件尾部附近也不得无界阻塞
+    started = time.monotonic()
+    tail = run(create_read_tool(tmp_path), {"path": "many.txt", "start_line": 999_900, "max_lines": 200})
+    assert time.monotonic() - started < 3
+    assert tail.metadata["line_count"] == 101
+    assert tail.metadata["next_start_line"] is None
+    assert not tail.truncated
+
+
+def test_read_lines_byte_budget_stops_on_whole_line(tmp_path: Path) -> None:
+    # 内部字节预算与 max_lines 同时生效:在整行边界收口,给出可续读的 next_start_line
+    (tmp_path / "wide.txt").write_text(("a" * 1_000 + "\n") * 1_200)
+    r = run(create_read_tool(tmp_path), {"path": "wide.txt", "start_line": 1, "max_lines": 2_000})
+    assert r.status is ResultStatus.OK
+    assert r.truncated
+    line_count = r.metadata["line_count"]
+    assert 0 < line_count < 1_200
+    assert len(r.text.encode("utf-8")) <= 1_000_000
+    assert r.metadata["next_start_line"] == line_count + 1
+    # 续页从收口处继续,不丢行也不重复
+    nxt = run(
+        create_read_tool(tmp_path),
+        {"path": "wide.txt", "start_line": r.metadata["next_start_line"], "max_lines": 2_000},
+    )
+    assert nxt.text.split("\n")[0] == "a" * 1_000
 
 
 def test_read_rejects_mixed_line_and_byte_modes(tmp_path: Path) -> None:
@@ -258,6 +323,42 @@ def test_list_files_floor_match_is_casefolded(tmp_path: Path) -> None:
     r = run(create_list_files_tool(tmp_path), {"path": ".", "include_hidden": True})
     relative = [line.split("\t")[2] for line in r.text.split("\n")]
     assert relative == ["keep.txt"]
+
+
+def test_list_files_skips_nested_floor_subtree(tmp_path: Path) -> None:
+    # 地板目录的子条目同样跳过(不只是工作区顶层)
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / ".git").mkdir()
+    (tmp_path / "sub" / ".git" / "config").write_text("x")
+    (tmp_path / "sub" / "keep.txt").write_text("k")
+    r = run(create_list_files_tool(tmp_path), {"path": ".", "include_hidden": True})
+    relative = [line.split("\t")[2] for line in r.text.split("\n")]
+    assert relative == ["sub", "sub/keep.txt"]
+
+
+def test_list_files_unreadable_directory_is_fail_open(tmp_path: Path) -> None:
+    # 读路径对畸形输入是结果不是异常:不可读子树跳过,其余照常列出
+    (tmp_path / "ok.txt").write_text("x")
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    (blocked / "secret.txt").write_text("s")
+    os.chmod(blocked, 0)
+    try:
+        if os.access(blocked, os.R_OK):
+            pytest.skip("permission bits not enforced for this user")
+        r = run(create_list_files_tool(tmp_path), {"path": "."})
+        assert r.status is ResultStatus.OK
+        relative = [line.split("\t")[2] for line in r.text.split("\n")]
+        assert "blocked" in relative
+        assert "blocked/secret.txt" not in relative
+        assert "ok.txt" in relative
+    finally:
+        os.chmod(blocked, 0o755)
+
+
+def test_list_files_rejects_empty_path(tmp_path: Path) -> None:
+    with pytest.raises(ToolValidationError):
+        create_list_files_tool(tmp_path).validate_input({"path": ""})
 
 
 def test_list_files_include_hidden_controls_dotfiles(tmp_path: Path) -> None:

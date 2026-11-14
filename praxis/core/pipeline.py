@@ -385,12 +385,19 @@ async def execute(call: ToolCall, ctx: ExecCtx) -> ToolResult:
     try:
         args = tool.validate_input(call.arguments)
         use = tool.resolve_use(args)
-    except ToolValidationError as exc:
+    except (ToolValidationError, ValueError, OSError, TypeError) as exc:
         # resolve_use 的越界围栏(checked_path)同样归入 invalid_input:
         # 未形成 use 就不存在"已决策未执行"的中间态,直接落 result。
+        # checked_path 对嵌入 NUL / ENAMETOOLONG 等畸形路径抛的是 ValueError/OSError;
+        # 这里统一收口,否则单个畸形参数就能炸穿 turn(B10 家族)。
+        message = (
+            f"{exc.path}: {exc.message}"
+            if isinstance(exc, ToolValidationError)
+            else _bounded(str(exc))
+        )
         result = _error_result(
             call, status=ResultStatus.ERROR, error_code="invalid_input",
-            message=f"{exc.path}: {exc.message}",
+            message=message,
         )
         _append_result_item(ctx, result)
         return result
