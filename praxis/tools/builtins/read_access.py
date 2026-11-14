@@ -11,10 +11,16 @@
 代数(``resolve_policy`` + ``path_access``,CI 规则 9 的唯一实现),对每个具体
 路径做"是否被任一策略来源拒绝"的合取——拒绝即跳过,绝不反向授权。
 
-规则来源与 ``decide`` 的 path 裁决保持一致:声明 policy + ceilings,逐一
-``resolve_policy`` 后最严者胜(任一来源 deny 即 deny)。session/once 规则层
-是审批授予的内存覆盖(只增开),不参与目录遍历的 deny 过滤;若未来出现
-deny 型 session 规则,应把来源列表扩展到这里而不是另写匹配器。
+规则来源与 ``decide`` 的 path 裁决保持一致:声明 policy + ceilings,再加
+session/once 两个覆盖层(``protocol.policy.overlay_policy`` 构造,与
+``core.permission._rule_layers`` 共用同一实现);逐一 ``resolve_policy`` 后
+最严者胜——任一来源 deny 即 deny。注意 ``session``/``always`` 的规则本身已被
+``apply_update`` 折进 ``permissions.policy``,覆盖层来源是额外的最严者检查;
+``once`` 只存在于 ``once_rules``,覆盖层是它唯一进入目录过滤的通道。
+
+覆盖层只收紧、不放宽(allow 被 ``/`` write 基线吸收),因此把它们纳入过滤
+是安全方向;绝不把覆盖层合并进 base policy——合并会让更具体的 allow 反向
+覆盖较宽的 deny。
 
 ``permissions=None``(单测直跑、无快照)返回空来源元组 ⇒ 不做逐条目过滤,
 阶段 1/2 既有工具行为不变。
@@ -26,17 +32,38 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from praxis.protocol.permission import PermissionContext
-from praxis.protocol.policy import ResolvedPolicy, path_access, resolve_policy
+from praxis.protocol.policy import (
+    PermissionPolicy,
+    ResolvedPolicy,
+    overlay_policy,
+    path_access,
+    resolve_policy,
+)
+
+
+def permission_declarations(
+    permissions: PermissionContext | None,
+) -> tuple[PermissionPolicy, ...]:
+    """权限快照 → 需逐一 resolve 的策略声明(policy + ceilings + 覆盖层)。
+
+    search 工具把同一组声明序列化给 worker,worker 侧再 ``resolve_policy``,
+    保证父子进程看到完全相同的来源集合。
+    """
+    if permissions is None:
+        return ()
+    declarations = [permissions.policy, *permissions.ceilings]
+    for rules in (permissions.session_rules, permissions.once_rules):
+        if rules:
+            declarations.append(overlay_policy(rules))
+    return tuple(declarations)
 
 
 def permission_sources(
     permissions: PermissionContext | None, workspace: Path
 ) -> tuple[ResolvedPolicy, ...]:
-    """把权限快照解析为路径裁决来源(policy + ceilings;无快照 → 空元组)。"""
-    if permissions is None:
-        return ()
+    """把权限快照解析为路径裁决来源(policy + ceilings + session/once 覆盖层)。"""
     return tuple(
-        resolve_policy(policy, workspace) for policy in (permissions.policy, *permissions.ceilings)
+        resolve_policy(policy, workspace) for policy in permission_declarations(permissions)
     )
 
 

@@ -38,12 +38,8 @@ from types import FrameType
 from typing import Any
 
 from praxis.protocol.floor import FLOOR_ENTRIES
-from praxis.protocol.policy import (
-    PermissionPolicy,
-    ResolvedPolicy,
-    path_access,
-    resolve_policy,
-)
+from praxis.protocol.policy import PermissionPolicy, ResolvedPolicy, resolve_policy
+from praxis.tools.builtins.read_access import is_read_denied
 
 _MAX_FILE_BYTES = 2_000_000
 _MAX_TOTAL_BYTES = 64_000_000
@@ -120,10 +116,6 @@ def _policy_sources(payload: dict[str, Any], root: Path) -> tuple[ResolvedPolicy
     )
 
 
-def _denied(sources: tuple[ResolvedPolicy, ...], path: Path) -> bool:
-    return any(not path_access(source, path, write=False) for source in sources)
-
-
 class _Counters:
     __slots__ = ("skipped_denied",)
 
@@ -145,7 +137,7 @@ def _files(
         path = pending.pop()
         if path.is_symlink():
             continue
-        if _denied(sources, path):
+        if is_read_denied(sources, path):
             counters.skipped_denied += 1
             continue
         if path.is_dir():
@@ -189,10 +181,20 @@ def _read_file(path: Path, limit: int) -> bytes:
         os.close(descriptor)
 
 
-def _text(value: dict[str, str]) -> str:
-    if "text" in value:
-        return value["text"]
-    return base64.b64decode(value["bytes"]).decode("utf-8", "replace")
+def _text(value: object) -> str:
+    """rg 的行载荷:畸形(非 dict / 非 str / 坏 base64)按空串处理而非炸穿。"""
+    if not isinstance(value, dict):
+        return ""
+    text = value.get("text")
+    if isinstance(text, str):
+        return text
+    encoded = value.get("bytes")
+    if not isinstance(encoded, str):
+        return ""
+    try:
+        return base64.b64decode(encoded).decode("utf-8", "replace")
+    except (ValueError, TypeError):
+        return ""
 
 
 def _backend(
@@ -202,7 +204,7 @@ def _backend(
     raw: bytes,
     limit: int,
     context: int,
-) -> tuple[list[dict[str, Any]], bool] | dict[str, str]:
+) -> tuple[list[dict[str, Any]], bool] | dict[str, Any]:
     """把一份文件字节交给打包 rg,解析 JSON 事件;参数非法 → error dict。"""
     arguments = [
         binary,
@@ -248,6 +250,8 @@ def _backend(
                 return {
                     "error_code": "invalid_input",
                     "error_message": errors.decode("utf-8", "replace")[:2000],
+                    # 标记这是 rg stderr:search 只把它放 metadata,不入 content。
+                    "stderr": True,
                 }
             events: list[dict[str, Any]] = []
             for line in output.splitlines():
@@ -279,7 +283,9 @@ def _search(payload: dict[str, Any]) -> dict[str, Any]:
 
     refusal = _under_deny_floor(root, target)
     if refusal:
-        return {"error_code": "search_worker_failed", "error_message": refusal}
+        # 目标落在 deny 地板子树:输入本身非法(管道到不了这里,floor 已在
+        # decide 拒绝;直构工具路径也应是结果而非 worker 故障)。
+        return {"error_code": "invalid_input", "error_message": refusal}
 
     # 即使没有任何候选文本文件也要验证 pattern:Rust 正则语法是公开契约,
     # 不支持的构造必须在后端显式失败。
@@ -293,9 +299,6 @@ def _search(payload: dict[str, Any]) -> dict[str, Any]:
             if total_bytes >= _MAX_TOTAL_BYTES:
                 truncated = True
                 break
-            if _denied(sources, path):
-                counters.skipped_denied += 1
-                continue
             remaining = min(_MAX_FILE_BYTES, _MAX_TOTAL_BYTES - total_bytes)
             try:
                 raw = _read_file(path, remaining)
@@ -323,25 +326,34 @@ def _search(payload: dict[str, Any]) -> dict[str, Any]:
             lines: dict[int, str] = {}
             found: list[dict[str, Any]] = []
             for event in events:
-                if event["type"] in {"match", "context"}:
-                    data = event["data"]
-                    lines[data["line_number"]] = _text(data["lines"]).rstrip("\r\n")
-                    if event["type"] == "match":
-                        found.append(data)
+                # rg JSON 行是外部数据:非 dict / 缺字段按畸形跳过并标记不完整,
+                # 不让一条坏记录炸掉整次搜索。
+                if not isinstance(event, dict):
+                    truncated = True
+                    continue
+                if event.get("type") not in {"match", "context"}:
+                    continue
+                data = event.get("data")
+                number = data.get("line_number") if isinstance(data, dict) else None
+                if not isinstance(data, dict) or not isinstance(number, int):
+                    truncated = True
+                    continue
+                lines[number] = _text(data.get("lines")).rstrip("\r\n")
+                if event["type"] == "match":
+                    found.append(data)
             for data in found:
                 if len(matches) >= limit:
                     truncated = True
                     break
                 number = data["line_number"]
-                line = lines[number]
-                span = data["submatches"][0]
-                encoded_line = line.encode("utf-8")
+                line = lines.get(number)
+                if line is None:
+                    truncated = True
+                    continue
                 match = {
                     "file_path": label,
                     "line_number": number,
                     "line_content": line[:_MAX_LINE_CHARS],
-                    "match_start": len(encoded_line[: span["start"]].decode("utf-8", "replace")),
-                    "match_end": len(encoded_line[: span["end"]].decode("utf-8", "replace")),
                     "context_before": [
                         lines[n][:_MAX_LINE_CHARS]
                         for n in range(max(1, number - context), number)

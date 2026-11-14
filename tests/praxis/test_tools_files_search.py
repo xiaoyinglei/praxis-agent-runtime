@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +21,10 @@ import pytest
 
 from praxis.core import permission
 from praxis.core.pipeline import ExecCtx, execute
-from praxis.protocol.permission import PermissionContext
+from praxis.interfaces.sdk import ScriptedAdapter, open_session
+from praxis.protocol.items import ItemKind
+from praxis.protocol.models import ModelResponse, ModelToolCall, Usage
+from praxis.protocol.permission import PermissionContext, PermissionUpdate
 from praxis.protocol.policy import PathRule, PermissionPolicy, path_access, resolve_policy
 from praxis.protocol.sandbox import ToolExecContext
 from praxis.protocol.tools import (
@@ -771,3 +775,160 @@ def test_pipeline_forwards_permissions_to_search(
     assert result.status is ResultStatus.OK
     assert "TOPSECRET" not in result.text
     assert result.metadata["skipped_denied"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# 复审补齐:覆盖层(I-1)、空结果、.agent_memory 语义、worker 进程组回收
+# ---------------------------------------------------------------------------
+
+
+def _script_call(call_id: str, name: str, arguments: dict[str, object] | None = None) -> ModelResponse:
+    return ModelResponse(
+        content="",
+        tool_calls=(ModelToolCall(call_id=call_id, name=name, arguments=arguments or {}),),
+        usage=Usage(0, 0),
+        finish_reason="tool_calls",
+    )
+
+
+def _script_stop(text: str) -> ModelResponse:
+    return ModelResponse(content=text, tool_calls=(), usage=Usage(0, 0), finish_reason="stop")
+
+
+def _tool_result_for(session: Any, call_id: str) -> Any:
+    matches = [
+        item
+        for item in session.items()
+        if item.kind == ItemKind.TOOL_RESULT and item.payload.get("call_id") == call_id
+    ]
+    assert matches, f"no tool_result for {call_id!r}"
+    return matches[-1]
+
+
+def _result_text(item: Any) -> str:
+    return "".join(
+        block["data"]["text"] for block in item.payload["content"] if block["type"] == "text"
+    )
+
+
+def test_search_no_match_returns_empty_ok(tmp_path: Path) -> None:
+    (tmp_path / "f.txt").write_text("hello world\n", encoding="utf-8")
+    r = run(create_search_text_tool(tmp_path), {"pattern": "absent-token"})
+    assert r.status is ResultStatus.OK
+    assert r.text == ""
+    assert r.metadata["total_matches"] == 0
+    assert r.metadata["truncated"] is False
+    assert r.metadata["skipped_denied"] == 0
+    assert not r.truncated
+
+
+@pytest.mark.parametrize("layer", ("session_rules", "once_rules"))
+def test_custom_overlay_deny_hides_secret(tmp_path: Path, layer: str) -> None:
+    # 直构 PermissionContext 的覆盖层形状(test_permission_pipeline.py:200):
+    # decide 会 deny 精确 target,目录级搜索也必须把该文件排除。
+    (tmp_path / "secret.txt").write_text("TOPSECRET", encoding="utf-8")
+    (tmp_path / "public.txt").write_text("public needle", encoding="utf-8")
+    ctx = _permission_ctx(tmp_path)
+    ctx = replace(ctx, **{layer: (PathRule(path="secret.txt", access="deny"),)})
+    r = run_with(
+        create_search_text_tool(tmp_path),
+        {"pattern": "TOPSECRET"},
+        ToolExecContext(permissions=ctx),
+    )
+    assert "TOPSECRET" not in r.text
+    assert r.metadata["skipped_denied"] >= 1
+
+
+def test_once_update_deny_applies_to_search(workspace: Path) -> None:
+    # 真 Session.update_permission(destination="once"):once 覆盖层是 deny 进入
+    # 目录过滤的唯一通道(apply_update 不把它折进 policy)。
+    (workspace / "secret.txt").write_text("TOPSECRET", encoding="utf-8")
+    (workspace / "public.txt").write_text("public needle", encoding="utf-8")
+    session = open_session(
+        workspace,
+        ScriptedAdapter(
+            [_script_call("c1", "search_text", {"pattern": "TOPSECRET"}), _script_stop("done")]
+        ),
+    )
+    try:
+        session.update_permission(
+            PermissionUpdate(rule=PathRule(path="secret.txt", access="deny"), destination="once")
+        )
+        asyncio.run(session.submit("find the token"))
+        item = _tool_result_for(session, "c1")
+        assert "TOPSECRET" not in _result_text(item)
+        assert item.payload["metadata"]["skipped_denied"] >= 1
+    finally:
+        session.close()
+
+
+def test_agent_memory_target_is_invalid_input(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    (workspace / ".agent_memory").mkdir(parents=True)
+    (workspace / ".agent_memory" / "secret.txt").write_text("TOPSECRET", encoding="utf-8")
+    r = run(
+        create_search_text_tool(workspace),
+        {"pattern": "TOPSECRET", "path": ".agent_memory"},
+    )
+    assert r.status is ResultStatus.ERROR
+    assert r.error_code == "invalid_input"
+    assert "agent memory is not searchable" in r.text
+
+
+def _spawn_sleeping_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[int]:
+    """把 worker bootstrap 换成 sleep,并记录真实子进程 pid。"""
+    (tmp_path / "f.txt").write_text("needle\n", encoding="utf-8")
+    pids: list[int] = []
+    real = asyncio.create_subprocess_exec
+
+    async def spy(*args: Any, **kwargs: Any) -> Any:
+        proc = await real(*args, **kwargs)
+        pids.append(proc.pid)
+        return proc
+
+    monkeypatch.setattr(search_module.asyncio, "create_subprocess_exec", spy)
+    monkeypatch.setattr(search_module, "_bootstrap", lambda: "import time; time.sleep(30)")
+    return pids
+
+
+def _assert_pid_dead(pid: int, budget: float = 6.0) -> None:
+    deadline = time.monotonic() + budget
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        assert time.monotonic() < deadline, f"worker pid {pid} survived; expected group kill"
+        time.sleep(0.05)
+
+
+def test_worker_process_group_killed_on_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pids = _spawn_sleeping_worker(monkeypatch, tmp_path)
+
+    async def scenario() -> None:
+        tool = create_search_text_tool(tmp_path)
+        task = asyncio.create_task(tool.run({"pattern": "needle"}, ToolExecContext()))
+        while not pids:
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert pids
+    _assert_pid_dead(pids[0])
+
+
+def test_worker_process_group_killed_on_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pids = _spawn_sleeping_worker(monkeypatch, tmp_path)
+    monkeypatch.setattr(search_module, "_WORKER_TIMEOUT_SECONDS", 0.2)
+    r = run(create_search_text_tool(tmp_path), {"pattern": "needle"})
+    assert r.status is ResultStatus.TIMEOUT
+    assert r.error_code == "timeout"
+    assert pids
+    _assert_pid_dead(pids[0])

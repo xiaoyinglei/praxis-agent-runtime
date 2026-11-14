@@ -33,7 +33,6 @@ from pathlib import Path
 from praxis.protocol.floor import floor_reason, host_private_paths
 from praxis.protocol.permission import Decision, PermissionContext, PermissionUpdate
 from praxis.protocol.policy import (
-    NetworkPolicy,
     NetworkRule,
     PathRule,
     PermissionPolicy,
@@ -43,6 +42,7 @@ from praxis.protocol.policy import (
     ToolRule,
     command_network_decision,
     network_decision,
+    overlay_policy,
     path_access,
     path_reason,
     resolve_policy,
@@ -76,27 +76,14 @@ def _policy_sources(ctx: PermissionContext) -> tuple[ResolvedPolicy, ...]:
 def _rule_layers(ctx: PermissionContext) -> tuple[ResolvedPolicy, ...]:
     """session/once 规则层:只收紧、不放宽(交集语义的一个来源)。
 
-    基线即"无意见":filesystem 以 "/" write 打底、network 以 allow 打底——
-    显式规则比基线更具体(或同路径更严)即生效;无命中 = 放行该层。
-    ToolRule 无基线问题:无命中 tool_decision 返回 None。
+    声明构造委托 ``protocol.policy.overlay_policy``(基线与折叠规则的唯一实现);
+    core 只负责逐层 resolve。ToolRule 无基线问题:无命中 tool_decision 返回 None。
     """
     layers: list[ResolvedPolicy] = []
     for rules in (ctx.session_rules, ctx.once_rules):
         if not rules:
             continue
-        path_rules = tuple(rule for rule in rules if isinstance(rule, PathRule))
-        tool_rules = tuple(rule for rule in rules if isinstance(rule, ToolRule))
-        network_rules = tuple(rule for rule in rules if isinstance(rule, NetworkRule))
-        layers.append(
-            resolve_policy(
-                PermissionPolicy(
-                    filesystem=(PathRule(path="/", access="write"), *path_rules),
-                    tools=tool_rules,
-                    network=NetworkPolicy(decision="allow", rules=network_rules),
-                ),
-                Path(ctx.workspace),
-            )
-        )
+        layers.append(resolve_policy(overlay_policy(rules), Path(ctx.workspace)))
     return tuple(layers)
 
 

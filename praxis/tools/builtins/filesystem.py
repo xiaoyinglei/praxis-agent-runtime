@@ -633,7 +633,9 @@ def create_list_files_tool(workspace: Path) -> Tool:
                 "<kind>\\t<bytes>\\t<relative path> line per entry (d=directory, f=file, "
                 "l=symlink; symlinks are never followed). Hidden entries are skipped "
                 f"unless include_hidden=true; protected trees ({_FLOOR_DIRECTORY_TEXT}) "
-                "are always skipped. Use max_entries to bound the listing."
+                "are always skipped. Entries denied by the permission policy "
+                "(including symlinks whose real target is outside permitted paths) "
+                "are omitted. Use max_entries to bound the listing."
             ),
             input_schema={
                 "type": "object",

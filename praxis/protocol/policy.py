@@ -19,6 +19,7 @@ import json
 import os
 import re
 import unicodedata
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -184,6 +185,32 @@ def resolve_policy(
         tools=policy.tools,
         network=policy.network,
         private_paths=tuple(private_paths),
+    )
+
+
+def overlay_policy(rules: Iterable[PolicyRule]) -> PermissionPolicy:
+    """把一个 session/once 覆盖层规则集折叠为可解析的策略声明。
+
+    基线是 ``/`` write 与 network allow(即"无意见"):显式 PathRule/ToolRule/
+    NetworkRule 比基线更具体即生效。覆盖层**只收紧、不放宽**——allow 规则会被
+    基线吸收。调用方必须把覆盖层与 base policy/ceilings **各自 resolve、决策时
+    最严者胜**,不得合并进同一份 policy:合并会让更具体的 allow 反向覆盖较宽的
+    deny,那是放宽而不是收紧。
+
+    返回值是普通声明(可 ``model_dump(mode="json")`` 跨进程传递);解析仍只经
+    ``resolve_policy``。
+    """
+    rule_tuple = tuple(rules)
+    return PermissionPolicy(
+        filesystem=(
+            PathRule(path="/", access="write"),
+            *(rule for rule in rule_tuple if isinstance(rule, PathRule)),
+        ),
+        tools=tuple(rule for rule in rule_tuple if isinstance(rule, ToolRule)),
+        network=NetworkPolicy(
+            decision="allow",
+            rules=tuple(rule for rule in rule_tuple if isinstance(rule, NetworkRule)),
+        ),
     )
 
 

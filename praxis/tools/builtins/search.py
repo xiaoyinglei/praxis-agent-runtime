@@ -53,6 +53,7 @@ from praxis.protocol.tools import (
 from praxis.tools.builtins.filesystem import PENDING_TOOL_CALL_ID
 from praxis.tools.builtins.paths import checked_path
 from praxis.tools.builtins.process import await_main_exit, signal_group
+from praxis.tools.builtins.read_access import permission_declarations
 from praxis.tools.builtins.search_worker import LIMITS
 
 _DEFAULT_CONTEXT_LINES = 2
@@ -66,8 +67,6 @@ _MAX_STDERR_CHARS = 2_000
 _WORKER_TIMEOUT_SECONDS = 14.0
 _CANCEL_GRACE_SECONDS = 0.5
 _POST_KILL_WAIT_SECONDS = 2.0
-# worker 的最终 JSON 以 _MAX_OUTPUT_BYTES 为上限;读取缓冲留出序列化/错误余量。
-_WORKER_STREAM_LIMIT = 4_000_000
 
 
 def rg_path() -> Path:
@@ -121,14 +120,11 @@ def _bootstrap() -> str:
 
 
 def _policies(exec_ctx: ToolExecContext) -> list[dict[str, Any]] | None:
-    """不可变权限快照 → worker(policy + ceilings 的纯 JSON 声明)。"""
-    permissions = exec_ctx.permissions
-    if permissions is None:
+    """不可变权限快照 → worker(policy + ceilings + session/once 覆盖层声明)。"""
+    declarations = permission_declarations(exec_ctx.permissions)
+    if not declarations:
         return None
-    return [
-        policy.model_dump(mode="json")
-        for policy in (permissions.policy, *permissions.ceilings)
-    ]
+    return [policy.model_dump(mode="json") for policy in declarations]
 
 
 def _result(
@@ -306,7 +302,7 @@ def create_search_text_tool(workspace: Path) -> Tool:
         if isinstance(worker_result, dict) and "error_code" in worker_result:
             error_code = str(worker_result["error_code"])
             message = str(worker_result.get("error_message", ""))
-            if error_code == "invalid_input":
+            if error_code == "invalid_input" and worker_result.get("stderr") is True:
                 # rg stderr 只进 metadata(前 2000 字符),模型可见文本保持简短。
                 return _result(
                     content="invalid_input: invalid search pattern or arguments",
