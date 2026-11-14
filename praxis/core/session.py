@@ -90,7 +90,14 @@ class ResumeNotConfirmed(RuntimeError):  # noqa: N818 — 设计 §5.2 守卫钉
 
 
 def _call_names(items: Sequence[Item]) -> dict[str, str]:
-    """call_id → 工具名:从最后出现的 model_response/tool_call/tool_result 取。"""
+    """call_id → 工具名:从最后出现的 model_response/tool_call/tool_result 取。
+
+    B31 判断(last-wins 对 reconcile 无害,交档):reconcile 映射的键本身就是裸
+    call_id,同 turn 跨轮复用 id 时 API 无法区分两条调用;可成为对账目标的必然
+    是尚无结果的那一轮,而"最后出现的同名调用"正是最近的声明窗口及其
+    tool_call——更早窗口已有结果,不会是需要命名的对账目标。裸 id 语义不变,
+    窗口化 reconcile API 属阶段 4。
+    """
     names: dict[str, str] = {}
     for item in items:
         if item.kind == ItemKind.MODEL_RESPONSE:
@@ -110,7 +117,18 @@ def _call_names(items: Sequence[Item]) -> dict[str, str]:
 
 
 def _latest_payloads(items: Sequence[Item], kind: str) -> dict[str, Mapping[str, JsonValue]]:
-    """某 kind 下 call_id → 最后一条 payload(同 call_id 多次请求/决策取最新)。"""
+    """某 kind 下 call_id → 最后一条 payload(同 call_id 多次请求/决策取最新)。
+
+    B31 判断(交档):
+    - 审批**选择/落笔**面(last-wins 无害):``_validate_approval`` 与
+      ``_write_approval_decisions`` 取最近一条 approval_request 的 digest——裸
+      call_id 重入只可能指向最近声明窗口,与管道 ``_latest_approval_decision``
+      的窗口无关绑定同口径;取最新正是重入要绑定/执行的动作。
+    - ``_pending_approvals`` 的**展示**面:其"已决策"集合按裸 call_id 判定,同
+      turn 跨轮复用 id 且两轮 digest 不同时,第一轮 decision 可能把第二轮新
+      request 误判为已决策(摘要隐藏,不产生孤儿 provider 请求)。这是裸 id
+      审批 API 的固有边界,窗口化属阶段 4 子代理审批面,本任务不改。
+    """
     latest: dict[str, Mapping[str, JsonValue]] = {}
     for item in items:
         if item.kind != kind:

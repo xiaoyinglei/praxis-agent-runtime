@@ -168,6 +168,53 @@ def test_reentry_with_changed_args_reasks(ctx: ExecCtx, monkeypatch: pytest.Monk
     assert all(i.kind != ItemKind.TOOL_CALL for i in items)
 
 
+def _model_response_item(ctx: ExecCtx, call_id: str, name: str, arguments: dict[str, object]) -> None:
+    """真实写入序下的 model_response item(声明窗口的声明者;B31 窗口配对用)。"""
+    ctx.store.append_items(
+        ctx.thread_id,
+        ctx.turn_id,
+        [
+            ItemEntry(
+                kind=ItemKind.MODEL_RESPONSE,
+                payload={
+                    "content": "",
+                    "tool_calls": ({"call_id": call_id, "name": name, "arguments": dict(arguments)},),
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                    "finish_reason": "tool_calls",
+                },
+            )
+        ],
+    )
+
+
+def test_second_round_same_call_id_different_args_never_inherits_approval(
+    ctx: ExecCtx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R-T7-2:同 turn 第二轮复用 c1 但参数不同 → 绝不继承第一轮 allow,必须重新 ask。
+
+    批准绑定是 call_id + args_digest + policy_revision(窗口无关)。参数不同时
+    digest 必然不匹配,旧批准作废;这里用完整两轮 item 流钉死该边界(第一轮
+    请求→批准→执行→结果,第二轮同 id 新参数)。
+    """
+    monkeypatch.setattr(permission, "decide", lambda *a: Decision.ask("test"))
+    _model_response_item(ctx, "c1", "read", dict(ARGS_A))
+    assert asyncio.run(execute(ToolCall("c1", "read", dict(ARGS_A)), ctx)).status is ResultStatus.PAUSED
+    _decision_item(ctx, "allow", args_digest(ARGS_A))
+    _resume(ctx)
+    assert asyncio.run(execute(ToolCall("c1", "read", dict(ARGS_A)), ctx)).status is ResultStatus.OK
+
+    _model_response_item(ctx, "c1", "read", dict(ARGS_B))  # 第二轮:同 id、不同参数
+    r = asyncio.run(execute(ToolCall("c1", "read", dict(ARGS_B)), ctx))
+    assert r.status is ResultStatus.PAUSED  # 不得沿用第一轮批准
+    items = ctx.store.read_turn_items(ctx.turn_id)
+    reqs = [i for i in items if i.kind == ItemKind.APPROVAL_REQUEST]
+    assert len(reqs) == 2
+    assert reqs[0].payload["args_digest"] == args_digest(ARGS_A)
+    assert reqs[-1].payload["args_digest"] == args_digest(ARGS_B)
+    # 第一轮恰好执行一次;第二轮未 dispatch(tool_call 只来自第一轮)
+    assert len([i for i in items if i.kind == ItemKind.TOOL_CALL]) == 1
+
+
 def test_reentry_with_matching_digest_executes(ctx: ExecCtx, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(permission, "decide", lambda *a: Decision.ask("test"))
     assert asyncio.run(execute(ToolCall("c1", "read", dict(ARGS_A)), ctx)).status is ResultStatus.PAUSED

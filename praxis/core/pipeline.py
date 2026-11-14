@@ -212,6 +212,13 @@ def _append_result_item(ctx: ExecCtx, result: ToolResult) -> None:
 
 
 def _latest_approval_decision(items: list[Item], call_id: str) -> Item | None:
+    """最近一条 approval_decision(裸 call_id;窗口无关绑定,已知边界见下)。
+
+    R-T7-2:绑定键是 call_id + args_digest + policy_revision,不含"声明窗口"。
+    同 turn 跨轮复用 call_id 时,参数与策略修订都相同的旧批准会被视为同一动作
+    而沿用(语义可接受);参数不同则 digest 不匹配,必然重新 ask。真正按声明
+    窗口绑定属阶段 4 子代理审批面统一处理,本函数保持窗口无关语义。
+    """
     for item in reversed(items):
         if item.kind == ItemKind.APPROVAL_DECISION and item.payload.get("call_id") == call_id:
             return item

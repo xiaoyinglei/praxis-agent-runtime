@@ -17,6 +17,10 @@ sweep(执行锁粒度 = thread,§5.1):
 classify_pending:resume 前的纯函数分类器(Task 9/14 消费),无副作用——
 把最后一条 model_response 里尚未拿到 tool_result 的调用,按"是否已写下
 tool_call item"(可能已有副作用)与"工具是否幂等"(能否安全重放)标注。
+结果配对判据与投影共用 ``core.context.pair_tool_results``:调用身份是
+"最后一条 model_response 的声明窗口",不是裸 call_id——同 turn 跨轮复用
+call_id 时,第一轮的结果绝不能把第二轮尚未执行的同 id 调用判为已解决
+(R-T7-1,否则 resume 静默丢掉一次调用)。
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from praxis.core.context import pair_tool_results
 from praxis.core.locks import ThreadBusy, thread_execution_lock
 from praxis.core.statemachine import IllegalTransition, TurnStatus, transition
 from praxis.protocol.items import Item, ItemKind
@@ -87,32 +92,37 @@ def classify_pending(items: Sequence[Item], tools: Mapping[str, Tool]) -> list[P
     """从 items(一个 turn 的完整日志)提取最后一条 model_response 的待决调用。
 
     规则:
-    - 只看**最后**一条 model_response——更早轮次的调用已被模型自己接管;
-    - 已有 tool_result 的 call_id 排除;
-    - started = 存在同 call_id 的 tool_call item;
+    - 只看**最后**一条 model_response(seq 最大)——更早轮次的调用已被模型
+      自己接管;
+    - 结果判据走 ``pair_tool_results`` 的声明窗口:只有配给**本条**
+      model_response 的 tool_result 才算已解决。同 turn 跨轮复用 call_id 时,
+      更早轮次的结果属于更早的声明窗口,不得吞掉本轮的调用(R-T7-1);
+    - started = 存在**本条声明之后**(seq 更大)的同 call_id tool_call item
+      ——更早轮次同 id 的 tool_call 不是本窗口的 dispatch;
     - idempotent = tools[name].idempotent,未知工具按 False;
     - 读路径零校验(B1):结构不符的条目静默跳过,绝不抛异常。
     """
     last_response: Item | None = None
-    started_call_ids: set[str] = set()
-    resulted_call_ids: set[str] = set()
     for item in items:
-        if item.kind == ItemKind.MODEL_RESPONSE:
+        if item.kind == ItemKind.MODEL_RESPONSE and (
+            last_response is None or item.seq >= last_response.seq
+        ):
             last_response = item
-        elif item.kind == ItemKind.TOOL_CALL:
-            call_id = item.payload.get("call_id")
-            if isinstance(call_id, str):
-                started_call_ids.add(call_id)
-        elif item.kind == ItemKind.TOOL_RESULT:
-            call_id = item.payload.get("call_id")
-            if isinstance(call_id, str):
-                resulted_call_ids.add(call_id)
 
     if last_response is None:
         return []
     raw_calls = last_response.payload.get("tool_calls")
     if not isinstance(raw_calls, (list, tuple)):
         return []
+
+    paired, _orphans = pair_tool_results(items)
+    started_call_ids: set[str] = set()
+    for item in items:
+        if item.kind != ItemKind.TOOL_CALL or item.seq <= last_response.seq:
+            continue
+        call_id = item.payload.get("call_id")
+        if isinstance(call_id, str) and item.turn_id == last_response.turn_id:
+            started_call_ids.add(call_id)
 
     pending: list[PendingCall] = []
     for entry in raw_calls:
@@ -122,8 +132,8 @@ def classify_pending(items: Sequence[Item], tools: Mapping[str, Tool]) -> list[P
         name = entry.get("name")
         if not isinstance(call_id, str) or not isinstance(name, str):
             continue
-        if call_id in resulted_call_ids:
-            continue
+        if (last_response.turn_id, last_response.seq, call_id) in paired:
+            continue  # 本窗口已有结果(更早窗口的结果不算)
         raw_arguments = entry.get("arguments")
         arguments: Mapping[str, JsonValue] = raw_arguments if isinstance(raw_arguments, Mapping) else {}
         tool = tools.get(name)

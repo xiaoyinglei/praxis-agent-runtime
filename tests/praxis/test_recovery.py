@@ -242,11 +242,17 @@ def test_classify_excludes_call_ids_with_tool_result() -> None:
 
 
 def test_classify_uses_last_model_response_only() -> None:
-    """多轮:只审最后一条 model_response;更早轮次未决的 call_id 不算 pending。"""
+    """多轮:只审最后一条 model_response;更早轮次未决的 call_id 不算 pending。
+
+    B31/R-T7-1 迁移:tool_call 只能属于**声明它的那条响应之后**的窗口(真实
+    写入序),旧夹具把 c2 的 tool_call 放在 c2 声明之前——那正是"裸 call_id
+    集合"的旧判据;现在按声明窗口 seq 判定 started,夹具改为真实写入序,
+    断言(只看最后一条响应、c2 started、c1 被取代)逐条不变。
+    """
     items = [
         _model_response(1, [_call("c1", "read_file")]),  # 没有任何 result——但已被取代
-        _item(2, ItemKind.TOOL_CALL.value, {"call_id": "c2", "tool_name": "write_file", "arguments": {}}),
         _model_response(3, [_call("c2", "write_file", {"path": "b.md"})]),
+        _item(4, ItemKind.TOOL_CALL.value, {"call_id": "c2", "tool_name": "write_file", "arguments": {}}),
     ]
     pending = classify_pending(items, _TOOLS)
     assert [(p.call.call_id, p.started) for p in pending] == [("c2", True)]

@@ -298,8 +298,11 @@ def test_model_response_no_content_and_no_valid_calls_skipped() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_pairing_repair_synthesizes_missing_result_immediately_after_assistant() -> None:
-    # (a) assistant 两个 call,只有 c1 有真实结果:c2 的合成结果紧跟 assistant,先于后续 item
+def test_pairing_repair_synthesizes_missing_result_in_declaration_order() -> None:
+    # (a) assistant 两个 call,只有 c1 有真实结果:配对修复后两条 tool 消息紧跟
+    # assistant、按声明顺序(c1 真实在前,c2 合成在后),先于后续 user item。
+    # B31 迁移:旧实现把合成消息插在 assistant 紧后、真实结果留在自身位置,
+    # 顺序是 c2→c1;声明窗口配对按 tool_calls 顺序输出(provider 组内顺序契约)。
     items = [
         mk(
             1,
@@ -317,8 +320,8 @@ def test_pairing_repair_synthesizes_missing_result_immediately_after_assistant()
     ]
     msgs = to_messages(items)
     assert [m.role for m in msgs] == ["assistant", "tool", "tool", "user"]
-    assert msgs[1] == ModelMessage(role="tool", content=_UNPAIRED_NOTE, tool_call_id="c2")
-    assert msgs[2].content == "real" and msgs[2].tool_call_id == "c1"
+    assert msgs[1].content == "real" and msgs[1].tool_call_id == "c1"
+    assert msgs[2] == ModelMessage(role="tool", content=_UNPAIRED_NOTE, tool_call_id="c2")
 
 
 def test_all_calls_unpaired_get_synthetic_results() -> None:
@@ -521,8 +524,10 @@ def test_r10_pairing_invariant_holds_with_duplicate_results() -> None:
     ]
     msgs = to_messages(items)
     tool_msgs = [m for m in msgs if m.role == "tool"]
-    assert [m.tool_call_id for m in tool_msgs] == ["c2", "c1"]
-    assert tool_msgs[1].content == "new"
+    # B31 迁移:按声明顺序(c1 真实结果在前,c2 合成在后);仍是每 id 恰一条。
+    assert [m.tool_call_id for m in tool_msgs] == ["c1", "c2"]
+    assert tool_msgs[0].content == "new"
+    assert tool_msgs[1] == ModelMessage(role="tool", content=_UNPAIRED_NOTE, tool_call_id="c2")
     assert "old" not in "".join(m.content for m in msgs)
 
 

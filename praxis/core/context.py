@@ -50,6 +50,66 @@ def build_context(items: Sequence[Item]) -> list[Item]:
     return folded
 
 
+# 声明窗口配对键/结果引用(B31/R-T7-1 共用,见 pair_tool_results)。
+type DeclarationKey = tuple[str | None, int, str]
+type ResultRef = tuple[int, int]
+
+
+def pair_tool_results(
+    items: Sequence[Item],
+) -> tuple[dict[DeclarationKey, ResultRef], set[DeclarationKey]]:
+    """把 tool_result 配给"声明窗口"——``to_messages`` 与 ``classify_pending`` 的唯一判据。
+
+    键 = ``(turn_id, 声明它的 model_response.seq, call_id)``:同一 turn 内复用
+    call_id(本地小模型每轮从 call_0 重新起号)不再互相覆盖。按 seq 升序扫一遍:
+
+    - ``model_response`` 的每个可解析 ``tool_calls[].call_id`` 打开/更新该
+      ``(turn_id, call_id)`` 的当前声明窗口(同一条响应声明两次同 id 折叠进
+      同一个窗口——属真畸形,``to_messages`` 侧仍为第二次声明补合成);
+    - ``tool_result`` 配给它之前**最近**的同 ``(turn_id, call_id)`` 声明;
+      同窗口多条结果取最新 ``(seq, 列表位置)`` 胜(R10),旧结果留库审计;
+    - 之前没有任何声明的结果进 ``orphans``(键用结果自身的
+      ``(turn_id, result.seq, call_id)``,供读端原样投影)。
+
+    纯读、有界(一次排序 + 一次线性扫)、永不抛:未知 kind/畸形 payload 一律
+    跳过,与 status/文本无关(denied/not_executed 也算"有结果")。返回值:
+    ``paired`` = 窗口键 → 进投影结果的 ``(seq, 列表位置)``;
+    ``orphans`` = 配不上声明的结果自身键集合。
+    """
+    ordered = sorted(enumerate(items), key=lambda entry: (entry[1].seq, entry[0]))
+    open_declarations: dict[tuple[str | None, str], DeclarationKey] = {}
+    paired: dict[DeclarationKey, ResultRef] = {}
+    orphans: set[DeclarationKey] = set()
+    for position, item in ordered:
+        if item.kind == ItemKind.MODEL_RESPONSE:
+            raw_calls = item.payload.get("tool_calls")
+            if not isinstance(raw_calls, (list, tuple)):
+                continue
+            for entry in raw_calls:
+                if not isinstance(entry, Mapping):
+                    continue
+                call_id = entry.get("call_id")
+                if isinstance(call_id, str):
+                    open_declarations[(item.turn_id, call_id)] = (
+                        item.turn_id,
+                        item.seq,
+                        call_id,
+                    )
+        elif item.kind == ItemKind.TOOL_RESULT:
+            call_id = item.payload.get("call_id")
+            if not isinstance(call_id, str):
+                continue
+            declaration = open_declarations.get((item.turn_id, call_id))
+            candidate = (item.seq, position)
+            if declaration is None:
+                orphans.add((item.turn_id, item.seq, call_id))
+                continue
+            current = paired.get(declaration)
+            if current is None or candidate >= current:
+                paired[declaration] = candidate
+    return paired, orphans
+
+
 def to_messages(items: Sequence[Item]) -> list[ModelMessage]:
     """把(已折叠的)Item 序列投影为模型可见消息;未知 kind 与畸形 payload 跳过,永不抛。
 
@@ -61,80 +121,60 @@ def to_messages(items: Sequence[Item]) -> list[ModelMessage]:
     - summary → user,前缀 "[conversation summary]\\n"
     - 其余 kind(turn_status/approval_*/tool_call/未知)→ 跳过
 
-    配对修复(R9):只改投影,不改 store 事实。两遍处理——
-    第一遍收集"有 tool_result item 的 (turn_id, call_id) 集合"(存在性按
-    kind+turn_id+call_id 判定,与 status/文本无关,denied/not_executed 也算
-    存在);第二遍顺序投影,紧跟在携带 tool_calls 的 assistant 消息之后,按其
-    tool_calls 顺序为该 assistant 所属 turn 中没有结果的 call_id 合成 tool 消息
-    (覆盖 cancelled/failed/abandoned-paused 轮次;INTERRUPTED 轮次由 recovery
-    写入真实 not_executed/outcome_unknown 结果,属于结果集合,原样投影)。真实
-    结果 item 遇到时正常投影,不会重复。
-    这样任何 provider 的 tool_use/tool_result 配对校验(OpenAI/Anthropic 会
-    拒绝孤儿 tool_calls)都不会因中断轮次而失败。
+    配对(B31/R9/R10,判据唯一来源是 ``pair_tool_results``):投影按 seq 顺序
+    进行(列表顺序不是事实,seq 才是),紧跟每个携带 tool_calls 的 assistant
+    消息之后,按声明顺序逐条输出该声明的配对结果;没有可用结果(未闭合声明,
+    或结果 payload 不可重建)时补 ``_UNPAIRED_TOOL_RESULT_NOTE`` 合成消息
+    (R9,覆盖 cancelled/failed/abandoned-paused 轮次;INTERRUPTED 轮次由
+    recovery 写入真实 not_executed/outcome_unknown 结果,属已配结果)。
+    同一声明窗口内多条结果只投影最新 seq 的一条(R10;reconcile 在
+    outcome_unknown 之后追加对账结果时旧结果仅留库审计),同一响应重复声明
+    同一 call_id 时第一次消费真实结果、后续声明补合成——每个声明恰有一条
+    tool 消息,provider 的 tool_use/tool_result 配对校验不会因复用 call_id
+    或中断轮次而失败。
 
-    结果覆盖(R10,同一第一遍的图完成):同一 turn 内一个 call_id 出现多条
-    tool_result 时只投影**最后**一条(最新 seq 胜;seq 相同取列表靠后者)。
-    reconcile 会在 outcome_unknown 之后追加对账结果——被覆盖的旧结果仍留在
-    item 日志做审计,但不再进入模型上下文,避免同一调用出现两个互相矛盾的
-    工具消息。
-
-    turn 作用域(整分支评审修复):存在性与覆盖判定都按 (turn_id, call_id)
-    分键——call_id 只在单个 turn 内是调用身份,跨 turn 不唯一(local provider
-    每轮从 call_0 重新起号、CLI 在 default 线程多轮累积)。全局按 call_id 分键
-    会把后一 turn 同 id 的真实结果判为"更新"而丢弃前一 turn 的结果、同时 R9
-    也不再为缺结果的 turn 合成 → 前一 turn 的 assistant 成为孤儿 tool_call,
-    真实 provider 拒收请求。turn_id 为 None 的 item 退化为 (None, call_id),
-    单线程行为不变。
+    配不上任何声明的**孤儿结果**在自身位置原样投影(fail-open 读:CLI 直调
+    遗留等旧数据不静默丢失);配对成功的结果只在声明 assistant 后出现一次。
+    turn_id 为 None 的 item 退化为 (None, seq, call_id),单线程行为不变。
     """
-    last_result_keys = _last_result_keys(items)
+    ordered = sorted(enumerate(items), key=lambda entry: (entry[1].seq, entry[0]))
+    paired, orphans = pair_tool_results(items)
+    latest_position = {key: position for key, (_seq, position) in paired.items()}
     messages: list[ModelMessage] = []
-    for position, item in enumerate(items):
+    used_keys: set[DeclarationKey] = set()
+    for _position, item in ordered:
         if item.kind == ItemKind.TOOL_RESULT:
             call_id = item.payload.get("call_id")
-            if isinstance(call_id, str) and last_result_keys.get((item.turn_id, call_id)) != (
-                item.seq,
-                position,
-            ):
-                continue  # R10:同 turn 内非最新结果,留在日志不进投影
+            if not isinstance(call_id, str):
+                continue
+            if (item.turn_id, item.seq, call_id) in orphans:
+                message = _to_message(item)  # 孤儿:原样投影(fail-open,永不抛)
+                if message is not None:
+                    messages.append(message)
+            # 已配对/被更新结果覆盖的结果由其声明窗口统一投影,自身位置不再重复
+            continue
         message = _to_message(item)
         if message is None:
             continue
         messages.append(message)
-        if message.role == "assistant" and message.tool_calls:
-            for call in message.tool_calls:
-                if (item.turn_id, call.call_id) not in last_result_keys:
-                    messages.append(
-                        ModelMessage(
-                            role="tool",
-                            content=_UNPAIRED_TOOL_RESULT_NOTE,
-                            tool_call_id=call.call_id,
-                        )
-                    )
+        if message.role != "assistant" or not message.tool_calls:
+            continue
+        for call in message.tool_calls:
+            key: DeclarationKey = (item.turn_id, item.seq, call.call_id)
+            result_message: ModelMessage | None = None
+            if key not in used_keys:
+                used_keys.add(key)
+                result_position = latest_position.get(key)
+                if result_position is not None:
+                    result_message = _to_message(items[result_position])
+            if result_message is None:  # 未闭合/不可重建 → R9 合成
+                result_message = ModelMessage(
+                    role="tool",
+                    content=_UNPAIRED_TOOL_RESULT_NOTE,
+                    tool_call_id=call.call_id,
+                )
+            messages.append(result_message)
     return messages
-
-
-def _last_result_keys(items: Sequence[Item]) -> dict[tuple[str | None, str], tuple[int, int]]:
-    """两遍处理第一遍:(turn_id, call_id) → 该 turn 该 call 最新 tool_result 的
-    (seq, 列表位置)。
-
-    键集合即"已有结果的 (turn_id, call_id)"(R9 配对判据);值给出该 call 在本
-    turn 内哪条结果进投影(R10 覆盖判据)。call_id 跨 turn 不唯一,键必须带
-    turn_id(见 to_messages docstring);存在性与覆盖判定只看 kind+turn_id+
-    call_id,与 status 无关。
-    """
-    latest: dict[tuple[str | None, str], tuple[int, int]] = {}
-    for position, item in enumerate(items):
-        if item.kind != ItemKind.TOOL_RESULT:
-            continue
-        call_id = item.payload.get("call_id")
-        if not isinstance(call_id, str):
-            continue
-        key = (item.seq, position)
-        result_id = (item.turn_id, call_id)
-        current = latest.get(result_id)
-        if current is None or key >= current:
-            latest[result_id] = key
-    return latest
 
 
 # ---------------------------------------------------------------------------
