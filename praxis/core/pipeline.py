@@ -162,6 +162,12 @@ def _error_result(
     )
 
 
+def _byte_truncated(result: ToolResult, encoded: bytes, limit: int) -> ToolResult:
+    """旧语义降级:保留 UTF-8 安全头部,重建单 text 块。"""
+    cut = encoded[:limit].decode("utf-8", errors="ignore")
+    return replace(result, content=(_text_block(cut),), truncated=True)
+
+
 def _finalize(
     raw: ToolResult,
     *,
@@ -175,7 +181,8 @@ def _finalize(
     内容寻址 artifact,item 只留头部片段 + 指针 + digest/字节数——全文只存一份
     (B22)。头部预算 ``min(_ARTIFACT_HEAD_BYTES, limit - 指针长度 - 1)`` 保证它
     严格短于全文(外部化条件即全文 > limit),因此完整正文绝不会随 item 落库。
-    未注入 ``artifacts``(单测/裸管道)时保留旧字节截断语义。
+    未注入 ``artifacts``(单测/裸管道)时保留旧字节截断语义;``put`` 抛 OSError
+    (磁盘满/权限错)同样降级为截断,并标 ``artifact_unavailable=True``。
     """
     result = replace(raw, tool_call_id=call.tool_call_id, tool_name=call.tool_name)
     encoded = result.text.encode("utf-8")
@@ -183,10 +190,17 @@ def _finalize(
     if len(encoded) <= limit:
         return result
     if artifacts is None:
-        cut = encoded[:limit].decode("utf-8", errors="ignore")
-        return replace(result, content=(_text_block(cut),), truncated=True)
+        return _byte_truncated(result, encoded, limit)
 
-    digest = artifacts.put(encoded)
+    try:
+        digest = artifacts.put(encoded)
+    except OSError:
+        # 磁盘满/权限错:如实降级为字节截断并在 metadata 标不可用,
+        # 绝不假装"已外部化"(否则模型拿到一个打不开的指针)。
+        degraded = _byte_truncated(result, encoded, limit)
+        degraded_metadata: dict[str, JsonValue] = dict(degraded.metadata)
+        degraded_metadata["artifact_unavailable"] = True
+        return replace(degraded, metadata=degraded_metadata)
     note = (
         f"\n[full output stored: artifact://{digest} "
         f"({len(encoded)} bytes); read with read_artifact]"

@@ -41,6 +41,7 @@ from praxis.store.artifacts import ArtifactIntegrityError, ArtifactStore
 from praxis.store.log import Store
 from praxis.store.turns import create_turn
 from praxis.tools.builtins.artifacts_tool import create_read_artifact_tool
+from praxis.tools.builtins.filesystem import create_read_tool
 
 DIGEST_A = "a" * 64
 
@@ -130,10 +131,14 @@ def test_put_get_roundtrip_and_mode(tmp_path: Path) -> None:
 def test_put_is_content_addressed(tmp_path: Path) -> None:
     a = ArtifactStore(tmp_path)
     d1 = a.put(b"same")
+    path = tmp_path / d1[:2] / d1
+    old = 1_000_000.0
+    os.utime(path, (old, old))
     d2 = a.put(b"same")
     assert d1 == d2
     assert list(a.iter_digests()) == [d1]
     assert a.size(d1) == 4
+    assert path.stat().st_mtime == old  # 已存在即返回,不重写(去重)
 
 
 def test_missing_artifact_returns_none(tmp_path: Path) -> None:
@@ -149,6 +154,17 @@ def test_invalid_digest_raises_value_error(tmp_path: Path, bad: str) -> None:
         a.get(bad)
     with pytest.raises(ValueError, match="invalid artifact digest"):
         a.size(bad)
+
+
+def test_get_and_size_map_oserror_to_missing(tmp_path: Path) -> None:
+    """目录替代文件/不可读 → None(由工具映射 artifact_not_found),不炸穿。"""
+    a = ArtifactStore(tmp_path)
+    d = a.put(b"x")
+    path = tmp_path / d[:2] / d
+    path.unlink()
+    path.mkdir()
+    assert a.get(d) is None
+    assert a.size(d) is None
 
 
 def test_integrity_mismatch_raises(tmp_path: Path) -> None:
@@ -179,6 +195,31 @@ def test_gc_keeps_referenced_and_fresh(tmp_path: Path) -> None:
     assert a.get(referenced) is not None
     assert a.get(stale) is None
     assert a.get(fresh) is not None  # 未引用但新鲜 → 宽限期内保留
+
+
+def test_symlinked_shard_and_file_are_ignored(tmp_path: Path) -> None:
+    """GC 离线运行:存储内指向外部的符号链接不能被枚举/删除。"""
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    a = ArtifactStore(root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    shard_digest = "ab" + "c" * 62
+    (outside / shard_digest).write_bytes(b"outside file")
+    old = time.time() - 7200
+    os.utime(outside / shard_digest, (old, old))
+    (root / "ab").symlink_to(outside, target_is_directory=True)
+
+    file_digest = "cd" + "e" * 62
+    link_target = tmp_path / "link-target"
+    link_target.write_bytes(b"linked")
+    (root / "cd").mkdir()
+    (root / "cd" / file_digest).symlink_to(link_target)
+
+    assert list(a.iter_digests()) == []
+    assert a.gc(set(), now=time.time()) == 0  # 不删任何东西
+    assert (outside / shard_digest).exists()
+    assert link_target.exists()
 
 
 def test_referenced_by_fail_open() -> None:
@@ -235,6 +276,28 @@ def test_externalized_head_never_splits_multibyte(store: Store, workspace: Path,
     assert "�" not in result.text  # 不产出替换字符
     assert full.startswith(head)  # 头部是完整字符前缀
     assert artifacts.get(digest) == full.encode("utf-8")
+
+
+def test_put_oserror_degrades_to_truncation(
+    store: Store, workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """磁盘满/权限错:如实降级为截断并标 artifact_unavailable,不假装存好了。"""
+
+    def _disk_full(self: ArtifactStore, data: bytes) -> str:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(ArtifactStore, "put", _disk_full)
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    ctx = _ctx(store, workspace, {"big": _text_tool("w" * 10_000, 256)}, artifacts=artifacts)
+
+    result = asyncio.run(execute(ToolCall("c1", "big", {}), ctx))
+
+    assert result.truncated
+    assert result.metadata["artifact_unavailable"] is True
+    assert "artifact_digest" not in result.metadata
+    assert len(result.text.encode("utf-8")) <= 256
+    stored = ctx.store.read_turn_items(ctx.turn_id)[-1]
+    assert stored.payload["metadata"]["artifact_unavailable"] is True
 
 
 def test_pipeline_without_artifacts_keeps_byte_truncation(
@@ -298,6 +361,26 @@ def test_read_artifact_pages(tmp_path: Path) -> None:
     assert tail.truncated is False and tail.metadata["next_offset"] is None
 
 
+def test_read_artifact_full_page_is_body_not_pointer(
+    store: Store, workspace: Path, tmp_path: Path
+) -> None:
+    """单页上限必须严格小于工具自身输出上限:满页不能再被外部化。"""
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    payload = "q" * 196_608
+    digest = artifacts.put(payload.encode("utf-8"))
+    ctx = _ctx(
+        store, workspace, {"read_artifact": create_read_artifact_tool(artifacts)}, artifacts=artifacts
+    )
+
+    result = asyncio.run(
+        execute(ToolCall("c1", "read_artifact", {"digest": digest, "max_bytes": 196_608}), ctx)
+    )
+
+    assert result.truncated is False
+    assert "artifact_digest" not in result.metadata  # 未再外部化
+    assert result.text == payload  # 返回的是正文,不是又一张指针
+
+
 def test_read_artifact_resolve_use_has_artifact_target(tmp_path: Path) -> None:
     tool = create_read_artifact_tool(ArtifactStore(tmp_path))
     use = tool.resolve_use({"digest": DIGEST_A})
@@ -357,5 +440,13 @@ def test_composition_registers_read_artifact(workspace: Path) -> None:
     try:
         assert "read_artifact" in session._tools
         assert {"read", "write", "bash"}.issubset(session._tools)
+        assert session._artifacts is not None
     finally:
         session.close()
+
+    # 工具表被整体替换且没有 read_artifact → 不注入 artifacts(退回旧截断)。
+    custom = build_session(workspace, ScriptedAdapter([]), tools=(create_read_tool(workspace),))
+    try:
+        assert custom._artifacts is None
+    finally:
+        custom.close()

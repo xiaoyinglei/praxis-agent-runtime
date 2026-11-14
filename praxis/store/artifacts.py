@@ -9,7 +9,8 @@
 - 每次 ``get`` 读后重算 sha256,不符即 ``ArtifactIntegrityError``(内容寻址的
   完整性不是"信文件名",而是"信内容");
 - ``put`` 用同目录 tmp + ``fsync`` + ``os.replace``,权限 0600;
-- ``gc`` 是**离线**函数:任何写路径/turn 循环都不得调用它(由测试钉死)。
+- ``gc`` 是**离线**函数:任何写路径/turn 循环都不得调用它(测试只钉死 execute
+  写路径;其余调用点必须自查)。
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import stat
 import tempfile
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
@@ -48,6 +50,8 @@ class ArtifactStore:
         shard = self._root / digest[:2]
         shard.mkdir(parents=True, exist_ok=True)
         target = shard / digest
+        if not target.is_symlink() and target.is_file():
+            return digest  # 内容寻址:同内容已存在,省一次全量写
         fd, tmp_name = tempfile.mkstemp(prefix=f".{digest}.", suffix=".tmp", dir=str(shard))
         tmp = Path(tmp_name)
         try:
@@ -57,6 +61,12 @@ class ArtifactStore:
                 os.fsync(stream.fileno())
             os.chmod(tmp, 0o600)
             os.replace(tmp, target)
+            # rename 的目录项也要落盘:否则崩溃后 item 声称 blob 存在而文件丢失。
+            dir_fd = os.open(shard, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
         except BaseException:
             tmp.unlink(missing_ok=True)
             raise
@@ -67,7 +77,9 @@ class ArtifactStore:
         path = self._path(digest)
         try:
             data = path.read_bytes()
-        except FileNotFoundError:
+        except OSError:
+            # 缺失/目录替代/权限错误一律按"不可读"处理,由工具映射为
+            # artifact_not_found——畸形输入永远是结果,不是异常。
             return None
         if hashlib.sha256(data).hexdigest() != digest:
             raise ArtifactIntegrityError(
@@ -79,19 +91,26 @@ class ArtifactStore:
         """artifact 字节数;缺失返回 None。"""
         path = self._path(digest)
         try:
-            return path.stat().st_size
-        except FileNotFoundError:
+            info = path.stat()
+        except OSError:
             return None
+        return info.st_size if stat.S_ISREG(info.st_mode) else None  # 目录/特殊文件不算 artifact
 
     def iter_digests(self) -> Iterator[str]:
-        """枚举目录中形状合法的 digest(读路径 fail-open:坏目录跳过)。"""
+        """枚举目录中形状合法的 digest(读路径 fail-open:坏目录跳过)。
+
+        符号链接的分片目录/文件一律跳过:GC 是离线跑的,不能靠 ``.praxis``
+        地板保证目录内没有"指向存储外"的链接。
+        """
         if not self._root.is_dir():
             return
         for shard in sorted(self._root.iterdir()):
-            if not shard.is_dir() or _SHARD_RE.fullmatch(shard.name) is None:
+            if shard.is_symlink() or not shard.is_dir() or _SHARD_RE.fullmatch(shard.name) is None:
                 continue
             for entry in sorted(shard.iterdir()):
-                if entry.is_file() and _DIGEST_RE.fullmatch(entry.name) is not None:
+                if entry.is_symlink() or not entry.is_file():
+                    continue
+                if _DIGEST_RE.fullmatch(entry.name) is not None:
                     yield entry.name
 
     # -- 离线 GC ----------------------------------------------------------------
@@ -99,19 +118,25 @@ class ArtifactStore:
     def gc(self, referenced: set[str], *, now: float, grace_seconds: float = 3600.0) -> int:
         """删除"未被引用且 mtime 早于宽限期"的 artifact;返回删除数。
 
-        **离线调用**:不在任何写路径或 turn 循环里。宽限期防止刚写入、尚未进入
-        item 日志的 artifact 被并发 GC 误删。
+        **离线调用**:不在任何写路径或 turn 循环里(测试只钉死 execute 写路径;
+        其余调用点必须自查)。``referenced`` 必须是**完整跨 thread 的**引用集合,
+        否则会删掉其他 thread 仍在引用的 blob。宽限期防止刚写入、尚未进入
+        item 日志的 artifact 被并发 GC 误删。符号链接/非常规文件一律不碰。
         """
         removed = 0
         for digest in list(self.iter_digests()):
             if digest in referenced:
                 continue
+            if (self._root / digest[:2]).is_symlink():  # iter_digests 已过滤,纵深防御
+                continue
             path = self._root / digest[:2] / digest
             try:
-                mtime = path.stat().st_mtime
+                info = path.lstat()
             except OSError:
                 continue
-            if now - mtime <= grace_seconds:
+            if not stat.S_ISREG(info.st_mode):  # lstat:symlink 不是常规文件
+                continue
+            if now - info.st_mtime <= grace_seconds:
                 continue
             try:
                 path.unlink()
@@ -124,7 +149,10 @@ class ArtifactStore:
     def referenced_by(items: Sequence[Item]) -> set[str]:
         """扫描 ``tool_result`` payload 的 ``metadata["artifact_digest"]``。
 
-        未知 kind / 畸形 payload 一律 fail-open 跳过(读路径永不因一条坏记录炸掉)。
+        只从**交给它的** items 收集引用:调用方必须传完整跨 thread 的 item 日志
+        (如逐 thread ``read_items`` 的并集),否则按单 turn/单 thread 喂进来会
+        漏掉其他范围仍在引用的 blob,GC 将误删。未知 kind / 畸形 payload 一律
+        fail-open 跳过(读路径永不因一条坏记录炸掉)。
         """
         found: set[str] = set()
         for item in items:

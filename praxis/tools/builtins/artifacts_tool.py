@@ -38,7 +38,9 @@ from praxis.protocol.tools import (
 PENDING_TOOL_CALL_ID = "pending"
 
 _DEFAULT_MAX_BYTES = 65_536
-_MAX_BYTES_LIMIT = 262_144
+# 必须严格小于本工具 max_model_output_bytes(200_000):否则取满一页会被管道
+# 再次外部化,模型要的一页变成又一张指针。
+_MAX_BYTES_LIMIT = 196_608
 _TOOL_NAME = "read_artifact"
 
 

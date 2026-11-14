@@ -227,6 +227,10 @@ def build_session(
     Task 8 入口:policy 见 _resolve_policy 来源序;mode 来源序 = 显式参数 >
     policy.approval,正交于策略(C5:bypass 只活在运行上下文,永不进 policy、
     永不落盘;切换 mode 不触碰任何策略规则),非法值边界拒绝。
+
+    artifact 外部化与回读能力耦合:``tools`` 整体替换后的工具表里没有
+    ``read_artifact`` 时,**不**注入 ArtifactStore,管道自动退回旧字节截断
+    语义——不会给模型一个无法回读的指针。
     """
     if thread_id is not None:
         _validate_thread_id(thread_id)
@@ -254,6 +258,9 @@ def build_session(
             )
         )
         tool_map: dict[str, Tool] = {tool.definition.name: tool for tool in tool_seq}
+        # 外部化与回读能力耦合:工具表被整体替换且没有 read_artifact 时,
+        # 不注入 artifacts——否则模型只会拿到打不开的指针,比旧字节截断更差。
+        effective_artifacts = artifact_store if "read_artifact" in tool_map else None
         effective_policy = _resolve_policy(root, policy)
         effective_mode: PermissionMode = mode if mode is not None else effective_policy.approval
         permissions = PermissionContext(
@@ -281,7 +288,7 @@ def build_session(
             retry_stream=make_retry_stream(
                 policy=RetryPolicy(), clock=time.time, sleep=asyncio.sleep
             ),
-            artifacts=artifact_store,
+            artifacts=effective_artifacts,
         )
     except BaseException:
         store.close()
