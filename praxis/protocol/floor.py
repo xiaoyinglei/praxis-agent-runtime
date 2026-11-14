@@ -89,23 +89,35 @@ def _is_under(candidate: Path, root_str: str) -> bool:
     return False
 
 
-def host_private_paths() -> tuple[str, ...]:
-    """返回宿主私有目录元组。
+def host_config_dir() -> Path:
+    """宿主全局配置目录(唯一来源;adapters 只消费,分层不破)。
 
-    - PRAXIS_CONFIG_DIR env 展开（不存在则为 ~/.config/praxis）。
-    - <tempdir>/praxis-command-jobs-<uid>。
+    ``PRAXIS_CONFIG_DIR`` 若给出则原样展开(expandvars + expanduser),否则
+    ``~/.config/praxis``。返回值语义与阶段 2 的 host_private_paths()[0] 逐字一致。
     """
     config_env = os.environ.get("PRAXIS_CONFIG_DIR")
     if config_env:
-        config_dir = os.path.expanduser(os.path.expandvars(config_env))
-    else:
-        config_dir = str(Path.home().resolve() / ".config" / "praxis")
+        return Path(os.path.expanduser(os.path.expandvars(config_env)))
+    return Path.home().resolve() / ".config" / "praxis"
 
-    temp_base = tempfile.gettempdir()
-    uid = os.getuid()
-    private_jobs_dir = f"{temp_base}/praxis-command-jobs-{uid}"
 
-    return (config_dir, private_jobs_dir)
+def command_jobs_dir() -> Path:
+    """后台命令会话 marker 目录(Task 15 复用;已在地板私有集合里)。
+
+    返回值语义与阶段 2 的 host_private_paths()[1] 逐字一致——刻意不做
+    resolve():tempdir 在 macOS 上可能经 /var → /private/var 改变字面形态,
+    host_private_paths() 的返回值集合必须保持不变。
+    """
+    return Path(tempfile.gettempdir()) / f"praxis-command-jobs-{os.getuid()}"
+
+
+def host_private_paths() -> tuple[str, ...]:
+    """返回宿主私有目录元组(两个公开定义函数的组合)。
+
+    - PRAXIS_CONFIG_DIR env 展开(不存在则为 ~/.config/praxis)。
+    - <tempdir>/praxis-command-jobs-<uid>。
+    """
+    return (str(host_config_dir()), str(command_jobs_dir()))
 
 
 def floor_reason(

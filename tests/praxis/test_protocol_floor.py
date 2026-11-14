@@ -19,7 +19,9 @@ import pytest
 from praxis.protocol.floor import (
     FLOOR_ENTRIES,
     FloorEntry,
+    command_jobs_dir,
     floor_reason,
+    host_config_dir,
     host_private_paths,
 )
 
@@ -213,3 +215,39 @@ def test_host_private_jobs_dir_uid(monkeypatch: pytest.MonkeyPatch) -> None:
     assert paths_a[1].endswith(f"-{uid}")
     assert paths_b[1].endswith(f"-{uid}")
     assert paths_a[1] == paths_b[1]
+
+
+# ── Task 5: 宿主路径定义收敛为两个公开函数 ─────────────────────────────
+
+
+def test_host_config_dir_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("PRAXIS_CONFIG_DIR", raising=False)
+    assert host_config_dir() == Path.home().resolve() / ".config" / "praxis"
+
+
+def test_host_config_dir_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PRAXIS_CONFIG_DIR", "/tmp/host-config-override")
+    assert host_config_dir() == Path("/tmp/host-config-override")
+
+
+def test_command_jobs_dir_matches_tempdir_and_uid() -> None:
+    expected = Path(tempfile.gettempdir()) / f"praxis-command-jobs-{os.getuid()}"
+    assert command_jobs_dir() == expected
+
+
+def test_host_private_paths_is_composed_from_extracted_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """host_private_paths 只是两个公开函数的组合;返回值集合逐字不变。"""
+    monkeypatch.setenv("PRAXIS_CONFIG_DIR", "/tmp/composed-praxis-config")
+    assert host_private_paths() == (str(host_config_dir()), str(command_jobs_dir()))
+    assert host_private_paths()[0] == "/tmp/composed-praxis-config"
+
+
+def test_host_config_dir_is_a_private_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """拆函数后不退化:配置库所在目录必须仍在地板私有集合里。"""
+    monkeypatch.setenv("PRAXIS_CONFIG_DIR", "/tmp/private-praxis-config")
+    assert str(host_config_dir()) in host_private_paths()
+
+
+def test_command_jobs_dir_is_a_private_path() -> None:
+    """Task 15 的 marker 目录必须仍在地板私有集合里。"""
+    assert str(command_jobs_dir()) in host_private_paths()
