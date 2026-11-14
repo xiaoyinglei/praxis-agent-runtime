@@ -16,6 +16,9 @@ Task 6 扩展:全局模型注册表与凭据面 re-export——ModelConfigStore/
 ConnectionEntry/CostMicros/ConfigVersionConflict、resolve/save_model_credential、
 model_adapter_for/validate_model_spec/probe_model/ProbeOutcome。CLI 的
 ``praxis models`` 因此不直依 adapters(provider 分派仍只有 composition 一处)。
+Task 17 扩展:artifact/计划/流式事件面 re-export——ArtifactStore/PlanSnapshot/
+latest_plan、ModelEvent 与三个 delta 型、assemble_model_events;宿主/UI 读取
+这些结构仍只经 sdk,不直依 core/store/protocol 内部模块。
 
 ``ConversationBusy``/``ResumeNotConfirmed`` 定义在 core.session 并由这里
 re-export:core 不得 import interfaces(import-linter praxis_core_purity),
@@ -42,13 +45,27 @@ from praxis.composition import build_session, model_adapter_for, validate_model_
 from praxis.core.events import Subscription
 from praxis.core.locks import ThreadBusy
 from praxis.core.permission import apply_update
+from praxis.core.planning import latest_plan
 from praxis.core.session import ConversationBusy, ResumeNotConfirmed, Session
 from praxis.core.statemachine import TurnStatus
 from praxis.core.turn import ApprovalSummary, TurnResult
 from praxis.protocol.items import Item, ItemKind
-from praxis.protocol.models import CostMicros, ModelResponse, ModelSpec, ModelToolCall, Usage
+from praxis.protocol.models import (
+    CostMicros,
+    ModelEvent,
+    ModelReasoningDelta,
+    ModelResponse,
+    ModelSpec,
+    ModelTextDelta,
+    ModelToolCall,
+    ModelToolCallDelta,
+    Usage,
+    assemble_model_events,
+)
 from praxis.protocol.permission import PermissionMode, PermissionUpdate
+from praxis.protocol.plan import PlanSnapshot
 from praxis.protocol.policy import NetworkRule, PathRule, PermissionPolicy, ToolRule
+from praxis.store.artifacts import ArtifactStore
 from praxis.store.turns import Turn
 from praxis.store.verify import VerifyReport
 
@@ -56,6 +73,7 @@ open_session = build_session
 
 __all__ = [
     "ApprovalSummary",
+    "ArtifactStore",
     "ConfigVersionConflict",
     "ConnectionEntry",
     "ConversationBusy",
@@ -64,15 +82,20 @@ __all__ = [
     "ItemKind",
     "ModelConfigStore",
     "ModelEntry",
+    "ModelEvent",
+    "ModelReasoningDelta",
     "ModelResponse",
     "ModelSpec",
+    "ModelTextDelta",
     "ModelToolCall",
+    "ModelToolCallDelta",
     "NetworkRule",
     "OpenAICompatAdapter",
     "PathRule",
     "PermissionMode",
     "PermissionPolicy",
     "PermissionUpdate",
+    "PlanSnapshot",
     "ProbeOutcome",
     "ResumeNotConfirmed",
     "ScriptedAdapter",
@@ -86,7 +109,9 @@ __all__ = [
     "Usage",
     "VerifyReport",
     "apply_update",
+    "assemble_model_events",
     "credential_source",
+    "latest_plan",
     "model_adapter_for",
     "open_session",
     "probe_model",

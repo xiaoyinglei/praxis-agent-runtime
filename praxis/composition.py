@@ -5,7 +5,8 @@ build_session 把分层组件装配成一个可用会话,顺序即依赖序:
 崩溃遗留的 running turn → interrupted,§5.8;活执行者持锁,Sweep 跳过,绝不误伤)
 → **CommandSessions + 孤儿命令进程组清扫**(Task 15:同一实例注入 bash 与
 manage_command;marker 清扫结果只记日志) → 默认内置工具(read/write/bash/
-manage_command/list_files/search_text/read_artifact,可由 tools 参数整体替换)
+manage_command/list_files/search_text/inspect_data_file/apply_patch/
+update_plan/run_python/read_artifact;顺序稳定,可由 tools 参数整体替换)
 → PermissionContext(``probe_backend()`` 真实沙箱探测)→ 线程 ensure/create →
 Session(注入 ``compile_sandbox``/``finalize_sandbox``、后台会话收尾面与唯一
 重试机制 ``retry_stream``——core 经结构签名消费,不 import adapters)。
@@ -64,12 +65,16 @@ from praxis.tools.builtins.command_sessions import (
     CommandSessions,
     create_manage_command_tool,
 )
+from praxis.tools.builtins.data import create_inspect_data_file_tool
 from praxis.tools.builtins.filesystem import (
     create_list_files_tool,
     create_read_tool,
     create_write_tool,
 )
+from praxis.tools.builtins.patch import create_apply_patch_tool
+from praxis.tools.builtins.planning import create_update_plan_tool
 from praxis.tools.builtins.process import signal_group
+from praxis.tools.builtins.python_tool import create_run_python_tool
 from praxis.tools.builtins.search import create_search_text_tool
 
 _VALID_MODES: tuple[PermissionMode, ...] = ("on-request", "never", "bypass")
@@ -312,6 +317,10 @@ def build_session(
                 create_manage_command_tool(sessions),
                 create_list_files_tool(root),
                 create_search_text_tool(root),
+                create_inspect_data_file_tool(root),
+                create_apply_patch_tool(root),
+                create_update_plan_tool(),
+                create_run_python_tool(root),
                 create_read_artifact_tool(artifact_store),
             )
         )

@@ -24,6 +24,20 @@ Also scans praxis/ for architecture hard-rule violations (阶段1 CI 硬规则):
  10. def decide 只允许 core/permission.py(唯一权限决策入口)。
  11. def floor_reason 与 FLOOR_ENTRIES 赋值只允许 protocol/floor.py(唯一地板)。
 
+阶段3A 追加(Task 17:单一来源继续收口):
+ 12. provider SDK 面(chat.completions.create/AsyncOpenAI/text/event-stream)
+     只允许 adapters/models/;
+ 13. def measure_request/count_text_tokens 只允许 adapters/models/tokenization.py;
+ 14. 重试机制(classify_failure/stream_with_retry/make_retry_stream)只允许
+     adapters/models/retry.py;重试策略类型(RetryPolicy/ModelFailure/RetryPlan/
+     NoRetryPlan/AttemptRecord/clock_floor/ModelUnavailableError)只允许
+     protocol/retry.py(两侧各唯一);
+ 15. CREATE TABLE/sqlite3.connect 只允许 store/log.py 与 adapters/config/store.py;
+ 16. 凭据存储(find-generic-password//usr/bin/security/0o600 凭据读写)只允许
+     adapters/config/credentials.py;
+ 17. def put( artifact 落盘)只允许 store/artifacts.py;
+ 18. MAX_PLAN_STEPS 定义只允许 protocol/plan.py。
+
 ``--praxis-only``:只扫 praxis 硬规则、跳过 rag 存量扫描(CI 门 R5:阶段1 只强制 praxis 规则)。
 
 Exit code 0: no anti-patterns found.
@@ -133,6 +147,26 @@ _PROFILE_CONSTRUCTION_LITERALS = ("(deny default)", "(version 1)", "sandbox-exec
 _RULE_ALGEBRA_FUNCS = frozenset(
     {"path_access", "resolve_policy", "tool_decision", "network_decision", "command_network_decision"}
 )
+
+# 阶段3A(Task 17)单一来源白名单:同样严格等于"相对 praxis 根的路径"。
+_PRAXIS_MODELS_PKG = ("adapters", "models")
+_PRAXIS_TOKENIZATION_FILE = ("adapters", "models", "tokenization.py")
+_PRAXIS_ADAPTERS_RETRY_FILE = ("adapters", "models", "retry.py")
+_PRAXIS_PROTOCOL_RETRY_FILE = ("protocol", "retry.py")
+_PRAXIS_GLOBAL_SQL_FILES = frozenset(
+    {("store", "log.py"), ("adapters", "config", "store.py")}
+)
+_PRAXIS_CREDENTIALS_FILE = ("adapters", "config", "credentials.py")
+_PRAXIS_ARTIFACTS_FILE = ("store", "artifacts.py")
+_PRAXIS_PLAN_FILE = ("protocol", "plan.py")
+
+_RETRY_MECHANISM_FUNCS = frozenset({"classify_failure", "stream_with_retry", "make_retry_stream"})
+_RETRY_POLICY_CLASSES = frozenset(
+    {"RetryPolicy", "ModelFailure", "RetryPlan", "NoRetryPlan", "AttemptRecord", "ModelUnavailableError"}
+)
+# 规则 16 的凭据信号:命令/Keychain 字面量与"凭据路径 + 0600"组合。
+_CREDENTIAL_COMMAND_MARKERS = ("find-generic-password",)
+_SECURITY_BASENAMES = frozenset({"security", "/usr/bin/security"})
 
 
 def _rel_to_praxis_parts(path: Path, praxis_root: Path | None) -> tuple[str, ...]:
@@ -345,6 +379,115 @@ def scan_praxis_file(path: Path, praxis_root: Path | None = None) -> list[str]:
                         "interrupted 只能由 recovery 写入(设计 §5.2)"
                     )
                     break
+
+    # 规则 12-18(阶段3A/Task 17):provider SDK、token 测量、重试分层、
+    # 全局 SQL、凭据存储、artifact put 与计划常量各自唯一。纯增:不改上方旧规则。
+    docstrings = _docstring_constant_ids(tree)
+    in_models_pkg = rel_parts[:2] == _PRAXIS_MODELS_PKG
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            chain = _dotted_chain(node)
+            if (
+                chain is not None
+                and chain[-3:] == ["chat", "completions", "create"]
+                and not in_models_pkg
+            ):
+                violations.append(
+                    f"line {node.lineno}: provider SDK surface outside adapters/models (B6/B25) — "
+                    "chat.completions.create 只允许在 adapters/models/ 内"
+                )
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if id(node) in docstrings:
+                continue
+            if "text/event-stream" in node.value and not in_models_pkg:
+                violations.append(
+                    f"line {node.lineno}: provider SDK surface outside adapters/models (B6/B25) — "
+                    "text/event-stream 字面量只允许在 adapters/models/ 内"
+                )
+            if "CREATE TABLE" in node.value and rel_parts not in _PRAXIS_GLOBAL_SQL_FILES:
+                violations.append(
+                    f"line {node.lineno}: global SQL outside store/log.py and adapters/config/store.py — "
+                    "CREATE TABLE 只允许两个全局库单一来源"
+                )
+            if rel_parts != _PRAXIS_CREDENTIALS_FILE:
+                if any(marker in node.value for marker in _CREDENTIAL_COMMAND_MARKERS):
+                    violations.append(
+                        f"line {node.lineno}: credential storage outside adapters/config/credentials.py — "
+                        "find-generic-password 只允许凭据层"
+                    )
+                if node.value in _SECURITY_BASENAMES:
+                    violations.append(
+                        f"line {node.lineno}: credential storage outside adapters/config/credentials.py — "
+                        "security 子进程只允许凭据层"
+                    )
+        elif isinstance(node, ast.Call):
+            chain = _dotted_chain(node.func)
+            if chain is not None and chain[-1] == "AsyncOpenAI" and not in_models_pkg:
+                violations.append(
+                    f"line {node.lineno}: provider SDK surface outside adapters/models (B6/B25) — "
+                    "AsyncOpenAI 只在 adapters/models/ 构造"
+                )
+            if chain == ["sqlite3", "connect"] and rel_parts not in _PRAXIS_GLOBAL_SQL_FILES:
+                violations.append(
+                    f"line {node.lineno}: global SQL outside store/log.py and adapters/config/store.py — "
+                    "sqlite3.connect 只允许两个全局库单一来源"
+                )
+            if rel_parts != _PRAXIS_CREDENTIALS_FILE and chain in (["os", "open"], ["os", "chmod"]):
+                args = list(node.args) + [kw.value for kw in node.keywords]
+                has_private_mode = any(
+                    isinstance(arg, ast.Constant) and type(arg.value) is int and arg.value == 0o600
+                    for arg in args
+                )
+                has_credential_path = any(
+                    isinstance(arg, ast.Constant)
+                    and isinstance(arg.value, str)
+                    and "credential" in arg.value.casefold()
+                    for arg in args
+                )
+                if has_private_mode and has_credential_path:
+                    violations.append(
+                        f"line {node.lineno}: credential storage outside adapters/config/credentials.py — "
+                        "0o600 凭据读写只允许凭据层"
+                    )
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name in ("measure_request", "count_text_tokens") and rel_parts != _PRAXIS_TOKENIZATION_FILE:
+                violations.append(
+                    f"line {node.lineno}: token measurement outside adapters/models/tokenization.py — "
+                    f"def {node.name}() 只允许 tokenization.py"
+                )
+            if node.name in _RETRY_MECHANISM_FUNCS and rel_parts != _PRAXIS_ADAPTERS_RETRY_FILE:
+                violations.append(
+                    f"line {node.lineno}: retry mechanism outside adapters/models/retry.py — "
+                    f"def {node.name}() 只允许 adapters/models/retry.py"
+                )
+            if node.name == "clock_floor" and rel_parts != _PRAXIS_PROTOCOL_RETRY_FILE:
+                violations.append(
+                    f"line {node.lineno}: retry policy definition outside protocol/retry.py — "
+                    "def clock_floor() 只允许 protocol/retry.py"
+                )
+            if node.name == "put" and rel_parts != _PRAXIS_ARTIFACTS_FILE:
+                violations.append(
+                    f"line {node.lineno}: artifact put() outside store/artifacts.py — "
+                    "artifact 落盘 put() 只允许 store/artifacts.py"
+                )
+        elif isinstance(node, ast.ClassDef):
+            if node.name in _RETRY_POLICY_CLASSES and rel_parts != _PRAXIS_PROTOCOL_RETRY_FILE:
+                violations.append(
+                    f"line {node.lineno}: retry policy definition outside protocol/retry.py — "
+                    f"class {node.name} 只允许 protocol/retry.py"
+                )
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            if node.value is None:  # 裸注解无定义,不算第二来源
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if (
+                any(isinstance(t, ast.Name) and t.id == "MAX_PLAN_STEPS" for t in targets)
+                and rel_parts != _PRAXIS_PLAN_FILE
+            ):
+                violations.append(
+                    f"line {node.lineno}: MAX_PLAN_STEPS definition outside protocol/plan.py — "
+                    "计划上限只允许 protocol/plan.py 单一来源"
+                )
 
     return list(dict.fromkeys(violations))
 

@@ -134,6 +134,43 @@ def test_sdk_reexports_model_registry_names() -> None:
         assert hasattr(sdk_pkg, name), f"sdk missing attribute {name}"
 
 
+def test_sdk_reexports_artifact_plan_and_event_surface() -> None:
+    """Task 17:artifact/计划/流式事件面只经 sdk 对外暴露。"""
+    for name in (
+        "ArtifactStore",
+        "PlanSnapshot",
+        "latest_plan",
+        "ModelEvent",
+        "ModelTextDelta",
+        "ModelReasoningDelta",
+        "ModelToolCallDelta",
+        "assemble_model_events",
+    ):
+        assert name in sdk_pkg.__all__, f"sdk.__all__ missing {name}"
+        assert hasattr(sdk_pkg, name), f"sdk missing attribute {name}"
+
+
+def test_default_tool_table_is_stable(workspace: Path) -> None:
+    """Task 17:默认工具表的成员与顺序是稳定契约(tools 参数仍可整体替换)。"""
+    session = open_session(workspace, ScriptedAdapter([_resp("ok")]))
+    try:
+        assert list(session._tools) == [  # noqa: SLF001 — 装配契约:顺序可断言
+            "read",
+            "write",
+            "bash",
+            "manage_command",
+            "list_files",
+            "search_text",
+            "inspect_data_file",
+            "apply_patch",
+            "update_plan",
+            "run_python",
+            "read_artifact",
+        ]
+    finally:
+        session.close()
+
+
 def test_r14_session_items_and_turns(workspace: Path) -> None:
     session = open_session(workspace, ScriptedAdapter([_resp("hi there")]))
     try:

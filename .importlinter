@@ -176,3 +176,12 @@ source_modules =
     praxis.tools
 forbidden_modules =
     praxis.adapters
+
+[importlinter:contract:praxis_interfaces_config_boundary]
+name = Praxis tools and core never import model config adapters directly
+type = forbidden
+source_modules =
+    praxis.tools
+    praxis.core
+forbidden_modules =
+    praxis.adapters.config

@@ -299,6 +299,236 @@ def test_floor_defs_allowed_in_floor_module(tmp_path):
     assert scan_praxis_file(f) == []
 
 
+# ===========================================================================
+# 阶段3A 新增硬规则(Task 17):单一来源继续收口
+#
+# ⑨ provider SDK 面只在 adapters/models/;⑩ token 测量只在 tokenization.py;
+# ⑪ 重试机制/策略分层两侧各自唯一;⑫ 全局 SQL 只在两个 store;
+# ⑬ 凭据存储只在 credentials.py;⑭ artifact put 只在 artifacts.py;
+# ⑮ MAX_PLAN_STEPS 定义只在 protocol/plan.py。
+# 机制沿用既有纪律:严格相对路径白名单 + AST(代码字符串排除 docstring)。
+# ===========================================================================
+
+
+# --- 规则⑨:provider SDK 面只在 adapters/models/ ---
+
+def test_chat_completions_create_outside_models_rejected(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/tools/evil.py",
+        "async def ask(client):\n    return await client.chat.completions.create(model='m')\n",
+    )
+    assert any("adapters/models" in v and "chat.completions.create" in v for v in scan_praxis_file(f))
+
+
+def test_async_openai_construction_outside_models_rejected(tmp_path):
+    f = _write(tmp_path, "praxis/core/evil.py", "CLIENT = AsyncOpenAI(api_key='k')\n")
+    assert any("AsyncOpenAI" in v and "adapters/models" in v for v in scan_praxis_file(f))
+
+
+def test_event_stream_literal_outside_models_rejected(tmp_path):
+    f = _write(tmp_path, "praxis/composition.py", 'HEADERS = {"Accept": "text/event-stream"}\n')
+    assert any("text/event-stream" in v for v in scan_praxis_file(f))
+
+
+def test_model_surface_allowed_in_adapters_models(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/adapters/models/ok.py",
+        'HEADERS = {"Accept": "text/event-stream"}\n'
+        "CLIENT = AsyncOpenAI(api_key='k')\n"
+        "async def ask(client):\n    return await client.chat.completions.create(model='m')\n",
+    )
+    assert scan_praxis_file(f) == []
+
+
+def test_event_stream_in_docstring_not_flagged(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/protocol/sandbox.py",
+        '"""Adapters may request text/event-stream from providers."""\nX = 1\n',
+    )
+    assert scan_praxis_file(f) == []
+
+
+# --- 规则⑩:token 测量只在 adapters/models/tokenization.py ---
+
+@pytest.mark.parametrize("func", ("measure_request", "count_text_tokens"))
+def test_token_measurement_outside_tokenization_rejected(tmp_path, func):
+    f = _write(tmp_path, "praxis/core/evil.py", f"def {func}(x):\n    return 0\n")
+    assert any("tokenization.py" in v for v in scan_praxis_file(f))
+
+
+def test_token_measurement_allowed_in_tokenization(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/adapters/models/tokenization.py",
+        "def count_text_tokens(text):\n    return 0\n\n\ndef measure_request(req):\n    return 0\n",
+    )
+    assert scan_praxis_file(f) == []
+
+
+# --- 规则⑪:重试机制(adapters)与策略(protocol)各自唯一 ---
+
+@pytest.mark.parametrize("func", ("classify_failure", "stream_with_retry", "make_retry_stream"))
+def test_retry_mechanism_outside_adapters_retry_rejected(tmp_path, func):
+    f = _write(tmp_path, "praxis/core/evil.py", f"def {func}(*args):\n    return None\n")
+    assert any("adapters/models/retry.py" in v for v in scan_praxis_file(f))
+
+
+def test_retry_mechanism_allowed_in_adapters_retry(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/adapters/models/retry.py",
+        "def classify_failure(exc):\n    return None\n\n\n"
+        "def stream_with_retry(factory):\n    return None\n\n\n"
+        "def make_retry_stream(policy):\n    return None\n",
+    )
+    assert scan_praxis_file(f) == []
+
+
+@pytest.mark.parametrize(
+    "definition",
+    (
+        "class RetryPolicy:\n    pass\n",
+        "class ModelFailure:\n    pass\n",
+        "class RetryPlan:\n    pass\n",
+        "class NoRetryPlan:\n    pass\n",
+        "class AttemptRecord:\n    pass\n",
+        "class ModelUnavailableError(RuntimeError):\n    pass\n",
+        "def clock_floor(records, now):\n    return now\n",
+    ),
+)
+def test_retry_policy_definition_outside_protocol_retry_rejected(tmp_path, definition):
+    f = _write(tmp_path, "praxis/core/evil.py", definition)
+    assert any("protocol/retry.py" in v for v in scan_praxis_file(f))
+
+
+def test_retry_policy_definition_allowed_in_protocol_retry(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/protocol/retry.py",
+        "class RetryPolicy:\n    pass\n\n\n"
+        "class ModelFailure:\n    pass\n\n\n"
+        "class RetryPlan:\n    pass\n\n\n"
+        "class NoRetryPlan:\n    pass\n\n\n"
+        "class AttemptRecord:\n    pass\n\n\n"
+        "class ModelUnavailableError(RuntimeError):\n    pass\n\n\n"
+        "def clock_floor(records, now):\n    return now\n",
+    )
+    assert scan_praxis_file(f) == []
+
+
+def test_retry_policy_decide_method_still_rejected(tmp_path):
+    # 规则③(def decide 只在 core/permission.py)保持零豁免:策略对象不得开路径豁免
+    f = _write(
+        tmp_path,
+        "praxis/protocol/retry.py",
+        "class RetryPolicy:\n    def decide(self, failure):\n        return None\n",
+    )
+    assert any("core/permission.py" in v for v in scan_praxis_file(f))
+
+
+# --- 规则⑫:全局 SQL 只在 store/log.py 与 adapters/config/store.py ---
+
+def test_create_table_outside_sql_files_rejected(tmp_path):
+    f = _write(tmp_path, "praxis/core/evil.py", 'DDL = "CREATE TABLE IF NOT EXISTS x(id TEXT)"\n')
+    assert any("store/log.py" in v and "CREATE TABLE" in v for v in scan_praxis_file(f))
+
+
+def test_sqlite_connect_outside_sql_files_rejected(tmp_path):
+    f = _write(tmp_path, "praxis/core/evil.py", "conn = sqlite3.connect('x.db')\n")
+    assert any("sqlite3.connect" in v for v in scan_praxis_file(f))
+
+
+@pytest.mark.parametrize("relpath", ("praxis/store/log.py", "praxis/adapters/config/store.py"))
+def test_global_sql_allowed_in_the_two_stores(tmp_path, relpath):
+    f = _write(
+        tmp_path,
+        relpath,
+        'DDL = "CREATE TABLE IF NOT EXISTS x(id TEXT)"\nconn = sqlite3.connect("x.db")\n',
+    )
+    assert scan_praxis_file(f) == []
+
+
+def test_create_table_in_docstring_not_flagged(tmp_path):
+    f = _write(tmp_path, "praxis/store/artifacts.py", '"""No CREATE TABLE here: artifacts are files."""\nX = 1\n')
+    assert scan_praxis_file(f) == []
+
+
+# --- 规则⑬:凭据存储只在 adapters/config/credentials.py ---
+
+def test_find_generic_password_outside_credentials_rejected(tmp_path):
+    f = _write(tmp_path, "praxis/core/evil.py", 'CMD = ["/usr/bin/security", "find-generic-password"]\n')
+    assert any("credentials.py" in v for v in scan_praxis_file(f))
+
+
+def test_security_subprocess_outside_credentials_rejected(tmp_path):
+    f = _write(tmp_path, "praxis/core/evil.py", 'CMD = ["security", "-i"]\n')
+    assert any("credentials.py" in v for v in scan_praxis_file(f))
+
+
+def test_credential_file_mode_outside_credentials_rejected(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/core/evil.py",
+        'fd = os.open("credentials/models.json", os.O_RDONLY | os.O_CREAT, 0o600)\n',
+    )
+    assert any("credentials.py" in v and "0o600" in v for v in scan_praxis_file(f))
+
+
+def test_credential_storage_allowed_in_credentials_module(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/adapters/config/credentials.py",
+        "import os\n"
+        "CMD = ['/usr/bin/security', 'find-generic-password']\n"
+        "fd = os.open('credentials/models.json', os.O_RDONLY, 0o600)\n",
+    )
+    assert scan_praxis_file(f) == []
+
+
+def test_private_mode_without_credential_context_not_flagged(tmp_path):
+    # 0o600 本身不是凭据信号:artifact/后台 marker 也用它
+    f = _write(tmp_path, "praxis/store/artifacts.py", "os.chmod(tmp, 0o600)\n")
+    assert scan_praxis_file(f) == []
+
+
+# --- 规则⑭:artifact put() 只在 store/artifacts.py ---
+
+def test_put_outside_artifacts_rejected(tmp_path):
+    f = _write(tmp_path, "praxis/core/evil.py", "def put(data):\n    return data\n")
+    assert any("store/artifacts.py" in v for v in scan_praxis_file(f))
+
+
+def test_put_allowed_in_artifacts(tmp_path):
+    f = _write(tmp_path, "praxis/store/artifacts.py", "class S:\n    def put(self, data):\n        return data\n")
+    assert scan_praxis_file(f) == []
+
+
+# --- 规则⑮:MAX_PLAN_STEPS 定义只在 protocol/plan.py ---
+
+def test_max_plan_steps_outside_plan_rejected(tmp_path):
+    f = _write(tmp_path, "praxis/tools/builtins/evil.py", "MAX_PLAN_STEPS = 20\n")
+    assert any("protocol/plan.py" in v for v in scan_praxis_file(f))
+
+
+def test_annotated_max_plan_steps_outside_plan_rejected(tmp_path):
+    # 沿用规则 8 的 AnnAssign 覆盖面
+    f = _write(tmp_path, "praxis/core/evil.py", "MAX_PLAN_STEPS: int = 20\n")
+    assert any("protocol/plan.py" in v for v in scan_praxis_file(f))
+
+
+def test_bare_max_plan_steps_annotation_not_flagged(tmp_path):
+    f = _write(tmp_path, "praxis/core/evil.py", "MAX_PLAN_STEPS: int\n")
+    assert scan_praxis_file(f) == []
+
+
+def test_max_plan_steps_allowed_in_plan_module(tmp_path):
+    f = _write(tmp_path, "praxis/protocol/plan.py", "MAX_PLAN_STEPS = 20\n")
+    assert scan_praxis_file(f) == []
+
+
 # --- 真实树:新规则零误报(与 CI 门同源,钉住 adapters/sandbox 豁免+注释/docstring 排除) ---
 
 def test_real_praxis_tree_clean_under_new_rules():
