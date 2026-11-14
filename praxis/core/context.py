@@ -52,7 +52,7 @@ def build_context(items: Sequence[Item]) -> list[Item]:
 
 # 声明窗口配对键/结果引用(B31/R-T7-1 共用,见 pair_tool_results)。
 type DeclarationKey = tuple[str | None, int, str]
-type ResultRef = tuple[int, int]
+type ResultRef = tuple[int, int]  # (seq, 列表位置):进投影的最新结果
 
 
 def pair_tool_results(
@@ -63,38 +63,42 @@ def pair_tool_results(
     键 = ``(turn_id, 声明它的 model_response.seq, call_id)``:同一 turn 内复用
     call_id(本地小模型每轮从 call_0 重新起号)不再互相覆盖。按 seq 升序扫一遍:
 
-    - ``model_response`` 的每个可解析 ``tool_calls[].call_id`` 打开/更新该
-      ``(turn_id, call_id)`` 的当前声明窗口(同一条响应声明两次同 id 折叠进
-      同一个窗口——属真畸形,``to_messages`` 侧仍为第二次声明补合成);
+    - ``model_response`` 的 ``tool_calls`` **整条可重建**(与
+      ``_reconstruct_tool_calls``/投影同一严格度)时,为其中每个 call_id 打开/
+      更新该 ``(turn_id, call_id)`` 的当前声明窗口;部分畸形的响应不开窗——
+      其配对结果因此成为孤儿、在自身位置 fail-open 投影,绝不被静默吞掉
+      (同一条响应声明两次同 id 折叠进同一窗口,``to_messages`` 侧为第二次
+      声明补合成);
     - ``tool_result`` 配给它之前**最近**的同 ``(turn_id, call_id)`` 声明;
       同窗口多条结果取最新 ``(seq, 列表位置)`` 胜(R10),旧结果留库审计;
     - 之前没有任何声明的结果进 ``orphans``(键用结果自身的
-      ``(turn_id, result.seq, call_id)``,供读端原样投影)。
+      ``(turn_id, result.seq, call_id)``,供读端原样投影);同 ``(turn_id,
+      call_id)`` 的多条孤儿同样最新 seq 胜——否则会投影出多条同
+      tool_call_id 的 tool 消息,provider 直接拒收。
 
     纯读、有界(一次排序 + 一次线性扫)、永不抛:未知 kind/畸形 payload 一律
     跳过,与 status/文本无关(denied/not_executed 也算"有结果")。返回值:
     ``paired`` = 窗口键 → 进投影结果的 ``(seq, 列表位置)``;
-    ``orphans`` = 配不上声明的结果自身键集合。
+    ``orphans`` = 配不上声明的**最新**结果自身键集合。
     """
     ordered = sorted(enumerate(items), key=lambda entry: (entry[1].seq, entry[0]))
     open_declarations: dict[tuple[str | None, str], DeclarationKey] = {}
     paired: dict[DeclarationKey, ResultRef] = {}
-    orphans: set[DeclarationKey] = set()
+    orphan_latest: dict[tuple[str | None, str], ResultRef] = {}
     for position, item in ordered:
         if item.kind == ItemKind.MODEL_RESPONSE:
             raw_calls = item.payload.get("tool_calls")
             if not isinstance(raw_calls, (list, tuple)):
                 continue
-            for entry in raw_calls:
-                if not isinstance(entry, Mapping):
-                    continue
-                call_id = entry.get("call_id")
-                if isinstance(call_id, str):
-                    open_declarations[(item.turn_id, call_id)] = (
-                        item.turn_id,
-                        item.seq,
-                        call_id,
-                    )
+            calls = _reconstruct_tool_calls(raw_calls)
+            if calls is None:
+                continue  # 部分畸形:不开窗(结果降级为孤儿,保持可投影)
+            for call in calls:
+                open_declarations[(item.turn_id, call.call_id)] = (
+                    item.turn_id,
+                    item.seq,
+                    call.call_id,
+                )
         elif item.kind == ItemKind.TOOL_RESULT:
             call_id = item.payload.get("call_id")
             if not isinstance(call_id, str):
@@ -102,11 +106,18 @@ def pair_tool_results(
             declaration = open_declarations.get((item.turn_id, call_id))
             candidate = (item.seq, position)
             if declaration is None:
-                orphans.add((item.turn_id, item.seq, call_id))
+                holder = (item.turn_id, call_id)
+                current_orphan = orphan_latest.get(holder)
+                if current_orphan is None or candidate >= current_orphan:
+                    orphan_latest[holder] = candidate
                 continue
             current = paired.get(declaration)
             if current is None or candidate >= current:
                 paired[declaration] = candidate
+    orphans = {
+        (turn_id, seq, call_id)
+        for (turn_id, call_id), (seq, _position) in orphan_latest.items()
+    }
     return paired, orphans
 
 

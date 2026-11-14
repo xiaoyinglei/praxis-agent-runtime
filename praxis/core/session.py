@@ -124,10 +124,10 @@ def _latest_payloads(items: Sequence[Item], kind: str) -> dict[str, Mapping[str,
       ``_write_approval_decisions`` 取最近一条 approval_request 的 digest——裸
       call_id 重入只可能指向最近声明窗口,与管道 ``_latest_approval_decision``
       的窗口无关绑定同口径;取最新正是重入要绑定/执行的动作。
-    - ``_pending_approvals`` 的**展示**面:其"已决策"集合按裸 call_id 判定,同
-      turn 跨轮复用 id 且两轮 digest 不同时,第一轮 decision 可能把第二轮新
-      request 误判为已决策(摘要隐藏,不产生孤儿 provider 请求)。这是裸 id
-      审批 API 的固有边界,窗口化属阶段 4 子代理审批面,本任务不改。
+    - ``_pending_approvals`` 的哈希键仍是裸 call_id,但抑制条件已收口到
+      ``(call_id, args_digest)``(C-1):同 turn 跨轮复用 id、第二轮不同参数
+      re-ask 时,旧决策不再吞掉新请求。裸 id 审批映射在"同 id 两轮同时待批"
+      时仍只能呈现一条(取最新),这是 resume API 的固有边界,窗口化属阶段 4。
     """
     latest: dict[str, Mapping[str, JsonValue]] = {}
     for item in items:
@@ -140,15 +140,25 @@ def _latest_payloads(items: Sequence[Item], kind: str) -> dict[str, Mapping[str,
 
 
 def _pending_approvals(items: Sequence[Item]) -> tuple[ApprovalSummary, ...]:
-    """本 turn 内没有 matching approval_decision 的 approval_request(镜像 turn 层口径)。"""
-    decided = set(_latest_payloads(items, ItemKind.APPROVAL_DECISION))
+    """本 turn 内没有 matching 决策的 approval_request(镜像 turn 层口径)。
+
+    C-1:抑制条件 = 同 ``(call_id, args_digest)`` 已有 decision(不是"该
+    call_id 出现过任何决策")。否则同 turn 跨轮复用 call_id、第二轮不同参数
+    re-ask 时,第一轮决策会把新一轮请求藏掉,PAUSED 的 pending_approvals 为空
+    → 人类无可批项。digest 不同即另一个动作,必须呈现。
+    """
+    decided: set[tuple[str, str]] = set()
+    for call_id, payload in _latest_payloads(items, ItemKind.APPROVAL_DECISION).items():
+        digest = payload.get("args_digest")
+        if isinstance(digest, str):
+            decided.add((call_id, digest))
     pending: dict[str, ApprovalSummary] = {}
     for call_id, payload in _latest_payloads(items, ItemKind.APPROVAL_REQUEST).items():
-        if call_id in decided:
-            continue
         tool_name = payload.get("tool_name")
         digest = payload.get("args_digest")
         if not isinstance(tool_name, str) or not isinstance(digest, str):
+            continue
+        if (call_id, digest) in decided:
             continue
         effects: tuple[str, ...] = ()
         raw_effects = payload.get("effects")

@@ -305,29 +305,42 @@ def _note_unknown(result: ToolResult, unknown_calls: list[str]) -> None:
 
 
 def _collect_pending_approvals(deps: TurnDeps, turn_id: str) -> tuple[ApprovalSummary, ...]:
-    """本 turn 内没有 matching approval_decision(按 call_id)的 approval_request。
+    """本 turn 内没有 matching 决策的 approval_request。
 
     读 item 而非缓存内存状态:item 日志是唯一事实源;同 call_id 多条请求取最新
     一条(re-ask 的摘要用新参数 digest)。
+
+    抑制条件(C-1,与管道 R5(b) 参数绑定同口径):一个请求只有在**同
+    ``(call_id, args_digest)``** 已有 approval_decision 时才算已决策。旧的
+    "该 call_id 出现过任意决策即抑制"在同一 turn 跨轮复用 call_id、第二轮以
+    不同参数 re-ask 时会把新一轮请求藏起来——turn 停在 PAUSED 却
+    ``pending_approvals == ()``,人类没有任何可批项。digest 不同即新动作,
+    必须呈现(policy_revision 只影响管道重入是否沿用旧批准,不影响"这是另一
+    个参数动作"的事实)。
     """
     items = deps.store.read_turn_items(turn_id)
-    decided: set[str] = set()
+    decided: set[tuple[str, str]] = set()
     for item in items:
-        if item.kind == ItemKind.APPROVAL_DECISION:
-            call_id = item.payload.get("call_id")
-            if isinstance(call_id, str):
-                decided.add(call_id)
-    pending: dict[str, ApprovalSummary] = {}
+        if item.kind != ItemKind.APPROVAL_DECISION:
+            continue
+        call_id = item.payload.get("call_id")
+        digest = item.payload.get("args_digest")
+        if isinstance(call_id, str) and isinstance(digest, str):
+            decided.add((call_id, digest))
+    latest_requests: dict[str, Mapping[str, JsonValue]] = {}
     for item in items:
         if item.kind != ItemKind.APPROVAL_REQUEST:
             continue
-        payload = item.payload
-        call_id = payload.get("call_id")
+        call_id = item.payload.get("call_id")
+        if isinstance(call_id, str):
+            latest_requests[call_id] = item.payload
+    pending: dict[str, ApprovalSummary] = {}
+    for call_id, payload in latest_requests.items():
         tool_name = payload.get("tool_name")
         digest = payload.get("args_digest")
-        if not isinstance(call_id, str) or not isinstance(tool_name, str) or not isinstance(digest, str):
+        if not isinstance(tool_name, str) or not isinstance(digest, str):
             continue
-        if call_id in decided:
+        if (call_id, digest) in decided:
             continue
         effects: tuple[str, ...] = ()
         raw_effects = payload.get("effects")

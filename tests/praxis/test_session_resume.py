@@ -447,6 +447,50 @@ def test_resume_approval_allow_executes_once_then_completes(
     assert session.result(paused.turn_id).pending_approvals == ()
 
 
+def test_second_round_reused_call_id_pending_visible_and_approvable(
+    workspace: Path, open_ws: Callable[..., Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C-1:同 turn 第二轮复用 call_0 但参数不同 → 新一轮 request 必须呈现且可批。
+
+    第一轮 decision 与第二轮 request 的 call_id 相同;旧实现按裸 call_id 抑制
+    待批项,导致 PAUSED 的 ``pending_approvals == ()``——人类没有任何可批项,
+    resume 又被守卫拒绝,只能翻日志手打。修复后抑制条件是
+    ``(call_id, args_digest)``;这里走完真实 submit → resume(approval) →
+    resume(approval) 的端到端链路,并断言两个文件都被批准写入。
+    """
+    monkeypatch.setattr(permission, "decide", lambda *a: Decision.ask("test"))
+    args_a = {"path": "a.txt", "content": "A-content"}
+    args_b = {"path": "b.txt", "content": "B-content"}
+    session = open_ws(
+        ScriptedAdapter(
+            [
+                _resp("", (("call_0", "write", args_a),)),
+                _resp("", (("call_0", "write", args_b),)),
+                _resp("all approved and done"),
+            ]
+        )
+    )
+
+    first = asyncio.run(session.submit("go"))
+    assert first.status is TurnStatus.PAUSED
+    assert [(p.call_id, p.args_digest) for p in first.pending_approvals] == [
+        ("call_0", args_digest(args_a))
+    ]
+
+    second = asyncio.run(session.resume(first.turn_id, approval={"call_0": "allow"}))
+    assert second.status is TurnStatus.PAUSED
+    # C-1 核心:第一轮 decision 不得吞掉第二轮(同 id、不同 digest)的新请求
+    assert [(p.call_id, p.args_digest) for p in second.pending_approvals] == [
+        ("call_0", args_digest(args_b))
+    ]
+
+    done = asyncio.run(session.resume(first.turn_id, approval={"call_0": "allow"}))
+    assert done.status is TurnStatus.COMPLETED and done.output == "all approved and done"
+    assert (workspace / "a.txt").read_text(encoding="utf-8") == "A-content"
+    assert (workspace / "b.txt").read_text(encoding="utf-8") == "B-content"
+    assert session.result(first.turn_id).pending_approvals == ()
+
+
 def test_resume_approval_denies_writes_denied_result(
     workspace: Path, open_ws: Callable[..., Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:

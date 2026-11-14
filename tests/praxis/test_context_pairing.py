@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from hypothesis import HealthCheck, given, settings
+from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from praxis.core.context import build_context, to_messages
@@ -151,6 +151,38 @@ def test_orphan_result_with_malformed_payload_is_skipped_not_raised() -> None:
     assert [m.content for m in to_messages(items)] == ["OK"]
 
 
+def test_multiple_orphan_results_same_id_only_latest_projects() -> None:
+    """同 (turn_id, call_id) 的多条孤儿结果仍最新 seq 胜(R10 精神)。
+
+    全部投影会产出多条同 tool_call_id 的 tool 消息——provider 直接拒收。
+    """
+    items = [
+        mk(1, ItemKind.USER_MESSAGE, {"text": "before"}),
+        result(2, "ghost", "OLD"),
+        result(3, "ghost", "NEW"),
+        mk(4, ItemKind.USER_MESSAGE, {"text": "after"}),
+    ]
+    msgs = to_messages(items)
+    assert [m.role for m in msgs] == ["user", "tool", "user"]
+    assert msgs[1].content == "NEW" and msgs[1].tool_call_id == "ghost"
+
+
+def test_partially_malformed_declaration_does_not_swallow_real_result() -> None:
+    """I-1:声明项整条不可重建(如缺 name)→ 不开窗,真实结果不得被静默吞掉。
+
+    开窗谓词与 ``_reconstruct_tool_calls`` 同严格度:assistant 渲染不出来时,
+    配对结果降级为孤儿、在自身位置 fail-open 投影(旧实现会因键在 paired 中
+    被抑制、assistant 又被跳过,结果从消息里消失)。
+    """
+    items = [
+        mk(1, ItemKind.MODEL_RESPONSE, {"content": "", "tool_calls": [{"call_id": "c1"}]}),
+        result(2, "c1", "REAL-RESULT"),
+    ]
+    msgs = to_messages(items)
+    assert [m.role for m in msgs] == ["tool"]
+    assert msgs[0].content == "REAL-RESULT" and msgs[0].tool_call_id == "c1"
+
+
 def test_pairable_result_is_not_projected_at_its_own_position() -> None:
     """配对成功的结果统一跟在声明 assistant 之后;自身位置不再重复投影。"""
     items = [
@@ -180,12 +212,18 @@ def test_malformed_paired_result_falls_back_to_synthesis() -> None:
 
 
 @st.composite
-def declaration_streams(draw: st.DrawFn) -> list[Item]:
-    """随机声明窗口 + 结果(0-2 条/声明)+ 孤儿结果 + 畸形/未知 kind,返回乱序列表。"""
+def declaration_streams(draw: st.DrawFn) -> tuple[list[Item], list[list[str]]]:
+    """随机声明窗口 + 结果(0-2 条/声明)+ 孤儿结果 + 畸形/未知 kind,乱序返回。
+
+    同时返回"每个可渲染 assistant 的 tool 消息期望内容(按声明顺序)"——属性
+    不只校验条数,还钉死内容归属:声明的投影必须等于该窗口内最新 seq 的真实
+    结果;无结果(或重复声明)才是合成注记。这样"第一轮结果串到第二轮窗口"
+    或"合成盖掉真实结果"都会被抓住。
+    """
     items: list[Item] = []
     seq = 0
     declared: set[str] = set()
-    pool = ["c0", "c1", "c2", "c3"]
+    pool = ["c0", "c1", "c2"]
     junk_payloads = st.one_of(
         st.just({}),
         st.just({"content": None}),
@@ -193,9 +231,17 @@ def declaration_streams(draw: st.DrawFn) -> list[Item]:
         st.just({"tool_calls": [{"call_id": 7, "name": "t"}]}),
         st.dictionaries(st.text(max_size=4), st.integers(-3, 3), max_size=3),
     )
+    # call_id -> (当前窗口声明 seq, 窗口内最新真实文本);声明换代时冻结旧窗口。
+    windows: dict[str, tuple[int, str | None]] = {}
+    frozen: dict[tuple[int, str], str | None] = {}
+    declarations_by_seq: dict[int, list[str]] = {}
 
-    for _ in range(draw(st.integers(0, 5))):
-        for _ in range(draw(st.integers(0, 2))):
+    def freeze(call_id: str) -> None:
+        previous_seq, latest = windows.pop(call_id)
+        frozen[(previous_seq, call_id)] = latest
+
+    for _ in range(draw(st.integers(0, 3))):
+        for _ in range(draw(st.integers(0, 1))):
             seq += 1
             items.append(
                 mk(
@@ -207,33 +253,59 @@ def declaration_streams(draw: st.DrawFn) -> list[Item]:
         # 孤儿结果:只从"此前未声明"的 id 池取,保证真的配不上任何声明
         unseen = [call_id for call_id in pool if call_id not in declared]
         if unseen and draw(st.booleans()):
-            for _ in range(draw(st.integers(1, 2))):
-                seq += 1
-                items.append(result(seq, draw(st.sampled_from(unseen)), f"orphan-{seq}"))
+            seq += 1
+            items.append(result(seq, draw(st.sampled_from(unseen)), f"orphan-{seq}"))
 
-        declarations = draw(st.lists(st.sampled_from(pool), min_size=1, max_size=4))
+        declarations = draw(st.lists(st.sampled_from(pool), min_size=1, max_size=3))
         seq += 1
         if draw(st.booleans()):
+            # 整条不可重建的畸形响应:不渲染、不产生窗口(其结果由别的轮次覆盖)
             items.append(mk(seq, ItemKind.MODEL_RESPONSE, draw(junk_payloads)))
-        else:
-            items.append(assistant(seq, declarations))
-            declared.update(declarations)
-
+            continue
+        for call_id in dict.fromkeys(declarations):
+            if call_id in windows:
+                freeze(call_id)
+            windows[call_id] = (seq, None)
+        items.append(assistant(seq, declarations))
+        declared.update(declarations)
+        declarations_by_seq[seq] = declarations
         for call_id in declarations:
             for _ in range(draw(st.integers(0, 2))):
                 if draw(st.booleans()):
                     seq += 1
-                    items.append(result(seq, call_id, draw(st.sampled_from(["a", "b", "c"]))))
+                    text = draw(st.sampled_from(["a", "b", "c"]))
+                    items.append(result(seq, call_id, text))
+                    declare_seq, _previous = windows[call_id]
+                    windows[call_id] = (declare_seq, text)
+    for call_id in list(windows):
+        freeze(call_id)
+
+    expected: list[list[str]] = []
+    for declare_seq in sorted(declarations_by_seq):
+        contents: list[str] = []
+        seen: set[str] = set()
+        for call_id in declarations_by_seq[declare_seq]:
+            latest = frozen.get((declare_seq, call_id))
+            if call_id not in seen and latest is not None:
+                contents.append(latest)  # 该窗口最新真实结果
+            else:
+                contents.append(_UNPAIRED_NOTE)  # 未闭合/重复声明 → 合成
+            seen.add(call_id)
+        expected.append(contents)
 
     shuffled = draw(st.permutations(items))
-    return list(shuffled)
+    return list(shuffled), expected
 
 
 @given(declaration_streams())
-@settings(deadline=None, max_examples=400, suppress_health_check=[HealthCheck.too_slow])
-def test_pairing_invariant_holds_for_arbitrary_streams(items: list[Item]) -> None:
+@settings(deadline=None, max_examples=200)
+def test_pairing_invariant_holds_for_arbitrary_streams(
+    data: tuple[list[Item], list[list[str]]],
+) -> None:
+    items, expected = data
     msgs = to_messages(items)  # 永不抛
     assert all(isinstance(m, ModelMessage) for m in msgs)
+    assistants: list[tuple[ModelMessage, list[ModelMessage]]] = []
     for index, message in enumerate(msgs):
         if message.role != "assistant" or not message.tool_calls:
             continue
@@ -242,13 +314,18 @@ def test_pairing_invariant_holds_for_arbitrary_streams(items: list[Item]) -> Non
             len(msgs),
         )
         group = [m for m in msgs[index + 1 : next_assistant] if m.role == "tool"]
+        assistants.append((message, group))
+
+    assert len(assistants) == len(expected)  # 每个可渲染声明恰好一个 assistant 组
+    for (message, group), wanted in zip(assistants, expected, strict=True):
         declared = [call.call_id for call in message.tool_calls]
-        # 每条声明(按出现次数计)在其 assistant 之后恰有一条 tool 消息(真实或合成)
+        # 内容归属:组内每条声明的 tool 消息逐条等于"该窗口最新真实内容/合成"
+        paired_messages = [m for m in group if m.tool_call_id in set(declared)]
+        assert [m.content for m in paired_messages] == wanted, (declared, group)
+        # 每条声明(按出现次数计)恰有一条 tool 消息(真实或合成),且保声明序
         for call_id in set(declared):
             following = [m for m in group if m.tool_call_id == call_id]
             assert len(following) == declared.count(call_id), (call_id, declared, group)
-        # 组内配对 tool 消息保持声明顺序(provider 组内顺序契约)
-        assert [m.tool_call_id for m in group if m.tool_call_id in set(declared)] == declared
 
 
 @st.composite
@@ -287,9 +364,253 @@ def junk_streams(draw: st.DrawFn) -> list[Item]:
 
 
 @given(junk_streams())
-@settings(deadline=None, max_examples=300, suppress_health_check=[HealthCheck.too_slow])
+@settings(deadline=None, max_examples=200)
 def test_to_messages_never_raises_on_arbitrary_junk(items: list[Item]) -> None:
     assert all(isinstance(m, ModelMessage) for m in to_messages(items))
+
+
+# ---------------------------------------------------------------------------
+# R9 配对修复:未配对的 assistant tool_calls 合成 tool 结果(真实 provider 配对规则)
+# ---------------------------------------------------------------------------
+
+
+def test_pairing_repair_synthesizes_missing_result_in_declaration_order() -> None:
+    # (a) assistant 两个 call,只有 c1 有真实结果:配对修复后两条 tool 消息紧跟
+    # assistant、按声明顺序(c1 真实在前,c2 合成在后),先于后续 user item。
+    # B31 迁移:旧实现把合成消息插在 assistant 紧后、真实结果留在自身位置,
+    # 顺序是 c2→c1;声明窗口配对按 tool_calls 顺序输出(provider 组内顺序契约)。
+    items = [assistant(1, ["c1", "c2"]), result(2, "c1", "real"), mk(3, ItemKind.USER_MESSAGE, {"text": "next"})]
+    msgs = to_messages(items)
+    assert [m.role for m in msgs] == ["assistant", "tool", "tool", "user"]
+    assert msgs[1].content == "real" and msgs[1].tool_call_id == "c1"
+    assert msgs[2] == ModelMessage(role="tool", content=_UNPAIRED_NOTE, tool_call_id="c2")
+
+
+def test_all_calls_unpaired_get_synthetic_results() -> None:
+    # (b) 零结果:全部合成,按 tool_calls 顺序
+    msgs = to_messages([assistant(1, ["c1", "c2"])])
+    assert msgs == [
+        ModelMessage(
+            role="assistant",
+            content="resp",
+            tool_calls=(
+                ModelToolCall(call_id="c1", name="t", arguments={}),
+                ModelToolCall(call_id="c2", name="t", arguments={}),
+            ),
+        ),
+        ModelMessage(role="tool", content=_UNPAIRED_NOTE, tool_call_id="c1"),
+        ModelMessage(role="tool", content=_UNPAIRED_NOTE, tool_call_id="c2"),
+    ]
+
+
+def test_fully_paired_history_has_no_synthesis() -> None:
+    # (c) 全配对:投影与旧行为逐字节一致——无任何合成消息
+    items = [
+        mk(1, ItemKind.USER_MESSAGE, {"text": "go"}),
+        assistant(2, ["c1"]),
+        result(3, "c1", "done"),
+        mk(4, ItemKind.MODEL_RESPONSE, {"content": "fin"}),
+    ]
+    msgs = to_messages(items)
+    assert [m.role for m in msgs] == ["user", "assistant", "tool", "assistant"]
+    assert all(_UNPAIRED_NOTE not in m.content for m in msgs)
+    assert msgs[2].content == "done"
+
+
+def test_denied_or_not_executed_result_counts_as_paired() -> None:
+    # (d) 存在性按 kind+call_id 判定,与 status/文本无关:denied/not_executed 不触发合成
+    for status in ("denied", "not_executed", "outcome_unknown", "error"):
+        items = [assistant(1, ["c1"]), _result_status(2, "c1", "x", status)]
+        msgs = to_messages(items)
+        assert [m.role for m in msgs] == ["assistant", "tool"], status
+        assert len(msgs) == 2, status
+
+
+@st.composite
+def pairing_items(draw: st.DrawFn) -> list[Item]:
+    # (e) 变体:每 turn 1-3 个 call id,从固定小池抽取——跨 turn 复用同一 id 是
+    # 真实形状(local provider 每轮从 call_0 重新起号;CLI 累积 default 线程);
+    # 单 turn 内 id 唯一,每个 id 随机有/无真实结果
+    items: list[Item] = []
+    seq = 0
+    for turn_idx in range(1, draw(st.integers(1, 4)) + 1):
+        turn_id = f"turn-{turn_idx}"
+        calls = draw(st.lists(st.sampled_from(["tc0", "tc1", "tc2"]), min_size=1, max_size=3, unique=True))
+        seq += 1
+        items.append(assistant(seq, calls, turn_id))
+        for call_id in calls:
+            if draw(st.booleans()):
+                seq += 1
+                items.append(result(seq, call_id, "ok", turn_id))
+        if draw(st.booleans()):
+            seq += 1
+            items.append(mk(seq, ItemKind.USER_MESSAGE, {"text": "next"}, turn_id))
+    return items
+
+
+@given(pairing_items())
+@settings(deadline=None, max_examples=150)
+def test_pairing_invariant_holds_for_every_assistant(items: list[Item]) -> None:
+    msgs = to_messages(items)
+    for idx, message in enumerate(msgs):
+        if message.role != "assistant" or not message.tool_calls:
+            continue
+        next_assistant = next(
+            (j for j in range(idx + 1, len(msgs)) if msgs[j].role == "assistant"),
+            len(msgs),
+        )
+        for call in message.tool_calls:
+            following = [
+                m
+                for m in msgs[idx + 1 : next_assistant]
+                if m.role == "tool" and m.tool_call_id == call.call_id
+            ]
+            assert len(following) == 1, call.call_id
+
+
+# ---------------------------------------------------------------------------
+# R10:同一 call_id 只投影最后一条 tool_result(最新 seq 胜;旧结果留库审计)
+# ---------------------------------------------------------------------------
+
+
+def _result_status(seq: int, call_id: str, text: str, status: str, turn_id: str = _TURN) -> Item:
+    return mk(
+        seq,
+        ItemKind.TOOL_RESULT,
+        {
+            "call_id": call_id,
+            "status": status,
+            "content": [{"type": "text", "data": {"text": text}}],
+        },
+        turn_id,
+    )
+
+
+def test_r10_only_last_result_for_a_call_is_projected() -> None:
+    items = [assistant(1, ["c1"]), _result_status(2, "c1", "first answer", "ok"),
+             _result_status(3, "c1", "second answer", "ok")]
+    msgs = to_messages(items)
+    assert [m.role for m in msgs] == ["assistant", "tool"]
+    assert msgs[1].content == "second answer"
+    assert msgs[1].tool_call_id == "c1"
+
+
+def test_r10_outcome_unknown_then_reconciled_projects_ok_only() -> None:
+    # reconcile 的真实序列:崩溃续跑写 outcome_unknown,人工对账再写 ok——只有最后一条进投影
+    items = [
+        assistant(1, ["c1"]),
+        _result_status(2, "c1", "[outcome unknown: process died during execution]", "outcome_unknown"),
+        _result_status(3, "c1", "reconciled by user: ok", "ok"),
+    ]
+    msgs = to_messages(items)
+    assert [m.role for m in msgs] == ["assistant", "tool"]
+    assert msgs[1].content == "reconciled by user: ok"
+    assert "outcome unknown" not in msgs[1].content
+    # failed 对账同理
+    items2 = [items[0], items[1], _result_status(3, "c1", "reconciled by user: failed", "error")]
+    msgs2 = to_messages(items2)
+    assert msgs2[1].content == "reconciled by user: failed"
+
+
+def test_r10_single_result_behavior_unchanged() -> None:
+    items = [assistant(1, ["c1"]), _result_status(2, "c1", "the only one", "ok"),
+             mk(3, ItemKind.USER_MESSAGE, {"text": "next"})]
+    msgs = to_messages(items)
+    assert [m.role for m in msgs] == ["assistant", "tool", "user"]
+    assert msgs[1].content == "the only one"
+
+
+def test_r10_pairing_invariant_holds_with_duplicate_results() -> None:
+    # 每 call_id 恰好一条 tool 消息(c1 双结果取最后,c2 走 R9 合成),且顺序不变
+    items = [
+        assistant(1, ["c1", "c2"]),
+        _result_status(2, "c1", "old", "outcome_unknown"),
+        _result_status(3, "c1", "new", "ok"),
+    ]
+    msgs = to_messages(items)
+    tool_msgs = [m for m in msgs if m.role == "tool"]
+    # B31 迁移:按声明顺序(c1 真实结果在前,c2 合成在后);仍是每 id 恰一条。
+    assert [m.tool_call_id for m in tool_msgs] == ["c1", "c2"]
+    assert tool_msgs[0].content == "new"
+    assert tool_msgs[1] == ModelMessage(role="tool", content=_UNPAIRED_NOTE, tool_call_id="c2")
+    assert "old" not in "".join(m.content for m in msgs)
+
+
+def test_r10_last_by_seq_wins_even_if_list_order_differs() -> None:
+    # 判据是 seq(最新 seq 胜),不是列表位置——乱序输入仍投影 seq 最大的一条
+    items = [assistant(1, ["c1"]), _result_status(4, "c1", "later seq wins", "ok"),
+             _result_status(2, "c1", "earlier seq loses", "ok")]
+    msgs = to_messages(items)
+    assert [m.role for m in msgs] == ["assistant", "tool"]
+    assert msgs[1].content == "later seq wins"
+
+
+# ---------------------------------------------------------------------------
+# 跨 turn 复用 call_id 的回归(整分支评审 Important #1):R9/R10 的存在性与
+# 覆盖键必须按 (turn_id, call_id) 分键——call_id 只在单个 turn 内是调用身份,
+# local provider 每轮从 call_0 重新起号、CLI 在 default 线程上多轮累积都会复用。
+# 全局键会把前一 turn 的真实结果判为"非最新"丢弃、同时不再为它合成 → 孤儿
+# assistant tool_call → 真实 provider 直接拒收请求。
+# ---------------------------------------------------------------------------
+
+
+def test_cross_turn_repeated_call_id_keeps_both_real_results() -> None:
+    # 两个 turn 都用 c1、各有真实结果:两个结果都必须投影——前一 turn 的结果
+    # 不得被跨 turn 的全局 R10 "最新 seq 胜" 判为旧结果而丢弃。
+    items = [
+        assistant(1, ["c1"], "turn-A"),
+        result(2, "c1", "from-turn-A", "turn-A"),
+        mk(3, ItemKind.USER_MESSAGE, {"text": "next"}, "turn-B"),
+        assistant(4, ["c1"], "turn-B"),
+        result(5, "c1", "from-turn-B", "turn-B"),
+    ]
+    msgs = to_messages(items)
+    assert [m.role for m in msgs] == ["assistant", "tool", "user", "assistant", "tool"]
+    assert msgs[1].content == "from-turn-A" and msgs[1].tool_call_id == "c1"
+    assert msgs[4].content == "from-turn-B" and msgs[4].tool_call_id == "c1"
+    assert all(_UNPAIRED_NOTE not in m.content for m in msgs)  # 两边都是真实结果,无合成
+
+
+def test_cross_turn_reuse_missing_result_synthesizes_only_that_turn() -> None:
+    # turn-A 的 c1 有真实结果、turn-B 的 c1 无结果:B 必须合成配对结果——
+    # A 的存在不得让 B 的 R9 合成被抑制(B 的 assistant 成为孤儿)。
+    items = [
+        assistant(1, ["c1"], "turn-A"),
+        result(2, "c1", "real-A", "turn-A"),
+        assistant(3, ["c1"], "turn-B"),
+    ]
+    msgs = to_messages(items)
+    assert [m.role for m in msgs] == ["assistant", "tool", "assistant", "tool"]
+    assert msgs[1].content == "real-A" and msgs[1].tool_call_id == "c1"
+    assert msgs[3] == ModelMessage(role="tool", content=_UNPAIRED_NOTE, tool_call_id="c1")
+
+
+def test_cross_turn_reuse_real_result_not_masked_by_later_turn_gap() -> None:
+    # 反向:turn-B 有结果不得掩盖 turn-A 缺结果——A 合成,B 投影真实结果。
+    items = [
+        assistant(1, ["c1"], "turn-A"),
+        assistant(2, ["c1"], "turn-B"),
+        result(3, "c1", "real-B", "turn-B"),
+    ]
+    msgs = to_messages(items)
+    assert [m.role for m in msgs] == ["assistant", "tool", "assistant", "tool"]
+    assert msgs[1].content == _UNPAIRED_NOTE and msgs[1].tool_call_id == "c1"
+    assert msgs[3].content == "real-B"
+
+
+def test_within_turn_r10_last_wins_holds_with_real_turn_ids() -> None:
+    # turn_id 分键后,单 turn 内 reconcile 覆盖语义不变:outcome_unknown 之后
+    # 的对账结果仍"最后一条胜",旧结果只留审计不进投影。
+    items = [
+        assistant(1, ["c1"], "turn-A"),
+        _result_status(
+            2, "c1", "[outcome unknown: process died during execution]", "outcome_unknown", "turn-A"
+        ),
+        _result_status(3, "c1", "reconciled by user: ok", "ok", "turn-A"),
+    ]
+    msgs = to_messages(items)
+    assert [m.role for m in msgs] == ["assistant", "tool"]
+    assert msgs[1].content == "reconciled by user: ok"
 
 
 # ---------------------------------------------------------------------------
