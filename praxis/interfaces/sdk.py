@@ -25,6 +25,7 @@ re-export:core 不得 import interfaces(import-linter praxis_core_purity),
 from __future__ import annotations
 
 from praxis.adapters.config.credentials import (
+    credential_source,
     resolve_model_credential,
     save_model_credential,
 )
@@ -85,6 +86,7 @@ __all__ = [
     "Usage",
     "VerifyReport",
     "apply_update",
+    "credential_source",
     "model_adapter_for",
     "open_session",
     "probe_model",

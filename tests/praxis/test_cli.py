@@ -124,6 +124,7 @@ def test_sdk_reexports_model_registry_names() -> None:
         "ModelSpec",
         "resolve_model_credential",
         "save_model_credential",
+        "credential_source",
         "model_adapter_for",
         "validate_model_spec",
         "probe_model",
@@ -1126,8 +1127,37 @@ def test_models_add_list_show_roundtrip(tmp_path: Path) -> None:
     assert "* ds" in marked.output
 
 
-def test_models_add_rejects_unresolvable_credential(tmp_path: Path) -> None:
-    result = _invoke_models(
+def _sse(text: str) -> bytes:
+    def chunk(delta: dict[str, Any], finish: str | None = None) -> bytes:
+        return (
+            "data: "
+            + json.dumps(
+                {
+                    "id": "chatcmpl-1",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": "m",
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+                }
+            )
+            + "\n\n"
+        ).encode()
+
+    return b"".join(
+        [
+            chunk({"role": "assistant", "content": text}),
+            chunk({}, finish="stop"),
+            b"data: [DONE]\n\n",
+        ]
+    )
+
+
+def test_models_add_login_check_end_to_end_without_preexisting_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R-T6-6:add(无凭据) → login(0600 文件) → check(stub transport) 三步全 0。"""
+    env = _env(tmp_path)
+    added = _invoke_models(
         [
             "add",
             "ds",
@@ -1138,11 +1168,46 @@ def test_models_add_rejects_unresolvable_credential(tmp_path: Path) -> None:
             "--api-key-env",
             "REGISTRY_KEY",
         ],
-        _env(tmp_path),
+        env,
     )
-    assert result.exit_code == 3, result.output
-    assert "praxis models login" in result.output
-    assert "Traceback" not in result.output
+    assert added.exit_code == 0, added.output
+
+    secret = "sk-e2e-secret"
+    logged = runner.invoke(
+        app,
+        ["models", "login", "ds"],
+        input=secret + "\n",
+        env=_env(tmp_path, REGISTRY_KEY=None),
+    )
+    assert logged.exit_code == 0, logged.output
+
+    import httpx
+
+    import praxis.interfaces.cli.models_cli as models_cli
+    from praxis.interfaces.sdk import OpenAICompatAdapter
+
+    captured: dict[str, Any] = {}
+
+    def fake_adapter(spec: Any, api_key: Any = None, **kwargs: Any) -> Any:
+        captured["api_key"] = api_key
+        return OpenAICompatAdapter(
+            spec,
+            api_key="stub",
+            http_client=httpx.AsyncClient(
+                transport=httpx.MockTransport(
+                    lambda request: httpx.Response(
+                        200, content=_sse("ok"), headers={"content-type": "text/event-stream"}
+                    )
+                )
+            ),
+        )
+
+    monkeypatch.setattr(models_cli, "model_adapter_for", fake_adapter)
+    checked = _invoke_models(["check", "ds"], _env(tmp_path, REGISTRY_KEY=None))
+    assert checked.exit_code == 0, checked.output
+    assert "ok: ds" in checked.output
+    # login 写入的 0600 文件确实被 check 解析到(而非 env)。
+    assert captured["api_key"] == secret
 
 
 def test_models_add_ollama_without_credential_is_normal(tmp_path: Path) -> None:
@@ -1235,6 +1300,148 @@ def test_models_add_rejects_invalid_context_window(tmp_path: Path) -> None:
         _env(tmp_path),
     )
     assert result.exit_code == 3, result.output
+
+
+def _add_model(
+    tmp_path: Path,
+    model_id: str,
+    base_url: str,
+    *,
+    extra: list[str] | None = None,
+    env: dict[str, str | None] | None = None,
+) -> Any:
+    return _invoke_models(
+        [
+            "add",
+            model_id,
+            "--provider",
+            "openai-compatible",
+            "--base-url",
+            base_url,
+            "--api-key-env",
+            "REGISTRY_KEY",
+            *(extra or []),
+        ],
+        env if env is not None else _env(tmp_path),
+    )
+
+
+def test_models_add_same_provider_two_endpoints_are_isolated(tmp_path: Path) -> None:
+    """R-T6-7:默认连接名是 model id,同 provider 两个端点互不接管。"""
+    first = _add_model(tmp_path, "vendor-a", "https://a.test/v1")
+    second = _add_model(tmp_path, "vendor-b", "https://b.test/v1")
+    assert first.exit_code == 0, first.output
+    assert second.exit_code == 0, second.output
+
+    shown_a = _invoke_models(["show", "vendor-a"], _env(tmp_path))
+    shown_b = _invoke_models(["show", "vendor-b"], _env(tmp_path))
+    assert "base_url: https://a.test/v1" in shown_a.output
+    assert "base_url: https://b.test/v1" in shown_b.output
+
+
+def test_models_add_rejects_mismatched_connection_reuse(tmp_path: Path) -> None:
+    """R-T6-7:--connection 指向既有连接时,不一致必须拒绝且连接行字节不变。"""
+    created = _invoke_models(
+        [
+            "connection",
+            "add",
+            "shared",
+            "--provider",
+            "openai-compatible",
+            "--base-url",
+            "https://a.test/v1",
+            "--api-key-env",
+            "REGISTRY_KEY",
+        ],
+        _env(tmp_path),
+    )
+    assert created.exit_code == 0, created.output
+
+    from praxis.adapters.config.store import ModelConfigStore
+
+    before = ModelConfigStore(tmp_path / "config.sqlite")
+    try:
+        original = before.get_connection("shared")
+    finally:
+        before.close()
+    assert original is not None
+
+    rejected = _add_model(
+        tmp_path,
+        "shared-model",
+        "https://b.test/v1",
+        extra=["--connection", "shared"],
+    )
+    assert rejected.exit_code == 3, rejected.output
+    assert "already exists with different" in rejected.output
+
+    after = ModelConfigStore(tmp_path / "config.sqlite")
+    try:
+        unchanged = after.get_connection("shared")
+    finally:
+        after.close()
+    assert unchanged == original
+
+    # 完全一致的复用被接受,且不要求重写连接。
+    reused = _add_model(
+        tmp_path,
+        "shared-model",
+        "https://a.test/v1",
+        extra=["--connection", "shared"],
+    )
+    assert reused.exit_code == 0, reused.output
+
+
+def test_models_add_replace_connection_requires_connection(tmp_path: Path) -> None:
+    result = _invoke_models(
+        [
+            "add",
+            "m",
+            "--provider",
+            "ollama",
+            "--base-url",
+            "http://127.0.0.1:11434",
+            "--replace-connection",
+        ],
+        _env(tmp_path),
+    )
+    assert result.exit_code == 3, result.output
+    assert "requires --connection" in result.output
+
+
+def test_models_list_sqlite_error_is_clean_exit_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R-T6-9:sqlite3.Error 不得裸 traceback。"""
+    from praxis.adapters.config.store import ModelConfigStore
+
+    def broken(self: Any) -> Any:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(ModelConfigStore, "list_models", broken)
+    result = _invoke_models(["list"], _env(tmp_path))
+    assert result.exit_code == 1, result.output
+    assert "disk I/O error" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_models_login_oserror_is_clean_exit_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R-T6-9:凭据写入的 OSError 归成干净失败。"""
+    assert _add_openai(tmp_path).exit_code == 0
+    import praxis.interfaces.cli.models_cli as models_cli
+
+    def denied(*args: Any, **kwargs: Any) -> None:
+        raise PermissionError("credential store is not writable")
+
+    monkeypatch.setattr(models_cli, "save_model_credential", denied)
+    result = runner.invoke(
+        app, ["models", "login", "ds"], input="sk-test\n", env=_env(tmp_path, REGISTRY_KEY=None)
+    )
+    assert result.exit_code == 1, result.output
+    assert "not writable" in result.output
+    assert "Traceback" not in result.output
 
 
 def test_models_remove_unknown_is_clean_exit_1(tmp_path: Path) -> None:
@@ -1341,7 +1548,12 @@ def test_models_check_exit_codes(
     import praxis.interfaces.cli.models_cli as models_cli
     from praxis.interfaces.sdk import ProbeOutcome
 
-    async def fake_ok(adapter: Any, *, tool_name: str = "__probe_noop") -> ProbeOutcome:
+    async def fake_ok(
+        adapter: Any,
+        *,
+        tool_name: str = "__probe_noop",
+        credential_source: Any = None,
+    ) -> ProbeOutcome:
         return ProbeOutcome(ok=True, steps=("text",), detail=None, usage=None)
 
     monkeypatch.setattr(models_cli, "probe_model", fake_ok)
@@ -1349,7 +1561,12 @@ def test_models_check_exit_codes(
     assert passed.exit_code == 0, passed.output
     assert "ok: ds" in passed.output
 
-    async def fake_fail(adapter: Any, *, tool_name: str = "__probe_noop") -> ProbeOutcome:
+    async def fake_fail(
+        adapter: Any,
+        *,
+        tool_name: str = "__probe_noop",
+        credential_source: Any = None,
+    ) -> ProbeOutcome:
         return ProbeOutcome(
             ok=False,
             steps=("text",),

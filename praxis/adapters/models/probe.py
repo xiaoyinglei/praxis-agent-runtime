@@ -16,10 +16,9 @@
   被指向"provider 协议违规"。
 - **provider 期**(``complete`` 抛出的任何异常):经
   ``adapters/models/retry.classify_failure``(唯一分类器)归一,detail =
-  步骤名 + 固定文案 + kind(+有界 diagnostic)。凭据类失败先判
-  ``api_key_env`` 的**在位性**(只读存在/非空,绝不读值):缺失/空 →
-  ``credential environment <NAME> is not set``;在位仍被拒 →
-  ``credential from <NAME> was rejected by the provider``。绝不出现旧实现的
+  步骤名 + 固定文案 + kind(+有界 diagnostic)。凭据类失败按调用方传入的
+  ``credential_source``(env/store/missing)归因;缺省 None 时才回落旧的
+  env 存在性判断(只读存在/非空,绝不读值)。绝不出现旧实现的
   "check endpoint, model, and credential environment" 这种误导归因。
 
 探针不进 turn 循环,也不写任何 item。
@@ -29,6 +28,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Literal
 
 from praxis.adapters.models.retry import classify_failure
 from praxis.protocol.models import (
@@ -42,6 +42,8 @@ from praxis.protocol.models import (
 )
 from praxis.protocol.retry import ModelFailure
 from praxis.protocol.tools import ToolDefinition
+
+CredentialSource = Literal["env", "store", "missing"]
 
 _TEXT_STEP = "text"
 _TOOL_STEP = "tools"
@@ -76,17 +78,41 @@ def _spec_of(adapter: ModelAdapter) -> ModelSpec | None:
 
 
 def _credential_root(env: str) -> str:
-    """凭据根因:只判 ``api_key_env`` 的存在与非空,值本身绝不读出/输出。"""
+    """兼容旧调用方(未传 source)的 env-only 归因;值本身绝不读出/输出。"""
     if not os.environ.get(env):
         return f"credential environment {env} is not set"
     return f"credential from {env} was rejected by the provider"
 
 
-def _detail(step: str, failure: ModelFailure, spec: ModelSpec | None) -> str:
-    """把分类器事实变成可行动的一句话;凭据失败点名 ``api_key_env``。"""
+def _named(env: str | None) -> str:
+    return f" for {env}" if env else ""
+
+
+def _detail(
+    step: str,
+    failure: ModelFailure,
+    spec: ModelSpec | None,
+    source: CredentialSource | None = None,
+) -> str:
+    """把分类器事实变成可行动的一句话;凭据失败按来源归因(R-T6-8)。
+
+    ``source`` 由调用方给出(env/store/missing);``None`` 保留旧的 env-only
+    推导,仅用于没有注册表上下文的直接探针调用。
+    """
     if failure.kind in ("authentication", "permission"):
         env = spec.api_key_env if spec is not None else None
-        root = _credential_root(env) if env else "credential was rejected by the provider"
+        if source == "env":
+            root = f"credential from {env} was rejected by the provider" if env else (
+                "credential was rejected by the provider"
+            )
+        elif source == "store":
+            root = f"saved credential{_named(env)} was rejected by the provider"
+        elif source == "missing":
+            root = f"no credential available{_named(env)}"
+        elif env:
+            root = _credential_root(env)
+        else:
+            root = "credential was rejected by the provider"
     else:
         root = failure.message
     detail = f"{step} step failed: {root} ({failure.kind})"
@@ -120,9 +146,16 @@ async def _build_and_complete(
 
 
 async def probe_model(
-    adapter: ModelAdapter, *, tool_name: str = "__probe_noop"
+    adapter: ModelAdapter,
+    *,
+    tool_name: str = "__probe_noop",
+    credential_source: CredentialSource | None = None,
 ) -> ProbeOutcome:
-    """探测一个已装配的模型适配器;失败永不抛穿,而是进 ``detail``。"""
+    """探测一个已装配的模型适配器;失败永不抛穿,而是进 ``detail``。
+
+    ``credential_source`` 是调用方对凭据来源的归因(env/store/missing);
+    缺省 None 时保留旧的 env-only 文案。
+    """
     spec = _spec_of(adapter)
     steps: list[str] = []
 
@@ -140,7 +173,7 @@ async def probe_model(
         return ProbeOutcome(
             ok=False,
             steps=tuple(steps),
-            detail=_detail(_TEXT_STEP, classify_failure(exc), spec),
+            detail=_detail(_TEXT_STEP, classify_failure(exc), spec, credential_source),
             usage=None,
         )
     usage = text_response.usage
@@ -164,7 +197,7 @@ async def probe_model(
             return ProbeOutcome(
                 ok=False,
                 steps=tuple(steps),
-                detail=_detail(_TOOL_STEP, classify_failure(exc), spec),
+                detail=_detail(_TOOL_STEP, classify_failure(exc), spec, credential_source),
                 usage=usage,
             )
         if DROPPED_TOOL_ARGUMENTS_MARKER in tool_response.content:

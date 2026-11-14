@@ -20,6 +20,7 @@ import pytest
 from praxis.adapters.config import credentials
 from praxis.adapters.config.credentials import (
     credential_identity,
+    credential_source,
     delete_model_credential,
     resolve_model_credential,
     save_model_credential,
@@ -284,3 +285,18 @@ def test_no_credential_returns_none_without_touching_filesystem(
     # 目录存在但无该 identity 条目 → None(不是错误)。
     _write_keys({_identity("OTHER_KEY"): "other"})
     assert resolve_model_credential(_NAME, _ENDPOINT) is None
+
+
+def test_credential_source_is_env_store_missing(
+    posix: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R-T6-8:探针归因需要知道凭据来自 env 还是已保存存储。"""
+    monkeypatch.delenv(_NAME, raising=False)
+    assert credential_source(_NAME, _ENDPOINT) == "missing"
+
+    save_model_credential(_NAME, _ENDPOINT, "sk-file-backed")
+    assert credential_source(_NAME, _ENDPOINT) == "store"
+    assert resolve_model_credential(_NAME, _ENDPOINT) == "sk-file-backed"
+
+    monkeypatch.setenv(_NAME, "sk-from-env")
+    assert credential_source(_NAME, _ENDPOINT) == "env"

@@ -183,6 +183,58 @@ def test_probe_rejected_credential_is_not_reported_as_missing(
     assert "sk-present-but-provider-rejects" not in detail
 
 
+def test_probe_saved_credential_rejection_is_attributed_to_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R-T6-8:file-backed 凭据被拒时不得说成"环境变量没设"。"""
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401,
+            json={
+                "error": {
+                    "message": "invalid api key",
+                    "type": "invalid_request_error",
+                    "code": "invalid_api_key",
+                }
+            },
+        )
+
+    spec = ModelSpec(model_id="deepseek-flash", base_url=_BASE, api_key_env="DEEPSEEK_API_KEY")
+    outcome = asyncio.run(
+        probe_model(
+            _compat(spec, handler, api_key="wrong"),
+            credential_source="store",
+        )
+    )
+
+    detail = outcome.detail or ""
+    assert "saved credential for DEEPSEEK_API_KEY was rejected by the provider" in detail
+    assert "is not set" not in detail
+    assert "environment" not in detail
+
+
+def test_probe_missing_credential_source_is_reported_as_missing() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401,
+            json={"error": {"message": "invalid api key", "code": "invalid_api_key"}},
+        )
+
+    spec = ModelSpec(model_id="deepseek-flash", base_url=_BASE, api_key_env="DEEPSEEK_API_KEY")
+    outcome = asyncio.run(
+        probe_model(
+            _compat(spec, handler, api_key="wrong"),
+            credential_source="missing",
+        )
+    )
+
+    detail = outcome.detail or ""
+    assert "no credential available for DEEPSEEK_API_KEY" in detail
+    assert "is not set" not in detail
+
+
 def test_probe_skips_tool_step_when_spec_says_no_tool_support() -> None:
     seen: list[dict[str, Any]] = []
 

@@ -12,9 +12,9 @@ credential 层保存,表结构由测试钉死。
 - 跨进程写经 ``BEGIN IMMEDIATE`` + ``busy_timeout=5000`` 串行。
 - 全局 revision 存在 ``model_config`` 的 ``revision`` 键,每次成功写 +1。
   CAS 不信任调用方/实例的内存视角:进入 IMMEDIATE 事务后 re-read 存储真值;
-  首次不符时在同一事务内 re-read 一次(刷新观察值),仍不符才抛
-  ``ConfigVersionConflict(observed_revision=...)``——至多一次,不 livelock
-  (B26:外部写不再造成永久冲突)。
+  ``expected_revision`` 不符时在同一事务内再做一次 re-read——这是**故意的
+  no-op 守卫**(同事务必得同值),不制造可观测的第二状态、也不改写调用方
+  视角;仍不符即带 ``observed_revision`` 干净抛出(R-T5-1;存储层不自动重放)。
 - 写事务只做最小 SQL;序列化/校验一律在 BEGIN 之前完成(会话库"写事务只
   INSERT"纪律的等价物:事务里不做哈希/重活)。
 - 读经 ``OrderedDict`` LRU 缓存(``_CACHE_MAX = 64``)+ 同一把锁;任何写**尝试**

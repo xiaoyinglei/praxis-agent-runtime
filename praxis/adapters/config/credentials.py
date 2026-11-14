@@ -23,6 +23,7 @@ import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Literal
 
 from praxis.protocol.floor import host_config_dir
 
@@ -77,11 +78,13 @@ def _credential_directory() -> Path:
 
 def _private_directory() -> Path:
     directory = _credential_directory()
-    if directory.is_symlink():
-        raise ValueError(_DIRECTORY_ERROR) from None
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
+        if directory.is_symlink():
+            raise ValueError(_DIRECTORY_ERROR)
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         metadata = directory.stat()
+    except ValueError:
+        raise
     except OSError:
         raise ValueError(_DIRECTORY_ERROR) from None
     if (
@@ -101,17 +104,22 @@ def _read_keys(path: Path) -> dict[str, str]:
         return {}
     except OSError:
         raise ValueError(_FILE_ERROR) from None
-    with os.fdopen(fd, "rb") as handle:
-        metadata = os.fstat(handle.fileno())
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != os.getuid()
-            or metadata.st_mode & 0o077
-            or metadata.st_nlink != 1
-            or metadata.st_size > _MAX_FILE_BYTES
-        ):
-            raise ValueError(_FILE_ERROR) from None
+    try:
+        handle = os.fdopen(fd, "rb")
+    except OSError:
+        os.close(fd)
+        raise ValueError(_FILE_ERROR) from None
+    with handle:
         try:
+            metadata = os.fstat(handle.fileno())
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_mode & 0o077
+                or metadata.st_nlink != 1
+                or metadata.st_size > _MAX_FILE_BYTES
+            ):
+                raise ValueError
             data = json.loads(handle.read())
             if (
                 not isinstance(data, dict)
@@ -128,7 +136,7 @@ def _read_keys(path: Path) -> dict[str, str]:
                     raise ValueError
                 parsed[name] = _validate_key(value)
             return parsed
-        except (TypeError, UnicodeError, ValueError):
+        except (OSError, TypeError, UnicodeError, ValueError):
             raise ValueError(_FILE_ERROR) from None
 
 
@@ -204,6 +212,21 @@ def resolve_model_credential(api_key_env: str, endpoint: str) -> str | None:
     return load_model_credential(api_key_env, endpoint)
 
 
+CredentialSource = Literal["env", "store", "missing"]
+
+
+def credential_source(api_key_env: str, endpoint: str) -> CredentialSource:
+    """凭据来源归因(只判存在性,不返回值):env / store / missing。
+
+    探针用它把"provider 拒绝凭据"归因到正确来源,避免把已保存的
+    Keychain/0600 凭据误报成"环境变量没设"(R-T6-8)。
+    """
+    value = os.environ.get(api_key_env)
+    if isinstance(value, str) and value.strip():
+        return "env"
+    return "store" if load_model_credential(api_key_env, endpoint) is not None else "missing"
+
+
 def save_model_credential(api_key_env: str, endpoint: str, value: str) -> None:
     """保存凭据值并回读校验;值绝不进入 argv。"""
     identity = credential_identity(api_key_env, endpoint)
@@ -276,7 +299,9 @@ def delete_model_credential(api_key_env: str, endpoint: str) -> None:
 
 
 __all__ = [
+    "CredentialSource",
     "credential_identity",
+    "credential_source",
     "delete_model_credential",
     "load_model_credential",
     "resolve_model_credential",

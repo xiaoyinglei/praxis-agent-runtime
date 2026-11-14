@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
+import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
 from decimal import Decimal
@@ -35,9 +37,17 @@ from praxis.interfaces.sdk import (
     save_model_credential,
     validate_model_spec,
 )
+from praxis.interfaces.sdk import (
+    credential_source as credential_source_of,
+)
 
 EXIT_COMPLETED = 0
 EXIT_FAILED = 1
+
+# 写前干跑只做 build_request(纯序列化、不发网络),不读取真实凭据(R-T6-6)。
+_DRY_RUN_API_KEY = "praxis-dry-run"
+# CLI 边界的"干净失败"集合(无裸 traceback;C4 同类)。
+_CLI_ERRORS = (ConfigVersionConflict, KeyError, OSError, sqlite3.Error, subprocess.TimeoutExpired, ValueError)
 
 _PROVIDERS = ("openai-compatible", "ollama")
 _PROVIDER_CHOICE = click.Choice(list(_PROVIDERS))
@@ -65,7 +75,7 @@ def _store() -> Iterator[ModelConfigStore]:
     try:
         store = ModelConfigStore()
         yield store
-    except (ConfigVersionConflict, KeyError, ValueError) as exc:
+    except _CLI_ERRORS as exc:
         message = exc.args[0] if isinstance(exc, KeyError) and exc.args else str(exc)
         _fail(str(message))
     finally:
@@ -170,7 +180,14 @@ def add(
         None, "--api-key-env", help="Environment variable name (never the value)."
     ),
     connection: str | None = typer.Option(
-        None, "--connection", help="Connection name (default: provider)."
+        None,
+        "--connection",
+        help="Existing connection to reuse (default: a connection named after the model id).",
+    ),
+    replace_connection: bool = typer.Option(
+        False,
+        "--replace-connection",
+        help="Explicitly overwrite a named connection whose settings differ.",
     ),
     remote_model_id: str | None = typer.Option(None, "--remote-model-id"),
     context_window: int = typer.Option(8192, "--context-window"),
@@ -181,7 +198,15 @@ def add(
     tokenizer: str | None = typer.Option(None, "--tokenizer"),
     option: list[str] = _OPTION_ARG,
 ) -> None:
-    """注册/更新一个模型;写库前先用目标 provider 的真实 adapter 干跑(R-T6-1)。"""
+    """注册/更新一个模型;写库前先用目标 provider 的真实 adapter 干跑(R-T6-1)。
+
+    干跑使用占位 key,不依赖真实凭据(R-T6-6):``build_request`` 是纯序列化、
+    不发网络,凭据缺失只应在 ``check``/运行时报告。默认连接名是 model id,
+    因此同一 provider 的不同端点天然隔离;``--connection`` 指向既有连接时必须
+    完全一致,``--replace-connection`` 才允许显式覆盖(R-T6-7)。
+    """
+    if replace_connection and connection is None:
+        raise typer.BadParameter("--replace-connection requires --connection")
     try:
         cost = CostMicros(
             input_per_1m=_price(price_in_per_1m, "--price-in-per-1m"),
@@ -204,35 +229,41 @@ def add(
     except (TypeError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from None
 
-    credential: str | None = None
-    if spec.api_key_env is not None:
-        try:
-            credential = resolve_model_credential(spec.api_key_env, base_url)
-        except ValueError as exc:
-            _fail(str(exc))
-    if provider == "openai-compatible" and credential is None:
-        hint = (
-            f"run: praxis models login {model_id}"
-            if spec.api_key_env is not None
-            else "pass --api-key-env and export that variable"
-        )
-        raise typer.BadParameter(
-            f"openai-compatible model {model_id!r} has no resolvable credential; {hint}"
-        )
-
     try:
-        validate_model_spec(spec, credential)
+        validate_model_spec(spec, _DRY_RUN_API_KEY)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from None
+    except OSError as exc:
+        _fail(str(exc))
 
+    connection_name = connection or model_id
     entry = ConnectionEntry(
-        name=connection or provider,
+        name=connection_name,
         provider=cast("Any", provider),
         base_url=base_url,
         api_key_env=api_key_env,
     )
     with _store() as store:
-        store.upsert_connection(entry)
+        existing = (
+            store.get_connection(connection_name) if connection is not None else None
+        )
+        if connection is not None and existing is not None:
+            mismatch = (
+                existing.provider != provider
+                or existing.base_url != base_url
+                or existing.api_key_env != api_key_env
+            )
+            if mismatch and not replace_connection:
+                raise typer.BadParameter(
+                    f"connection {connection_name!r} already exists with different "
+                    "provider/base_url/api_key_env; use another --connection name "
+                    "or pass --replace-connection"
+                )
+            if mismatch:
+                store.upsert_connection(entry)
+            # 完全一致 → 复用既有连接行,不改写它。
+        else:
+            store.upsert_connection(entry)
         store.upsert_model(ModelEntry(spec=spec, connection=entry, revision=0))
     typer.echo(f"ok: registered {model_id}")
 
@@ -314,7 +345,7 @@ def login(model_id: str) -> None:
         _fail("empty credential; nothing saved")
     try:
         save_model_credential(spec.api_key_env, spec.base_url or "", value)
-    except ValueError as exc:
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
         _fail(str(exc))
     typer.echo(f"ok: credential saved for {model_id}")
 
@@ -324,16 +355,17 @@ def check(model_id: str) -> None:
     """轻量探针:文本步(+ 支持工具时的工具步);ok → 0,失败 → 1。"""
     with _store() as store:
         spec = store.resolve_spec(model_id)
+    source = None
     try:
-        api_key = (
-            resolve_model_credential(spec.api_key_env, spec.base_url or "")
-            if spec.api_key_env is not None
-            else None
-        )
+        if spec.api_key_env is not None:
+            api_key = resolve_model_credential(spec.api_key_env, spec.base_url or "")
+            source = credential_source_of(spec.api_key_env, spec.base_url or "")
+        else:
+            api_key = None
         adapter = model_adapter_for(spec, api_key)
-    except ValueError as exc:
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
         _fail(str(exc))
-    outcome = asyncio.run(probe_model(adapter))
+    outcome = asyncio.run(probe_model(adapter, credential_source=source))
     if outcome.detail:
         typer.echo(outcome.detail, err=True)
     if outcome.usage is not None:
