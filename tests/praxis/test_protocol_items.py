@@ -42,11 +42,12 @@ def test_item_is_frozen() -> None:
         item.seq = 2
 
 
-def test_item_kind_values_are_the_ten_agreed() -> None:
+def test_item_kind_values_are_the_eleven_agreed() -> None:
     assert {kind.value for kind in ItemKind} == {
         "user_message",
         "steering",
         "model_response",
+        "model_attempt",
         "tool_call",
         "tool_result",
         "approval_request",

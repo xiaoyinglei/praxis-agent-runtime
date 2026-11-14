@@ -9,7 +9,9 @@ import pytest
 from praxis.protocol.events import (
     ApprovalRequested,
     Event,
+    ModelOutputDelta,
     ModelResponseReceived,
+    ModelRetried,
     ToolFinished,
     ToolStarted,
     TurnStatusChanged,
@@ -120,6 +122,8 @@ def test_events_are_frozen_and_hashable() -> None:
         ToolFinished(turn_id="t1", call_id="c1", status="ok"),
         ApprovalRequested(turn_id="t1", call_id="c1", tool_name="write_file", args_digest="d" * 64),
         ModelResponseReceived(turn_id="t1", content_preview="hello"),
+        ModelOutputDelta(turn_id="t1", kind="text", text="hello"),
+        ModelRetried(turn_id="t1", attempt=0, kind="server_error", retry_at=1.0),
     )
     # Event 是 PEP 695 别名:3.12 下 isinstance 不接受别名本体,取 __value__ 联合。
     assert set(Event.__value__.__args__) == {
@@ -128,6 +132,8 @@ def test_events_are_frozen_and_hashable() -> None:
         ToolFinished,
         ApprovalRequested,
         ModelResponseReceived,
+        ModelOutputDelta,
+        ModelRetried,
     }
     for event in events:
         assert isinstance(event, Event.__value__)

@@ -5,7 +5,8 @@ build_session 把分层组件装配成一个可用会话,顺序即依赖序:
 崩溃遗留的 running turn → interrupted,§5.8;活执行者持锁,Sweep 跳过,绝不误伤)
 → 默认三内置工具(read/write/bash,可由 tools 参数整体替换)→ PermissionContext
 (``probe_backend()`` 真实沙箱探测)→ 线程 ensure/create → Session(注入
-``compile_sandbox``/``finalize_sandbox``——core 经结构签名消费,不 import adapters)。
+``compile_sandbox``/``finalize_sandbox`` 与唯一重试机制 ``retry_stream``——
+core 经结构签名消费,不 import adapters)。
 
 thread_id 是外部输入且直接参与 lockfile 命名:在这里(边界)先验拒绝空串、路径
 分隔符、NUL 与 ``..`` 成分——locks.py 会再拦一次,但边界拒绝让错误在碰文件系统
@@ -16,9 +17,12 @@ thread_id 是外部输入且直接参与 lockfile 命名:在这里(边界)先验
 
 from __future__ import annotations
 
+import asyncio
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
+from praxis.adapters.models.retry import make_retry_stream
 from praxis.adapters.sandbox.base import probe_backend
 from praxis.adapters.sandbox.compile import compile_sandbox, finalize_sandbox
 from praxis.core.events import EventBus
@@ -27,6 +31,7 @@ from praxis.core.session import Session
 from praxis.protocol.models import ModelAdapter
 from praxis.protocol.permission import PermissionContext, PermissionMode
 from praxis.protocol.policy import PermissionPolicy
+from praxis.protocol.retry import RetryPolicy
 from praxis.protocol.tools import Tool
 from praxis.store.log import Store
 from praxis.tools.builtins.command import create_bash_tool
@@ -120,6 +125,10 @@ def build_session(
             max_steps,
             compile_sandbox=compile_sandbox,
             finalize_sandbox=finalize_sandbox,
+            # 唯一重试机制在此绑定:真实时钟 + asyncio.sleep;core 只见结构签名。
+            retry_stream=make_retry_stream(
+                policy=RetryPolicy(), clock=time.time, sleep=asyncio.sleep
+            ),
         )
     except BaseException:
         store.close()

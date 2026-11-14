@@ -58,6 +58,7 @@ from praxis.protocol.items import Item, ItemKind
 from praxis.protocol.json import JsonValue
 from praxis.protocol.models import ModelAdapter, ModelSettings, ModelToolCall
 from praxis.protocol.permission import PermissionContext, PermissionUpdate
+from praxis.protocol.retry import RetryingStream
 from praxis.protocol.tools import ResultStatus, Tool
 from praxis.store.log import ItemEntry, Store
 from praxis.store.turns import Turn, create_turn, get_turn, list_turns
@@ -264,6 +265,7 @@ class Session:
         system_prompt: str | None = None,
         compile_sandbox: SandboxCompiler | None = None,
         finalize_sandbox: SandboxFinalizer | None = None,
+        retry_stream: RetryingStream | None = None,
     ) -> None:
         self._store = store
         self._bus = bus
@@ -284,6 +286,7 @@ class Session:
         )
         self._compile_sandbox = compile_sandbox
         self._finalize_sandbox = finalize_sandbox
+        self._retry_stream = retry_stream
 
     # -- 身份与生命周期 -------------------------------------------------------
 
@@ -567,6 +570,7 @@ class Session:
             max_steps=self._max_steps,
             compile_sandbox=self._compile_sandbox,
             finalize_sandbox=self._finalize_sandbox,
+            retry_stream=self._retry_stream,
         )
         try:
             with thread_execution_lock(self._workspace, self._thread_id):

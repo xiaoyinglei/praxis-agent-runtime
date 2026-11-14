@@ -18,6 +18,7 @@ class ItemKind(StrEnum):
     USER_MESSAGE = "user_message"
     STEERING = "steering"
     MODEL_RESPONSE = "model_response"
+    MODEL_ATTEMPT = "model_attempt"
     TOOL_CALL = "tool_call"
     TOOL_RESULT = "tool_result"
     APPROVAL_REQUEST = "approval_request"
