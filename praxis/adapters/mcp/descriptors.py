@@ -56,6 +56,7 @@ from typing import cast
 
 from mcp.types import Tool as McpTool
 
+from praxis.adapters.mcp._errors import bounded_exception_message, bounded_message
 from praxis.adapters.mcp.config import HttpServerConfig, McpServerConfig
 from praxis.adapters.mcp.lifecycle import McpConnection
 from praxis.adapters.mcp.names import canonical_tool_name
@@ -80,10 +81,6 @@ from praxis.protocol.tools import (
 _TOOL_TIMEOUT_SECONDS = 30.0
 _MAX_MODEL_OUTPUT_BYTES = 1_000_000
 _CONFIG_CHANGED_MESSAGE = "config changed; reconnect"
-_MAX_ERROR_MESSAGE_CHARS = 512
-_MAX_LEAF_MESSAGES = 8
-_MAX_LEAF_SCAN = 64
-_MAX_LEAF_DEPTH = 64
 _DEFAULT_DESCRIPTION = "Configured MCP tool."
 _PENDING_TOOL_CALL_ID = "pending"
 
@@ -300,7 +297,7 @@ def _config_drift_result(
 
 
 def _guard_result(descriptor: McpToolDescriptor, error_code: str, message: str) -> ToolResult:
-    bounded = _bounded(message)
+    bounded = bounded_message(message, fallback="MCP tool call failed")
     return ToolResult(
         tool_call_id=_PENDING_TOOL_CALL_ID,
         tool_name=descriptor.canonical_name,
@@ -321,46 +318,11 @@ def _guard_result(descriptor: McpToolDescriptor, error_code: str, message: str) 
 def _call_failure_message(error: BaseException) -> str:
     """摊平 ExceptionGroup 的叶子消息并截断——绝不带出 TaskGroup 包装文案。
 
-    T16 的实测形状是 ``ExceptionGroup(ExceptionGroup(TimeoutError))``;T19 在
-    connect 阶段负责把同一形状转诊断,工具层这里只保证调用失败可读且有界。
-    遍历受叶子数与嵌套深度双重上限约束(M5):超出的节点只计数、不展开,
-    敌意/深嵌套 group 不会造成无界工作。
+    唯一摊平实现在 ``adapters.mcp._errors``(T19);T16 的实测形状是
+    ``ExceptionGroup(ExceptionGroup(TimeoutError))``,connect 阶段的同一形状
+    由 manager 转诊断。工具层这里只保证调用失败可读且有界。
     """
-    leaves, excess = _leaves(error)
-    detail = "; ".join(f"{type(leaf).__name__}: {leaf}" for leaf in leaves)
-    if excess:
-        detail = f"{detail}; (+{excess} more)" if detail else f"MCP tool call failed; (+{excess} more)"
-    return _bounded(detail or "MCP tool call failed")
-
-
-def _leaves(error: BaseException) -> tuple[list[BaseException], int]:
-    """非递归摊平;返回 (叶子列表, 未展开节点数)。
-
-    上限:最多 ``_MAX_LEAF_MESSAGES`` 个叶子、``_MAX_LEAF_DEPTH`` 层嵌套。
-    超限节点计入 ``excess`` 而不是递归下钻/追加到消息。
-    """
-    leaves: list[BaseException] = []
-    excess = 0
-    stack: list[tuple[BaseException, int]] = [(error, 0)]
-    groups = 0
-    while stack:
-        current, depth = stack.pop()
-        if isinstance(current, BaseExceptionGroup):
-            if depth >= _MAX_LEAF_DEPTH or groups >= _MAX_LEAF_SCAN:
-                excess += 1
-                continue
-            groups += 1
-            stack.extend((sub, depth + 1) for sub in reversed(current.exceptions))
-        elif len(leaves) < _MAX_LEAF_MESSAGES:
-            leaves.append(current)
-        else:
-            excess += 1
-    return leaves, excess
-
-
-def _bounded(message: str) -> str:
-    collapsed = " ".join(message.split())
-    return collapsed[:_MAX_ERROR_MESSAGE_CHARS] or "MCP tool call failed"
+    return bounded_exception_message(error, fallback="MCP tool call failed")
 
 
 def _schema_fingerprint(schema: Mapping[str, JsonValue]) -> str:

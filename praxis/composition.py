@@ -34,6 +34,8 @@ from praxis.adapters.config.credentials import resolve_model_credential
 from praxis.adapters.config.store import ModelConfigStore
 from praxis.adapters.hooks.config import load_host_hooks
 from praxis.adapters.hooks.runner import spawn_hook
+from praxis.adapters.mcp.manager import McpBundle
+from praxis.adapters.mcp.manager import connect_mcp_servers as _connect_mcp_servers
 from praxis.adapters.models.ollama import OllamaAdapter
 from praxis.adapters.models.openai_compat import OpenAICompatAdapter
 from praxis.adapters.models.retry import make_retry_stream
@@ -51,7 +53,7 @@ from praxis.core.compaction import (
 from praxis.core.events import EventBus
 from praxis.core.permission import network_verdict
 from praxis.core.recovery import sweep, sweep_orphan_command_jobs
-from praxis.core.session import Session
+from praxis.core.session import AsyncCloser, Session
 from praxis.protocol.hooks import HookOutcome, HookSetup, HookSpec
 from praxis.protocol.json import JsonValue
 from praxis.protocol.models import (
@@ -62,13 +64,14 @@ from praxis.protocol.models import (
     WireRequest,
 )
 from praxis.protocol.permission import PermissionContext, PermissionMode
-from praxis.protocol.policy import PermissionPolicy, url_host
+from praxis.protocol.policy import PermissionPolicy, PolicyVerdict, url_host
 from praxis.protocol.retry import RetryPolicy
 from praxis.protocol.skills import SkillCatalog
-from praxis.protocol.tools import Tool
+from praxis.protocol.tools import Tool, ToolSource
 from praxis.store.artifacts import ArtifactStore
 from praxis.store.log import Store
 from praxis.tools.builtins.artifacts_tool import create_read_artifact_tool
+from praxis.tools.builtins.child_env import child_env
 from praxis.tools.builtins.command import create_bash_tool
 from praxis.tools.builtins.command_sessions import (
     CommandSessions,
@@ -301,12 +304,15 @@ def _host_hook_setup(root: Path) -> HookSetup:
     return HookSetup(specs=specs, spawn=_spawn_host_hook)
 
 
-def _resolve_policy(root: Path, explicit: PermissionPolicy | None) -> PermissionPolicy:
+def resolve_declared_policy(root: Path, explicit: PermissionPolicy | None) -> PermissionPolicy:
     """policy 来源序(Task 8):显式参数 > ``.praxis/permissions.json`` > 默认。
 
     文件是策略**声明**(always 授权由 Session 原子写合并于此);坏文件/坏 JSON
     一律 ValueError 边界拒绝,绝不静默回退默认(fail early at the boundary;
     pydantic strict 的 ValidationError 就是 ValueError 的子类)。
+
+    T19:名字转正——MCP connect 的声明快照与 ``build_session`` 必须来自**同一
+    加载实现**;宿主(CLI)先取快照,再同时交给 connect 与 open_session。
     """
     if explicit is not None:
         return explicit
@@ -317,6 +323,28 @@ def _resolve_policy(root: Path, explicit: PermissionPolicy | None) -> Permission
         return PermissionPolicy.model_validate_json(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise ValueError(f"cannot load policy file {path}: {exc}") from exc
+
+
+async def connect_mcp_servers(
+    workspace: Path,
+    *,
+    policy: PermissionPolicy | None = None,
+    network_verdict_at_connect: Callable[[str], PolicyVerdict] | None = None,
+) -> McpBundle:
+    """MCP eager connect 的公开装配入口(T19;sdk/CLI 只经这里)。
+
+    本函数是 ``adapters.mcp.manager.connect_mcp_servers`` 的**唯一绑定点**:
+    ``sandbox_compiler`` 与 ``env_builder``(``child_env`` 的唯一实现)在这里
+    注入,adapters 层因此不 import tools(R-T15-7)。``policy`` 是
+    ``resolve_declared_policy`` 的声明快照;``None`` 表示调用方未声明。
+    """
+    return await _connect_mcp_servers(
+        workspace,
+        policy=policy,
+        sandbox_compiler=compile_sandbox,
+        env_builder=child_env,
+        network_verdict_at_connect=network_verdict_at_connect,
+    )
 
 
 def build_session(
@@ -332,6 +360,8 @@ def build_session(
     max_steps: int = 50,
     hooks: HookSetup | None = None,
     skills_catalog: SkillCatalog | None = None,
+    extra_tools: Sequence[Tool] = (),
+    integrations: Sequence[AsyncCloser] = (),
 ) -> Session:
     """装配一个 Session:唯一组合根。CLI/TUI/host 一律经 sdk.open_session 走到这里。
 
@@ -341,7 +371,7 @@ def build_session(
     ``PRAXIS_MODEL_ID/PRAXIS_API_KEY/PRAXIS_BASE_URL`` 构造一个 ModelSpec,
     适配器仍然只由 ``_adapter_for`` 装配——不是第二装配入口。
 
-    Task 8 入口:policy 见 _resolve_policy 来源序;mode 来源序 = 显式参数 >
+    Task 8 入口:policy 见 resolve_declared_policy 来源序;mode 来源序 = 显式参数 >
     policy.approval,正交于策略(C5:bypass 只活在运行上下文,永不进 policy、
     永不落盘;切换 mode 不触碰任何策略规则),非法值边界拒绝。
 
@@ -353,6 +383,11 @@ def build_session(
     双根调用 ``load_skill_catalog``(PROJECT 上溯 + ``$SKILL_PATH``);显式参数
     (测试)完全绕过文件系统扫描。空目录是常态,注入步骤在 core 里自然恒等——
     不设 ``SKILLS_ENABLED`` 开关。composition 可 import tools,core 不可。
+
+    T19:``extra_tools``(MCP 投影)并入默认/显式工具表,任何**名字冲突**都在
+    这里边界拒绝(跨 server 同名也在 merge 处暴露,T18 交接);``integrations``
+    (MCP bundle)注入 Session,``close()/aclose()`` 在 command_sessions 之后、
+    store 之前收尾。
     """
     if thread_id is not None:
         _validate_thread_id(thread_id)
@@ -429,10 +464,26 @@ def build_session(
             )
         )
         tool_map: dict[str, Tool] = {tool.definition.name: tool for tool in tool_seq}
+        # T19:MCP 工具在仓库边界并入;任何重名都是装配错误(extra↔builtin 或
+        # 跨 server canonical 名冲突)。先查后写,错误点名字与双方来源,绝不
+        # 静默覆盖(覆盖会让一个 server 的工具永远不可达)。
+        for extra in extra_tools:
+            name = extra.definition.name
+            existing = tool_map.get(name)
+            if existing is not None:
+                origin = (
+                    "a built-in/configured tool of the same name"
+                    if existing.source is ToolSource.BUILTIN
+                    else "another extra tool (two MCP servers expose the same name)"
+                )
+                raise ValueError(
+                    f"tool name {name!r} from extra tools collides with {origin}"
+                )
+            tool_map[name] = extra
         # 外部化与回读能力耦合:工具表被整体替换且没有 read_artifact 时,
         # 不注入 artifacts——否则模型只会拿到打不开的指针,比旧字节截断更差。
         effective_artifacts = artifact_store if "read_artifact" in tool_map else None
-        effective_policy = _resolve_policy(root, policy)
+        effective_policy = resolve_declared_policy(root, policy)
         effective_mode: PermissionMode = mode if mode is not None else effective_policy.approval
         permissions = PermissionContext(
             workspace=str(root),
@@ -467,6 +518,7 @@ def build_session(
             command_sessions=sessions,
             hooks=hook_setup,
             skills_catalog=resolved_skills,
+            integrations=tuple(integrations),
         )
     except BaseException:
         store.close()

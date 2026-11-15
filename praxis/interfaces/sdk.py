@@ -21,6 +21,13 @@ model_adapter_for/validate_model_spec/probe_model/ProbeOutcome。CLI 的
 Task 17 扩展:artifact/计划/流式事件面 re-export——ArtifactStore/PlanSnapshot/
 latest_plan、ModelEvent 与三个 delta 型、assemble_model_events;宿主/UI 读取
 这些结构仍只经 sdk,不直依 core/store/protocol 内部模块。
+Task 19 扩展:MCP 接线面 re-export——connect_mcp_servers/McpBundle/
+McpServerStatus、resolve_declared_policy(声明快照唯一加载实现),以及
+``praxis mcp`` 只读管理所需的配置面(load_mcp_configs/resolve_mcp_config_path/
+decide_mcp_config_trust/mcp_config_write_path/normalize_mcp_name)与
+save_mcp_bearer。宿主构造 typed ``extra_tools``/hooks/skills 面所需的
+``ToolSource``/``SkillCatalog``/``load_host_hooks`` 一并出口(修复轮 #1;
+无豁免)。CLI 因此不直依 adapters(契约 praxis_cli_via_sdk)。
 
 ``ConversationBusy``/``ResumeNotConfirmed`` 定义在 core.session 并由这里
 re-export:core 不得 import interfaces(import-linter praxis_core_purity),
@@ -39,6 +46,7 @@ from praxis.adapters.config.credentials import (
     delete_web_search_credential,
     resolve_model_credential,
     resolve_web_search_credential,
+    save_mcp_bearer,
     save_model_credential,
     save_web_search_credential,
     web_search_credential_source,
@@ -49,6 +57,18 @@ from praxis.adapters.config.store import (
     ModelConfigStore,
     ModelEntry,
 )
+from praxis.adapters.hooks.config import load_host_hooks
+from praxis.adapters.mcp.config import (
+    HttpServerConfig,
+    McpServerConfig,
+    StdioServerConfig,
+    decide_mcp_config_trust,
+    load_mcp_configs,
+    mcp_config_write_path,
+    resolve_mcp_config_path,
+)
+from praxis.adapters.mcp.manager import McpBundle, McpServerStatus
+from praxis.adapters.mcp.names import normalize_mcp_name
 from praxis.adapters.models.openai_compat import OpenAICompatAdapter
 from praxis.adapters.models.probe import ProbeOutcome, probe_model
 from praxis.adapters.models.scripted import ScriptedAdapter
@@ -61,7 +81,13 @@ from praxis.adapters.web.search import (
     SearchProviderConfig,
     load_web_search_config,
 )
-from praxis.composition import build_session, model_adapter_for, validate_model_spec
+from praxis.composition import (
+    build_session,
+    connect_mcp_servers,
+    model_adapter_for,
+    resolve_declared_policy,
+    validate_model_spec,
+)
 from praxis.core.events import Subscription
 from praxis.core.locks import ThreadBusy
 from praxis.core.permission import apply_update
@@ -85,6 +111,8 @@ from praxis.protocol.models import (
 from praxis.protocol.permission import PermissionMode, PermissionNotice, PermissionUpdate
 from praxis.protocol.plan import PlanSnapshot
 from praxis.protocol.policy import NetworkRule, PathRule, PermissionPolicy, ToolRule
+from praxis.protocol.skills import SkillCatalog
+from praxis.protocol.tools import ToolSource
 from praxis.store.artifacts import ArtifactStore
 from praxis.store.turns import Turn
 from praxis.store.verify import VerifyReport
@@ -92,14 +120,19 @@ from praxis.store.verify import VerifyReport
 open_session = build_session
 
 __all__ = [
+    "API_KEY_ENV_NAME",
     "ApprovalSummary",
     "ArtifactStore",
     "ConfigVersionConflict",
     "ConnectionEntry",
     "ConversationBusy",
     "CostMicros",
+    "HttpServerConfig",
     "Item",
     "ItemKind",
+    "McpBundle",
+    "McpServerConfig",
+    "McpServerStatus",
     "ModelConfigStore",
     "ModelEntry",
     "ModelEvent",
@@ -117,7 +150,6 @@ __all__ = [
     "PermissionPolicy",
     "PermissionUpdate",
     "PlanSnapshot",
-    "API_KEY_ENV_NAME",
     "ProbeOutcome",
     "ResumeNotConfirmed",
     "SEARCH_ENDPOINTS",
@@ -126,9 +158,12 @@ __all__ = [
     "SearchProvider",
     "SearchProviderConfig",
     "Session",
+    "SkillCatalog",
+    "StdioServerConfig",
     "Subscription",
     "ThreadBusy",
     "ToolRule",
+    "ToolSource",
     "Turn",
     "TurnResult",
     "TurnStatus",
@@ -136,15 +171,24 @@ __all__ = [
     "VerifyReport",
     "apply_update",
     "assemble_model_events",
+    "connect_mcp_servers",
     "credential_source",
+    "decide_mcp_config_trust",
     "delete_web_search_credential",
     "latest_plan",
+    "load_host_hooks",
+    "load_mcp_configs",
     "load_web_search_config",
+    "mcp_config_write_path",
     "model_adapter_for",
+    "normalize_mcp_name",
     "open_session",
     "probe_model",
+    "resolve_declared_policy",
+    "resolve_mcp_config_path",
     "resolve_model_credential",
     "resolve_web_search_credential",
+    "save_mcp_bearer",
     "save_model_credential",
     "save_web_search_credential",
     "validate_model_spec",

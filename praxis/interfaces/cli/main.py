@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal, NoReturn, cast
 
@@ -24,12 +25,14 @@ import click
 import typer
 from typer.core import TyperGroup
 
+from praxis.interfaces.cli.mcp_cli import app as mcp_app
 from praxis.interfaces.cli.models_cli import app as models_app
 from praxis.interfaces.cli.render import render_item
 from praxis.interfaces.cli.slash import REGISTRY, ExitChat
 from praxis.interfaces.cli.web_cli import app as web_app
 from praxis.interfaces.sdk import (
     ConversationBusy,
+    McpBundle,
     ModelResponse,
     ModelToolCall,
     PermissionMode,
@@ -41,7 +44,10 @@ from praxis.interfaces.sdk import (
     TurnResult,
     TurnStatus,
     Usage,
+    connect_mcp_servers,
     open_session,
+    resolve_declared_policy,
+    resolve_mcp_config_path,
 )
 
 EXIT_COMPLETED = 0
@@ -113,12 +119,13 @@ class _UsageExit3Group(TyperGroup):
 app = typer.Typer(
     cls=_UsageExit3Group,
     name="praxis",
-    help="Praxis workspace agent — minimal console (run/chat/resume/status/log/steer/verify/models/web).",
+    help="Praxis workspace agent — minimal console (run/chat/resume/status/log/steer/verify/models/web/mcp).",
     add_completion=False,
     no_args_is_help=True,
 )
 app.add_typer(models_app, name="models")
 app.add_typer(web_app, name="web")
+app.add_typer(mcp_app, name="mcp")
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +219,8 @@ def _open_session_guarded(
     policy: PermissionPolicy | None,
     mode: PermissionMode | None,
     thread_id: str,
+    extra_tools: Sequence[Any] = (),
+    integrations: Sequence[Any] = (),
 ) -> Session:
     """R12:open_session 的 ValueError(损坏的既有状态,如 .praxis/permissions.json
     无法解析)是运行时失败 → 干净错误消息 + EXIT_FAILED(1),绝不裸 traceback(C4)。
@@ -225,6 +234,8 @@ def _open_session_guarded(
             policy=policy,
             mode=mode,
             thread_id=thread_id,
+            extra_tools=extra_tools,
+            integrations=integrations,
         )
     except KeyError as exc:
         message = exc.args[0] if exc.args else str(exc)
@@ -337,6 +348,82 @@ def _print_turn_ref(session: Session, result: TurnResult) -> None:
 
 
 # ---------------------------------------------------------------------------
+# MCP 单 loop 装配(Q9)
+# ---------------------------------------------------------------------------
+
+
+def _mcp_configured(workspace: Path) -> bool:
+    """是否存在 MCP 配置;配置损坏时返回 True,让 connect 路径给出干净错误。
+
+    无配置时走**逐字不变的**既有同步装配路径(空 bundle 不引入任何行为变化;
+    既有 CLI 测试不因 T19 改写)。显式路径/信任门错误属于运行时失败,交给
+    ``_connect_bundle`` 统一打印并退出 1。
+    """
+    try:
+        return resolve_mcp_config_path(workspace) is not None
+    except ValueError:
+        return True
+
+
+def _policy_snapshot(workspace: Path, policy: Path | None) -> PermissionPolicy:
+    """声明快照的唯一加载点;同一对象同时交给 connect 与 open_session。"""
+    explicit = _load_policy_file(Path(policy)) if policy is not None else None
+    try:
+        return resolve_declared_policy(workspace, explicit)
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(EXIT_FAILED) from None
+
+
+def _adapter_for_options(model: str | None, scripted: Path | None) -> Any:
+    if scripted is not None:
+        return ScriptedAdapter(_load_scripted(Path(scripted)))
+    return None
+
+
+async def _connect_bundle(workspace: Path, policy: PermissionPolicy) -> McpBundle:
+    try:
+        return await connect_mcp_servers(workspace, policy=policy)
+    except (OSError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(EXIT_FAILED) from None
+
+
+def _report_mcp_statuses(bundle: McpBundle) -> None:
+    """把跳过/不可用诊断如实打到 stderr(绝不静默吞掉一个 server)。"""
+    for status in bundle.statuses:
+        if status.diagnostic_code is None:
+            continue
+        typer.echo(
+            f"warning: mcp server {status.server_name} ({status.diagnostic_code}): "
+            f"{status.diagnostic_message}",
+            err=True,
+        )
+
+
+def _open_mcp_session(
+    workspace: Path,
+    bundle: McpBundle,
+    *,
+    model: str | None,
+    scripted: Path | None,
+    policy: PermissionPolicy,
+    mode: str | None,
+    thread: str | None,
+) -> Session:
+    return _open_session_guarded(
+        workspace,
+        _adapter_for_options(model, scripted),
+        model=model,
+        policy=policy,
+        mode=cast("PermissionMode | None", mode),
+        thread_id=_resolve_thread(thread),
+        extra_tools=bundle.tools,
+        integrations=(bundle,),
+    )
+
+
+# ---------------------------------------------------------------------------
 # run / resume
 # ---------------------------------------------------------------------------
 
@@ -352,16 +439,79 @@ def run(
     mode: str | None = _MODE_OPT,
 ) -> None:
     """一次性 turn:提交 prompt,打印结果,按 turn 终态决定退出码。"""
-    session = _open_from_options(workspace, model, scripted, thread, policy, mode)
+    root = _resolve_workspace(workspace)
+    if not _mcp_configured(root):
+        # 无 MCP:既有同步装配路径逐字保留(T19 零行为变化)。
+        session = _open_from_options(workspace, model, scripted, thread, policy, mode)
+        try:
+            result = asyncio.run(session.submit(prompt))
+        except ConversationBusy as exc:
+            typer.echo(f"busy: {exc}", err=True)
+            raise typer.Exit(EXIT_FAILED) from None
+        finally:
+            session.close()
+        _print_turn_ref(session, result)
+        raise typer.Exit(_report_turn(result))
+    raise typer.Exit(
+        asyncio.run(
+            _run_with_mcp(
+                root,
+                prompt,
+                model=model,
+                scripted=scripted,
+                thread=thread,
+                policy=policy,
+                mode=mode,
+            )
+        )
+    )
+
+
+async def _run_with_mcp(
+    root: Path,
+    prompt: str,
+    *,
+    model: str | None,
+    scripted: Path | None,
+    thread: str | None,
+    policy: Path | None,
+    mode: str | None,
+) -> int:
+    """Q9:connect → open_session → submit → ``finally`` aclose 都在同一 loop。
+
+    MCP owner task 活在连接它的 loop 里;``asyncio.run`` 之外再 close 会让
+    进程组逃逸。``session.aclose`` 先 integrations 后 store,bundle aclose
+    幂等(与 Session.close 双触达无害)。
+    """
+    snapshot = _policy_snapshot(root, policy)
+    bundle = await _connect_bundle(root, snapshot)
+    _report_mcp_statuses(bundle)
+    session: Session | None = None
+    result: TurnResult | None = None
     try:
-        result = asyncio.run(session.submit(prompt))
-    except ConversationBusy as exc:
-        typer.echo(f"busy: {exc}", err=True)
-        raise typer.Exit(EXIT_FAILED) from None
+        session = _open_mcp_session(
+            root,
+            bundle,
+            model=model,
+            scripted=scripted,
+            policy=snapshot,
+            mode=mode,
+            thread=thread,
+        )
+        try:
+            result = await session.submit(prompt)
+        except ConversationBusy as exc:
+            typer.echo(f"busy: {exc}", err=True)
+            return EXIT_FAILED
     finally:
-        session.close()
+        if session is not None:
+            await session.aclose()
+        else:
+            await bundle.aclose()
+    if result is None or session is None:
+        return EXIT_FAILED
     _print_turn_ref(session, result)
-    raise typer.Exit(_report_turn(result))
+    return _report_turn(result)
 
 
 def _parse_approval(allow: list[str], deny: list[str]) -> dict[str, Literal["allow", "deny"]]:
@@ -404,26 +554,94 @@ def resume(
     """续跑 paused/interrupted turn:--confirm 人工确认,--allow/--deny 审批,--reconcile 对账。"""
     approval_map = _parse_approval(allow, deny)
     reconcile_map = _parse_reconcile(reconcile)
-    session = _open_from_options(workspace, model, scripted, thread, policy, mode)
-    try:
-        result = asyncio.run(
-            session.resume(
+    root = _resolve_workspace(workspace)
+    if not _mcp_configured(root):
+        session = _open_from_options(workspace, model, scripted, thread, policy, mode)
+        try:
+            result = asyncio.run(
+                session.resume(
+                    turn_id,
+                    confirm=confirm,
+                    approval=approval_map or None,
+                    reconcile=reconcile_map or None,
+                )
+            )
+        except (ResumeNotConfirmed, ValueError) as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(EXIT_USAGE) from None
+        except ConversationBusy as exc:
+            typer.echo(f"busy: {exc}", err=True)
+            raise typer.Exit(EXIT_FAILED) from None
+        finally:
+            session.close()
+        _print_turn_ref(session, result)
+        raise typer.Exit(_report_turn(result))
+    raise typer.Exit(
+        asyncio.run(
+            _resume_with_mcp(
+                root,
                 turn_id,
                 confirm=confirm,
                 approval=approval_map or None,
                 reconcile=reconcile_map or None,
+                model=model,
+                scripted=scripted,
+                thread=thread,
+                policy=policy,
+                mode=mode,
             )
         )
-    except (ResumeNotConfirmed, ValueError) as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(EXIT_USAGE) from None
-    except ConversationBusy as exc:
-        typer.echo(f"busy: {exc}", err=True)
-        raise typer.Exit(EXIT_FAILED) from None
+    )
+
+
+async def _resume_with_mcp(
+    root: Path,
+    turn_id: str,
+    *,
+    confirm: bool,
+    approval: Mapping[str, Literal["allow", "deny"]] | None,
+    reconcile: Mapping[str, Literal["ok", "failed"]] | None,
+    model: str | None,
+    scripted: Path | None,
+    thread: str | None,
+    policy: Path | None,
+    mode: str | None,
+) -> int:
+    """与 ``_run_with_mcp`` 同一条单 loop 纪律(connect → resume → aclose)。"""
+    snapshot = _policy_snapshot(root, policy)
+    bundle = await _connect_bundle(root, snapshot)
+    _report_mcp_statuses(bundle)
+    session: Session | None = None
+    result: TurnResult | None = None
+    try:
+        session = _open_mcp_session(
+            root,
+            bundle,
+            model=model,
+            scripted=scripted,
+            policy=snapshot,
+            mode=mode,
+            thread=thread,
+        )
+        try:
+            result = await session.resume(
+                turn_id, confirm=confirm, approval=approval, reconcile=reconcile
+            )
+        except (ResumeNotConfirmed, ValueError) as exc:
+            typer.echo(f"error: {exc}", err=True)
+            return EXIT_USAGE
+        except ConversationBusy as exc:
+            typer.echo(f"busy: {exc}", err=True)
+            return EXIT_FAILED
     finally:
-        session.close()
+        if session is not None:
+            await session.aclose()
+        else:
+            await bundle.aclose()
+    if result is None or session is None:
+        return EXIT_FAILED
     _print_turn_ref(session, result)
-    raise typer.Exit(_report_turn(result))
+    return _report_turn(result)
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +755,156 @@ def _chat_loop(session: Session) -> None:
         _chat_turn(session, text)
 
 
+def _resolve_future(future: asyncio.Future[str | None], value: str | None) -> None:
+    """loop 线程内的 future 结算;已被取消/已结算时静默忽略。"""
+    if not future.done():
+        future.set_result(value)
+
+
+async def _read_answer_async(prompt_text: str) -> str | None:
+    """R-T19-2:daemon 线程读 stdin,**不占默认 executor**。
+
+    ``asyncio.to_thread`` 的 worker 会阻塞在 ``input()`` 上,而首次 Ctrl+C
+    之后 ``Runner.close()`` 会 join 默认 executor 的工作线程 ⇒ 进程挂住。
+    专起 daemon 线程并用 ``call_soon_threadsafe`` 结算 future:第一次 Ctrl+C
+    取消 ``await`` 即可干净返回,阻塞中的 daemon 线程随进程退出(它可能仍
+    握着终端提示符;这是本方案已知的提示符回显角落,不阻塞退出)。
+    """
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str | None] = loop.create_future()
+
+    def read() -> None:
+        value = _read_answer(prompt_text)
+        try:
+            loop.call_soon_threadsafe(_resolve_future, future, value)
+        except RuntimeError:
+            return  # loop 已关闭:线程随进程退出
+
+    threading.Thread(target=read, name="praxis-chat-input", daemon=True).start()
+    return await future
+
+
+async def _chat_turn_async(session: Session, text: str) -> None:
+    """异步版单 turn 错误边界(与 ``_chat_turn`` 同一 C1 语义)。"""
+    try:
+        result = await session.submit(text)
+    except KeyboardInterrupt:
+        typer.echo("cancelled")
+        return
+    except ConversationBusy as exc:
+        typer.echo(f"busy: {exc}")
+        return
+    except Exception as exc:  # noqa: BLE001 — C1 错误边界
+        typer.echo(f"error: {type(exc).__name__}: {exc}")
+        return
+    await _chat_result_async(session, result)
+
+
+async def _chat_result_async(session: Session, result: TurnResult) -> None:
+    """异步版审批循环;输入提示放到线程,submit/resume 仍在 MCP owner loop。"""
+    while True:
+        code = _report_turn(result)
+        if code != EXIT_PAUSED:
+            return
+        approval: dict[str, Literal["allow", "deny"]] = {}
+        for summary in result.pending_approvals:
+            verdict = await asyncio.to_thread(
+                _ask_verdict,
+                f"allow {summary.tool_name} (call {summary.call_id}, digest {summary.args_digest[:12]})? [y/n] ",
+                _VERDICTS_YES_NO,
+            )
+            if verdict is None:
+                typer.echo("cancelled")
+                return
+            approval[summary.call_id] = cast("Literal['allow', 'deny']", verdict)
+        reconcile: dict[str, Literal["ok", "failed"]] = {}
+        for call_id in result.unknown_calls:
+            outcome = await asyncio.to_thread(
+                _ask_verdict,
+                f"call {call_id} side effect already happened? [ok/failed] ",
+                _VERDICTS_OUTCOME,
+            )
+            if outcome is None:
+                typer.echo("cancelled")
+                return
+            reconcile[call_id] = cast("Literal['ok', 'failed']", outcome)
+        if not approval and not reconcile:
+            return
+        try:
+            result = await session.resume(
+                result.turn_id, approval=approval or None, reconcile=reconcile or None
+            )
+        except KeyboardInterrupt:
+            typer.echo("cancelled")
+            return
+        except Exception as exc:  # noqa: BLE001 — C1 错误边界
+            typer.echo(f"error: {type(exc).__name__}: {exc}")
+            return
+
+
+async def _chat_loop_async(session: Session) -> None:
+    """异步 REPL:stdin 读取在 daemon 线程(R-T19-2),模型/MCP 调用留在同一循环。"""
+    while True:
+        line = await _read_answer_async("> ")
+        if line is None:
+            return
+        text = line.strip()
+        if not text:
+            continue
+        if text.startswith("/"):
+            parts = text[1:].split(maxsplit=1)
+            name = parts[0].lower() if parts else ""
+            command = REGISTRY.get(name)
+            if command is None:
+                typer.echo(f"unknown command: /{name} (try /help)")
+                continue
+            try:
+                output = command.run(session)
+            except ExitChat:
+                return
+            except Exception as exc:  # noqa: BLE001 — slash 也走错误边界
+                typer.echo(f"error: {type(exc).__name__}: {exc}")
+                continue
+            if output:
+                typer.echo(output)
+            continue
+        await _chat_turn_async(session, text)
+
+
+async def _chat_with_mcp(
+    root: Path,
+    *,
+    model: str | None,
+    scripted: Path | None,
+    thread: str | None,
+    policy: Path | None,
+    mode: str | None,
+) -> int:
+    """Q9:整个 REPL 活在一个 ``asyncio.run`` 里(MCP owner task 不跨 loop)。"""
+    snapshot = _policy_snapshot(root, policy)
+    bundle = await _connect_bundle(root, snapshot)
+    _report_mcp_statuses(bundle)
+    session: Session | None = None
+    try:
+        session = _open_mcp_session(
+            root,
+            bundle,
+            model=model,
+            scripted=scripted,
+            policy=snapshot,
+            mode=mode,
+            thread=thread,
+        )
+        typer.echo(f"praxis chat — thread {session.thread_id} — /help for commands, /exit to leave")
+        await _chat_loop_async(session)
+        return EXIT_COMPLETED
+    finally:
+        if session is not None:
+            await session.aclose()
+        else:
+            await bundle.aclose()
+
+
 @app.command()
 def chat(
     workspace: Path | None = _WORKSPACE_OPT,
@@ -547,12 +915,27 @@ def chat(
     mode: str | None = _MODE_OPT,
 ) -> None:
     """交互式 REPL:每 turn 错误边界(C1);/help /status /exit 查表分派。"""
-    session = _open_from_options(workspace, model, scripted, thread, policy, mode)
-    typer.echo(f"praxis chat — thread {session.thread_id} — /help for commands, /exit to leave")
-    try:
-        _chat_loop(session)
-    finally:
-        session.close()
+    root = _resolve_workspace(workspace)
+    if not _mcp_configured(root):
+        session = _open_from_options(workspace, model, scripted, thread, policy, mode)
+        typer.echo(f"praxis chat — thread {session.thread_id} — /help for commands, /exit to leave")
+        try:
+            _chat_loop(session)
+        finally:
+            session.close()
+        return
+    raise typer.Exit(
+        asyncio.run(
+            _chat_with_mcp(
+                root,
+                model=model,
+                scripted=scripted,
+                thread=thread,
+                policy=policy,
+                mode=mode,
+            )
+        )
+    )
 
 
 # ---------------------------------------------------------------------------

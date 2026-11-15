@@ -41,6 +41,7 @@ Session 构造只允许 praxis/composition.py(CI 规则 7,设计 §4.1 唯一组
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
@@ -81,6 +82,8 @@ from praxis.store.log import ItemEntry, Store
 from praxis.store.turns import Turn, create_turn, get_turn, list_turns
 from praxis.store.verify import VerifyReport, verify_store
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_SYSTEM_PROMPT_TEMPLATE = (
     "You are Praxis, a workspace coding agent. Workspace: {workspace}. "
     "Use tools to inspect and modify files. Answer concisely."
@@ -110,14 +113,19 @@ class ResumeNotConfirmed(RuntimeError):  # noqa: N818 — 设计 §5.2 守卫钉
     """interrupted turn 未经人工确认(confirm=True)不得续跑(§5.2 守卫)。"""
 
 
-class CommandSessionsCloser(Protocol):
-    """composition 注入的后台会话收尾面(Task 15;core 不 import tools)。
+class AsyncCloser(Protocol):
+    """composition 注入的异步收尾面(Task 15/T19;core 不 import 具体实现)。
 
-    ``CommandSessions.aclose()`` 结构匹配。Session.close 只经这个协议触达
-    后台命令会话:取消所有在跑命令、删除 marker,不留活口。
+    ``CommandSessions.aclose()`` 与 T19 ``McpBundle.aclose()`` 均结构匹配。
+    Session 只经这个协议触达后台命令会话与 MCP integrations:取消在跑命令、
+    删除 marker、关闭 MCP owner task/沙箱产物——不留活口。
     """
 
     async def aclose(self) -> None: ...
+
+
+# Task 15 名字保留为同一协议的别名(不新增第二 closer 协议;T19 ruling)。
+CommandSessionsCloser = AsyncCloser
 
 
 # ---------------------------------------------------------------------------
@@ -319,9 +327,10 @@ class Session:
         measure_tokens: Callable[[WireRequest], int] | None = None,
         summary_max_output_tokens: int = SUMMARY_MAX_OUTPUT_TOKENS,
         summary_prompt_max_chars: int = SUMMARY_PROMPT_MAX_CHARS,
-        command_sessions: CommandSessionsCloser | None = None,
+        command_sessions: AsyncCloser | None = None,
         hooks: HookSetup | None = None,
         skills_catalog: SkillCatalog | None = None,
+        integrations: Sequence[AsyncCloser] = (),
     ) -> None:
         self._store = store
         self._bus = bus
@@ -349,6 +358,8 @@ class Session:
         self._summary_max_output_tokens = summary_max_output_tokens
         self._summary_prompt_max_chars = summary_prompt_max_chars
         self._command_sessions = command_sessions
+        # T19:宿主装配的异步收尾面(MCP bundle 等);close/aclose 统一收尾。
+        self._integrations = tuple(integrations)
         self._hooks = hooks
         # None = 不注入 skill 目录(既有测试/单测路径);composition 注入 loader 产出。
         self._skills_catalog = skills_catalog
@@ -372,22 +383,53 @@ class Session:
         """订阅本会话的事件总线(UI 提示通道,§5.6;事件非事实,item 日志才是)。"""
         return self._bus.subscribe()
 
-    def close(self) -> None:
-        """关闭 store(写者线程收尾);EventBus 无持久资源,不另设关闭。
+    async def aclose(self) -> None:
+        """异步收尾:**command_sessions → integrations → store**(顺序钉死)。
 
-        Task 15:先走后台命令会话收尾(取消所有在跑会话、删 marker)。同步 API
-        在无运行中事件循环时用 ``asyncio.run``;若被异步宿主调用,交给当前循环。
+        MCP owner task 活在连接它的 loop 里,必须在 loop 关闭前 await 收尾;
+        CLI 的 ``finally: await session.aclose()`` 走这里。单条收尾失败只记日志
+        (mirror command_sessions tolerance),绝不让一个坏 integration 挡住其余
+        收尾或 store 关闭。
         """
-        sessions = self._command_sessions
         try:
-            if sessions is not None:
-                try:
-                    asyncio.get_running_loop()
-                except RuntimeError:
-                    asyncio.run(sessions.aclose())
-                else:
-                    asyncio.ensure_future(sessions.aclose())
+            await self._close_runtime()
         finally:
+            self._store.close()
+
+    async def _close_runtime(self) -> None:
+        sessions = self._command_sessions
+        if sessions is not None:
+            try:
+                await sessions.aclose()
+            except Exception:  # noqa: BLE001 — 收尾容忍(与既有 close 语义一致)
+                logger.warning("command sessions teardown failed", exc_info=True)
+        for integration in self._integrations:
+            try:
+                await integration.aclose()
+            except Exception:  # noqa: BLE001 — 一个 integration 不得阻塞其余收尾
+                logger.warning("session integration teardown failed", exc_info=True)
+
+    def close(self) -> None:
+        """同步收尾;EventBus 无持久资源,不另设关闭。
+
+        Task 15/T19:先走后台命令会话与 integrations 收尾(取消在跑会话、删
+        marker、关闭 MCP 连接),最后关 store。同步 API 在无运行中事件循环时用
+        ``asyncio.run``;若被异步宿主调用,交给当前循环(store 仍立即关闭——
+        集成本身不依赖 store,T19 测试钉住这一顺序)。
+        """
+        if self._command_sessions is None and not self._integrations:
+            self._store.close()
+            return
+        try:
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                asyncio.run(self._close_runtime())
+            else:
+                asyncio.ensure_future(self._close_runtime())
+        finally:
+            # 修复轮 #5:closer 抛 BaseException(如 KeyboardInterrupt)时也绝不
+            # 让写者线程成为孤儿——store.close 必须执行。
             self._store.close()
 
     # -- 权限更新(Task 8:once/session/always;设计 §5.3/§5.12;裁决 R6)-----

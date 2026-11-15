@@ -72,6 +72,10 @@ from praxis.protocol.floor import host_config_dir
 
 _ENV_VAR = "PRAXIS_MCP_CONFIG"
 _DEFAULT_FILENAME = "mcp_servers.yaml"
+# 修复轮 #4:结构性上界——server 名与 HTTP URL 是诊断/消息的插值来源,
+# 加载期就拒绝超长值,避免无界字符串进入任何 readout。
+_MAX_NAME_CHARS = 256
+_MAX_URL_CHARS = 4096
 _ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -205,6 +209,22 @@ def resolve_mcp_config_path(
     return decide_mcp_config_trust(candidate, workspace=root).config_path
 
 
+def mcp_config_write_path() -> Path:
+    """CLI ``mcp add/remove`` 的写入目标(与来源序同一选择,但不要求文件已存在)。
+
+    显式 ``PRAXIS_MCP_CONFIG``(非空)优先,否则 ``host_config_dir()/mcp_servers.yaml``;
+    相对路径是用法错误(与读取侧 ``_PATH_ERROR`` 同一文案)。信任门/卫生在**下次
+    加载**时照常执行——写入口不为 CLI 开旁路。
+    """
+    configured = os.environ.get(_ENV_VAR, "").strip()
+    candidate = (
+        Path(configured).expanduser() if configured else host_config_dir() / _DEFAULT_FILENAME
+    )
+    if not candidate.is_absolute():
+        raise ValueError(_PATH_ERROR)
+    return candidate
+
+
 def load_mcp_configs(
     workspace: Path,
     path: Path | None = None,
@@ -320,6 +340,10 @@ def _parse_servers(
         if not enabled and not include_disabled:
             continue
         name = _required_text(raw, "name")
+        if len(name) > _MAX_NAME_CHARS:
+            raise ValueError(
+                f"MCP server name exceeds {_MAX_NAME_CHARS} characters; shorten it"
+            )
         normalized = normalize_mcp_name(name)
         if not normalized:
             # M3:边界拒绝,不让运行期拼出空名字的通配/工具名。
@@ -334,7 +358,8 @@ def _parse_servers(
         if colliding is not None:
             raise ValueError(
                 "MCP server names collide after normalization: "
-                f"{_bounded(colliding)!r} and {_bounded(name)!r} both normalize to {normalized!r}"
+                f"{_bounded(colliding)!r} and {_bounded(name)!r} both normalize to "
+                f"{_bounded(normalized)!r}"
             )
         names.add(name)
         normalized_names[normalized] = name
@@ -444,10 +469,14 @@ def _http_config(
 def _validate_http_url(value: str) -> str:
     """旧 ``validate_http_mcp_url`` 的等价物:仅 https、无凭证/query/fragment。
 
+    修复轮 #4:URL 长度先于一切解析检查(≤4096),错误文案不再回显 URL。
+
     端口限制在 ``validate_public_url`` 内部(``{None,80,443}``),与旧实现
     所调的同一函数一致;存储形态直接取 ``str(httpx.URL(...))``(旧实现同源):
     host 小写/IDNA、IPv6 保留方括号、非 ASCII path 百分号编码、省略 443。
     """
+    if len(value) > _MAX_URL_CHARS:
+        raise ValueError(f"MCP HTTP URL exceeds {_MAX_URL_CHARS} characters; shorten it")
     try:
         raw = httpx.URL(value)
         if raw.fragment or raw.query:
@@ -574,5 +603,6 @@ __all__ = [
     "config_sha256",
     "decide_mcp_config_trust",
     "load_mcp_configs",
+    "mcp_config_write_path",
     "resolve_mcp_config_path",
 ]
