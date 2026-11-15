@@ -38,6 +38,12 @@ True、HTTP URL 仅 https 且无凭证/query/fragment(``validate_public_url``
   仍只承担拒绝语义。T18 的 endpoint 逐字相等守卫因此与请求侧同源。
 - (M3)server 名必须能规范化为非空串(全 unicode/全标点 ⇒ 加载期可诊断
   拒绝);这是相对旧实现"到运行期才拼出 ``mcp____*`` 垃圾"的有意收紧。
+- **stdio 工具的 effects 有意差异(T17)**:``StdioServerConfig`` 的工具
+  声明**空** ``static_effects``(不声明 NETWORK;只有 HTTP server 的工具
+  带 NETWORK)。stdio server 进程的网络能力已由 T19 编译的沙箱 profile
+  决定,与 bash 同一 D9 面;因此默认策略下 stdio 调用可经 ``policy-grant``
+  自动放行,直到 tool-name 规则/hook 收紧。这是 controller 钉死的值,
+  T21 对照表保留该 parity 行(旧实现对所有 transport 都声明 NETWORK)。
 - ``StdioServerConfig``/``HttpServerConfig`` 字段逐一对齐旧两型,唯末位
   新增 ``enabled``(默认 True):默认加载仍只返回 enabled 条目,CLI 需要
   disabled 的可见状态时经 ``include_disabled=True`` 取完整记录。

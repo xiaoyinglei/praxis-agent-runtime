@@ -17,13 +17,19 @@
   1_000_000``;``cancellation_mode=REMOTE_BEST_EFFORT``;
   ``interrupt_behavior=CANCEL``(legacy 姿态);``source=ToolSource.MCP``。
 
-**调用期守卫 = 唯一两处**(Q3/R-T17-1):
+**调用期守卫 = 唯一一处**(Q3/R-T17-2):
 
-1. (a) 配置字节 sha256 漂移:factory 构造时经 ``config_sha_provider`` 捕获
-   基线,``run`` 每次重读;不一致 ⇒ ``mcp_config_changed``
+1. 配置字节 sha256 漂移:factory 构造时经 ``config_sha_provider`` 捕获基线,
+   ``run`` 每次重读;不一致 ⇒ ``mcp_config_changed``
    ("config changed; reconnect")。这是**重连问题**,不是权限问题。
-2. (b) catalog 成员缺失:``run`` 对照 factory 时的目录快照,未知
-   canonical 名 ⇒ ``mcp_tool_unknown``。
+
+**目录新鲜度不由工具层复查**(R-T17-2):factory 产出的 Tool 元组**就是**
+连接时目录快照,未转换的工具根本不在工具表里、也不可能被调用;即便在
+``run`` 里再对照一份由同一批 descriptor 构造的 ``catalog_names``,那也只是
+同义反复(审查确认的结构冗余),原 ``mcp_tool_unknown`` 码与其直构测试已
+删除。目录/配置变化统一由"构造即快照 + 重连语义"承接(T19),策略变化由
+``decide`` + 审批 ``args_digest``/``policy_revision`` 承接——这正是 Q3
+要求消灭"三层自带守卫"的终态。
 
 brief 原有的 (b) "live schema 指纹漂移 ⇒ ``mcp_tool_changed``" 在
 **R-T17-1 收敛下不实现**:praxis 没有 live schema 通道(不重列就看不见
@@ -68,7 +74,6 @@ from praxis.protocol.tools import (
     ToolResult,
     ToolSource,
     ToolTarget,
-    ToolValidationError,
     json_schema_input,
 )
 
@@ -77,6 +82,8 @@ _MAX_MODEL_OUTPUT_BYTES = 1_000_000
 _CONFIG_CHANGED_MESSAGE = "config changed; reconnect"
 _MAX_ERROR_MESSAGE_CHARS = 512
 _MAX_LEAF_MESSAGES = 8
+_MAX_LEAF_SCAN = 64
+_MAX_LEAF_DEPTH = 64
 _DEFAULT_DESCRIPTION = "Configured MCP tool."
 _PENDING_TOOL_CALL_ID = "pending"
 
@@ -161,12 +168,10 @@ def mcp_tools_for_connection(
         names.add(descriptor.canonical_name)
         descriptors.append(descriptor)
 
-    catalog_names = frozenset(descriptor.canonical_name for descriptor in descriptors)
     return tuple(
         _build_tool(
             descriptor,
             connection=connection,
-            catalog_names=catalog_names,
             config_sha_provider=config_sha_provider,
             config_sha_at_connect=config_sha_at_connect,
         )
@@ -199,7 +204,6 @@ def _build_tool(
     descriptor: McpToolDescriptor,
     *,
     connection: McpConnection,
-    catalog_names: frozenset[str],
     config_sha_provider: Callable[[], str],
     config_sha_at_connect: str,
 ) -> Tool:
@@ -220,20 +224,15 @@ def _build_tool(
         )
 
     def resolve_use(_arguments: Mapping[str, JsonValue]) -> ResolvedUse:
-        # 目录成员校验:factory 只投影目录内工具,这里仍 fail-closed——工具对象
-        # 若脱离原目录(重连/替换)则不再产生可执行 use。
-        if descriptor.canonical_name not in catalog_names:
-            raise ToolValidationError(
-                path="$",
-                message=f"MCP tool is not in the connected catalog: {descriptor.canonical_name}",
-            )
+        # 目录成员校验已按 R-T17-2 删除:工具表本身就是连接时目录快照,未转换的
+        # 工具不可能进入 execute;继续对照同批 descriptor 只会是同义反复。
         return ResolvedUse(effects=static_effects, targets=targets)
 
     async def run(
         arguments: Mapping[str, JsonValue],
         _exec_ctx: ToolExecContext,
     ) -> ToolResult:
-        # Q3 唯一两处调用期守卫(见模块 docstring):配置漂移在前,目录成员在后。
+        # Q3 唯一调用期守卫:配置字节漂移(目录新鲜度由构造即快照 + 重连承担)。
         drift = _config_drift_result(
             descriptor,
             config_sha_provider=config_sha_provider,
@@ -241,12 +240,6 @@ def _build_tool(
         )
         if drift is not None:
             return drift
-        if descriptor.canonical_name not in catalog_names:
-            return _guard_result(
-                descriptor,
-                "mcp_tool_unknown",
-                f"MCP tool is not in the connected catalog: {descriptor.canonical_name}",
-            )
         try:
             raw = await connection.session.call_tool(
                 descriptor.tool_name,
@@ -330,16 +323,39 @@ def _call_failure_message(error: BaseException) -> str:
 
     T16 的实测形状是 ``ExceptionGroup(ExceptionGroup(TimeoutError))``;T19 在
     connect 阶段负责把同一形状转诊断,工具层这里只保证调用失败可读且有界。
+    遍历受叶子数与嵌套深度双重上限约束(M5):超出的节点只计数、不展开,
+    敌意/深嵌套 group 不会造成无界工作。
     """
-    leaves = _leaves(error)[:_MAX_LEAF_MESSAGES]
+    leaves, excess = _leaves(error)
     detail = "; ".join(f"{type(leaf).__name__}: {leaf}" for leaf in leaves)
+    if excess:
+        detail = f"{detail}; (+{excess} more)" if detail else f"MCP tool call failed; (+{excess} more)"
     return _bounded(detail or "MCP tool call failed")
 
 
-def _leaves(error: BaseException) -> list[BaseException]:
-    if isinstance(error, BaseExceptionGroup):
-        return [leaf for sub in error.exceptions for leaf in _leaves(sub)]
-    return [error]
+def _leaves(error: BaseException) -> tuple[list[BaseException], int]:
+    """非递归摊平;返回 (叶子列表, 未展开节点数)。
+
+    上限:最多 ``_MAX_LEAF_MESSAGES`` 个叶子、``_MAX_LEAF_DEPTH`` 层嵌套。
+    超限节点计入 ``excess`` 而不是递归下钻/追加到消息。
+    """
+    leaves: list[BaseException] = []
+    excess = 0
+    stack: list[tuple[BaseException, int]] = [(error, 0)]
+    groups = 0
+    while stack:
+        current, depth = stack.pop()
+        if isinstance(current, BaseExceptionGroup):
+            if depth >= _MAX_LEAF_DEPTH or groups >= _MAX_LEAF_SCAN:
+                excess += 1
+                continue
+            groups += 1
+            stack.extend((sub, depth + 1) for sub in reversed(current.exceptions))
+        elif len(leaves) < _MAX_LEAF_MESSAGES:
+            leaves.append(current)
+        else:
+            excess += 1
+    return leaves, excess
 
 
 def _bounded(message: str) -> str:

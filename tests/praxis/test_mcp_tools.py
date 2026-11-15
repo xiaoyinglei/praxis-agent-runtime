@@ -7,9 +7,10 @@
   4096 工具 / 256 页 / 4 MiB 资源上限(常量逐字 + 边界行为);
 - 输出归一:content text/image/embedded-resource(文本与 blob)、
   ``structuredContent``、``isError``、legacy fallback 形状、真实 SDK 模型;
-- 调用期守卫唯一两处:config sha 漂移 ⇒ ``mcp_config_changed``(经真实
-  ``pipeline.execute``);catalog 成员缺失 ⇒ ``mcp_tool_unknown``;
-  意外 SDK 异常(ExceptionGroup 摊平)⇒ ``mcp_call_failed`` 有界;
+- 调用期守卫唯一一处(R-T17-2):config sha 漂移 ⇒ ``mcp_config_changed``
+  (经真实 ``pipeline.execute``);目录新鲜度由"构造即快照 + 重连语义"承担,
+  ``mcp_tool_unknown`` 因结构冗余已删除。意外 SDK 异常(ExceptionGroup
+  有界摊平)⇒ ``mcp_call_failed``;畸形 structuredContent 同码;
 - 超限输出经管道按 ``max_model_output_bytes=1_000_000`` 截断;
 - 三入口一致性形状样本:同一 MCP Tool 经 ``permission.decide`` 与 builtin
   完全同判;经 ``pipeline.execute`` 三次(模型/CLI/resume 共同入口)结果一致;
@@ -43,11 +44,7 @@ from praxis.adapters.mcp.catalog import (
     list_all_tools,
 )
 from praxis.adapters.mcp.config import HttpServerConfig, StdioServerConfig
-from praxis.adapters.mcp.descriptors import (
-    McpToolDescriptor,
-    _build_tool,
-    mcp_tools_for_connection,
-)
+from praxis.adapters.mcp.descriptors import McpToolDescriptor, mcp_tools_for_connection
 from praxis.adapters.mcp.lifecycle import McpConnection
 from praxis.adapters.mcp.output import normalize_mcp_output
 from praxis.core import permission
@@ -57,7 +54,6 @@ from praxis.protocol.items import ItemKind
 from praxis.protocol.json import thaw_json
 from praxis.protocol.permission import PermissionContext
 from praxis.protocol.policy import PermissionPolicy, ToolRule
-from praxis.protocol.sandbox import ToolExecContext
 from praxis.protocol.tools import (
     CancellationMode,
     InterruptBehavior,
@@ -67,7 +63,6 @@ from praxis.protocol.tools import (
     ToolEffect,
     ToolSource,
     ToolTarget,
-    ToolValidationError,
 )
 from praxis.store.log import Store
 from praxis.store.turns import create_turn
@@ -569,7 +564,7 @@ def test_normalize_real_sdk_call_tool_result() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 调用期守卫:Q3 唯一两处(配置漂移 + catalog 成员)
+# 调用期守卫:Q3 唯一一处(R-T17-2:config sha;目录新鲜度靠构造即快照+重连)
 # ---------------------------------------------------------------------------
 
 
@@ -586,32 +581,9 @@ def test_config_sha_drift_is_refused_before_the_call(store: Store, workspace: Pa
 
     assert result.status is ResultStatus.ERROR
     assert result.error_code == "mcp_config_changed"
-    assert "config changed; reconnect" in (result.error_message or "")
-    assert session.calls == []
-
-
-def test_unknown_tool_against_catalog_snapshot_is_refused() -> None:
-    session = _FakeSession()
-    descriptor = McpToolDescriptor(
-        server_name="srv",
-        tool_name="ghost",
-        description="ghost tool",
-        input_schema={"type": "object"},
-    )
-    tool = _build_tool(
-        descriptor,
-        connection=_connection(tools=(), session=session),
-        catalog_names=frozenset(),
-        config_sha_provider=lambda: "sha-a",
-        config_sha_at_connect="sha-a",
-    )
-    result = asyncio.run(tool.run({}, ToolExecContext()))  # type: ignore[arg-type]
-
-    assert result.status is ResultStatus.ERROR
-    assert result.error_code == "mcp_tool_unknown"
-    # 同一事实在 use 解析期也 fail-closed(管道会折成 invalid_input,不执行)。
-    with pytest.raises(ToolValidationError, match="not in the connected catalog"):
-        tool.resolve_use({})
+    # 常量文案固定且不回显任何 sha 值(运维只看到"重连"指示)。
+    assert result.error_message == "config changed; reconnect"
+    assert holder["sha"] not in result.error_message
     assert session.calls == []
 
 
@@ -631,6 +603,37 @@ def test_sdk_exception_group_failure_is_bounded_and_call_scoped(store: Store, wo
     assert "transport exploded" in message
     assert "unhandled errors in a TaskGroup" not in message
     assert len(message) <= 512
+
+
+def test_malformed_structured_content_maps_to_mcp_call_failed(store: Store, workspace: Path) -> None:
+    # 输出归一不制造第二套错误码:畸形结构化值统一折 mcp_call_failed。
+    session = _FakeSession(
+        {"content": [{"type": "text", "text": "ok"}], "structuredContent": {"bad": object()}}
+    )
+    connection = _connection(tools=(_mcp_tool("echo"),), session=session)
+    (tool,) = mcp_tools_for_connection(connection, _stdio_config(), config_sha_provider=lambda: "sha-a")
+
+    result = asyncio.run(execute(ToolCall("c1", tool.definition.name, {}), _ctx(store, workspace, tool)))
+
+    assert result.status is ResultStatus.ERROR
+    assert result.error_code == "mcp_call_failed"
+    assert "invalid MCP tool output (TypeError)" in (result.error_message or "")
+
+
+def test_deeply_nested_exception_group_is_bounded(store: Store, workspace: Path) -> None:
+    # M5:ExceptionGroup 展开受叶子数/嵌套深度双重上限约束(敌意 group 不得
+    # 造成无界工作)。200 层嵌套只会计数,不会递归下钻。
+    error: BaseException = RuntimeError("deep leaf")
+    for _ in range(200):
+        error = ExceptionGroup("wrap", [error])
+    connection = _connection(tools=(_mcp_tool("echo"),), session=_FakeSession(error=error))
+    (tool,) = mcp_tools_for_connection(connection, _stdio_config(), config_sha_provider=lambda: "sha-a")
+
+    result = asyncio.run(execute(ToolCall("c1", tool.definition.name, {}), _ctx(store, workspace, tool)))
+
+    assert result.status is ResultStatus.ERROR
+    assert result.error_code == "mcp_call_failed"
+    assert len(result.error_message or "") <= 512
 
 
 def test_is_error_result_flows_through_pipeline(store: Store, workspace: Path) -> None:
