@@ -38,6 +38,8 @@ True、HTTP URL 仅 https 且无凭证/query/fragment(``validate_public_url``
   仍只承担拒绝语义。T18 的 endpoint 逐字相等守卫因此与请求侧同源。
 - (M3)server 名必须能规范化为非空串(全 unicode/全标点 ⇒ 加载期可诊断
   拒绝);这是相对旧实现"到运行期才拼出 ``mcp____*`` 垃圾"的有意收紧。
+  T18 修复轮再加一条:**归一化后同名**(``a-b`` vs ``a_b``)也在加载期拒绝
+  并点名两个原始名——它们共享同一凭据 service 与工具前缀,不能共存。
 - **stdio 工具的 effects 有意差异(T17)**:``StdioServerConfig`` 的工具
   声明**空** ``static_effects``(不声明 NETWORK;只有 HTTP server 的工具
   带 NETWORK)。stdio server 进程的网络能力已由 T19 编译的沙箱 profile
@@ -310,6 +312,7 @@ def _parse_servers(
 
     configs: list[McpServerConfig] = []
     names: set[str] = set()
+    normalized_names: dict[str, str] = {}
     for raw in raw_servers:
         if not isinstance(raw, Mapping):
             raise ValueError(_ENTRY_ERROR)
@@ -317,14 +320,24 @@ def _parse_servers(
         if not enabled and not include_disabled:
             continue
         name = _required_text(raw, "name")
-        if not normalize_mcp_name(name):
+        normalized = normalize_mcp_name(name)
+        if not normalized:
             # M3:边界拒绝,不让运行期拼出空名字的通配/工具名。
             raise ValueError(
                 f"MCP server name must normalize to a non-empty value: {_bounded(name)}"
             )
         if name in names:
             raise ValueError(f"duplicate MCP server: {_bounded(name)}")
+        # M3(T18 修复轮):归一化后同名 ⇒ 同一凭据 service/工具前缀,必须在
+        # 加载期拒绝并点名两个原始名字(旧 mcp_admin 的 normalized==name 意图)。
+        colliding = normalized_names.get(normalized)
+        if colliding is not None:
+            raise ValueError(
+                "MCP server names collide after normalization: "
+                f"{_bounded(colliding)!r} and {_bounded(name)!r} both normalize to {normalized!r}"
+            )
         names.add(name)
+        normalized_names[normalized] = name
         _reject_oauth_keys(raw)
         transport = str(raw.get("transport", "stdio"))
         if transport not in {"stdio", "http"}:

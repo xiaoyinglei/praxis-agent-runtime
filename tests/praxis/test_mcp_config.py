@@ -293,6 +293,18 @@ def test_duplicate_names_are_rejected(workspace: Path) -> None:
         load_mcp_configs(workspace, path)
 
 
+def test_normalized_name_collisions_are_rejected(workspace: Path) -> None:
+    """M3(T18 修复轮):``a-b`` 与 ``a_b`` 共享凭据 service/工具前缀 ⇒ 加载期拒绝。"""
+    payload = {"servers": [_stdio(name="a-b"), _stdio(name="a_b")]}
+    path = _write_config(workspace.parent / "outside", payload)
+    with pytest.raises(ValueError) as excinfo:
+        load_mcp_configs(workspace, path)
+    message = str(excinfo.value)
+    assert "collide after normalization" in message
+    assert "'a-b'" in message
+    assert "'a_b'" in message.split("both normalize to")[1]
+
+
 @pytest.mark.parametrize("name", ["___", "名字", "!!!"])
 def test_server_name_must_normalize_to_non_empty(workspace: Path, name: str) -> None:
     """M3:加载期拒绝规范化后为空的名字(旧实现到运行期才拼出垃圾通配)。"""

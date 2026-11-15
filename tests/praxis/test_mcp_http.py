@@ -30,8 +30,8 @@ from typing import Any
 import httpx
 import pytest
 import yaml
-from mcp.types import ToolAnnotations
 from mcp.types import Tool as McpTool
+from mcp.types import ToolAnnotations
 
 from praxis.adapters.config import credentials
 from praxis.adapters.config.credentials import (
@@ -221,9 +221,32 @@ def test_binding_mismatch_is_bounded_and_hides_value(monkeypatch: pytest.MonkeyP
     save_mcp_bearer("remote", _ENDPOINT, secret)
     with pytest.raises(ValueError) as excinfo:
         load_mcp_bearer("remote", _OTHER_ENDPOINT)
-    assert str(excinfo.value) == "MCP credential is bound to a different endpoint"
-    assert secret not in str(excinfo.value)
+    message = str(excinfo.value)
+    # 端点不是秘密:错误必须点名 requested/stored 两个 httpx 规范化端点并给
+    # 可执行动作;bearer 值永不出现。
+    assert message.startswith(
+        "MCP credential is bound to a different endpoint; save it again for this endpoint"
+    )
+    assert f"requested {_OTHER_ENDPOINT}" in message
+    assert f"stored {_ENDPOINT}" in message
+    assert secret not in message
     assert excinfo.value.__cause__ is None
+
+
+def test_clear_mcp_bearer_accepts_none_or_valid_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _force_posix(monkeypatch)
+    save_mcp_bearer("remote", _ENDPOINT, "token")
+    clear_mcp_bearer("remote")  # None:按名删除,跳过 URL 校验
+    assert load_mcp_bearer("remote", _ENDPOINT) is None
+
+    save_mcp_bearer("remote", _ENDPOINT, "token")
+    with pytest.raises(ValueError, match="must be a valid URL"):
+        clear_mcp_bearer("remote", "not a url")
+    assert load_mcp_bearer("remote", _ENDPOINT) == "token"
+    clear_mcp_bearer("remote", _ENDPOINT)
+    assert load_mcp_bearer("remote", _ENDPOINT) is None
 
 
 def test_binding_is_byte_exact_after_httpx_canonicalization(
@@ -234,8 +257,9 @@ def test_binding_is_byte_exact_after_httpx_canonicalization(
     save_mcp_bearer("remote", "https://MCP.Example.com:443/rpc", "token")
     assert load_mcp_bearer("remote", _ENDPOINT) == "token"
     # 尾斜杠不同 ⇒ 逐字绑定拒绝(不做 rstrip)。
-    with pytest.raises(ValueError, match="bound to a different endpoint"):
+    with pytest.raises(ValueError, match="bound to a different endpoint") as excinfo:
         load_mcp_bearer("remote", _ENDPOINT + "/")
+    assert f"requested {_ENDPOINT}/" in str(excinfo.value)
     with pytest.raises(ValueError, match="must be a valid URL"):
         save_mcp_bearer("remote", "not a url", "token")
 
@@ -443,6 +467,36 @@ def test_connect_gate_allow_handshakes_and_lists_full_catalog(
     asyncio.run(scenario())
 
 
+def test_http_client_wiring_is_direct_and_non_following(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M8-lite:握手用的 httpx client 必须是直连、不跟随重定向、read=300。"""
+    server = _FakeMcpServer()
+    _install_transport(monkeypatch, server.handler)
+    captured: dict[str, Any] = {}
+
+    class _RecordingAsyncClient(httpx.AsyncClient):
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr(http_transport.httpx, "AsyncClient", _RecordingAsyncClient)
+
+    async def scenario() -> None:
+        async with owned_http_connection(
+            _http_config(), workspace=Path("/tmp/unused"), network_verdict_at_connect=_allow
+        ):
+            pass
+
+    asyncio.run(scenario())
+    assert captured["trust_env"] is False
+    assert captured["follow_redirects"] is False
+    timeout = captured["timeout"]
+    assert isinstance(timeout, httpx.Timeout)
+    assert timeout.read == 300.0
+    assert isinstance(captured["transport"], GuardedMcpTransport)
+
+
 def _mcp_tool(
     name: str,
     *,
@@ -630,6 +684,8 @@ def test_binding_mismatch_prevents_connection(monkeypatch: pytest.MonkeyPatch) -
             ):
                 pytest.fail("bound credential must not connect")
         assert "sk-wrong-endpoint" not in str(excinfo.value)
+        assert _ENDPOINT in str(excinfo.value)
+        assert _OTHER_ENDPOINT in str(excinfo.value)
 
     asyncio.run(scenario())
     assert server.requests == []

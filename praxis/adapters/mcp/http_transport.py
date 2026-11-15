@@ -107,8 +107,9 @@ class GuardedMcpTransport(httpx.AsyncBaseTransport):
         if host != request.url.netloc.decode("ascii").casefold():
             raise McpTransportError(_HOST_CODE, _HOST_MESSAGE)
         response = await self._inner.handle_async_request(request)
-        # 旧实现用 ``response.is_redirect``(依赖 Location);这里按状态码区间,
-        # 300-399 一律拒绝,与"无论方法、有无 Location"的裁决一致。
+        # 与旧 ``response.is_redirect`` **完全同义**:httpx 的 is_redirect 就是
+        # ``codes.is_redirect``(300-399),二者都不看 Location/方法。这里直判
+        # 状态码只为让"一切 3xx"在源码里显式可读,不是行为增强。
         if 300 <= response.status_code < 400:
             await response.aclose()
             raise McpTransportError(_REDIRECT_CODE, _REDIRECT_MESSAGE)

@@ -372,6 +372,17 @@ class _PublicTransport(httpx.AsyncBaseTransport):
         await self._pool.aclose()
 
 
+def _direct_transport(
+    *,
+    resolver: Resolver | None = None,
+    backend: httpcore.AsyncNetworkBackend | None = None,
+) -> _PublicTransport:
+    """DNS 固定直连传输的**唯一构造点**(PublicHttpClient 与 public_http_transport 共用)。"""
+    inner = httpcore.AnyIOBackend() if backend is None else backend
+    pinned = _PinnedNetworkBackend(_default_resolver if resolver is None else resolver, inner)
+    return _PublicTransport(pinned)
+
+
 def public_http_transport(
     *,
     resolver: Resolver | None = None,
@@ -382,9 +393,7 @@ def public_http_transport(
     供非 web 的宿主自有 HTTP 集成复用同一连接期校验(T18 的 MCP HTTP);
     ``resolver``/``backend`` 是确定性测试接缝,绝不暴露给模型。
     """
-    inner = httpcore.AnyIOBackend() if backend is None else backend
-    pinned = _PinnedNetworkBackend(_default_resolver if resolver is None else resolver, inner)
-    return _PublicTransport(pinned)
+    return _direct_transport(resolver=resolver, backend=backend)
 
 
 @dataclass(frozen=True, slots=True)
@@ -443,8 +452,7 @@ class PublicHttpClient:
             normalized_no_proxy if no_proxy is None else ",".join(no_proxy.replace(",", " ").split())
         )
         inner = httpcore.AnyIOBackend() if backend is None else backend
-        pinned = _PinnedNetworkBackend(_default_resolver if resolver is None else resolver, inner)
-        self._transport = _PublicTransport(pinned)
+        self._transport = _direct_transport(resolver=resolver, backend=backend)
         # 代理路径用普通 backend(不经 pinned 包装):上游代理负责最终 IP 裁决
         # (legacy 语义,按设计旁路本地钉死)。backend 接缝对两条 transport 同时生效
         # (生产 backend=None ⇒ 两者皆 AnyIOBackend;测试注入假 backend 可演 CONNECT)。

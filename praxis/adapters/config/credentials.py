@@ -70,7 +70,6 @@ _MCP_UNSUPPORTED_PLATFORM = (
 _MCP_NAME_ERROR = "MCP credential name must normalize to a non-empty server name"
 _MCP_ENDPOINT_ERROR = "MCP credential endpoint must be a valid URL"
 _MCP_VALUE_ERROR = "MCP bearer token must be a nonempty single-line value"
-_MCP_BINDING_ERROR = "MCP credential is bound to a different endpoint"
 _MCP_INVALID_ERROR = "Saved MCP credential is invalid; save it again"
 
 
@@ -512,12 +511,26 @@ def _mcp_endpoint(endpoint_url: str) -> str:
         raise ValueError(_MCP_ENDPOINT_ERROR) from None
 
 
+def _bounded_endpoint(value: str, limit: int = 256) -> str:
+    """端点是 host 配置(不是秘密),但错误文案仍做单行/长度有界。"""
+    text = " ".join(value.split())
+    return text if len(text) <= limit else f"{text[: limit - 1]}…"
+
+
+def _binding_error(requested: str, bound: str) -> str:
+    """可执行的绑定错误:点名两个 endpoint(均经 httpx 规范化),绝不带 token。"""
+    return (
+        "MCP credential is bound to a different endpoint; save it again for this endpoint "
+        f"(requested {_bounded_endpoint(requested)}; stored {_bounded_endpoint(bound)})"
+    )
+
+
 def load_mcp_bearer(name: str, endpoint_url: str) -> str | None:
     """读取 server 名的 bearer;未保存返回 None。
 
-    URL 绑定:stored url 与 ``endpoint_url`` 逐字不相等 ⇒
-    ``ValueError``("bound to a different endpoint")。错误文案只点名绑定关系,
-    绝不回显 token 或 stored 载荷。
+    URL 绑定:stored url 与 ``endpoint_url`` 逐字不相等 ⇒ ``ValueError``
+    ("bound to a different endpoint; save it again for this endpoint"),
+    文案点名 requested/stored 两个端点(端点不是秘密),但绝不回显 token。
     """
     service = mcp_credential_service(name)
     stored = _load_service(
@@ -538,8 +551,9 @@ def load_mcp_bearer(name: str, endpoint_url: str) -> str | None:
     bearer = payload.get("bearer")
     if not isinstance(bound_url, str) or not isinstance(bearer, str):
         raise ValueError(_MCP_INVALID_ERROR) from None
-    if bound_url != _mcp_endpoint(endpoint_url):
-        raise ValueError(_MCP_BINDING_ERROR) from None
+    requested = _mcp_endpoint(endpoint_url)
+    if bound_url != requested:
+        raise ValueError(_binding_error(requested, bound_url)) from None
     try:
         return _validate_key(bearer)
     except ValueError:
@@ -570,15 +584,16 @@ def save_mcp_bearer(name: str, endpoint_url: str, value: str) -> None:
     )
 
 
-def clear_mcp_bearer(name: str, endpoint_url: str) -> None:
+def clear_mcp_bearer(name: str, endpoint_url: str | None = None) -> None:
     """删除 server 名的 bearer;不存在是 no-op。
 
-    ``endpoint_url`` 只做与 save/load 相同的规范化校验;删除按 **server 名**
-    作用(旧 ``_delete_keychain(name)`` 语义):endpoint 轮换不应让旧凭据变成
-    无法清除的孤儿。
+    删除按 **server 名**作用(旧 ``_delete_keychain(name)`` 语义):endpoint
+    轮换不应让旧凭据变成无法清除的孤儿。``endpoint_url`` 给定时只做与
+    save/load 相同的规范化校验;``None`` 跳过 URL 校验(调用方只需按名清理)。
     """
     service = mcp_credential_service(name)
-    _mcp_endpoint(endpoint_url)
+    if endpoint_url is not None:
+        _mcp_endpoint(endpoint_url)
     _delete_service(
         service=service,
         file_key=service,
