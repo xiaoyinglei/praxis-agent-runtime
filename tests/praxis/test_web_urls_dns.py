@@ -144,16 +144,21 @@ class FakeBackend(httpcore.AsyncNetworkBackend):
 
 
 class FakeResolver:
-    """getaddrinfo 注入点:固定答案列表或异常;记录调用。"""
+    """getaddrinfo 注入点:固定答案列表或异常;记录调用。by_host 提供逐主机答案。"""
 
-    def __init__(self, answers: Sequence[str] | Exception) -> None:
+    def __init__(
+        self, answers: Sequence[str] | Exception, *, by_host: dict[str, list[str]] | None = None
+    ) -> None:
         self.answers = answers
+        self.by_host = by_host
         self.calls: list[tuple[str, int]] = []
 
     async def __call__(self, host: str, port: int) -> list[str]:
         self.calls.append((host, port))
         if isinstance(self.answers, Exception):
             raise self.answers
+        if self.by_host is not None and host in self.by_host:
+            return list(self.by_host[host])
         return list(self.answers)
 
 
@@ -682,15 +687,17 @@ def test_redirect_chain_authorize_sequence_and_header_stripping() -> None:
     assert result.body == b"final"
     assert result.final_url == "https://b.example/landing"
     assert calls == ["https://a.example/", "https://b.example/landing"]
-    second_request = b"".join(hop2.writes).lower()
+    # 线路机制:h11 发送时小写化头名,值保留原始大小写(httpx 不小写化值);
+    # 剥离按 headers.items() 的小写键判定。
+    second_raw = b"".join(hop2.writes)
+    second_request = second_raw.lower()
     assert b"authorization" not in second_request
     assert b"cookie" not in second_request
     assert b"x-custom" not in second_request
-    assert b"accept: text/html" in second_request
-    # httpx.Headers 在线路上把值小写化(legacy 同一行为)。
-    assert b"accept-language: zh-cn" in second_request
-    assert b"user-agent: praxis-test" in second_request
-    assert b"accept-encoding: gzip, identity" in second_request
+    assert b"accept: text/html" in second_raw
+    assert b"accept-language: zh-CN" in second_raw
+    assert b"user-agent: praxis-test" in second_raw
+    assert b"accept-encoding: gzip, identity" in second_raw
     # 首跳保留原始凭证头。
     first_request = b"".join(hop1.writes).lower()
     assert b"authorization: bearer secret-token" in first_request
@@ -1115,3 +1122,162 @@ def test_keepalive_zero_no_dns_cache() -> None:
     assert resolver.calls == [("a.example", 443), ("b.example", 443)]
     assert len(backend.connects) == 2
     assert hop1.closed and hop2.closed
+
+
+# ---------------------------------------------------------------------------
+# 修复轮 R-T10-1/2:有界错误面收口(ProxyError / InvalidURL 泄漏)+ folded minors
+# ---------------------------------------------------------------------------
+
+
+def test_proxy_connect_rejection_maps_connect_failed_sanitized() -> None:
+    # IMPORTANT #1:CONNECT 非 2xx ⇒ httpcore.ProxyError(⊄ NetworkError)必须被映射;
+    # 消息不得回显代理的远端 reason phrase(安全消息设计)。
+    connect_reject = FakeStream(
+        response_chunks("407 Proxy Authentication Required", headers=[("Proxy-Authenticate", "Basic")])
+    )
+    backend = FakeBackend([connect_reject])
+    resolver = FakeResolver([PUBLIC_IP])
+    client, _ = make_client(
+        resolver=resolver, backend=backend, proxy_url="http://proxy.corp:8080"
+    )
+    with pytest.raises(PublicWebError) as excinfo:
+        asyncio.run(client.fetch("https://example.com/"))
+    assert excinfo.value.code == "connect_failed"
+    message = str(excinfo.value)
+    assert "407" not in message
+    assert "Proxy Authentication Required" not in message
+    # 代理模式:连的是代理本身,origin 不经本地 resolver(旁路语义)。
+    assert resolver.calls == []
+    assert [(host, port) for host, port, _ in backend.connects] == [("proxy.corp", 8080)]
+
+
+@pytest.mark.parametrize("host", ["💩.com", "ϐ.com"])
+def test_idna_invalid_host_rejected_at_precheck(host: str) -> None:
+    # IMPORTANT #2:legacy httpx.URL 预检的 IDNA 严格性必须恢复(预检层拒,零 DNS)。
+    with pytest.raises(PublicWebError) as excinfo:
+        validate_public_url(f"https://{host}/")
+    assert excinfo.value.code == "invalid_url"
+
+
+def test_structural_idna_invalid_host_rejected_at_precheck() -> None:
+    # stdlib IDNA2003 层:空标签/超长标签(比 legacy 更严,fail-closed 方向)。
+    for url in ("https://a..b/", "https://" + "x" * 64 + ".com/"):
+        with pytest.raises(PublicWebError) as excinfo:
+            validate_public_url(url)
+        assert excinfo.value.code == "invalid_url"
+
+
+@pytest.mark.parametrize("host", ["💩.com", "ϐ.com"])
+def test_fetch_idna_invalid_host_bounded_error(host: str) -> None:
+    # 端到端:最终码 invalid_url、零连接(断言最终码,不论哪层捕获)。
+    backend = FakeBackend([FakeStream(response_chunks(body=b"never"))])
+    client, _ = make_client(resolver=FakeResolver([PUBLIC_IP]), backend=backend)
+    with pytest.raises(PublicWebError) as excinfo:
+        asyncio.run(client.fetch(f"https://{host}/"))
+    assert excinfo.value.code == "invalid_url"
+    assert backend.connects == []
+
+
+@pytest.mark.parametrize("host", ["💩.com", "ϐ.com"])
+def test_redirect_to_idna_invalid_host_same_code(host: str) -> None:
+    # 攻击者重定向到 IDNA 非法主机:同一 invalid_url 码,第二跳 authorize 仍被调。
+    hop1 = FakeStream(response_chunks("302 Found", headers=[("Location", f"https://{host}/")]))
+    backend = FakeBackend([hop1, FakeStream(response_chunks(body=b"never"))])
+    client, calls = make_client(resolver=FakeResolver([PUBLIC_IP]), backend=backend)
+    with pytest.raises(PublicWebError) as excinfo:
+        asyncio.run(client.fetch("https://a.example/"))
+    assert excinfo.value.code == "invalid_url"
+    assert calls == ["https://a.example/", f"https://{host}/"]
+    assert len(backend.connects) == 1
+
+
+def test_client_invalidurl_catch_layer_independent(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 兜底层 (b) 独立证明:即使预检放行( monkeypatch 成透传),httpx.Request 构造期
+    # 的 httpx.InvalidURL 仍被映射为 invalid_url,绝不裸泄漏。
+    import praxis.adapters.web.client as client_module
+
+    monkeypatch.setattr(
+        client_module, "validate_public_url", lambda url: ("💩.com", 443, "/")
+    )
+    backend = FakeBackend([FakeStream(response_chunks(body=b"never"))])
+    client, _ = make_client(resolver=FakeResolver([PUBLIC_IP]), backend=backend)
+    with pytest.raises(PublicWebError) as excinfo:
+        asyncio.run(client.fetch("https://anything.example/"))
+    assert excinfo.value.code == "invalid_url"
+    assert backend.connects == []
+
+
+def test_redirect_percent_encoded_hostname_not_decoded() -> None:
+    # M3:Location 的百分号编码主机名不被解码——"%6Cocalhost" 含 % ⇒ 预检拒。
+    hop1 = FakeStream(response_chunks("302 Found", headers=[("Location", "https://%6Cocalhost/")]))
+    backend = FakeBackend([hop1, FakeStream(response_chunks(body=b"never"))])
+    client, calls = make_client(resolver=FakeResolver([PUBLIC_IP]), backend=backend)
+    with pytest.raises(PublicWebError) as excinfo:
+        asyncio.run(client.fetch("https://a.example/"))
+    assert excinfo.value.code == "invalid_url"
+    assert calls == ["https://a.example/", "https://%6Cocalhost/"]
+    assert len(backend.connects) == 1
+
+
+def test_redirect_mapped_private_dns_answer_nonpublic() -> None:
+    # M3:重定向落地主机 DNS 返回 ::ffff:127.0.0.1 ⇒ 连接期 nonpublic_address。
+    hop1 = FakeStream(response_chunks("302 Found", headers=[("Location", "https://b.example/")]))
+    backend = FakeBackend([hop1, FakeStream(response_chunks(body=b"never"))])
+    resolver = FakeResolver(
+        [PUBLIC_IP], by_host={"a.example": [PUBLIC_IP], "b.example": ["::ffff:127.0.0.1"]}
+    )
+    client, calls = make_client(resolver=resolver, backend=backend)
+    with pytest.raises(PublicWebError) as excinfo:
+        asyncio.run(client.fetch("https://a.example/"))
+    assert excinfo.value.code == "nonpublic_address"
+    assert calls == ["https://a.example/", "https://b.example/"]
+    assert [host for host, _, _ in backend.connects] == [PUBLIC_IP]  # 私有地址从未连接
+
+
+def test_tls_handshake_timeout_maps_timeout_code_fake_clock() -> None:
+    # M3:TLS 握手超时 ⇒ timeout 码(fake seam + 假时钟,零墙钟)。
+    from praxis.adapters.web.client import _PublicStream
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        clock = {"now": 100.0}
+        original_time = loop.time
+        loop.time = lambda: clock["now"]  # type: ignore[method-assign]
+        try:
+
+            class HangingTLSStream(FakeStream):
+                async def start_tls(
+                    self,
+                    ssl_context: ssl.SSLContext,
+                    server_hostname: str | None = None,
+                    timeout: float | None = None,
+                ) -> httpcore.AsyncNetworkStream:
+                    clock["now"] += 10.0  # 烧穿候选预算
+                    await asyncio.sleep(0)  # 让 loop 检查定时器(假时钟已过期)
+                    await asyncio.sleep(0)
+                    return self
+
+            stream = HangingTLSStream(response_chunks(body=b"never"))
+            backend = FakeBackend([stream])
+            candidates = _ConnectionCandidates(backend, [PUBLIC_IP], 443, 1.0, None, None)
+            connected = await candidates.connect()
+            assert candidates.index == len(candidates.addresses)  # 无候选可回退
+            wrapped = _PublicStream(connected, candidates)
+            with pytest.raises(PublicWebError) as excinfo:
+                await wrapped.start_tls(ssl.create_default_context(), "example.com", 1.0)
+            assert excinfo.value.code == "timeout"
+            assert stream.closed
+        finally:
+            loop.time = original_time  # type: ignore[method-assign]
+
+    asyncio.run(scenario())
+
+
+def test_json_body_nan_value_error_contract() -> None:
+    # M1 裁决:NaN/Infinity 是调用方输入类错误,保留裸 ValueError(legacy :415 parity,
+    # allow_nan=False);T12 控制 body,不属于 PublicWebError 有界面。
+    backend = FakeBackend([FakeStream(response_chunks(body=b"never"))])
+    client, _ = make_client(resolver=FakeResolver([PUBLIC_IP]), backend=backend)
+    with pytest.raises(ValueError):
+        asyncio.run(client.fetch("https://a.example/", method="POST", json_body={"k": float("nan")}))
+    assert backend.connects == []

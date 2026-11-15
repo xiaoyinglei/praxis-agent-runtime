@@ -15,7 +15,9 @@ authorize 回调产生(T11 绑 decide 闭包);``invalid_url`` 由 URL 预检产�
 ``WebFetchResponse.status`` 原样返回;旧 network_error 拆为 connect_failed /
 tls_failed;旧 request_too_large/response_too_large 统一 max_bytes_exceeded;
 旧 unsupported_encoding/invalid_encoding 统一 encoding_unsupported;
-旧 redirect_not_allowed 归 invalid_redirect(POST 恒禁重定向);无 turn 账本(Q7)。
+旧 redirect_not_allowed 归 invalid_redirect(POST 恒禁重定向);旧
+proxy_connection_failed 归 connect_failed(不回显代理 reason phrase);
+httpx.InvalidURL 兜底 ⇒ invalid_url(R-T10-1);无 turn 账本(Q7)。
 
 authorize 契约:每跳先于 validate/connect 调 ``authorize(str(target))``,可抛
 **任意**异常,客户端原样传播(同一实例)且绝不触碰该目标的网络。
@@ -426,10 +428,10 @@ class PublicHttpClient:
         inner = httpcore.AnyIOBackend() if backend is None else backend
         pinned = _PinnedNetworkBackend(_default_resolver if resolver is None else resolver, inner)
         self._transport = _PublicTransport(pinned)
-        # 代理路径用普通 backend:上游代理负责最终 IP 裁决(legacy 语义,按设计旁路本地钉死)。
-        self._proxy_transport = (
-            _PublicTransport(httpcore.AnyIOBackend(), proxy) if proxy is not None else None
-        )
+        # 代理路径用普通 backend(不经 pinned 包装):上游代理负责最终 IP 裁决
+        # (legacy 语义,按设计旁路本地钉死)。backend 接缝对两条 transport 同时生效
+        # (生产 backend=None ⇒ 两者皆 AnyIOBackend;测试注入假 backend 可演 CONNECT)。
+        self._proxy_transport = _PublicTransport(inner, proxy) if proxy is not None else None
 
     def connection_mode(self, target: str) -> str:
         """'direct' | 'trusted_proxy'(legacy :388-392;no_proxy 命中回落 direct)。"""
@@ -452,7 +454,12 @@ class PublicHttpClient:
         json_body: Mapping[str, Any] | None = None,
         max_bytes: int | None = None,
     ) -> WebFetchResponse:
-        """有界抓取;max_bytes 是可信调用方的逐请求覆盖(默认取 limits)。"""
+        """有界抓取;max_bytes 是可信调用方的逐请求覆盖(默认取 limits)。
+
+        json_body 须为 JSON 安全值(T12 控制请求体):NaN/Infinity 抛裸 ValueError
+        (legacy web_http.py:415 allow_nan=False parity,调用方输入类,不属于
+        PublicWebError 有界错误面)。
+        """
         limit = self._limits.max_bytes if max_bytes is None else max_bytes
         if limit < 1:
             raise ValueError("Response byte limit must be positive.")
@@ -471,8 +478,17 @@ class PublicHttpClient:
             raise abort.original from None
         except PublicWebError:
             raise
+        except httpx.InvalidURL:
+            # 兜底层 (b):预检 IDNA 三层之外残余的 httpx 解析失败(InvalidURL ⊄ HTTPError),
+            # 绝不裸泄漏给调用方。
+            raise PublicWebError(
+                "invalid_url", "A public HTTP(S) URL on port 80 or 443 is required."
+            ) from None
         except (TimeoutError, httpx.TimeoutException, httpcore.TimeoutException):
             raise PublicWebError("timeout", "The public HTTP request exceeded its deadline.") from None
+        except httpcore.ProxyError:
+            # ProxyError ⊄ NetworkError:CONNECT 非 2xx 单独映射;消息不回显代理 reason phrase。
+            raise PublicWebError("connect_failed", "The configured proxy rejected the connection.") from None
         except ssl.SSLError:
             # TLS 已成功、字节已发之后的 TLS 层失败:无回退(结构保证),直接 tls_failed。
             raise PublicWebError("tls_failed", "The public HTTPS connection failed during TLS.") from None

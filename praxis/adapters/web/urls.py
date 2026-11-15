@@ -9,12 +9,19 @@
 ``PublicWebError`` 定义在本模块(urls 与 client 共用、避免循环导入),client
 再导出;fetch 路径自产码集见 client.py 模块 docstring,预检自产 ``invalid_url``
 (legacy 逐字 parity,T12 映射为 invalid_input)。
+
+IDNA 三层(R-T10-1):(a) stdlib ``host.encode("idna")`` 拒结构性非法(空标签/
+超长标签;IDNA2003 scope,比 legacy 更严);(a') ``httpx.URL`` wire 语法门恢复
+legacy IDNA2008 严格性(💩/ϐ 类在预检层拒);(b) client 另有 ``httpx.InvalidURL``
+⇒ invalid_url 兜底。三层全零 DNS。
 """
 
 from __future__ import annotations
 
 import ipaddress
 from urllib.parse import urlsplit
+
+import httpx
 
 __all__ = ["PublicWebError", "is_public_address", "validate_public_url"]
 
@@ -54,8 +61,8 @@ def validate_public_url(url: str) -> tuple[str, int, str]:
 
     拒绝:scheme ∉ {http,https}、userinfo、端口 ∉ {None,80,443}、host 含 ``%``、
     ``localhost``/``.localhost`` 后缀、非公网字面 IP(IPv4-mapped 先还原)、
-    空白/控制字符。host 小写并去尾点;fragment 丢弃;空 path 规范化为 ``/``。
-    任何失败抛 ``PublicWebError("invalid_url")``。
+    空白/控制字符、IDNA 非法主机名(三层,见模块 docstring)。host 小写并去尾点;
+    fragment 丢弃;空 path 规范化为 ``/``。任何失败抛 ``PublicWebError("invalid_url")``。
     """
     invalid = PublicWebError("invalid_url", "A public HTTP(S) URL on port 80 or 443 is required.")
     if not url or any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in url):
@@ -78,11 +85,21 @@ def validate_public_url(url: str) -> tuple[str, int, str]:
         try:
             ipaddress.ip_address(host)
         except ValueError:
-            pass  # 主机名:预检不解析 DNS,连接期再逐答案裁决
+            # 主机名:预检不解析 DNS,连接期再逐答案裁决;但 IDNA 可编码性在这里判。
+            # (a) stdlib idna 是 IDNA2003 scope:拒空标签/超长标签等结构性非法;
+            # nameprep 会接受 💩/ϐ 之类 httpx(IDNA2008)拒绝的字符——那一类由
+            # 下方 httpx.URL wire 门与 client 的 InvalidURL 兜底层负责。
+            try:
+                host.encode("idna")
+            except UnicodeError:
+                raise invalid from None
         else:
             if not is_public_address(host):
                 raise invalid
-    except ValueError:
+        # (a') wire 语法门:恢复 legacy httpx.URL 预检的 IDNA2008 严格性(💩/ϐ 类
+        # 在预检层拒)。只做语法裁决,不参与主机名判定(判定一律 urlsplit 上方已完成)。
+        httpx.URL(url)
+    except (ValueError, httpx.InvalidURL):
         raise invalid from None
     target = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
     effective_port = port if port is not None else (443 if parsed.scheme == "https" else 80)
