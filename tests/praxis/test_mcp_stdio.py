@@ -14,6 +14,14 @@
   都是生产的 ``child_env``(不是 fake),所以"最小环境"语义两层同源。
 - **fail-closed**(``sandbox_spec is None`` ⇒ ``SandboxRefusal``)全平台必跑。
 
+**证据分工(防止过度信任 ps)**:六路证据=运行面证明 envp 送达;argv 形态
+回归由构造期护栏(``_argv_violations`` 直接判 ``_stdio_parameters`` 的产物)
++ T20 静态规则负责。原因是实测确认的盲区:把旧病灶形态
+``/usr/bin/env -i SECRET_MCP_KEY=<secret> … cmd`` 原样派生,**六路断言全绿**
+——密钥暴露发生在 exec 窗口期,而 server 自报的 ``sys.argv`` 与 ``ps`` 看到的
+都是内层命令的 argv(外层 env 已 exec 掉),稳态行为探针看不见它。因此另有
+一条负向构造用例证明护栏对旧形态确实报警(不是空转)。
+
 真实证据面:真 ``mcp`` SDK(client + server)、真子进程、真 ``ps`` 复查。
 同步点一律"等驱动任务/等进程消失"(M9),不用固定时长 sleep 当同步手段;
 每个用例结束都必须无 owner task 残留、无孤儿进程(2026-11-13 事故教训)。
@@ -24,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 import uuid
@@ -36,7 +45,9 @@ from typing import Any
 import pytest
 
 from praxis.adapters.mcp.config import StdioServerConfig
-from praxis.adapters.mcp.lifecycle import McpConnection, owned_stdio_connection
+# _stdio_parameters 是刻意直取的私有构造点:argv 形态护栏必须钉在"重新引入
+# 旧病灶的那一行"上,而不是只靠运行面探针(见模块 docstring 的盲区说明)。
+from praxis.adapters.mcp.lifecycle import McpConnection, _stdio_parameters, owned_stdio_connection
 from praxis.adapters.sandbox.base import probe_backend
 from praxis.adapters.sandbox.compile import compile_sandbox, finalize_sandbox
 from praxis.protocol.permission import PermissionContext
@@ -52,6 +63,7 @@ _NO_SANDBOX_REASON = (
     "mcp stdio server requires a sandbox backend; configure bwrap/seatbelt or run on a supported platform"
 )
 _MISSING_BINARY = "/nonexistent-praxis-mcp-probe-binary"
+_ENV_PAIR = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +144,21 @@ def _connect(
         env_builder=child_env,
         close_timeout_seconds=close_timeout_seconds,
     )
+
+
+def _argv_violations(args: list[str]) -> list[str]:
+    """构造期护栏:argv 里不得出现 env 重置形态(S7 回归的确定性守卫)。
+
+    三条判据(controller 钉死):零 ``KEY=VALUE``、零 ``/usr/bin/env``、零 ``-i``。
+    ``-i`` 是粗判据(合法命令也可能带 ``-i``),本护栏只作用于本夹具的构造产物;
+    全仓静态禁令归 T20。违规描述只点名键名,不回显值(秘密不进失败输出)。
+    """
+    violations = [f"env pair in argv: {arg.split('=', 1)[0]}=" for arg in args if _ENV_PAIR.match(arg)]
+    if "/usr/bin/env" in args:
+        violations.append("env reset binary in argv: /usr/bin/env")
+    if "-i" in args:
+        violations.append("env -i flag in argv")
+    return violations
 
 
 def _leaves(exc: BaseException) -> list[BaseException]:
@@ -294,6 +321,54 @@ def test_s7_secret_travels_via_envp_only_passthrough(workspace: Path, monkeypatc
     asyncio.run(scenario())
 
 
+def test_construction_argv_carries_no_env_reset(workspace: Path) -> None:
+    """S7 构造期护栏:在 ``_stdio_parameters`` 的产物上直接判 argv 形态。
+
+    运行面六路证据只证明 envp 送达,看不见旧病灶的 exec 窗口期暴露(见模块
+    docstring);这条是"重新引入旧形态即红"的确定性回归守卫。
+    """
+    token, secret = _token(), _secret()
+    with _spec(workspace, real=False) as spec:
+        config = _config(workspace, token, secret=secret)
+        params = _stdio_parameters(config, workspace=workspace, spec=spec, env_builder=child_env)
+        assert _argv_violations(params.args) == []
+        # 裁决钉死的拼装形状逐字核对。
+        assert params.command == spec.argv_prefix[0]
+        assert params.args == [*spec.argv_prefix[1:], config.command, *config.args]
+        assert params.env == {**child_env(Path(spec.scratch_dir), workspace), **config.env}
+        assert params.env["SECRET_MCP_KEY"] == secret
+        assert params.cwd == config.cwd
+        assert secret not in " ".join(params.args)
+
+
+def test_guard_flags_the_legacy_env_reset_shape(workspace: Path) -> None:
+    """负向构造:旧病灶形态必须被护栏报警(证明护栏不是空转)。
+
+    只构造 argv,**绝不派生**——旧形态会把密钥写进真实命令行。同一份输入下
+    正解产物必须干净,两者对照即 S7 的构造期证据。
+    """
+    token, secret = _token(), _secret()
+    with _spec(workspace, real=False) as spec:
+        config = _config(workspace, token, secret=secret)
+        environment = {**child_env(Path(spec.scratch_dir), workspace), **config.env}
+        legacy_args = [
+            *spec.argv_prefix[1:],
+            "/usr/bin/env",
+            "-i",
+            *(f"{key}={value}" for key, value in sorted(environment.items())),
+            config.command,
+            *config.args,
+        ]
+        violations = _argv_violations(legacy_args)
+        assert "env pair in argv: SECRET_MCP_KEY=" in violations
+        assert "env reset binary in argv: /usr/bin/env" in violations
+        assert "env -i flag in argv" in violations
+        assert secret in " ".join(legacy_args)  # 旧形态确实把密钥明文写进 argv
+        params = _stdio_parameters(config, workspace=workspace, spec=spec, env_builder=child_env)
+        assert _argv_violations(params.args) == []
+        assert secret not in " ".join(params.args)
+
+
 def test_missing_sandbox_refuses_without_spawning(workspace: Path) -> None:
     """R-PF-5:无沙箱后端一律 fail-closed,绝不裸宿主派生(同 search_text 先例)。"""
     token = _token()
@@ -350,6 +425,37 @@ def test_caller_cancel_before_ready_reaps_owner_and_child(workspace: Path) -> No
 
             task = asyncio.create_task(opener(), name="opener")
             await _wait_owner("mcp-owner:probe")
+            task.cancel()
+            outcomes = await asyncio.gather(task, return_exceptions=True)
+            assert isinstance(outcomes[0], asyncio.CancelledError)
+            assert _owner_tasks() == []
+        await _wait_process_gone(token)
+
+    asyncio.run(scenario())
+
+
+def test_caller_cancel_after_ready_closes_owner_and_child(workspace: Path) -> None:
+    """M2:取消落在 yield body 内(已就绪)⇒ 同一姿势有界关闭,无 owner/孤儿。
+
+    同步点是 body 自己 set 的 event(不是 sleep 猜时机);body 里的长 sleep 只是
+    取消的落点。与 ready 前取消的区别:此时 ``ready`` 已完成,关闭走
+    ``stop.set()`` → owner 自己退出栈,而不是 ``task.cancel()`` 腿。
+    """
+    token = _token()
+
+    async def scenario() -> None:
+        with _spec(workspace, real=False) as spec:
+            config = _config(workspace, token, secret=_secret())
+            in_body = asyncio.Event()
+
+            async def opener() -> None:
+                async with _connect(config, workspace, spec) as conn:
+                    assert await _call_text(conn, "echo", {"message": "ready"}) == "echo: ready"
+                    in_body.set()
+                    await asyncio.sleep(30)
+
+            task = asyncio.create_task(opener(), name="opener")
+            await asyncio.wait_for(in_body.wait(), 10.0)
             task.cancel()
             outcomes = await asyncio.gather(task, return_exceptions=True)
             assert isinstance(outcomes[0], asyncio.CancelledError)
@@ -442,6 +548,9 @@ def test_s7_secret_travels_via_envp_only_real_seatbelt(workspace: Path, monkeypa
             assert spec.backend == "seatbelt"
             assert spec.argv_prefix[0] == "/usr/bin/sandbox-exec"
             config = _config(workspace, token, secret=secret)
+            # 生产姿势同样过构造期护栏:真 seatbelt 前缀下 argv 也只有前缀+命令。
+            params = _stdio_parameters(config, workspace=workspace, spec=spec, env_builder=child_env)
+            assert _argv_violations(params.args) == []
             async with _connect(config, workspace, spec) as conn:
                 await _assert_s7_evidence(
                     conn,
