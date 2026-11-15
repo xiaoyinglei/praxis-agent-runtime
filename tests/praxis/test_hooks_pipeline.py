@@ -86,13 +86,19 @@ def _hook_setup(
     stdout_json: str = _ALLOWED,
     counter: Path | None = None,
     name: str = "policy",
+    tool_names: tuple[str, ...] = (),
+    effects: tuple[str, ...] = (),
+    record: Path | None = None,
 ) -> HookSetup:
-    """落一个真实 /bin/sh hook 并绑定真实 spawn;counter 记录每次进程启动。"""
+    """落一个真实 /bin/sh hook 并绑定真实 spawn;counter 记录每次进程启动。
+
+    ``record`` 给出时把 HookRequest 原文写进该文件(断言请求形状)。
+    """
     host.mkdir(parents=True, exist_ok=True)
     body = ""
     if counter is not None:
         body += f"echo run >> {shlex.quote(str(counter))}\n"
-    body += "cat >/dev/null\n"
+    body += f"cat > {shlex.quote(str(record))}\n" if record is not None else "cat >/dev/null\n"
     body += f"printf '%s' {shlex.quote(stdout_json)}"
     script = host / f"{name}-{event}.sh"
     script.write_text("#!/bin/sh\n" + body + "\n", encoding="utf-8")
@@ -103,6 +109,8 @@ def _hook_setup(
         event=cast("Any", event),
         argv=(str(script),),
         directory=str(host),
+        tool_names=tool_names,
+        effects=effects,
     )
     return HookSetup(specs=(spec,), spawn=_real_spawn)
 
@@ -172,12 +180,13 @@ def _run(ctx: ExecCtx, tool_name: str, arguments: Mapping[str, Any]) -> Any:
 def test_rule_deny_not_exempted_by_hook_allow(store: Store, workspace: Path, tmp_path: Path) -> None:
     (workspace / "secret.txt").write_text("secret\n", encoding="utf-8")
     counter = tmp_path / "spawns.txt"
+    record = tmp_path / "request.json"
     ctx = _ctx(
         store,
         workspace,
         {"read": create_read_tool(workspace)},
         policy=PermissionPolicy(filesystem=(PathRule(path="secret.txt", access="deny"),)),
-        hooks=_hook_setup(tmp_path / "host", counter=counter, stdout_json=_ALLOWED),
+        hooks=_hook_setup(tmp_path / "host", counter=counter, stdout_json=_ALLOWED, record=record),
     )
     result = _run(ctx, "read", {"path": "secret.txt"})
     assert result.status is ResultStatus.DENIED
@@ -185,6 +194,13 @@ def test_rule_deny_not_exempted_by_hook_allow(store: Store, workspace: Path, tmp
     assert result.error_message.startswith("rule: ")
     assert "hook:" not in result.error_message
     assert _spawn_count(counter) == 1  # hook 确实执行了;allow 只是结构上不产生裁决
+    request = json.loads(record.read_text(encoding="utf-8"))
+    # Minor 3:hook 看到的 workspace 必须是 resolved 绝对路径。
+    assert request["workspace"] == str(workspace.resolve())
+    assert Path(cast("str", request["workspace"])).is_absolute()
+    assert request["event"] == "PreToolUse"
+    assert request["tool_name"] == "read"
+    assert request["arguments"] == {"path": "secret.txt"}
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +288,37 @@ def test_execute_process_sandbox_verdict_not_bypassed_by_hook_allow(
     assert result.error_code == "permission_denied"
     assert result.error_message == "sandbox_unavailable"
     assert _spawn_count(counter) == 1
+
+
+# ---------------------------------------------------------------------------
+# R-T5-3:选择器两轴是 AND,空轴才不过滤
+# ---------------------------------------------------------------------------
+
+
+def test_selector_axes_are_and_not_or(store: Store, workspace: Path, tmp_path: Path) -> None:
+    """tool_names 命中(read)但 effects 不命中(read_workspace)⇒ 不 spawn、无裁决。
+
+    若实现误读为 OR,该 hook 会 spawn 并 deny;断言 OK + 0 spawn 即钉死 AND。
+    """
+    (workspace / "note.txt").write_text("seed\n", encoding="utf-8")
+    counter = tmp_path / "spawns.txt"
+    ctx = _ctx(
+        store,
+        workspace,
+        {"read": create_read_tool(workspace)},
+        hooks=_hook_setup(
+            tmp_path / "host",
+            stdout_json=_BLOCKED,
+            counter=counter,
+            tool_names=("read",),  # 命中
+            effects=("write_workspace",),  # 不命中 read 的 read_workspace
+        ),
+    )
+    result = _run(ctx, "read", {"path": "note.txt"})
+    assert result.status is ResultStatus.OK
+    assert result.text == "seed\n"
+    assert _spawn_count(counter) == 0
+    assert _hook_items(ctx) == []
 
 
 # ---------------------------------------------------------------------------
@@ -452,14 +499,36 @@ def _scripted() -> ScriptedAdapter:
     )
 
 
-def _observe_denial(items: list[Item]) -> tuple[str, str]:
+def _observe_first_decision(items: list[Item]) -> tuple[str, str]:
+    """与 test_three_entry_consistency 同一观测口径(首次 execute 的类别 + reason)。"""
     results = [
         item.payload
         for item in items
         if item.kind == ItemKind.TOOL_RESULT and item.payload.get("call_id") == _CALL_ID
     ]
-    assert len(results) == 1, [item.kind for item in items]
-    return str(results[0]["status"]), str(results[0]["error_message"])
+    requests = [
+        item.payload
+        for item in items
+        if item.kind == ItemKind.APPROVAL_REQUEST and item.payload.get("call_id") == _CALL_ID
+    ]
+    decisions = [
+        item.payload
+        for item in items
+        if item.kind == ItemKind.APPROVAL_DECISION and item.payload.get("call_id") == _CALL_ID
+    ]
+    if results:
+        result = results[0]
+        message = str(result.get("error_message") or "")
+        if (
+            result.get("status") == "denied"
+            or result.get("error_code") in {"permission_denied", "sandbox_refused"}
+            or message.startswith("floor")
+        ):
+            return "denied", message
+        return "executed", "executed"
+    if requests and not decisions:
+        return "asked", "approval_required"
+    raise AssertionError(f"no first decision observed: {[item.kind for item in items]}")
 
 
 def _write_hooks_config(host: Path, script: Path) -> Path:
@@ -474,26 +543,83 @@ def _write_hooks_config(host: Path, script: Path) -> Path:
     return config
 
 
+_ASK_POLICY = PermissionPolicy(tools=(ToolRule(pattern="read", decision="ask"),))
+
+
+def _entry_hooks(entry_root: Path) -> tuple[HookSetup, Path]:
+    """每个入口独立的真 hook(allow)与 spawn 计数文件。"""
+    counter = entry_root / "spawns.txt"
+    return _hook_setup(entry_root / "host", counter=counter, stdout_json=_ALLOWED), counter
+
+
 def test_three_entries_same_hook_decision(tmp_path: Path) -> None:
-    host = tmp_path / "host"
-    hooks = _hook_setup(host, stdout_json=_BLOCKED)
-    script = Path(cast("HookSpec", hooks.specs[0]).argv[0])
-    hooks_config = _write_hooks_config(host, script)
+    """同 call+policy+hooks(model / CLI / resume)⇒ 同 decision+reason。
+
+    resume 腿是**真续跑**:ask 规则触发 PAUSED → ``session.resume(approval=...)``
+    → 重入执行;Pre hook 折叠复用 ⇒ spawn 计数仍为 1(会话层幂等,不止管道层)。
+    """
     observations: dict[str, tuple[str, str]] = {}
 
-    for entry in ("model", "resume"):
-        workspace = tmp_path / entry / "workspace"
-        _seed_workspace(workspace)
-        session = open_session(workspace, _scripted(), thread_id=entry, hooks=hooks)
-        try:
-            asyncio.run(session.submit("hook parity"))
-            observations[entry] = _observe_denial(session.items())
-        finally:
-            session.close()
+    # model 入口
+    model_root = tmp_path / "model"
+    _seed_workspace(model_root / "workspace")
+    model_hooks, model_counter = _entry_hooks(model_root)
+    session = open_session(
+        model_root / "workspace",
+        _scripted(),
+        policy=_ASK_POLICY,
+        thread_id="model",
+        hooks=model_hooks,
+    )
+    try:
+        asyncio.run(session.submit("hook parity"))
+        observations["model"] = _observe_first_decision(session.items())
+    finally:
+        session.close()
+    assert _spawn_count(model_counter) == 1
 
-    workspace = tmp_path / "cli" / "workspace"
+    # resume 入口:submit → asked → 批准 → 真重入
+    resume_root = tmp_path / "resume"
+    _seed_workspace(resume_root / "workspace")
+    resume_hooks, resume_counter = _entry_hooks(resume_root)
+    session = open_session(
+        resume_root / "workspace",
+        _scripted(),
+        policy=_ASK_POLICY,
+        thread_id="resume",
+        hooks=resume_hooks,
+    )
+    try:
+        first = asyncio.run(session.submit("hook parity"))
+        observations["resume"] = _observe_first_decision(session.items())
+        assert first.status is TurnStatus.PAUSED
+        assert _spawn_count(resume_counter) == 1
+        second = asyncio.run(session.resume(first.turn_id, approval={_CALL_ID: "allow"}))
+        resumed_items = session.items()
+    finally:
+        session.close()
+    assert second.status is TurnStatus.COMPLETED
+    assert _spawn_count(resume_counter) == 1  # 审批重入 0 次新 spawn
+    resumed_hooks = [item for item in resumed_items if item.kind == ItemKind.HOOK_INVOCATION]
+    assert _phases(resumed_hooks) == ["started", "settled"]  # 恰一组,不重复写
+    resumed_results = [
+        item.payload
+        for item in resumed_items
+        if item.kind == ItemKind.TOOL_RESULT and item.payload.get("call_id") == _CALL_ID
+    ]
+    assert len(resumed_results) == 1
+    assert resumed_results[0]["status"] == "ok"
+
+    # CLI 入口:同一 policy + 同一 hook 经 PRAXIS_HOOKS_CONFIG 真实加载
+    cli_root = tmp_path / "cli"
+    workspace = cli_root / "workspace"
     _seed_workspace(workspace)
-    scripted_file = tmp_path / "cli" / "scripted.json"
+    cli_hooks, cli_counter = _entry_hooks(cli_root)
+    script = Path(cast("HookSpec", cli_hooks.specs[0]).argv[0])
+    hooks_config = _write_hooks_config(cli_root / "host", script)
+    policy_file = cli_root / "policy.json"
+    policy_file.write_text(_ASK_POLICY.model_dump_json(), encoding="utf-8")
+    scripted_file = cli_root / "scripted.json"
     scripted_file.write_text(
         json.dumps(
             [
@@ -519,6 +645,8 @@ def test_three_entries_same_hook_decision(tmp_path: Path) -> None:
             "cli",
             "--scripted",
             str(scripted_file),
+            "--policy",
+            str(policy_file),
         ],
         env={**_CLEAN_ENV, "PRAXIS_HOOKS_CONFIG": str(hooks_config)},
     )
@@ -529,13 +657,14 @@ def test_three_entries_same_hook_decision(tmp_path: Path) -> None:
     )
     cli_store = Store(workspace / ".praxis" / "praxis.sqlite")
     try:
-        observations["cli"] = _observe_denial(cli_store.read_items("cli"))
+        observations["cli"] = _observe_first_decision(cli_store.read_items("cli"))
     finally:
         cli_store.close()
+    assert _spawn_count(cli_counter) == 1
 
     assert set(observations) == {"model", "resume", "cli"}
     assert len(set(observations.values())) == 1, observations
-    assert observations["model"] == ("denied", f"hook:policy:blocked: {_FEEDBACK}")
+    assert observations["model"] == ("asked", "approval_required")
 
 
 if __name__ == "__main__":  # pragma: no cover

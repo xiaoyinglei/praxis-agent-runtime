@@ -330,7 +330,7 @@ def _hook_request(
         "invocation_id": invocation_id,
         "thread_id": ctx.thread_id,
         "turn_id": ctx.turn_id,
-        "workspace": str(ctx.workspace),
+        "workspace": str(ctx.workspace.expanduser().resolve()),
         "tool_call_id": call.tool_call_id,
         "tool_name": tool_name,
         "arguments": _json_field(args),

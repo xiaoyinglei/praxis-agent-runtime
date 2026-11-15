@@ -190,8 +190,11 @@ def hook_invocation_id(
     """稳定的 hook 调用身份:``"hook_" + sha256(turn_id|event|name|digest)[:32]``。
 
     同一 Turn 内重入(审批恢复)必须得到同一身份,才能用 ``fold_hook_items``
-    复用已结算结论、不重复 spawn。``digest`` 在 Pre 是参数摘要,在 Post 是
-    结果摘要(由调用方 T5 计算)。
+    复用已结算结论、不重复 spawn。``digest`` 契约(R-T5-2):**Pre 与 Post 都
+    使用参数摘要 ``args_digest(arguments)``**——Post 刻意不用结果摘要:结果
+    摘要会在 cancel→resume 重执行时改变,导致 Post hook 再 spawn 一次,重新
+    引入调用幂等性要防止的副作用重复;同参数下观察复用是可接受的。该有意
+    差异(旧实现按结果 digested)由 T21 parity 对照表钉住。
     """
     payload = "|".join((turn_id, event, hook_name, digest))
     return "hook_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
