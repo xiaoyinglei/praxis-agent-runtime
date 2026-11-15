@@ -166,6 +166,13 @@ def test_tool_aci_shape_and_absent_keys() -> None:
     # 抽取是进程内线程,线程不可杀:如实 FINISH_CURRENT(3A inspect_data_file 同款)。
     assert tool.interrupt_behavior is InterruptBehavior.FINISH_CURRENT
     assert tool.source is ToolSource.BUILTIN
+    # M2:≤16000 的摘录预算使管道外部化在本工具上不可达,不得向模型承诺 artifact
+    # 指针;M4:错误枚举覆盖抽取/行窗口码。
+    description = tool.definition.description
+    assert "artifact" not in description
+    assert "web_line_out_of_range" in description
+    assert "web_content_empty" in description
+    assert "source_truncated" in description
 
 
 def test_resolve_use_target_is_raw_url() -> None:
@@ -215,6 +222,27 @@ def test_schema_accepts_in_range(arguments: dict[str, Any]) -> None:
     assert tool.validate_input({"url": URL, **arguments})["url"] == URL
 
 
+def test_integral_float_integer_arguments_are_coerced() -> None:
+    # JSON Schema 2020-12 接受 2.0 作为 integer(3.5/true/"3" 在 schema 层拒绝)。
+    # 不做 int 化会让 lines[2.0] 抛裸 TypeError ⇒ 管道折成不透明 tool_error。
+    lines = [f"line {index}" for index in range(1, 151)]
+    body = "\n".join(lines).encode()
+    int_result, _ = fetch(
+        body,
+        content_type="text/plain; charset=utf-8",
+        arguments={"start_line": 2, "max_lines": 100, "max_bytes": 4_096},
+    )
+    float_result, _ = fetch(
+        body,
+        content_type="text/plain; charset=utf-8",
+        arguments={"start_line": 2.0, "max_lines": 100.0, "max_bytes": 4_096.0},
+    )
+    assert float_result.is_error is False
+    assert float_result.text == int_result.text
+    assert float_result.metadata == int_result.metadata
+    assert int_result.text.splitlines()[0] == "2: line 2"
+
+
 def test_invalid_url_precheck_is_legacy_shaped_invalid_input() -> None:
     tool, _ = make_tool([])
     with pytest.raises(ToolValidationError) as excinfo:
@@ -247,6 +275,7 @@ def test_html_extraction_strips_noise_and_keeps_block_breaks() -> None:
     assert result.metadata["start_line"] == 1
     assert result.metadata["end_line"] == 3
     assert result.metadata["truncated"] is False
+    assert result.metadata["source_truncated"] is False
 
 
 def test_metadata_keys_are_exactly_the_brief_set() -> None:
@@ -256,6 +285,7 @@ def test_metadata_keys_are_exactly_the_brief_set() -> None:
         "final_url",
         "total_bytes",
         "truncated",
+        "source_truncated",
         "line_count",
         "start_line",
         "end_line",
@@ -328,7 +358,7 @@ def test_source_extraction_cap_200_000_characters() -> None:
     assert len(body) > MAX_SOURCE_CHARACTERS
     result, _ = fetch(body, content_type="text/plain; charset=utf-8")
     assert result.is_error is False
-    assert result.metadata["truncated"] is True
+    assert result.metadata["source_truncated"] is True
     assert result.metadata["line_count"] <= MAX_SOURCE_CHARACTERS // 99 + 2
     assert result.metadata["total_bytes"] == len(body)
 
@@ -484,12 +514,14 @@ def test_redirect_to_private_url_maps_invalid_url() -> None:
 
 
 def test_timeout_maps_web_fetch_failed_timeout() -> None:
-    stream = FakeStream(response_chunks(body=b"never"))
-    backend = FakeBackend([stream], delays=[5.0])
+    # 确定性 timeout:流在读取时抛 TimeoutError(与真实 deadline 同映射路径),
+    # 不依赖墙钟 sleep。
+    stream = FakeStream(response_chunks(body=b"never"), read_error=TimeoutError("deadline"))
+    backend = FakeBackend([stream])
     client, _ = make_client(
         resolver=FakeResolver([PUBLIC_IP]),
         backend=backend,
-        limits=WebLimits(timeout_seconds=0.2),
+        limits=WebLimits(timeout_seconds=20),
     )
     (tool,) = create_web_fetch_tools(client, limits=WebLimits())
     result = run_tool(tool, {})
@@ -530,17 +562,19 @@ class RecordingClient:
 
 
 def test_timeout_arg_forwarded_and_clamped_by_limits_and_tool_budget() -> None:
+    # 宿主上限高于工具级 75s:120s 请求必须夹到 75s(不是 120,也不是宿主上限)。
     client = RecordingClient()
-    (tool,) = create_web_fetch_tools(client, limits=WebLimits(timeout_seconds=60))  # type: ignore[arg-type]
+    (tool,) = create_web_fetch_tools(client, limits=WebLimits(timeout_seconds=120))  # type: ignore[arg-type]
     assert run_tool(tool, {}).is_error is False
     assert run_tool(tool, {"timeout_seconds": 120}).is_error is False
     assert run_tool(tool, {"timeout_seconds": 5}).is_error is False
-    assert client.timeouts == [45.0, 60.0, 5.0]
+    assert client.timeouts == [45.0, 75.0, 5.0]
 
+    # 宿主上限低于 75s:宿主硬上限胜出(模型参数不能抬高 limits)。
     tighter = RecordingClient()
-    (clamped,) = create_web_fetch_tools(tighter, limits=WebLimits(timeout_seconds=60, max_bytes=16_000))  # type: ignore[arg-type]
+    (clamped,) = create_web_fetch_tools(tighter, limits=WebLimits(timeout_seconds=30))  # type: ignore[arg-type]
     run_tool(clamped, {"timeout_seconds": 120})
-    assert tighter.timeouts == [60.0]
+    assert tighter.timeouts == [30.0]
 
 
 def test_excerpt_budget_clamped_by_host_limits() -> None:

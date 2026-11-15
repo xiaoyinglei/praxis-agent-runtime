@@ -94,7 +94,6 @@ _BLOCK_TAGS = frozenset(
         "ul",
     }
 )
-_PRE_TAGS = frozenset({"pre", "textarea"})
 _TEXT_MEDIA_PREFIXES = ("text/",)
 _TEXT_MEDIA_TYPES = frozenset(
     {"application/json", "application/ld+json", "application/xml", "application/javascript"}
@@ -165,7 +164,6 @@ class _TextExtractor(HTMLParser):
         self._noise_depth = 0
         # head 可能无闭合地进入 body:单独用布尔态,遇到 <body> 立即解除。
         self._in_head = False
-        self._pre_depth = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag in _NOISE_TAGS:
@@ -181,8 +179,6 @@ class _TextExtractor(HTMLParser):
                 self._in_head = False
             else:
                 return
-        if tag in _PRE_TAGS:
-            self._pre_depth += 1
         if tag in _BLOCK_TAGS or tag == "br":
             self._parts.append("\n")
 
@@ -205,8 +201,6 @@ class _TextExtractor(HTMLParser):
             return
         if self._in_head:
             return
-        if tag in _PRE_TAGS and self._pre_depth:
-            self._pre_depth -= 1
         if tag in _BLOCK_TAGS:
             self._parts.append("\n")
 

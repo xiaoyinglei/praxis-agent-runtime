@@ -458,6 +458,11 @@ class PublicHttpClient:
     ) -> WebFetchResponse:
         """有界抓取;max_bytes/timeout_seconds 是可信调用方的逐请求覆盖(默认取 limits)。
 
+        **调用方不变量(composition/T20)**:client 与本客户端配套的工具工厂必须用
+        **同一份** ``WebLimits`` 构造(逐请求上限只有一个事实来源)。逐请求覆盖只
+        接受可信调用方——模型参数已由工具 schema 与工具侧 min(limits, 工具预算)
+        钳制;client 层不再二次硬钳制,这是有意的分层(避免两处各自缩放同一上限)。
+
         json_body 须为 JSON 安全值(T12 控制请求体):NaN/Infinity 抛裸 ValueError
         (legacy web_http.py:415 allow_nan=False parity,调用方输入类,不属于
         PublicWebError 有界错误面)。
