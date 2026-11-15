@@ -2,8 +2,9 @@
 
 brief Step 1 清单逐条:
 - schema 阈值逐个:max_bytes 4096..16000、max_lines 1..500、timeout 5..120;
-- 有意差异显式断言:`{render, source_id, compare_to_source_id, view, section_id,
-  start_link, start_section, find, max_tokens, refresh}` **不在 schema**(R-PF-2');
+- 有意差异显式断言:`{source_id, compare_to_source_id, view, section_id,
+  start_link, start_section, find, max_tokens, refresh}` **不在 schema**
+  (R-PF-2';T14 起 render 入 schema,其余仍缺席);
 - 行窗口跨多字节文本(UTF-8 字节预算)、默认 12000/100、长行 512 字符切块;
 - 200_000 源抽取上限;65_536 输出上限经管道 artifact 指针(用缩小上限的 Tool 副本
   复现,因为 schema 的 max_bytes ≤16000 本身不可能触到 65_536);
@@ -67,7 +68,6 @@ from tests.praxis.test_web_urls_dns import (
 
 URL = "https://example.com/page"
 _ABSENT_KEYS = {
-    "render",
     "source_id",
     "compare_to_source_id",
     "view",
@@ -151,8 +151,8 @@ def test_tool_aci_shape_and_absent_keys() -> None:
     assert tool.definition.name == WEB_FETCH_TOOL_NAME
     schema = tool.definition.input_schema
     properties = set(schema["properties"])  # type: ignore[arg-type]
-    assert properties == {"url", "max_bytes", "timeout_seconds", "start_line", "max_lines"}
-    # R-PF-2' 有意差异:schema 完全不含这些旧键(T14 才加 render)。
+    assert properties == {"url", "max_bytes", "timeout_seconds", "start_line", "max_lines", "render"}
+    # R-PF-2' 有意差异:schema 不含这些旧键(T14 只加 render,其余仍缺席)。
     assert _ABSENT_KEYS.isdisjoint(properties)
     assert schema["additionalProperties"] is False
     assert tuple(schema["required"]) == ("url",)

@@ -31,10 +31,16 @@ class PublicWebError(RuntimeError):
 
     ``code`` 是唯一机器可读分支面;消费者按 code 分支,绝不按消息文本。
     message 可省(T11 的 ``PublicWebError("denied")`` 形状)。
+
+    ``verdict``(T14 增,机器可读):authorizer 拒绝时携带原裁决
+    ``"ask"``/``"deny"``——浏览器子资源闸据此分别计数 ``blocked_ask``/
+    ``blocked_deny``(S8:ask 与 deny 同拦)。空串 = 非授权来源的错误。
+    它是 code 之下的二级机器字段,不是消息文本分支。
     """
 
-    def __init__(self, code: str, message: str = "") -> None:
+    def __init__(self, code: str, message: str = "", *, verdict: str = "") -> None:
         self.code = code
+        self.verdict = verdict
         super().__init__(message)
 
 

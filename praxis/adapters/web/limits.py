@@ -10,13 +10,19 @@
 内联 JSON——旧语义保留,文件 ≤4096 字节)> 显式 path 参数 >
 ``host_config_dir()/web.json`` 的可选 ``"limits"`` 块。宿主文件缺失或块缺失
 ⇒ 默认值; malformed ⇒ ValueError 点名文件。**workspace 文件绝不读**。
+
+T14 扩:web.json 的可选 ``"browser"`` 块(``browser_requests`` 1..128 默认 64、
+``browser_network_bytes`` 1_000_000..32_000_000 默认 8_000_000)——**本次渲染
+调用**的预算,不是 turn 账本(Q7)。``"limits"`` 块仍只含三个传输字段;browser
+键出现在 limits 块里按未知键拒绝(两个块各管各的,不互相串门)。env 文件保持
+legacy 的扁平 limits 形状(只传输字段)。
 """
 
 from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from praxis.protocol.floor import host_config_dir
@@ -42,13 +48,17 @@ def web_configuration_path() -> Path:
 class WebLimits:
     """逐请求硬上限;模型参数不能抬高这些上限(T12 schema 钳制在更小区间)。
 
-    范围:max_bytes 4096..32_000_000;timeout_seconds (0, 300];max_redirects 0..10。
+    范围:max_bytes 4096..32_000_000;timeout_seconds (0, 300];max_redirects 0..10;
+    browser_requests 1..128(T14,逐渲染调用);browser_network_bytes
+    1_000_000..32_000_000(T14,逐渲染调用)。
     类型严格(JSON 浮点 max_bytes 之类直接拒),与旧 pydantic strict 同向。
     """
 
     max_bytes: int = 2_000_000
     timeout_seconds: float = 20.0
     max_redirects: int = 5
+    browser_requests: int = 64
+    browser_network_bytes: int = 8_000_000
 
     def __post_init__(self) -> None:
         if type(self.max_bytes) is not int or not 4096 <= self.max_bytes <= 32_000_000:
@@ -57,6 +67,15 @@ class WebLimits:
             raise ValueError("web limits timeout_seconds must be a number in (0, 300]")
         if type(self.max_redirects) is not int or not 0 <= self.max_redirects <= 10:
             raise ValueError("web limits max_redirects must be an int in 0..10")
+        if type(self.browser_requests) is not int or not 1 <= self.browser_requests <= 128:
+            raise ValueError("web limits browser_requests must be an int in 1..128")
+        if type(self.browser_network_bytes) is not int or not 1_000_000 <= self.browser_network_bytes <= 32_000_000:
+            raise ValueError("web limits browser_network_bytes must be an int in 1000000..32000000")
+
+
+# 两个配置块各管各的字段集合:limits=传输(T10 冻结),browser=渲染调用(T14)。
+_TRANSPORT_FIELDS = frozenset({"max_bytes", "timeout_seconds", "max_redirects"})
+_BROWSER_FIELDS = frozenset({"browser_requests", "browser_network_bytes"})
 
 
 def _read_bounded_json(path: Path, max_bytes: int) -> object:
@@ -74,7 +93,7 @@ def _read_bounded_json(path: Path, max_bytes: int) -> object:
 def _limits_from_mapping(data: object, source: Path) -> WebLimits:
     if not isinstance(data, dict):
         raise ValueError(f"web limits must be a JSON object: {source}")
-    unknown = set(data) - {field.name for field in fields(WebLimits)}
+    unknown = set(data) - _TRANSPORT_FIELDS
     if unknown:
         raise ValueError(f"web limits has unknown keys {sorted(unknown)}: {source}")
     try:
@@ -83,11 +102,24 @@ def _limits_from_mapping(data: object, source: Path) -> WebLimits:
         raise ValueError(f"invalid web limits in {source}: {error}") from None
 
 
+def _browser_from_mapping(data: object, source: Path) -> WebLimits:
+    """``"browser"`` 块 → 只含 browser 字段的 WebLimits(其余默认;范围同 dataclass)。"""
+    if not isinstance(data, dict):
+        raise ValueError(f"web browser limits must be a JSON object: {source}")
+    unknown = set(data) - _BROWSER_FIELDS
+    if unknown:
+        raise ValueError(f"web browser limits has unknown keys {sorted(unknown)}: {source}")
+    try:
+        return WebLimits(**data)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"invalid web browser limits in {source}: {error}") from None
+
+
 def load_web_limits(path: Path | None = None) -> WebLimits:
     """加载逐请求上限:env PRAXIS_WEB_LIMITS(文件路径)> path > host_config_dir()/web.json。
 
     env 指向的文件缺失/超限/坏形状 ⇒ ValueError 点名文件(显式配置必须可用);
-    宿主 web.json 缺失或无 "limits" 块 ⇒ 默认值。
+    宿主 web.json 缺失或无 "limits"/"browser" 块 ⇒ 对应默认值。
     """
     env = os.environ.get("PRAXIS_WEB_LIMITS")
     if env:
@@ -104,6 +136,12 @@ def load_web_limits(path: Path | None = None) -> WebLimits:
         return WebLimits()
     if not isinstance(data, dict):
         raise ValueError(f"web configuration must be a JSON object: {source}")
-    if "limits" not in data:
-        return WebLimits()
-    return _limits_from_mapping(data["limits"], source)
+    limits = _limits_from_mapping(data["limits"], source) if "limits" in data else WebLimits()
+    if "browser" in data:
+        browser = _browser_from_mapping(data["browser"], source)
+        limits = replace(
+            limits,
+            browser_requests=browser.browser_requests,
+            browser_network_bytes=browser.browser_network_bytes,
+        )
+    return limits

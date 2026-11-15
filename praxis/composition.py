@@ -259,10 +259,11 @@ def make_web_authorizer(
 
     契约(T10 authorize:任意异常原样传播、先于 validate/connect):
     - allow ⇒ 返回 None;
-    - ask ⇒ raise ``PublicWebError("denied", "approval required for <host>")``
+    - ask ⇒ raise ``PublicWebError("denied", "approval required for <host>", verdict="ask")``
       ——逐跳/子资源是**执行期检查点**:ask 不再被无视放行,而是中止本次请求
       并指向 NetworkRule 授权路径;初始 URL 的 ask 由 decide 正常暂停审批;
-    - deny ⇒ raise ``PublicWebError("denied")``。
+    - deny ⇒ raise ``PublicWebError("denied", verdict="deny")``。
+    ``verdict`` 机器字段(T14)供浏览器子资源闸分别计数 blocked_ask/blocked_deny。
     URL 原样交给 ``network_verdict``(归一化完全由 protocol.policy 承担);
     闭包内不再改写/重解析待裁决的 URL 串。
     """
@@ -272,8 +273,8 @@ def make_web_authorizer(
         if verdict == "allow":
             return
         if verdict == "ask":
-            raise PublicWebError("denied", f"approval required for {_web_url_host(url)}")
-        raise PublicWebError("denied")
+            raise PublicWebError("denied", f"approval required for {_web_url_host(url)}", verdict="ask")
+        raise PublicWebError("denied", verdict="deny")
 
     return authorize
 

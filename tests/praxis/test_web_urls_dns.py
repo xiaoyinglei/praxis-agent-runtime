@@ -305,10 +305,12 @@ def test_validate_public_url_does_no_dns() -> None:
 def test_web_limits_defaults_and_fields() -> None:
     limits = WebLimits()
     assert (limits.max_bytes, limits.timeout_seconds, limits.max_redirects) == (2_000_000, 20.0, 5)
-    # Q7 有意差异显式断言:只有逐请求硬上限,没有 turn 级账本字段。
-    assert tuple(f.name for f in fields(WebLimits)) == ("max_bytes", "timeout_seconds", "max_redirects")
+    # Q7 有意差异显式断言:只有逐请求/逐调用硬上限,没有 turn 级账本字段。
+    # T14 扩 browser 逐调用预算(仍不是 turn 账本)。
+    assert tuple(f.name for f in fields(WebLimits)) == (
+        "max_bytes", "timeout_seconds", "max_redirects", "browser_requests", "browser_network_bytes",
+    )
     assert not hasattr(limits, "turn_requests")
-    assert not hasattr(limits, "browser_requests")
 
 
 def test_web_limits_range_validation() -> None:
