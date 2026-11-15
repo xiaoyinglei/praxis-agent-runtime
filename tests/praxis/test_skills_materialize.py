@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 from pathlib import Path
 from typing import Any
 
@@ -47,17 +48,21 @@ from praxis.protocol.sandbox import ToolExecContext
 from praxis.protocol.tools import (
     CancellationMode,
     InterruptBehavior,
+    ResolvedUse,
     ResultStatus,
     Tool,
     ToolCall,
+    ToolContentBlock,
+    ToolDefinition,
     ToolEffect,
+    ToolResult,
     ToolSource,
     ToolTarget,
     ToolValidationError,
 )
 from praxis.store.log import Store
 from praxis.store.turns import create_turn
-from praxis.tools.builtins.filesystem import create_read_tool
+from praxis.tools.builtins.filesystem import PENDING_TOOL_CALL_ID, create_read_tool
 from praxis.tools.builtins.skills import (
     create_invoke_skill_tool,
     create_materialize_skill_asset_tool,
@@ -140,6 +145,43 @@ def _skill_tools(workspace: Path) -> tuple[Tool, Tool]:
     )
 
 
+def _forging_invoke_tool(skill_id: str) -> Tool:
+    """测试替身:把 ``skill_id`` 作为成功 invoke 事实提交,用于模拟目录漂移。"""
+
+    def run(
+        arguments: Any, exec_ctx: ToolExecContext
+    ) -> ToolResult:
+        return ToolResult(
+            tool_call_id=PENDING_TOOL_CALL_ID,
+            tool_name="invoke_skill",
+            content=(ToolContentBlock(type="text", data={"text": "forged"}),),
+            status=ResultStatus.OK,
+            metadata={"skill_id": skill_id},
+        )
+
+    return Tool(
+        definition=ToolDefinition(
+            name="invoke_skill",
+            description="test-only invoke_skill substitute",
+            input_schema={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        ),
+        validate_input=lambda arguments: arguments,
+        run=run,
+        static_effects=frozenset(),
+        resolve_use=lambda arguments: ResolvedUse(frozenset(), ()),
+        idempotent=True,
+        concurrency_safe=False,
+        cancellation_mode=CancellationMode.COOPERATIVE,
+        interrupt_behavior=InterruptBehavior.CANCEL,
+        timeout_seconds=5.0,
+        max_model_output_bytes=1_000,
+    )
+
+
 def _result_payload(store: Store, turn_id: str) -> dict[str, Any]:
     items = store.read_turn_items(turn_id)
     assert items[-1].kind == ItemKind.TOOL_RESULT
@@ -191,7 +233,8 @@ def test_tool_shape_matches_legacy_numbers(workspace: Path) -> None:
 
     # Q8:落点与 gitignore 负担必须写进模型可见描述。
     description = tool.definition.description
-    assert ".scratch/skills/" in description
+    assert ".scratch/skills/<safe_id>/" in description
+    assert "sanitized" in description.casefold()
     assert "gitignore" in description.casefold()
     assert ".praxis" in description
 
@@ -205,6 +248,46 @@ def test_safe_id_formula_and_gitignore_note(workspace: Path) -> None:
     assert ":" not in use.targets[1].value
 
 
+def test_safe_id_collision_shares_destination_but_activation_keys_on_skill_id(
+    workspace: Path,
+) -> None:
+    """safe_id 截断/清洗会碰撞(``a:b`` 与 ``a_b`` 都落 ``a_b``);激活守卫仍按 skill_id。
+
+    目录共享是有意语义(同一落点最后一次复制胜出),但"能否复制"永远取决于
+    精确 skill_id 的激活事实,不能因为目录同名而被豁免。
+    """
+    namespaced = _write_skill(workspace, "b", namespace="a")  # id = "a:b" ⇒ safe_id a_b
+    plain = _write_skill(workspace, "a_b")  # id = "a_b" ⇒ safe_id a_b
+    _write_asset(namespaced, "scripts/x.sh", b"namespaced\n")
+    _write_asset(plain, "scripts/x.sh", b"plain\n")
+    tool = create_materialize_skill_asset_tool(workspace)
+    arguments = {"skill_id": "a:b", "relative_path": "scripts/x.sh"}
+    destination = workspace / ".scratch" / "skills" / "a_b" / "scripts" / "x.sh"
+
+    first = tool.run(
+        arguments, ToolExecContext(active_skill_ids=frozenset({"a:b"}))
+    )
+    assert first.status is ResultStatus.OK
+    assert first.metadata["workspace_path"] == ".scratch/skills/a_b/scripts/x.sh"
+    assert destination.read_bytes() == b"namespaced\n"
+
+    second = tool.run(
+        {"skill_id": "a_b", "relative_path": "scripts/x.sh"},
+        ToolExecContext(active_skill_ids=frozenset({"a_b"})),
+    )
+    assert second.status is ResultStatus.OK
+    assert second.metadata["workspace_path"] == ".scratch/skills/a_b/scripts/x.sh"
+    assert destination.read_bytes() == b"plain\n"
+
+    # 只激活了 a:b 时,请求 a_b 仍被拒——共享目录不构成激活。
+    denied = tool.run(
+        {"skill_id": "a_b", "relative_path": "scripts/x.sh"},
+        ToolExecContext(active_skill_ids=frozenset({"a:b"})),
+    )
+    assert denied.status is ResultStatus.ERROR
+    assert denied.error_code == "skill_not_active"
+
+
 # ---------------------------------------------------------------------------
 # 激活守卫(唯一权限耦合)
 # ---------------------------------------------------------------------------
@@ -214,11 +297,9 @@ def test_inactive_skill_is_skill_not_active_direct(workspace: Path) -> None:
     _write_skill(workspace, "ghost")
     tool = create_materialize_skill_asset_tool(workspace)
 
-    result = asyncio.run(
-        tool.run(
-            {"skill_id": "ghost", "relative_path": "scripts/a.sh"},
-            ToolExecContext(),  # 无激活:默认空集
-        )
+    result = tool.run(
+        {"skill_id": "ghost", "relative_path": "scripts/a.sh"},
+        ToolExecContext(),  # 无激活:默认空集
     )
 
     assert result.status is ResultStatus.ERROR
@@ -258,26 +339,42 @@ def test_activated_id_outside_catalog_is_skill_not_found(workspace: Path) -> Non
     """激活事实存在但目录快照里没有该 id(异常装配路径)⇒ 明确的错误,不是 tool_error。"""
     tool = create_materialize_skill_asset_tool(workspace)  # 空目录:无任何 skill
 
-    result = asyncio.run(
-        tool.run(
-            {"skill_id": "ghost", "relative_path": "scripts/a.sh"},
-            ToolExecContext(active_skill_ids=frozenset({"ghost"})),
-        )
+    result = tool.run(
+        {"skill_id": "ghost", "relative_path": "scripts/a.sh"},
+        ToolExecContext(active_skill_ids=frozenset({"ghost"})),
     )
 
     assert result.status is ResultStatus.ERROR
     assert result.error_code == "skill_not_found"
 
 
+def test_catalog_drift_skill_not_found_via_pipeline(workspace: Path, store: Store) -> None:
+    """管道级:已提交的成功激活事实 + materialize 目录快照缺该 id ⇒ skill_not_found。"""
+    materialize = create_materialize_skill_asset_tool(workspace)  # 空目录快照
+    forge = _forging_invoke_tool("ghost")
+    ctx = _exec_ctx(store, workspace, (forge, materialize))
+
+    assert _run(ctx, "invoke_skill", {}, call_id="c-forge").status is ResultStatus.OK
+    result = _run(
+        ctx,
+        _MATERIALIZE,
+        {"skill_id": "ghost", "relative_path": "scripts/a.sh"},
+        call_id="c-materialize",
+    )
+
+    assert result.status is ResultStatus.ERROR
+    assert result.error_code == "skill_not_found"
+    payload = _result_payload(store, ctx.turn_id)
+    assert payload["error_code"] == "skill_not_found"
+
+
 def test_missing_asset_is_asset_not_found(workspace: Path) -> None:
     _write_skill(workspace, "empty")
     tool = create_materialize_skill_asset_tool(workspace)
 
-    result = asyncio.run(
-        tool.run(
-            {"skill_id": "empty", "relative_path": "scripts/missing.sh"},
-            ToolExecContext(active_skill_ids=frozenset({"empty"})),
-        )
+    result = tool.run(
+        {"skill_id": "empty", "relative_path": "scripts/missing.sh"},
+        ToolExecContext(active_skill_ids=frozenset({"empty"})),
     )
 
     assert result.status is ResultStatus.ERROR
@@ -325,6 +422,82 @@ def test_activated_roundtrip_bytes_metadata_and_scratch_landing(
     assert payload["metadata"]["workspace_path"] == expected_path
     assert payload["metadata"]["source_fingerprint"] == hashlib.sha256(data).hexdigest()
     assert payload["metadata"]["size_bytes"] == len(data)
+
+
+def test_namespaced_skill_materialized_end_to_end(workspace: Path, store: Store) -> None:
+    """命名空间 skill(``ns:round``)走真实管道 invoke → materialize 全链路。"""
+    skill_dir = _write_skill(workspace, "round", namespace="ns")
+    data = b"namespace asset\n"
+    _write_asset(skill_dir, "scripts/go.sh", data)
+    invoke, materialize = _skill_tools(workspace)
+    ctx = _exec_ctx(store, workspace, (invoke, materialize))
+
+    assert _run(ctx, "invoke_skill", {"name": "ns:round"}).status is ResultStatus.OK
+    result = _run(
+        ctx,
+        _MATERIALIZE,
+        {"skill_id": "ns:round", "relative_path": "scripts/go.sh"},
+        call_id="c-materialize",
+    )
+
+    assert result.status is ResultStatus.OK
+    assert result.metadata["workspace_path"] == ".scratch/skills/ns_round/scripts/go.sh"
+    destination = workspace / ".scratch" / "skills" / "ns_round" / "scripts" / "go.sh"
+    assert destination.read_bytes() == data
+
+
+def test_executable_bit_is_preserved(workspace: Path) -> None:
+    """M5:旧 ``shutil.copy2`` 的 exec-bit fidelity —— scripts 资产保留权限位。"""
+    skill_dir = _write_skill(workspace, "exec")
+    asset = _write_asset(skill_dir, "scripts/run.sh", b"#!/bin/sh\necho ok\n")
+    asset.chmod(0o755)
+    tool = create_materialize_skill_asset_tool(workspace)
+
+    result = tool.run(
+        {"skill_id": "exec", "relative_path": "scripts/run.sh"},
+        ToolExecContext(active_skill_ids=frozenset({"exec"})),
+    )
+
+    assert result.status is ResultStatus.OK
+    destination = workspace / ".scratch" / "skills" / "exec" / "scripts" / "run.sh"
+    assert destination.stat().st_mode & 0o777 == 0o755
+    assert destination.read_bytes() == b"#!/bin/sh\necho ok\n"
+
+
+def test_asset_over_cap_is_asset_too_large(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """praxis 独有防御(旧实现无上限):整块读入必须有界。"""
+    monkeypatch.setattr("praxis.tools.builtins.skills._MAX_SKILL_ASSET_BYTES", 8)
+    skill_dir = _write_skill(workspace, "huge")
+    _write_asset(skill_dir, "scripts/big.sh", b"0123456789")
+    tool = create_materialize_skill_asset_tool(workspace)
+
+    result = tool.run(
+        {"skill_id": "huge", "relative_path": "scripts/big.sh"},
+        ToolExecContext(active_skill_ids=frozenset({"huge"})),
+    )
+
+    assert result.status is ResultStatus.ERROR
+    assert result.error_code == "asset_too_large"
+    assert not (workspace / ".scratch").exists()
+
+
+def test_fifo_asset_is_not_a_regular_file(workspace: Path) -> None:
+    """M2:O_NONBLOCK 打开 FIFO 不阻塞;S_ISREG 检查把它挡成 asset_not_found。"""
+    skill_dir = _write_skill(workspace, "fifo")
+    (skill_dir / "scripts").mkdir(parents=True, exist_ok=True)
+    os.mkfifo(skill_dir / "scripts" / "pipe")
+    tool = create_materialize_skill_asset_tool(workspace)
+
+    result = tool.run(
+        {"skill_id": "fifo", "relative_path": "scripts/pipe"},
+        ToolExecContext(active_skill_ids=frozenset({"fifo"})),
+    )
+
+    assert result.status is ResultStatus.ERROR
+    assert result.error_code == "asset_not_found"
+    assert not (workspace / ".scratch").exists()
 
 
 def test_scratch_is_not_floor_and_read_tool_can_consume_it(
@@ -479,6 +652,23 @@ def test_source_symlink_outside_skill_root_is_rejected(
     )
 
     # 源围栏 + O_NOFOLLOW:不读技能根之外的字节,也不落任何目标。
+    assert result.status is ResultStatus.ERROR
+    assert result.error_code == "asset_not_found"
+    assert not (workspace / ".scratch").exists()
+
+
+def test_source_symlink_inside_skill_root_is_still_rejected(workspace: Path) -> None:
+    """M7:根**内**的末尾符号链接也拒绝(O_NOFOLLOW),不能借链接换名复制。"""
+    skill_dir = _write_skill(workspace, "selflink")
+    real = _write_asset(skill_dir, "scripts/real.sh", b"real bytes\n")
+    (skill_dir / "scripts" / "alias.sh").symlink_to(real)
+    tool = create_materialize_skill_asset_tool(workspace)
+
+    result = tool.run(
+        {"skill_id": "selflink", "relative_path": "scripts/alias.sh"},
+        ToolExecContext(active_skill_ids=frozenset({"selflink"})),
+    )
+
     assert result.status is ResultStatus.ERROR
     assert result.error_code == "asset_not_found"
     assert not (workspace / ".scratch").exists()

@@ -34,7 +34,7 @@ import hashlib
 import logging
 import os
 import re
-import tempfile
+import stat
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
@@ -68,7 +68,7 @@ from praxis.protocol.tools import (
     json_schema_input,
 )
 from praxis.tools.builtins.filesystem import PENDING_TOOL_CALL_ID
-from praxis.tools.builtins.paths import checked_path
+from praxis.tools.builtins.paths import atomic_write_bytes, checked_path
 
 logger = logging.getLogger(__name__)
 
@@ -520,6 +520,9 @@ _MATERIALIZE_SKILL_NAME = "materialize_skill_asset"
 
 # 旧 integrations/skills.py:70-83 的 MaterializeSkillAssetInput(extra=forbid)。
 _MAX_ASSET_RELATIVE_PATH_CHARS = 4096
+# praxis 独有防御(旧实现无上限):资产整块进内存后复制,必须有界。
+# T21 对照会显式钉住这一差异。
+_MAX_SKILL_ASSET_BYTES = 4_194_304
 # 旧 integrations/skills.py:335-339:资产只允许 scripts/ 与 references/ 两个子树。
 _SKILL_ASSET_ROOT_SEGMENTS = frozenset({"scripts", "references"})
 
@@ -617,26 +620,6 @@ def _within_skill_root(root: Path, candidate: Path) -> bool:
     return common == root
 
 
-def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    """同目录 tmp + ``os.replace`` 的字节原子写(与 ``paths.atomic_write_text`` 同语义)。
-
-    ``paths.atomic_write_text`` 只接受 str;skill 资产可能是二进制,这里保留
-    一份最小的字节版而不是把二进制伪装成文本。失败时清理 tmp,绝不留下半写文件。
-    """
-    directory = path.parent
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(directory))
-    tmp = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
-
-
 def _materialize_error(code: str, message: str) -> ToolResult:
     """materialize 的固定有界错误结果(同 :func:`_activation_error` 形状)。"""
     bounded = message[:512]
@@ -672,7 +655,10 @@ def create_materialize_skill_asset_tool(workspace: Path) -> Tool:
 
     catalog = load_skill_catalog(workspace)
 
-    async def run(
+    # 同步 def(不是 async):管道对同步工具经 ``asyncio.to_thread`` 派发,阻塞的
+    # open/read 不会占住事件循环;配合 O_NONBLOCK + S_ISREG 检查,worker 也不会
+    # 永久卡在 FIFO/设备文件上,5.0s 超时仍可触发。
+    def run(
         arguments: Mapping[str, JsonValue],
         exec_ctx: ToolExecContext,
     ) -> ToolResult:
@@ -708,24 +694,54 @@ def create_materialize_skill_asset_tool(workspace: Path) -> Tool:
             )
 
         # O_NOFOLLOW:拒绝末尾符号链接(即使其目标在根内)——资产是普通文件,
-        # 不跟随。commonpath 已覆盖中间目录的符号链接逃逸。
+        # 不跟随。commonpath 已覆盖中间目录的符号链接逃逸。O_NONBLOCK 让 FIFO
+        # 打开不阻塞;随后 S_ISREG 把它挡掉。
         try:
-            fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            fd = os.open(
+                source,
+                os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
+            )
         except OSError:
             return _materialize_error(
                 "asset_not_found", f"skill asset is not a readable file: {relative.as_posix()}"
             )
         try:
+            file_stat = os.fstat(fd)
+        except OSError:
+            os.close(fd)
+            return _materialize_error(
+                "asset_not_found", f"skill asset is not a readable file: {relative.as_posix()}"
+            )
+        if not stat.S_ISREG(file_stat.st_mode):
+            os.close(fd)
+            return _materialize_error(
+                "asset_not_found",
+                f"skill asset is not a regular file: {relative.as_posix()}",
+            )
+        if file_stat.st_size > _MAX_SKILL_ASSET_BYTES:
+            os.close(fd)
+            return _materialize_error(
+                "asset_too_large",
+                f"skill asset exceeds {_MAX_SKILL_ASSET_BYTES} bytes: {relative.as_posix()}",
+            )
+        try:
             with os.fdopen(fd, "rb") as stream:
-                data = stream.read()
+                # 多读 1 字节兜住"读前被追加"的竞态;上限是硬裁决。
+                data = stream.read(_MAX_SKILL_ASSET_BYTES + 1)
         except OSError:
             return _materialize_error(
                 "asset_not_found", f"skill asset is not a readable file: {relative.as_posix()}"
+            )
+        if len(data) > _MAX_SKILL_ASSET_BYTES:
+            return _materialize_error(
+                "asset_too_large",
+                f"skill asset exceeds {_MAX_SKILL_ASSET_BYTES} bytes: {relative.as_posix()}",
             )
 
         destination = _checked_destination(workspace, skill_id, relative)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write_bytes(destination, data)
+        # M5:保留源权限位(旧 shutil.copy2 的 exec-bit fidelity)。
+        atomic_write_bytes(destination, data, mode=stat.S_IMODE(file_stat.st_mode) & 0o777)
 
         workspace_path = _scratch_relative_destination(skill_id, relative).as_posix()
         return ToolResult(
@@ -762,7 +778,8 @@ def create_materialize_skill_asset_tool(workspace: Path) -> Tool:
             description=(
                 "Copy one scripts/ or references/ file from an already activated skill "
                 "(call invoke_skill for that skill first) into "
-                ".scratch/skills/<skill_id>/ in the workspace. Use the returned "
+                ".scratch/skills/<safe_id>/ in the workspace, where <safe_id> is the "
+                "sanitized lowercase skill id. Use the returned "
                 "workspace path with file or command tools. .scratch is a normal "
                 "workspace directory (not .praxis, which is floor-protected and "
                 "unreadable to the sandbox), and it is NOT git-ignored automatically: "
