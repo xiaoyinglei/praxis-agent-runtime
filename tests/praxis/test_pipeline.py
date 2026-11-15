@@ -127,6 +127,8 @@ def test_execute_allow_appends_call_then_result(ctx: ExecCtx) -> None:
     assert call_item.payload["args_digest"] == args_digest(ARGS_A)
     assert list(call_item.payload["effects"]) == ["read_workspace"]
     assert call_item.payload["idempotent"] is True
+    # T2:来源分类的持久事实,默认 builtin(§5.10 替代 revision 前缀分类)。
+    assert call_item.payload["source"] == "builtin"
     assert result_item.payload["status"] == "ok"
     assert result_item.payload["content"][0]["type"] == "text"
     assert result_item.payload["content"][0]["data"]["text"] == "hello pipeline"

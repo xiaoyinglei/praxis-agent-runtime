@@ -237,6 +237,7 @@ def _append_call_item(
         "targets": _target_dicts(use),
         "args_digest": digest,
         "idempotent": tool.idempotent,
+        "source": tool.source.value,
     }
     ctx.store.append_items(
         ctx.thread_id, ctx.turn_id, [ItemEntry(kind=ItemKind.TOOL_CALL, payload=payload)]

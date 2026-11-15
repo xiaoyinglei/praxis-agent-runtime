@@ -132,6 +132,13 @@ class CancellationMode(StrEnum):
     NOT_CANCELLABLE = "not_cancellable"
 
 
+class ToolSource(StrEnum):
+    """工具来源分类的唯一事实(§5.10:禁止用 revision/名字字符串前缀反推来源)。"""
+
+    BUILTIN = "builtin"
+    MCP = "mcp"
+
+
 class InterruptBehavior(StrEnum):
     CANCEL = "cancel"
     FINISH_CURRENT = "finish_current"
@@ -428,6 +435,7 @@ class Tool:
     timeout_seconds: float
     max_model_output_bytes: int
     check_permission: CheckPermission | None = None
+    source: ToolSource = ToolSource.BUILTIN
 
     def __post_init__(self) -> None:
         if not isinstance(self.definition, ToolDefinition):
@@ -446,6 +454,8 @@ class Tool:
             raise TypeError("cancellation_mode must be a CancellationMode")
         if not isinstance(self.interrupt_behavior, InterruptBehavior):
             raise TypeError("interrupt_behavior must be an InterruptBehavior")
+        if not isinstance(self.source, ToolSource):
+            raise TypeError("source must be a ToolSource")
         _require_exact_bool(self.idempotent, field_name="idempotent")
         _require_exact_bool(self.concurrency_safe, field_name="concurrency_safe")
         if (
