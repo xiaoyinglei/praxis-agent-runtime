@@ -308,12 +308,17 @@ def _web_url_host(url: str) -> str:
 def _playwright_importable() -> bool:
     """T20 renderer 探针:查 ``playwright.async_api`` 子模块是否存在。
 
-    ``find_spec`` 不执行目标模块(dotted 名会导入父包,但不 import
-    async_api);composition 模块级因此没有 playwright import 链(纯文本安装
-    仍可打开会话)。探针函数本身是 monkeypatch 接缝(测试用它钉住
-    render-capable / 纯文本两种装配结果)。
+    **必须是 total**:dotted ``find_spec`` 会导入父包,playwright 缺失时抛
+    ``ModuleNotFoundError``(父包 spec 异常时还可能 ``ValueError``)——base
+    (text-only)安装每次默认 ``build_session`` 都会调本探针,任何异常都会
+    让会话打不开。异常 ⇒ False(纯文本面,render 如实 render_unavailable)。
+    ``find_spec`` 不执行 async_api 本身;composition 模块级无 playwright
+    import 链。探针是 monkeypatch 接缝(测试钉两种装配结果)。
     """
-    return importlib.util.find_spec("playwright.async_api") is not None
+    try:
+        return importlib.util.find_spec("playwright.async_api") is not None
+    except (ModuleNotFoundError, ValueError):
+        return False
 
 
 def _browser_renderer_factory(

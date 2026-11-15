@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import os
 from pathlib import Path
 
@@ -155,8 +156,10 @@ def test_wired_default_authorize_reads_live_session_policy(workspace: Path) -> N
         )
         authorize = client._authorize  # noqa: SLF001 — 唯一授权闭包的接线点
         url = "https://live.example/path"
-        with pytest.raises(PublicWebError):
+        with pytest.raises(PublicWebError) as denied:
             authorize(url)
+        assert denied.value.code == "denied"
+        assert denied.value.verdict == "ask"  # 默认 ask,而非 fail-closed deny
 
         session.update_permission(
             PermissionUpdate(
@@ -165,5 +168,36 @@ def test_wired_default_authorize_reads_live_session_policy(workspace: Path) -> N
             )
         )
         assert authorize(url) is None
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize("error_type", (ModuleNotFoundError, ValueError))
+def test_playwright_probe_is_total_when_dotted_lookup_raises(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch, error_type: type[Exception]
+) -> None:
+    """回归:base 安装(playwright 缺失)时 dotted find_spec 会抛异常。
+
+    不 monkeypatch ``_playwright_importable`` 本身;而是替换底层
+    ``importlib.util.find_spec``,让**任何 dotted 名**(含
+    ``playwright.async_api``)抛出父包缺失/异常 spec 的真实错误类型。探针
+    必须 total ⇒ False,默认 build_session 必须成功,web_fetch 保持纯文本面
+    (无 EXECUTE_PROCESS)。pyproject `browser` extra 可选;
+    scripts/agent_install_smoke.sh 的 base-install disjoint 断言即此回归面。
+    """
+    real_find_spec = importlib.util.find_spec
+
+    def raising_find_spec(name: str, *args: object, **kwargs: object) -> object:
+        if "." in name:
+            raise error_type(f"stubbed dotted lookup failure: {name}")
+        return real_find_spec(name, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(importlib.util, "find_spec", raising_find_spec)
+    assert composition._playwright_importable() is False
+    session = open_session(workspace, ScriptedAdapter([]))
+    try:
+        assert len(session._tools) == 15  # noqa: SLF001 — base 安装仍可开会话
+        tool = session._tools["web_fetch"]  # noqa: SLF001 — 装配契约
+        assert ToolEffect.EXECUTE_PROCESS not in tool.static_effects
     finally:
         session.close()

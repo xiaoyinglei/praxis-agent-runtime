@@ -643,6 +643,11 @@ def scan_praxis_file(path: Path, praxis_root: Path | None = None) -> list[str]:
 
     # 规则 19-23(阶段3B/Task 20):MCP 名字、S7 argv 重置、B33 宿主 env、
     # 单一定义点与宿主配置文件读取面。纯增:不改上方旧规则。
+    # 规则 21(B33)已知盲区(文档化,非静默,本轮不扩 matcher):
+    # - ``from os import environ`` 后 ``{**environ}``(名字链不是 os.environ);
+    # - ``dict(**os.environ)``(kwargs 展开不是位置参数);
+    # - ``{k: os.environ[k] for k in os.environ}``(对 keys 推导,非 items);
+    # - 跨函数/多重赋值的别名数据流(别名只做单遍近似,见 _environment_aliases)。
     environment_aliases = _environment_aliases(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
