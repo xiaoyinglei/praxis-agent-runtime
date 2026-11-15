@@ -137,7 +137,10 @@ _WEB_FETCH_INPUT_SCHEMA: dict[str, Any] = {
             "minimum": MIN_TIMEOUT_SECONDS,
             "maximum": MAX_TIMEOUT_SECONDS,
             "default": DEFAULT_TIMEOUT_SECONDS,
-            "description": "Per-request fetch timeout in seconds (default 45, hard tool cap 75).",
+            "description": (
+                "Per-request HTTP fetch timeout in seconds (default 45, hard tool cap 75); "
+                "the render path uses the host-configured 30-second render deadline instead."
+            ),
         },
         "start_line": {
             "type": "integer",
@@ -166,6 +169,8 @@ _WEB_FETCH_INPUT_SCHEMA: dict[str, Any] = {
 }
 
 # render_unavailable 的可诊断文案(factory 缺失与 playwright/chromium 缺失同口径)。
+# 与 browser.py 的同名文案有意双份(本模块运行期不得 import browser——可选依赖);
+# 改一处必须同步另一处。
 _RENDER_UNAVAILABLE_MESSAGE = (
     "Browser rendering is unavailable. Install the optional browser support: "
     "uv sync --extra browser; then uv run python -m playwright install chromium."
@@ -417,13 +422,17 @@ def create_web_fetch_tools(
         "renders with a local Playwright-managed Chromium helper (its own sandbox, a fresh "
         "ephemeral context, no user profile); auto renders once only when HTML extraction "
         "yields no text. Rendering spawns a browser process, so it additionally requires the "
-        "command-network permission posture and an available sandbox; it is application-level "
-        "request mediation, not OS network isolation. Every sub-resource URL passes the same "
-        "permission check at request time: ask and deny both abort that sub-resource (counts "
-        "appear as blocked_ask/blocked_deny); nothing is silently passed. Rendering is bounded "
-        "to 64 requests, 8000000 network bytes (8000000 per single response), a 2000000-byte "
-        "DOM and 30 seconds by default; host web.json browser limits may lower or raise the "
-        "request/byte ceilings within their validated ranges. Over-budget renders stop "
+        "command-network permission posture and an available sandbox. It is application-level "
+        "request mediation, not OS network isolation: HTTP(S) requests are brokered through "
+        "the permission check, WebSocket connections are blocked, and WebRTC non-proxied UDP "
+        "and WebTransport are hard-disabled via browser flags. Every HTTP(S) sub-resource URL "
+        "passes the same permission check at request time: ask and deny both abort that "
+        "sub-resource (counts appear as blocked_ask/blocked_deny); nothing is silently passed. "
+        "Rendering is bounded to 64 requests, 8000000 network bytes (8000000 per single "
+        "response, main document included), a 2000000-byte DOM and 30 seconds by default; "
+        "host web.json browser limits may lower or raise the request/byte ceilings within "
+        "their validated ranges. The 30-second render deadline is host-configured; "
+        "timeout_seconds applies only to HTTP text reads. Over-budget renders stop "
         "fetching and return the partial DOM (budget_stopped=true, truncated=true). Rendered "
         "results add metadata: rendered, requests_used, bytes_used, dom_bytes, blocked_ask, "
         "blocked_deny, blocked_other, budget_aborted, budget_stopped, failed_resources, "

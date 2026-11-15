@@ -126,13 +126,19 @@ class FakePage:
 
     async def wait_for_load_state(self, state: str, *, timeout: float) -> None:
         self._harness.wait_states.append((state, timeout))
+        if self._harness.crash_on == "networkidle":
+            raise browser.PlaywrightError("Target crashed")
         if state in self._harness.load_timeouts:
             raise browser.PlaywrightTimeoutError(f"Timeout {state}")
 
     async def wait_for_timeout(self, milliseconds: float) -> None:
         self._harness.settles.append(milliseconds)
+        if self._harness.crash_on == "settle":
+            raise browser.PlaywrightError("Target crashed")
 
     async def content(self) -> str:
+        if self._harness.crash_on == "content":
+            raise browser.PlaywrightError("Target crashed")
         return self._harness.dom
 
 
@@ -168,6 +174,9 @@ class FakeContext:
         return self.page
 
     async def close(self) -> None:
+        # review R1 minor:私有目录必须在浏览器关闭之后才删。
+        env = (self._harness.launch_kwargs or {}).get("env", {})
+        self._harness.dir_alive_at_close = Path(env["HOME"]).exists() if env.get("HOME") else None
         self._harness.closed.append("context")
 
 
@@ -212,6 +221,8 @@ class FakePlaywrightContextManager:
         self._harness = harness
 
     async def start(self) -> FakeDriver:
+        if self._harness.start_error is not None:
+            raise self._harness.start_error
         return FakeDriver(self._harness)
 
 
@@ -227,6 +238,8 @@ class FakeHarness:
         websocket: bool = False,
         load_timeouts: tuple[str, ...] = (),
         launch_error: Exception | None = None,
+        start_error: Exception | None = None,
+        crash_on: str | None = None,
         cdp_pid: int | None = None,
     ) -> None:
         self.dom = dom
@@ -235,6 +248,8 @@ class FakeHarness:
         self.websocket = websocket
         self.load_timeouts = load_timeouts
         self.launch_error = launch_error
+        self.start_error = start_error
+        self.crash_on = crash_on
         self.cdp_pid = cdp_pid
         self.launch_kwargs: dict[str, Any] | None = None
         self.context_kwargs: dict[str, Any] | None = None
@@ -248,6 +263,7 @@ class FakeHarness:
         self.settles: list[float] = []
         self.closed: list[str] = []
         self.cdp_sessions = 0
+        self.dir_alive_at_close: bool | None = None
 
     async def dispatch(self, request: FakeRequest) -> FakeRoute:
         assert self.route_handler is not None, "context.route must be registered before goto"
@@ -577,7 +593,16 @@ def test_browser_env_whitelist_proxy_and_sandbox(monkeypatch: pytest.MonkeyPatch
     assert harness.launch_kwargs["proxy"] == {"server": "http://127.0.0.1:9", "bypass": "<-loopback>"}
     assert harness.launch_kwargs["chromium_sandbox"] is True
     assert harness.launch_kwargs["headless"] is True
+    # 出口硬禁(review R1):WebRTC 非代理 UDP 与 WebTransport 必须出现在启动参数。
+    args = harness.launch_kwargs["args"]
+    assert "--force-webrtc-ip-handling-policy=disable_non_proxied_udp" in args
+    assert "--disable-features=WebTransport" in args
+    # launch 超时预算-aware(legacy remaining_ms(15_000) 同口径)。
+    assert harness.launch_kwargs["timeout"] == 15_000
     assert harness.context_kwargs == {"service_workers": "block", "accept_downloads": False}
+    # 私有目录在关闭时仍存活,render 返回后才删(review R1 minor 顺序钉)。
+    assert harness.dir_alive_at_close is True
+    assert not Path(env["HOME"]).exists()
 
 
 def test_cleanup_killpg_fallback_targets_discovered_group(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -632,6 +657,55 @@ def test_non_2xx_initial_maps_http_error(monkeypatch: pytest.MonkeyPatch) -> Non
         asyncio.run(renderer.render(URL))
     assert caught.value.code == "http_error"
     assert harness.launch_kwargs is None  # 非 2xx 不起浏览器
+
+
+def test_initial_main_document_capped_by_browser_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    # review R1 #2:主文档与子资源同一口径——宿主 max_bytes=32MB 也不得一次读穿
+    # 8MB 单响应帽;9MB 主文档 ⇒ 流式超限(budget-stop 形状),不是 32MB 读取。
+    harness = FakeHarness()
+    renderer, client, _ = make_renderer(
+        harness,
+        monkeypatch,
+        bodies={URL: b"x" * 9_000_000},
+        limits=WebLimits(max_bytes=32_000_000, browser_network_bytes=32_000_000),
+    )
+    with pytest.raises(PublicWebError) as caught:
+        asyncio.run(renderer.render(URL))
+    assert caught.value.code == "max_bytes_exceeded"
+    assert client.calls[0]["max_bytes"] == 8_000_000
+    assert harness.launch_kwargs is None  # 主文档超限不起浏览器
+
+
+def test_initial_3mb_page_succeeds_under_default_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    # review R1 #2:默认传输上限 2MB 不得影子化 browser 预算——3MB wire 主文档
+    # 默认被接受(假 DOM 与 wire body 独立:渲染产物是小 DOM,不触 2MB DOM 帽)。
+    harness = FakeHarness()
+    renderer, client, _ = make_renderer(harness, monkeypatch, bodies={URL: b"x" * 3_000_000})
+    page = asyncio.run(renderer.render(URL))
+    assert client.calls[0]["max_bytes"] == 8_000_000  # min(8MB, 默认 browser 预算 8MB)
+    assert page.bytes_used == 3_000_000 > 2_000_000
+    assert page.text == "rendered marker"
+
+
+def test_driver_start_failure_maps_render_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    # review R1 #3:start 相位 PlaywrightError 不得裸泄。
+    harness = FakeHarness(start_error=browser.PlaywrightError("driver failed to start"))
+    renderer, _, _ = make_renderer(harness, monkeypatch)
+    with pytest.raises(PublicWebError) as caught:
+        asyncio.run(renderer.render(URL))
+    assert caught.value.code == "render_unavailable"
+    assert "playwright install chromium" in str(caught.value)
+
+
+@pytest.mark.parametrize("crash_on", ["networkidle", "settle", "content"])
+def test_midrender_crash_maps_render_failed(monkeypatch: pytest.MonkeyPatch, crash_on: str) -> None:
+    # review R1 #3:渲染中(攻击者可触发)renderer crash ⇒ render_failed,不裸泄。
+    harness = FakeHarness(crash_on=crash_on)
+    renderer, _, _ = make_renderer(harness, monkeypatch)
+    with pytest.raises(PublicWebError) as caught:
+        asyncio.run(renderer.render(URL))
+    assert caught.value.code == "render_failed"
+    assert harness.closed == ["context", "browser", "driver"]
 
 
 # ---------------------------------------------------------------------------
