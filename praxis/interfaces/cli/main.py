@@ -27,6 +27,7 @@ from typer.core import TyperGroup
 from praxis.interfaces.cli.models_cli import app as models_app
 from praxis.interfaces.cli.render import render_item
 from praxis.interfaces.cli.slash import REGISTRY, ExitChat
+from praxis.interfaces.cli.web_cli import app as web_app
 from praxis.interfaces.sdk import (
     ConversationBusy,
     ModelResponse,
@@ -112,11 +113,12 @@ class _UsageExit3Group(TyperGroup):
 app = typer.Typer(
     cls=_UsageExit3Group,
     name="praxis",
-    help="Praxis workspace agent — minimal console (run/chat/resume/status/log/steer/verify/models).",
+    help="Praxis workspace agent — minimal console (run/chat/resume/status/log/steer/verify/models/web).",
     add_completion=False,
     no_args_is_help=True,
 )
 app.add_typer(models_app, name="models")
+app.add_typer(web_app, name="web")
 
 
 # ---------------------------------------------------------------------------

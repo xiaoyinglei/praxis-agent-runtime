@@ -19,10 +19,14 @@
 前缀 ``praxis.web.``。同一 env 名在不同 provider 下互不串用。
 
 **工具面**:``create_web_search_tools(client, config_provider=..., credential_provider=...)``
-——config 每次调用现读(live web.json,不缓存快照)。``resolve_use`` 的 target
-是 provider endpoint 的**原始 URL 串**(decide 的 URL 面,授权按域);
-provider 请求经 ``PublicHttpClient`` 发出,因此 authorize/DNS 固定/重定向纪律
-与 web_fetch 完全一致。错误码收敛为 ``web_search_unconfigured`` 与
+——config 每次调用现读(live web.json,不缓存快照)。``credential_provider``
+接收**同一个 live cfg 对象**(R-T13-1):provider 与 endpoint 因此原子绑定,
+中途改写 web.json 也不会把 A 的 endpoint 请求配上 B 的 endpoint 作用域凭据。
+``resolve_use`` 的 target 是 provider endpoint 的**原始 URL 串**(decide 的 URL
+面,授权按域);provider 请求经 ``PublicHttpClient`` 发出(authorize/DNS 固定
+与 web_fetch 一致),但 ``follow_redirects=False``(legacy ``allow_redirects=False``
+parity,R-T13-3):搜索端点任何 3xx 都是 ``invalid_redirect``。错误码收敛为
+``web_search_unconfigured`` 与
 ``web_search_failed:<class|PublicWebError.code>``:401/403 ⇒ ``unauthorized``、
 429 ⇒ ``rate_limited``、其他非 2xx ⇒ ``http_error``(只带数字状态)、
 畸形响应/凭据回显 ⇒ ``invalid_response``;消息永不回显响应 body 或 key。
@@ -63,11 +67,13 @@ from praxis.protocol.tools import (
 )
 
 __all__ = [
+    "API_KEY_ENV_NAME",
     "DEFAULT_MAX_RESULTS",
     "MAX_MODEL_OUTPUT_BYTES",
     "MAX_RESULTS_LIMIT",
     "MIN_MAX_RESULTS",
     "SEARCH_ENDPOINTS",
+    "SEARCH_PROVIDERS",
     "TOOL_TIMEOUT_SECONDS",
     "WEB_SEARCH_TOOL_NAME",
     "SearchProvider",
@@ -81,6 +87,10 @@ __all__ = [
 WEB_SEARCH_TOOL_NAME = "web_search"
 
 SearchProvider = Literal["deepseek", "brave", "tavily"]
+
+# provider 名集合与环境变量名的唯一事实(web_cli 经 sdk re-export 消费)。
+SEARCH_PROVIDERS: tuple[SearchProvider, ...] = ("deepseek", "brave", "tavily")
+API_KEY_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 # provider API base URL(legacy web.py 逐字;同时是凭据 identity 的 endpoint)。
 SEARCH_ENDPOINTS: dict[SearchProvider, str] = {
@@ -96,7 +106,6 @@ TOOL_TIMEOUT_SECONDS = 45.0
 MAX_MODEL_OUTPUT_BYTES = 65_536
 
 _WEB_JSON_MAX_BYTES = 16_384
-_API_KEY_ENV = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _PROVIDER_ENV = "PRAXIS_WEB_SEARCH_PROVIDER"
 _CONFIG_KEYS = frozenset({"version", "provider", "api_key_env", "limits"})
 _MAX_ERROR_CHARACTERS = 1_000
@@ -123,7 +132,7 @@ class SearchProviderConfig:
     def __post_init__(self) -> None:
         if self.provider not in SEARCH_ENDPOINTS:
             raise ValueError("web search provider must be deepseek, brave or tavily")
-        if _API_KEY_ENV.fullmatch(self.api_key_env) is None:
+        if API_KEY_ENV_NAME.fullmatch(self.api_key_env) is None:
             raise ValueError("web search api_key_env must be an environment variable name")
 
 
@@ -135,7 +144,9 @@ class WebSearchError(Exception):
         super().__init__(message)
 
 
-def load_web_search_config(path: Path | None = None) -> SearchProviderConfig | None:
+def load_web_search_config(
+    path: Path | None = None, *, environ: Mapping[str, str] | None = None
+) -> SearchProviderConfig | None:
     """加载搜索 provider 配置:显式 path > ``host_config_dir()/web.json``。
 
     文件缺失 ⇒ None;malformed(坏 JSON/未知键/坏 provider/非法 env 名)⇒
@@ -166,18 +177,19 @@ def load_web_search_config(path: Path | None = None) -> SearchProviderConfig | N
             f"web search configuration has unknown keys {sorted(unknown)}: {source}"
         )
 
-    env_provider = os.environ.get(_PROVIDER_ENV) or None
+    environment = os.environ if environ is None else environ
+    env_provider = environment.get(_PROVIDER_ENV) or None
     provider: object = env_provider if env_provider is not None else data.get("provider")
     api_key_env: object = data.get("api_key_env")
     if provider is None and api_key_env is None:
         # 仅含 "limits" 块的共享 web.json:合法,但不是搜索配置。
         return None
     where = f"{source} ({_PROVIDER_ENV})" if env_provider is not None else str(source)
-    if not isinstance(provider, str) or provider not in SEARCH_ENDPOINTS:
+    if not isinstance(provider, str) or provider not in SEARCH_PROVIDERS:
         raise ValueError(
             f"web search provider must be deepseek, brave or tavily in {where}"
         )
-    if not isinstance(api_key_env, str) or _API_KEY_ENV.fullmatch(api_key_env) is None:
+    if not isinstance(api_key_env, str) or API_KEY_ENV_NAME.fullmatch(api_key_env) is None:
         raise ValueError(
             f"web search api_key_env must be an environment variable name in {where}"
         )
@@ -283,6 +295,7 @@ async def run_web_search(
                     "Accept": "application/json",
                 },
                 json_body={"query": query, "count": max_results, "need_content": False},
+                follow_redirects=False,
             )
         elif cfg.provider == "tavily":
             response = await client.fetch(
@@ -301,6 +314,7 @@ async def run_web_search(
                     "include_raw_content": False,
                     "include_images": False,
                 },
+                follow_redirects=False,
             )
         else:
             url = str(
@@ -314,6 +328,7 @@ async def run_web_search(
                     "X-Subscription-Token": key,
                     "Accept": "application/json",
                 },
+                follow_redirects=False,
             )
     except PublicWebError as error:
         raise WebSearchError(
@@ -415,13 +430,14 @@ def create_web_search_tools(
     client: PublicHttpClient,
     *,
     config_provider: Callable[[], SearchProviderConfig | None],
-    credential_provider: Callable[[str], str | None],
+    credential_provider: Callable[[SearchProviderConfig], str | None],
 ) -> tuple[Tool, ...]:
     """造 ``web_search`` Tool(当前恰一个;tuple 形状与 web_fetch 一致)。
 
     ``config_provider`` 每次调用现读(live web.json);``credential_provider``
-    接收 ``api_key_env`` 并返回凭据值(composition 绑到
-    ``resolve_web_search_credential(env, SEARCH_ENDPOINTS[provider])``)。
+    接收**同一个 live cfg**并返回凭据值(composition 绑到
+    ``lambda cfg: resolve_web_search_credential(cfg.api_key_env,
+    SEARCH_ENDPOINTS[cfg.provider])``),provider 与 endpoint 原子绑定(R-T13-1)。
     """
 
     def _config() -> SearchProviderConfig | None:
@@ -448,7 +464,7 @@ def create_web_search_tools(
         if cfg is None:
             return _error_result("web_search_unconfigured", _UNCONFIGURED_MESSAGE)
         try:
-            key = credential_provider(cfg.api_key_env)
+            key = credential_provider(cfg)
         except ValueError as error:
             return _error_result(
                 "web_search_unconfigured",

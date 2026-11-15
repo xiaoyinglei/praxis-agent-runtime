@@ -713,6 +713,30 @@ def test_redirect_relative_location_joined() -> None:
     assert calls == ["https://a.example/first", "https://a.example/next?q=1"]
 
 
+def test_follow_redirects_false_rejects_first_hop_default_unchanged() -> None:
+    """R-T13-3:显式 False ⇒ 首个 3xx invalid_redirect(不消费跳数);默认仍跟随。"""
+    hop = FakeStream(response_chunks("302 Found", headers=[("Location", "https://b.example/")]))
+    backend = FakeBackend([hop, FakeStream(response_chunks(body=b"never"))])
+    client, calls = make_client(resolver=FakeResolver([PUBLIC_IP]), backend=backend)
+    with pytest.raises(PublicWebError) as excinfo:
+        asyncio.run(client.fetch("https://a.example/", follow_redirects=False))
+    assert excinfo.value.code == "invalid_redirect"
+    assert calls == ["https://a.example/"]  # Location 从未被授权/解析
+    assert len(backend.connects) == 1
+
+    follow_hop = FakeStream(
+        response_chunks("302 Found", headers=[("Location", "https://b.example/")])
+    )
+    follow_backend = FakeBackend([follow_hop, FakeStream(response_chunks(body=b"final"))])
+    follow_client, follow_calls = make_client(
+        resolver=FakeResolver([PUBLIC_IP]), backend=follow_backend
+    )
+    result = asyncio.run(follow_client.fetch("https://a.example/"))
+    assert result.body == b"final"
+    assert follow_calls == ["https://a.example/", "https://b.example/"]
+    assert len(follow_backend.connects) == 2
+
+
 def test_redirect_location_4097_rejected() -> None:
     # ⑥ Location 4097 字符拒绝(4096 上限)。
     long_location = "https://b.example/" + "a" * (4097 - len("https://b.example/"))

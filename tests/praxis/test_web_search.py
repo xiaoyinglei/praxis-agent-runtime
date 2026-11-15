@@ -50,6 +50,7 @@ from praxis.adapters.web.search import (
 from praxis.composition import make_web_authorizer
 from praxis.core.events import EventBus
 from praxis.core.pipeline import ExecCtx, execute
+from praxis.interfaces.cli import app as cli_app
 from praxis.interfaces.cli import web_cli
 from praxis.protocol.items import ItemKind
 from praxis.protocol.permission import PermissionContext
@@ -135,6 +136,7 @@ def make_tool(
     authorize: object = None,
     resolver: FakeResolver | None = None,
     config_provider: object = None,
+    credential_provider: object = None,
 ) -> tuple[Tool, FakeBackend, FakeResolver]:
     backend = FakeBackend(streams)
     resolver = resolver if resolver is not None else FakeResolver([PUBLIC_IP])
@@ -142,7 +144,7 @@ def make_tool(
     (tool,) = create_web_search_tools(
         client,
         config_provider=config_provider if config_provider is not None else (lambda: config),  # type: ignore[arg-type]
-        credential_provider=lambda _env: key,
+        credential_provider=credential_provider if credential_provider is not None else (lambda _cfg: key),  # type: ignore[arg-type]
     )
     return tool, backend, resolver
 
@@ -267,6 +269,36 @@ def test_config_is_live_not_snapshotted(tmp_path: Path) -> None:
     assert len(resolver.calls) == 2
 
 
+def test_credential_binding_is_atomic_with_live_config(tmp_path: Path) -> None:
+    """R-T13-1:credential_provider 收到同一个 live cfg ⇒ 中途改写 web.json 也无串用。"""
+    path = tmp_path / "web.json"
+    write_config(path, provider="brave", api_key_env="BRAVE_SEARCH_KEY")
+    seen: list[tuple[str, str]] = []
+
+    def credential_provider(config: SearchProviderConfig) -> str:
+        seen.append((config.provider, config.api_key_env))
+        # 在凭据解析中途把 web.json 翻成另一个 provider:本次调用必须仍用旧快照。
+        write_config(path, provider="deepseek", api_key_env="DEEPSEEK_SEARCH_KEY")
+        return f"key-{config.provider}"
+
+    tool, backend, _ = make_tool(
+        [json_stream(_PAYLOADS["brave"]), json_stream(_PAYLOADS["deepseek"])],
+        config_provider=lambda: load_web_search_config(path),
+        credential_provider=credential_provider,
+    )
+    first = run_tool(tool)
+    assert first.metadata["provider"] == "brave"
+    assert request_parts(backend.issued[0])[2]["x-subscription-token"] == "key-brave"
+
+    second = run_tool(tool)
+    assert second.metadata["provider"] == "deepseek"
+    assert request_parts(backend.issued[1])[2]["authorization"] == "Bearer key-deepseek"
+    assert seen == [
+        ("brave", "BRAVE_SEARCH_KEY"),
+        ("deepseek", "DEEPSEEK_SEARCH_KEY"),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # ACI:schema / 效果 / target / 取消声明
 # ---------------------------------------------------------------------------
@@ -357,7 +389,7 @@ def test_cancellation_propagates_from_await_point() -> None:
     (tool,) = create_web_search_tools(
         SlowClient(),  # type: ignore[arg-type]
         config_provider=lambda: DEEPSEEK,
-        credential_provider=lambda _env: KEY,
+        credential_provider=lambda _cfg: KEY,
     )
 
     async def scenario() -> None:
@@ -368,6 +400,43 @@ def test_cancellation_propagates_from_await_point() -> None:
             await task
 
     asyncio.run(scenario())
+
+
+class BlockingReadStream(FakeStream):
+    """响应头之后的 read 永久挂起,用于真实 client 取消/关闭验证。"""
+
+    def __init__(self, started: asyncio.Event) -> None:
+        super().__init__()
+        self.started = started
+
+    async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        self.reads += 1
+        self.started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+def test_real_client_cancellation_closes_response_stream() -> None:
+    """R-T13-M7:CANCEL 声明由真实 client.fetch 取消 + socket 关闭钉住。"""
+    started = asyncio.Event()
+    stream = BlockingReadStream(started)
+    backend = FakeBackend([stream])
+    client, _ = make_client(resolver=FakeResolver([PUBLIC_IP]), backend=backend)
+    (tool,) = create_web_search_tools(
+        client,
+        config_provider=lambda: DEEPSEEK,
+        credential_provider=lambda _cfg: KEY,
+    )
+
+    async def scenario() -> None:
+        task = asyncio.create_task(tool.run({"query": QUERY}, ToolExecContext()))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert stream.closed is True
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +505,24 @@ def test_brave_request_shape_and_normalization() -> None:
     assert headers["x-subscription-token"] == KEY
     assert headers["accept"] == "application/json"
     assert body == b""
+
+
+@pytest.mark.parametrize(
+    "config", [DEEPSEEK, BRAVE, TAVILY], ids=["deepseek", "brave", "tavily"]
+)
+def test_search_rejects_redirects_without_second_hop(config: SearchProviderConfig) -> None:
+    stream = FakeStream(
+        response_chunks(
+            "302 Found",
+            headers=[("Location", "https://evil.example/next")],
+            body=b"",
+        )
+    )
+    tool, backend, resolver = make_tool([stream], config=config)
+    result = run_tool(tool)
+    assert result.error_code == "web_search_failed:invalid_redirect"
+    assert len(backend.connects) == 1
+    assert len(resolver.calls) == 1
 
 
 def test_max_results_caps_and_reports_truncated() -> None:
@@ -714,6 +801,12 @@ def test_web_keychain_uses_praxis_web_service_and_stdin(
     assert "praxis.model." not in command
     assert KEY not in argv
 
+    read_argv, _read_kwargs = calls[1]
+    assert read_argv[:2] == ["/usr/bin/security", "find-generic-password"]
+    service = read_argv[read_argv.index("-s") + 1]
+    assert service.startswith("praxis.web.")
+    assert KEY not in read_argv
+
 
 # ---------------------------------------------------------------------------
 # CLI:praxis web login / status(不写 web.json,不打印 key)
@@ -782,10 +875,54 @@ def test_cli_login_validates_provider_and_key_env(tmp_path: Path) -> None:
     write_host_config(provider="brave")
     mismatch = _runner().invoke(web_cli.app, ["login", "deepseek"], input=f"{KEY}\n")
     assert mismatch.exit_code == 1
-    assert "selects provider 'brave'" in mismatch.output
+    assert "provider is 'brave'" in mismatch.output
+    assert "web login brave" in mismatch.output
 
     bad_env = _runner().invoke(
         web_cli.app, ["login", "deepseek", "--key-env", "1BAD"], input=f"{KEY}\n"
     )
     assert bad_env.exit_code != 0
     assert "environment variable name" in bad_env.output
+
+# ---------------------------------------------------------------------------
+# main.py 挂载与 env 覆盖归因(R-T13-2 / M5 / M6)
+# ---------------------------------------------------------------------------
+
+
+def test_main_app_mounts_praxis_web() -> None:
+    help_result = _runner().invoke(cli_app, ["web", "login", "--help"])
+    assert help_result.exit_code == 0, help_result.output
+    assert "--key-env" in help_result.output
+
+    status_result = _runner().invoke(cli_app, ["web", "status"])
+    assert status_result.exit_code == 0, status_result.output
+    assert "not configured" in status_result.output
+
+
+def test_cli_login_env_override_names_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_host_config(provider="deepseek", api_key_env="DEEPSEEK_SEARCH_KEY")
+    monkeypatch.setenv("PRAXIS_WEB_SEARCH_PROVIDER", "brave")
+
+    # 文件 provider(deepseek)仍可显式登录;提示运行时 provider 来自 env。
+    allowed = _runner().invoke(web_cli.app, ["login", "deepseek"], input=f"{KEY}\n")
+    assert allowed.exit_code == 0, allowed.output
+    assert "runtime provider is brave from PRAXIS_WEB_SEARCH_PROVIDER" in allowed.output
+
+    # 与文件/生效 provider 都不同 ⇒ 失败文案归因 env,而不是 "web.json selects"。
+    blocked = _runner().invoke(web_cli.app, ["login", "tavily"], input=f"{KEY}\n")
+    assert blocked.exit_code == 1
+    assert "PRAXIS_WEB_SEARCH_PROVIDER=brave" in blocked.output
+    assert "web.json selects" not in blocked.output
+
+
+def test_cli_status_rewrites_model_credential_wording(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_host_config()
+    monkeypatch.setattr(credentials, "_PLATFORM", "win32")
+    result = _runner().invoke(web_cli.app, ["status"])
+    assert result.exit_code == 1
+    assert "web search credentials require macOS or POSIX" in result.output
+    assert "model credential" not in result.output.lower()

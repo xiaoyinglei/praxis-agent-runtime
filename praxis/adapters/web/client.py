@@ -455,8 +455,13 @@ class PublicHttpClient:
         json_body: Mapping[str, Any] | None = None,
         max_bytes: int | None = None,
         timeout_seconds: float | None = None,
+        follow_redirects: bool = True,
     ) -> WebFetchResponse:
         """有界抓取;max_bytes/timeout_seconds 是可信调用方的逐请求覆盖(默认取 limits)。
+
+        ``follow_redirects=False``(R-T13-3,legacy ``allow_redirects=False`` parity):
+        首个 3xx 直接 ``invalid_redirect``,不消费跳数、不发第二跳。搜索 provider
+        端点按 legacy 语义禁止重定向;web_fetch 默认仍跟随并逐跳授权。
 
         **调用方不变量(composition/T20)**:client 与本客户端配套的工具工厂必须用
         **同一份** ``WebLimits`` 构造(逐请求上限只有一个事实来源)。逐请求覆盖只
@@ -483,7 +488,9 @@ class PublicHttpClient:
         request_headers["Accept-Encoding"] = "gzip, identity"
         try:
             async with asyncio.timeout(timeout):
-                return await self._fetch_loop(url, method, request_headers, content, limit, timeout)
+                return await self._fetch_loop(
+                    url, method, request_headers, content, limit, timeout, follow_redirects
+                )
         except _AuthorizeAbortError as abort:
             raise abort.original from None
         except PublicWebError:
@@ -513,6 +520,7 @@ class PublicHttpClient:
         content: bytes | None,
         limit: int,
         timeout: float,
+        follow_redirects: bool,
     ) -> WebFetchResponse:
         target = url
         wire_bytes = 0
@@ -542,6 +550,10 @@ class PublicHttpClient:
             response = await transport.handle_async_request(request)
             try:
                 if 300 <= response.status_code < 400:
+                    if not follow_redirects:
+                        raise PublicWebError(
+                            "invalid_redirect", "Redirects are not allowed for this request."
+                        )
                     if method != "GET":
                         raise PublicWebError(
                             "invalid_redirect", "Redirects are not allowed for this request."

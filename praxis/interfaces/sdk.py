@@ -54,7 +54,9 @@ from praxis.adapters.models.probe import ProbeOutcome, probe_model
 from praxis.adapters.models.scripted import ScriptedAdapter
 from praxis.adapters.web.limits import web_configuration_path
 from praxis.adapters.web.search import (
+    API_KEY_ENV_NAME,
     SEARCH_ENDPOINTS,
+    SEARCH_PROVIDERS,
     SearchProvider,
     SearchProviderConfig,
     load_web_search_config,
@@ -115,9 +117,11 @@ __all__ = [
     "PermissionPolicy",
     "PermissionUpdate",
     "PlanSnapshot",
+    "API_KEY_ENV_NAME",
     "ProbeOutcome",
     "ResumeNotConfirmed",
     "SEARCH_ENDPOINTS",
+    "SEARCH_PROVIDERS",
     "ScriptedAdapter",
     "SearchProvider",
     "SearchProviderConfig",
