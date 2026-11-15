@@ -62,7 +62,7 @@ from praxis.protocol.models import (
     WireRequest,
 )
 from praxis.protocol.permission import PermissionContext, PermissionMode
-from praxis.protocol.policy import PermissionPolicy
+from praxis.protocol.policy import PermissionPolicy, url_host
 from praxis.protocol.retry import RetryPolicy
 from praxis.protocol.skills import SkillCatalog
 from praxis.protocol.tools import Tool
@@ -279,11 +279,8 @@ def make_web_authorizer(
 
 
 def _web_url_host(url: str) -> str:
-    """仅用于拒绝对话文案的主机名(不参与规则匹配——那是 network_decision 的事)。"""
-    try:
-        return (urlsplit(url).hostname or "").lower().rstrip(".") or url
-    except ValueError:
-        return url
+    """仅用于拒绝对话文案的主机名(R-T11-4 唯一归一化;不参与规则匹配)。"""
+    return url_host(url) or url
 
 
 async def _spawn_host_hook(

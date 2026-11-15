@@ -51,7 +51,7 @@ from uuid import uuid4
 from praxis.core.compaction import SUMMARY_MAX_OUTPUT_TOKENS, SUMMARY_PROMPT_MAX_CHARS
 from praxis.core.events import EventBus, Subscription
 from praxis.core.locks import ThreadBusy, thread_execution_lock
-from praxis.core.permission import apply_update, extend_policy
+from praxis.core.permission import apply_update, command_network_verdict, extend_policy
 from praxis.core.pipeline import SandboxCompiler, SandboxFinalizer
 from praxis.core.recovery import classify_pending
 from praxis.core.statemachine import TurnStatus, transition
@@ -72,7 +72,7 @@ from praxis.protocol.permission import (
     PermissionNotice,
     PermissionUpdate,
 )
-from praxis.protocol.policy import NetworkRule, command_network_decision, resolve_policy
+from praxis.protocol.policy import NetworkRule
 from praxis.protocol.retry import RetryingStream
 from praxis.protocol.skills import SkillCatalog
 from praxis.protocol.tools import ResultStatus, Tool
@@ -98,6 +98,8 @@ _D9_NOTICE_TEXT = (
     "granting this network rule makes bash command network fail-closed (D9); "
     "approvals for bash will be required as whole-tool asks"
 )
+# R-T11-2:once 授权只在当前执行批生效(批末由 _execute 清除),披露必须如实标范围。
+_D9_ONCE_SUFFIX = " — this effect lasts only for the current execution batch (once grant)."
 
 
 class ConversationBusy(RuntimeError):  # noqa: N818 — 设计 §5.8/plan 钉死的名字
@@ -399,18 +401,23 @@ class Session:
         session→always),原子写 ``.praxis/permissions.json``——该文件即策略
         声明,composition 下次打开时按"显式参数 > 文件 > 默认"加载。
 
-        D9 披露(阶段 2 留档②):NetworkRule 以 session/always 落地后,若 live
-        策略的 ``command_network_decision`` 为 deny(存在任何域过滤即 fail
-        closed),返回 ``PermissionNotice`` 如实告知 bash 后续将走整工具 ask。
-        其余路径返回 None——零行为变化。
+        D9 披露(阶段 2 留档② + R-T11-2):NetworkRule 以 session/always 落地后,
+        若 live 的 ``command_network_verdict`` 为 deny(任何来源存在域过滤即
+        fail closed),返回 ``PermissionNotice``;once 授权同理,但仅当它**首次**
+        把命令网络从非 deny 翻成 deny(已 deny 时无行为变化、不重复告警),且
+        文案带"仅当前执行批"的范围后缀。其余路径返回 None——零行为变化。
         """
+        once_flips_deny = False
+        if isinstance(update.rule, NetworkRule) and update.destination == "once":
+            once_flips_deny = command_network_verdict(self._permissions) != "deny"
         self._permissions = apply_update(self._permissions, update)
         if update.destination == "always":
             self._persist_policy()
-        if isinstance(update.rule, NetworkRule) and update.destination in ("session", "always"):
-            live = resolve_policy(self._permissions.policy, Path(self._permissions.workspace))
-            if command_network_decision(live) == "deny":
+        if isinstance(update.rule, NetworkRule) and command_network_verdict(self._permissions) == "deny":
+            if update.destination in ("session", "always"):
                 return PermissionNotice(kind=_D9_NOTICE_KIND, text=_D9_NOTICE_TEXT)
+            if update.destination == "once" and once_flips_deny:
+                return PermissionNotice(kind=_D9_NOTICE_KIND, text=_D9_NOTICE_TEXT + _D9_ONCE_SUFFIX)
         return None
 
     def _persist_policy(self) -> None:
@@ -486,7 +493,8 @@ class Session:
         reconcile: Mapping[str, Literal["ok", "failed"]] | None = None,
         permission_updates: Sequence[PermissionUpdate] = (),
     ) -> TurnResult:
-        """续跑 interrupted/paused turn——每一步都以 item 为事实,决策全部显式落库。
+        """续跑 interrupted/paused turn——审批决策以 item 为事实显式落库,
+        授权建议经 ``permission_updates`` update 通道落地(两者不混写)。
 
         ``permission_updates`` 是审批流里人类**显式选择**的建议落地(例如 URL
         ask 的域级 NetworkRule):先纯代数预验(零写入),再逐条经

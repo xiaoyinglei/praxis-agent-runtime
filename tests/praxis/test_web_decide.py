@@ -70,6 +70,7 @@ D9_TEXT = (
     "granting this network rule makes bash command network fail-closed (D9); "
     "approvals for bash will be required as whole-tool asks"
 )
+D9_ONCE_TEXT = D9_TEXT + " — this effect lasts only for the current execution batch (once grant)."
 NETWORK_EFFECTS = frozenset({ToolEffect.NETWORK})
 EXEC_EFFECTS = frozenset({ToolEffect.EXECUTE_PROCESS})
 
@@ -140,6 +141,13 @@ def exec_use() -> ResolvedUse:
     return ResolvedUse(effects=EXEC_EFFECTS, targets=())
 
 
+def hybrid_use(url: str = URL) -> ResolvedUse:
+    return ResolvedUse(
+        effects=NETWORK_EFFECTS | EXEC_EFFECTS,
+        targets=(ToolTarget(kind="url", value=url),),
+    )
+
+
 def resp(content: str, calls: tuple[tuple[str, str, dict[str, Any]], ...] = ()) -> ModelResponse:
     return ModelResponse(
         content=content,
@@ -202,16 +210,49 @@ def test_url_decision_matrix_across_modes(ws: Path, mode: str, verdict: str) -> 
         assert decision.reason == f"rule: network denied: {URL}"
 
 
-def test_network_ask_precedes_sandbox_available(ws: Path) -> None:
-    """沙箱可用也不能越过 URL ask(第 2 步先于第 7 步;web 只声明 NETWORK)。"""
+def test_network_ask_precedes_sandbox_auto_for_hybrid_tool(ws: Path) -> None:
+    """R-T11-3:混合工具(NETWORK + EXECUTE_PROCESS)+ 沙箱可用。
+
+    NETWORK-only 时第 7 步无论顺序都返回 None(空转);混合工具使 sandbox_auto
+    真正可返回 allow,才钉住"第 2 步 URL ask 先于第 7 步沙箱放行"。
+    """
+    hybrid = make_tool(
+        TOOL_NAME,
+        NETWORK_EFFECTS | EXEC_EFFECTS,
+        (ToolTarget(kind="url", value=URL),),
+    )
     ctx = make_ctx(
         ws,
         policy=_policy_for_verdict("ask"),
         sandbox=SandboxAvailability(backend="seatbelt", available=True),
     )
-    decision = decide(url_tool(), url_use(), ctx)
+    decision = decide(hybrid, hybrid_use(), ctx)
     assert decision.is_ask
     assert decision.reason == f"rule: network requires approval: {URL}"
+    # 绝不能是沙箱/执行放行
+    assert not decision.is_allow
+
+
+def test_hybrid_tool_sandbox_leg_is_live_without_network_ask(ws: Path) -> None:
+    """对照腿:同一混合工具 + 命令网络 allow 时第 7 步真的会 allow。
+
+    (URL ask 与 command_network allow 在同一 ctx 不可能共存:命令网络按来源
+    取最严,任何产生 URL ask 的域过滤来源都会让命令网络 deny——所以用这条
+    对照腿证明 sandbox_auto 对混合工具不是空转。)
+    """
+    hybrid = make_tool(
+        TOOL_NAME,
+        NETWORK_EFFECTS | EXEC_EFFECTS,
+        (ToolTarget(kind="url", value=URL),),
+    )
+    ctx = make_ctx(
+        ws,
+        policy=PermissionPolicy(network=NetworkPolicy(decision="allow")),
+        sandbox=SandboxAvailability(backend="seatbelt", available=True),
+    )
+    decision = decide(hybrid, hybrid_use(), ctx)
+    assert decision.is_allow
+    assert decision.reason == "sandbox"
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +340,28 @@ def test_network_verdict_folds_all_sources_most_restrictive(ws: Path) -> None:
     assert network_verdict(ctx, URL) == "deny"
 
 
+@pytest.mark.parametrize(
+    ("url", "host"),
+    [
+        ("https://a.b.c/d", "a.b.c"),
+        ("https://A.B.C:443/d", "a.b.c"),
+        ("https://a.b.c./d", "a.b.c"),
+        ("http://evil.com@actual.example/", "actual.example"),
+        ("https://port-bearing.example:443/x", "port-bearing.example"),
+    ],
+)
+def test_suggested_domain_rule_roundtrips_to_allow(ws: Path, url: str, host: str) -> None:
+    """R-T11-4 往返钉:建议规则经同一 url_host 归一化后必须放行同一个 URL。"""
+    decision = decide(url_tool(url=url), url_use(url), make_ctx(ws))
+    rule = decision.suggestions[0].rule
+    assert isinstance(rule, NetworkRule)
+    assert rule.domain == host
+    allowed = make_ctx(
+        ws, policy=PermissionPolicy(network=NetworkPolicy(rules=(rule,)))
+    )
+    assert network_verdict(allowed, url) == "allow"
+
+
 # ---------------------------------------------------------------------------
 # ③ update_permission → D9 PermissionNotice(仅 NetworkRule + session/always)
 # ---------------------------------------------------------------------------
@@ -322,7 +385,12 @@ def test_update_permission_network_grant_returns_notice_and_takes_effect(
         session.close()
 
 
-def test_update_permission_once_network_returns_none(ws: Path) -> None:
+def test_update_permission_once_network_returns_once_scoped_notice(ws: Path) -> None:
+    """R-T11-2:once NetworkRule 同样让命令网络 fail-closed(整批),必须披露。
+
+    once 规则只进 once_rules、不折进 policy——URL 裁决仍被 policy 的 ask 压住
+    (不放大);但命令网络按来源取最严,once 层的域过滤足以 deny bash。
+    """
     session = open_session(ws, ScriptedAdapter([]))
     try:
         notice = session.update_permission(
@@ -330,8 +398,61 @@ def test_update_permission_once_network_returns_none(ws: Path) -> None:
                 rule=NetworkRule(domain=HOST, decision="allow"), destination="once"
             )
         )
-        assert notice is None
+        assert notice == PermissionNotice(kind="command_network_blocked", text=D9_ONCE_TEXT)
         assert network_verdict(session.permissions, URL) == "ask"  # once 不折进 policy
+    finally:
+        session.close()
+
+
+def test_once_notice_cleared_after_batch_then_non_network_update_returns_none(ws: Path) -> None:
+    """批末 once_rules 清除后,命令网络恢复;非 NetworkRule 更新返回 None。"""
+    session = open_session(ws, ScriptedAdapter([resp("done")]))
+    try:
+        assert session.update_permission(
+            PermissionUpdate(
+                rule=NetworkRule(domain=HOST, decision="allow"), destination="once"
+            )
+        ) is not None
+        assert asyncio.run(session.submit("go")).status is TurnStatus.COMPLETED
+        assert session.permissions.once_rules == ()  # _execute finally 已清除
+        assert (
+            session.update_permission(
+                PermissionUpdate(
+                    rule=ToolRule(pattern=TOOL_NAME, decision="allow"), destination="session"
+                )
+            )
+            is None
+        )
+    finally:
+        session.close()
+
+
+def test_resume_once_network_update_surfaces_once_notice(ws: Path) -> None:
+    """R-T11-2:同一披露通道覆盖 resume(permission_updates=...) 的 once 授权。"""
+    tool = url_tool()
+    session = open_session(
+        ws,
+        ScriptedAdapter([resp("", (("c1", TOOL_NAME, {}),)), resp("done")]),
+        tools=(tool,),
+    )
+    try:
+        paused = asyncio.run(session.submit("fetch it"))
+        assert paused.status is TurnStatus.PAUSED
+        once_update = PermissionUpdate(
+            rule=NetworkRule(domain=HOST, decision="allow"), destination="once"
+        )
+        resumed = asyncio.run(
+            session.resume(
+                paused.turn_id,
+                approval={"c1": "allow"},
+                permission_updates=(once_update,),
+            )
+        )
+        assert resumed.status is TurnStatus.COMPLETED
+        assert resumed.notices == (
+            PermissionNotice(kind="command_network_blocked", text=D9_ONCE_TEXT),
+        )
+        assert session.permissions.once_rules == ()  # 批末清除(披露已如实标范围)
     finally:
         session.close()
 

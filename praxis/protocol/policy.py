@@ -253,14 +253,29 @@ def tool_decision(policy: ResolvedPolicy, name: str) -> PolicyVerdict | None:
     return max(decisions, key=_DECISION_ORDER.__getitem__) if decisions else None
 
 
+def url_host(url: str) -> str | None:
+    """URL 的主机归一化(``urlsplit.hostname`` 小写、去尾点);非法/空 ⇒ None。
+
+    规则匹配与建议构造的**唯一**主机归一化(R-T11-4):``network_decision``
+    内部、URL ask 的域级建议、web authorizer 的拒绝文案全部消费本函数。
+    不做 scheme/端口校验——那是 ``network_decision`` / ``validate_public_url``
+    的职责;本函数只回答"这个 URL 指向哪个主机"。
+    """
+    try:
+        host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return None
+    return host or None
+
+
 def network_decision(policy: ResolvedPolicy, url: str) -> PolicyVerdict:
     """http(s) 主机匹配:rules 取最严(base deny 不被覆盖),denied 压一切,白名单外一律 deny。"""
     try:
-        parsed = urlsplit(url)
-        host = (parsed.hostname or "").lower().rstrip(".")
+        scheme = urlsplit(url).scheme
     except ValueError:
         return "deny"
-    if parsed.scheme not in {"http", "https"} or not host:
+    host = url_host(url)
+    if scheme not in {"http", "https"} or host is None:
         return "deny"
     decision = policy.network.decision
     matching = [rule.decision for rule in policy.network.rules if _domain_matches(host, rule.domain)]

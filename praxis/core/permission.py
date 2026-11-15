@@ -29,7 +29,6 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import replace
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from praxis.protocol.floor import floor_reason, host_private_paths
 from praxis.protocol.permission import (
@@ -53,6 +52,7 @@ from praxis.protocol.policy import (
     path_reason,
     resolve_policy,
     tool_decision,
+    url_host,
 )
 from praxis.protocol.tools import ResolvedUse, Tool, ToolEffect
 
@@ -139,7 +139,12 @@ def network_verdict(ctx: PermissionContext, url: str) -> PolicyVerdict:
     return _most_restrictive(network_decision(source, url) for source in _all_sources(ctx)) or "deny"
 
 
-def _command_network_verdict(ctx: PermissionContext) -> PolicyVerdict:
+def command_network_verdict(ctx: PermissionContext) -> PolicyVerdict:
+    """EXECUTE_PROCESS 的命令网络最终裁决(公开唯一 fold;D9 披露与 decide 共用)。
+
+    全部来源逐一 ``command_network_decision`` 后取最严:任何来源存在域名过滤
+    (allowed/denied/rules)即 deny——bash 无法逐域强制,只能整工具 fail-closed。
+    """
     return _most_restrictive(command_network_decision(source) for source in _all_sources(ctx)) or "deny"
 
 
@@ -183,15 +188,13 @@ def _tool_ask(
 def _host_suggestions(url: str) -> tuple[PermissionUpdate, ...]:
     """URL ask 的域级建议(阶段 2 留档①):只授权**这一个主机**,比整工具窄。
 
-    主机归一化与 ``network_decision`` 完全同源(urlsplit.hostname 小写去尾点),
-    不发明第二套归一化。NetworkRule 只接受主机名(IPv6 字面量/非 ASCII 无法
-    表达)⇒ 该 URL 只保留工具级建议,绝不因建议构造失败而把 ask 变成 deny。
+    主机归一化与 ``network_decision`` 完全同源(``protocol.policy.url_host``;
+    R-T11-4 唯一归一化),不发明第二套。NetworkRule 只接受主机名(IPv6 字面量/
+    非 ASCII 无法表达)⇒ 该 URL 只保留工具级建议,绝不因建议构造失败而把 ask
+    变成 deny。
     """
-    try:
-        host = (urlsplit(url).hostname or "").lower().rstrip(".")
-    except ValueError:
-        return ()
-    if not host:
+    host = url_host(url)
+    if host is None:
         return ()
     try:
         rule = NetworkRule(domain=host, decision="allow")
@@ -223,7 +226,7 @@ def deny_rules(tool: Tool, use: ResolvedUse, ctx: PermissionContext) -> Decision
     for url in _url_targets(use):
         if network_verdict(ctx, url) == "deny":
             return Decision.deny(f"rule: network denied: {url}")
-    if ToolEffect.EXECUTE_PROCESS in use.effects and _command_network_verdict(ctx) == "deny":
+    if ToolEffect.EXECUTE_PROCESS in use.effects and command_network_verdict(ctx) == "deny":
         return Decision.deny("rule: command network denied")
     hook = _hook_decision(ctx, "deny")
     if hook is not None:
@@ -238,7 +241,7 @@ def ask_rules(tool: Tool, use: ResolvedUse, ctx: PermissionContext) -> Decision 
     for url in _url_targets(use):
         if network_verdict(ctx, url) == "ask":
             return _url_ask(tool, f"rule: network requires approval: {url}", url)
-    if ToolEffect.EXECUTE_PROCESS in use.effects and _command_network_verdict(ctx) == "ask":
+    if ToolEffect.EXECUTE_PROCESS in use.effects and command_network_verdict(ctx) == "ask":
         return _tool_ask(tool, "rule: command network requires approval")
     hook = _hook_decision(ctx, "ask")
     if hook is not None:
