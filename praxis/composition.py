@@ -24,7 +24,7 @@ import asyncio
 import logging
 import os
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -32,6 +32,8 @@ import httpx
 
 from praxis.adapters.config.credentials import resolve_model_credential
 from praxis.adapters.config.store import ModelConfigStore
+from praxis.adapters.hooks.config import load_host_hooks
+from praxis.adapters.hooks.runner import spawn_hook
 from praxis.adapters.models.ollama import OllamaAdapter
 from praxis.adapters.models.openai_compat import OpenAICompatAdapter
 from praxis.adapters.models.retry import make_retry_stream
@@ -48,6 +50,8 @@ from praxis.core.compaction import (
 from praxis.core.events import EventBus
 from praxis.core.recovery import sweep, sweep_orphan_command_jobs
 from praxis.core.session import Session
+from praxis.protocol.hooks import HookOutcome, HookSetup, HookSpec
+from praxis.protocol.json import JsonValue
 from praxis.protocol.models import (
     ModelAdapter,
     ModelMessage,
@@ -240,6 +244,23 @@ def _measure_request_tokens(req: WireRequest) -> int:
     return measure_request(req).count
 
 
+async def _spawn_host_hook(
+    spec: HookSpec, request: Mapping[str, JsonValue]
+) -> HookOutcome:
+    """T4 runner 的生产绑定:整组 SIGKILL 语义由 injected signal_group 提供。"""
+    return await spawn_hook(spec, request, kill_group=signal_group)
+
+
+def _host_hook_setup(root: Path) -> HookSetup:
+    """装配 Host command hook(T5):workspace 一律以已 resolve 的绝对路径进入。
+
+    T3 留档的相对路径角落在此收口——``load_host_hooks`` 的快照与真实
+    工作区必须同源。``spawn`` 只做机制;阀门/结算在 core 管道。
+    """
+    specs = load_host_hooks(root.expanduser().resolve(), None)
+    return HookSetup(specs=specs, spawn=_spawn_host_hook)
+
+
 def _resolve_policy(root: Path, explicit: PermissionPolicy | None) -> PermissionPolicy:
     """policy 来源序(Task 8):显式参数 > ``.praxis/permissions.json`` > 默认。
 
@@ -269,6 +290,7 @@ def build_session(
     thread_id: str | None = None,
     tools: Sequence[Tool] | None = None,
     max_steps: int = 50,
+    hooks: HookSetup | None = None,
 ) -> Session:
     """装配一个 Session:唯一组合根。CLI/TUI/host 一律经 sdk.open_session 走到这里。
 
@@ -312,6 +334,9 @@ def build_session(
         else SUMMARY_PROMPT_MAX_CHARS
     )
     root = Path(workspace)
+    # T5:默认从 Host 配置装配 command hooks(显式 hooks 参数=测试路径,完全
+    # 绕过加载)。workspace 传已 resolve 的绝对路径(T3 相对路径角落收口)。
+    hook_setup = hooks if hooks is not None else _host_hook_setup(root)
     praxis_dir = root / ".praxis"
     praxis_dir.mkdir(parents=True, exist_ok=True)
     store = Store(praxis_dir / "praxis.sqlite")
@@ -389,6 +414,7 @@ def build_session(
             summary_max_output_tokens=summary_max_output_tokens,
             summary_prompt_max_chars=summary_prompt_max_chars,
             command_sessions=sessions,
+            hooks=hook_setup,
         )
     except BaseException:
         store.close()

@@ -17,18 +17,21 @@ handler-callable 双入口两种信任模型;这里只保留 **command hook** �
   幂等身份只由 ``turn_id|event|hook_name|digest`` 决定;``started``/``settled``
   item 的投影在协议层完成,core 与 adapters 都可消费。运行器的实际 spawn 在
   ``adapters/hooks/runner.py``,不触达 store。
+- ``HookSetup`` 是会话装配面(§5.14):已校验 ``specs`` + 注入的 ``SpawnHook``
+  机制签名;纯数据 + Callable,不持有 store/进程资源,Session.close 无需收尾。
 """
 
 from __future__ import annotations
 
 import hashlib
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 from praxis.protocol.items import Item
+from praxis.protocol.json import JsonValue
 from praxis.protocol.tools import ToolEffect
 
 HookEvent = Literal["PreToolUse", "PostToolUse"]
@@ -163,6 +166,22 @@ class HookOutcome:
             object.__setattr__(
                 self, "feedback", _truncate_utf8(self.feedback, MAX_FEEDBACK_BYTES)
             )
+
+
+type SpawnHook = Callable[[HookSpec, Mapping[str, JsonValue]], Awaitable[HookOutcome]]
+
+
+@dataclass(frozen=True, slots=True)
+class HookSetup:
+    """一次会话的 hook 装配:已校验 specs + 注入的 spawn 机制。
+
+    纯数据 + Callable(协议层合法):``spawn`` 是机制签名,core 不 import
+    adapters——生产实现由 composition 绑定 ``spawn_hook(kill_group=
+    signal_group)``。本对象不持有 store/进程资源,Session.close 无需 hook 收尾。
+    """
+
+    specs: tuple[HookSpec, ...]
+    spawn: SpawnHook
 
 
 def hook_invocation_id(

@@ -51,6 +51,7 @@ from praxis.core.events import EventBus
 from praxis.core.pipeline import ExecCtx, SandboxCompiler, SandboxFinalizer, execute
 from praxis.core.statemachine import TurnStatus, transition
 from praxis.protocol.events import ModelOutputDelta, ModelResponseReceived, ModelRetried
+from praxis.protocol.hooks import HookSetup
 from praxis.protocol.items import Item, ItemKind
 from praxis.protocol.json import JsonValue
 from praxis.protocol.models import (
@@ -122,6 +123,8 @@ class TurnDeps:
     summary_max_output_tokens: int = SUMMARY_MAX_OUTPUT_TOKENS
     # 摘要请求正文上限(K-4);composition 按上下文窗口推导后注入。
     summary_prompt_max_chars: int = SUMMARY_PROMPT_MAX_CHARS
+    # None = 不接 hook(单测路径);生产 composition 装配 Host hook 并注入。
+    hooks: HookSetup | None = None
 
 
 @dataclass
@@ -178,6 +181,7 @@ def _exec_ctx(deps: TurnDeps, state: TurnState) -> ExecCtx:
         compile_sandbox=deps.compile_sandbox,
         finalize_sandbox=deps.finalize_sandbox,
         artifacts=deps.artifacts,
+        hooks=deps.hooks,
     )
 
 

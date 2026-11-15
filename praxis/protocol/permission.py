@@ -67,10 +67,16 @@ class Decision:
 
 @dataclass(frozen=True, slots=True)
 class HookDecision:
-    """hook 返回的权限裁决(§5.14 预留位)。"""
+    """hook 返回的权限裁决(§5.14)。
+
+    ``feedback`` 是 R-PF-1 的尾段(构造期已按 2048 字节截断,见
+    ``protocol.hooks.HookOutcome``):deny/ask 的 reason 由 core 拼成
+    ``hook:<source>: <feedback>``;缺省空串,既有 3A 构造零改动。
+    """
 
     source: str
     verdict: PolicyVerdict
+    feedback: str = ""
 
 
 @dataclass(frozen=True, slots=True)

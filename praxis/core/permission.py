@@ -31,7 +31,12 @@ from dataclasses import replace
 from pathlib import Path
 
 from praxis.protocol.floor import floor_reason, host_private_paths
-from praxis.protocol.permission import Decision, PermissionContext, PermissionUpdate
+from praxis.protocol.permission import (
+    Decision,
+    HookDecision,
+    PermissionContext,
+    PermissionUpdate,
+)
 from praxis.protocol.policy import (
     NetworkRule,
     PathRule,
@@ -130,11 +135,22 @@ def _command_network_verdict(ctx: PermissionContext) -> PolicyVerdict:
     return _most_restrictive(command_network_decision(source) for source in _all_sources(ctx)) or "deny"
 
 
-def _hook_source(ctx: PermissionContext, verdict: PolicyVerdict) -> str | None:
+def _hook_decision(ctx: PermissionContext, verdict: PolicyVerdict) -> HookDecision | None:
     for hook in ctx.hook_decisions:
         if hook.verdict == verdict:
-            return hook.source
+            return hook
     return None
+
+
+def _hook_reason(hook: HookDecision) -> str:
+    """hook deny/ask 的 reason:``hook:<source>``,有 feedback 时带尾段(R-PF-1)。
+
+    feedback 在 ``HookOutcome`` 构造期已截断到 2048 字节;管道最终还会
+    经 ``_bounded(512)`` 归一——这里只负责拼装,不做第二套截断。
+    """
+    if hook.feedback:
+        return f"hook:{hook.source}: {hook.feedback}"
+    return f"hook:{hook.source}"
 
 
 def _tool_ask(tool: Tool, reason: str) -> Decision:
@@ -166,9 +182,9 @@ def deny_rules(tool: Tool, use: ResolvedUse, ctx: PermissionContext) -> Decision
             return Decision.deny(f"rule: network denied: {url}")
     if ToolEffect.EXECUTE_PROCESS in use.effects and _command_network_verdict(ctx) == "deny":
         return Decision.deny("rule: command network denied")
-    source = _hook_source(ctx, "deny")
-    if source is not None:
-        return Decision.deny(f"hook:{source}")
+    hook = _hook_decision(ctx, "deny")
+    if hook is not None:
+        return Decision.deny(_hook_reason(hook))
     return None
 
 
@@ -181,9 +197,9 @@ def ask_rules(tool: Tool, use: ResolvedUse, ctx: PermissionContext) -> Decision 
             return _tool_ask(tool, f"rule: network requires approval: {url}")
     if ToolEffect.EXECUTE_PROCESS in use.effects and _command_network_verdict(ctx) == "ask":
         return _tool_ask(tool, "rule: command network requires approval")
-    source = _hook_source(ctx, "ask")
-    if source is not None:
-        return _tool_ask(tool, f"hook:{source}")
+    hook = _hook_decision(ctx, "ask")
+    if hook is not None:
+        return _tool_ask(tool, _hook_reason(hook))
     return None
 
 

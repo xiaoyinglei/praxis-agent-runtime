@@ -63,6 +63,7 @@ from praxis.core.turn import (
     pending_approval_summaries,
     run_turn,
 )
+from praxis.protocol.hooks import HookSetup
 from praxis.protocol.items import Item, ItemKind
 from praxis.protocol.json import JsonValue
 from praxis.protocol.models import ModelAdapter, ModelSettings, ModelToolCall, WireRequest
@@ -304,6 +305,7 @@ class Session:
         summary_max_output_tokens: int = SUMMARY_MAX_OUTPUT_TOKENS,
         summary_prompt_max_chars: int = SUMMARY_PROMPT_MAX_CHARS,
         command_sessions: CommandSessionsCloser | None = None,
+        hooks: HookSetup | None = None,
     ) -> None:
         self._store = store
         self._bus = bus
@@ -331,6 +333,7 @@ class Session:
         self._summary_max_output_tokens = summary_max_output_tokens
         self._summary_prompt_max_chars = summary_prompt_max_chars
         self._command_sessions = command_sessions
+        self._hooks = hooks
 
     # -- 身份与生命周期 -------------------------------------------------------
 
@@ -638,6 +641,7 @@ class Session:
             measure_tokens=self._measure_tokens,
             summary_max_output_tokens=self._summary_max_output_tokens,
             summary_prompt_max_chars=self._summary_prompt_max_chars,
+            hooks=self._hooks,
         )
         try:
             with thread_execution_lock(self._workspace, self._thread_id):

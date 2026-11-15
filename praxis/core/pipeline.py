@@ -10,6 +10,10 @@ execute 步骤序(与代码一一对应):
    ``unknown_tool``/``invalid_input``)返回——已有 result 即非 pending,
    recovery 不会列它,故不写 tool_call item、不发 started/finished;
 2. ``resolve_use`` + ``permission.decide``(经模块属性调用:唯一决策入口);
+   注入 hooks 时先在 decide 之前结算 PreToolUse(§5.14):started/settled item
+   按 ``hook_invocation_id`` 幂等折叠(审批重入不重复 spawn),非 allowed 的
+   hook 结论作为 HookDecision 进入唯一 decide——**hook allow 结构上无裁决,
+   规则/bypass/地板/沙箱依旧完全生效**;
 3. 审批重入(R5 硬化):**新鲜 deny 是终局**,任何 bound 决策不得翻案;
    bound 决策仅在 args_digest 一致 **且** policy_revision 等于当前 revision
    时有效(legacy item 缺 revision = 作废,fail-closed)→ 按 allow/deny 陈述;
@@ -28,6 +32,8 @@ execute 步骤序(与代码一一对应):
 8. 占位符替换 + 超 ``max_model_output_bytes`` 的**写时外部化**(注入
    ``artifacts`` 时:全文进内容寻址 artifact,item 只留头部+指针+摘要;
    未注入则旧字节截断)→ tool_result item → emit ToolFinished。
+   PostToolUse 在工具返回后、``_finalize`` 之前结算:结论只进
+   ``metadata["post_tool_hook"]``,绝不改 status/content、绝不阻断。
 
 沙箱编译/清理经注入进入 core(``SandboxCompiler``/``SandboxFinalizer`` 结构
 签名,adapters 结构匹配;core 不 import adapters——praxis_core_purity)。
@@ -47,7 +53,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
@@ -57,9 +63,17 @@ from praxis.core.events import EventBus
 from praxis.core.statemachine import TurnStatus, transition
 from praxis.protocol.events import ApprovalRequested, ToolFinished, ToolStarted
 from praxis.protocol.floor import floor_reason, host_private_paths
+from praxis.protocol.hooks import (
+    HookEvent,
+    HookOutcome,
+    HookSetup,
+    HookSpec,
+    fold_hook_items,
+    hook_invocation_id,
+)
 from praxis.protocol.items import Item, ItemKind
 from praxis.protocol.json import JsonValue, thaw_json
-from praxis.protocol.permission import Decision, PermissionContext
+from praxis.protocol.permission import Decision, HookDecision, PermissionContext
 from praxis.protocol.sandbox import SandboxRefusal, SandboxSpec, ToolExecContext
 from praxis.protocol.tools import (
     InterruptBehavior,
@@ -107,6 +121,8 @@ class ExecCtx:
     finalize_sandbox: SandboxFinalizer | None = None
     # None = 不外部化(单测/裸管道):超限结果退回旧字节截断语义。
     artifacts: ArtifactStore | None = None
+    # None = 不接 hook(单测/裸管道):行为与未接线前逐字不变。
+    hooks: HookSetup | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +278,205 @@ def _append_result_item(ctx: ExecCtx, result: ToolResult) -> None:
 
 
 # ---------------------------------------------------------------------------
+# hook 两执行点(设计 §5.14;3B 笔记 §4)
+#
+# 结算归位:core 写 started/settled item、协议层 fold 投影、adapters 只 spawn
+# 进程。幂等身份 = ``hook_invocation_id(turn_id, event, name, digest)``:
+# 审批重入时已 settled 的调用直接复用结论,**不重复 spawn**。
+# ---------------------------------------------------------------------------
+
+# PostToolUse 只观察:多个 hook 时在 metadata 里保留最严重的那条摘要。
+_POST_SEVERITY: dict[str, int] = {
+    "allowed": 0,
+    "observed": 1,
+    "unknown": 2,
+    "unavailable": 3,
+    "error": 4,
+    "timeout": 5,
+    "blocked": 6,
+}
+
+
+def _matching_hook_specs(
+    hooks: HookSetup, event: HookEvent, tool_name: str, effects: frozenset[ToolEffect]
+) -> tuple[HookSpec, ...]:
+    """选择器语义:空 tool_names/effects = 该轴不筛选(与加载期约定一致)。"""
+    effect_names = {effect.value for effect in effects}
+    return tuple(
+        spec
+        for spec in hooks.specs
+        if spec.event == event
+        and (not spec.tool_names or tool_name in spec.tool_names)
+        and (not spec.effects or not spec.effects.isdisjoint(effect_names))
+    )
+
+
+def _hook_request(
+    ctx: ExecCtx,
+    call: ToolCall,
+    tool_name: str,
+    use: ResolvedUse,
+    args: Mapping[str, JsonValue],
+    invocation_id: str,
+    event: HookEvent,
+) -> dict[str, JsonValue]:
+    """HookRequest 的 JSON 兼容形状。
+
+    R-T5-1:PostToolUse 有意**不含** ``source_item_id``——结果 item 在此刻尚未
+    提交,旧实现的"源 item"在 praxis 结算序里不存在;T21 对照表钉住该差异。
+    """
+    return {
+        "event": event,
+        "invocation_id": invocation_id,
+        "thread_id": ctx.thread_id,
+        "turn_id": ctx.turn_id,
+        "workspace": str(ctx.workspace),
+        "tool_call_id": call.tool_call_id,
+        "tool_name": tool_name,
+        "arguments": _json_field(args),
+        "effects": _effect_names(use),
+        "input_revision": ctx.policy_revision,
+    }
+
+
+def _append_hook_item(
+    ctx: ExecCtx,
+    *,
+    invocation_id: str,
+    event: HookEvent,
+    hook: str,
+    phase: str,
+    status: str | None = None,
+    feedback: str = "",
+) -> None:
+    """started = 最小相位载荷;settled 携带结论(status/feedback)。"""
+    payload: dict[str, JsonValue] = {
+        "invocation_id": invocation_id,
+        "event": event,
+        "hook": hook,
+        "phase": phase,
+    }
+    if status is not None:
+        payload["status"] = status
+        payload["feedback"] = feedback
+    ctx.store.append_items(
+        ctx.thread_id, ctx.turn_id, [ItemEntry(kind=ItemKind.HOOK_INVOCATION, payload=payload)]
+    )
+
+
+async def _settle_hook(
+    ctx: ExecCtx,
+    hooks: HookSetup,
+    spec: HookSpec,
+    request: Mapping[str, JsonValue],
+    invocation_id: str,
+    items: Sequence[Item],
+) -> HookOutcome:
+    """一次 hook 调用的幂等结算:已 settled ⇒ 复用(0 spawn),否则 spawn 并落账。
+
+    外层 ``CancelledError``:先写 ``settled status="unknown"`` 再原样上抛——
+    进程是否已产生副作用不可知,恢复面必须 fail-closed 而不是假装没发生。
+    """
+    folded = fold_hook_items(items, invocation_id)
+    if folded is not None:
+        return folded
+    _append_hook_item(
+        ctx,
+        invocation_id=invocation_id,
+        event=spec.event,
+        hook=spec.name,
+        phase="started",
+    )
+    try:
+        outcome = await hooks.spawn(spec, request)
+    except asyncio.CancelledError:
+        _append_hook_item(
+            ctx,
+            invocation_id=invocation_id,
+            event=spec.event,
+            hook=spec.name,
+            phase="settled",
+            status="unknown",
+            feedback="outer cancellation",
+        )
+        raise
+    _append_hook_item(
+        ctx,
+        invocation_id=invocation_id,
+        event=spec.event,
+        hook=spec.name,
+        phase="settled",
+        status=outcome.status,
+        feedback=outcome.feedback,
+    )
+    return outcome
+
+
+async def _pre_hook_decisions(
+    ctx: ExecCtx,
+    hooks: HookSetup,
+    call: ToolCall,
+    tool: Tool,
+    use: ResolvedUse,
+    args: Mapping[str, JsonValue],
+    digest: str,
+    items: Sequence[Item],
+) -> tuple[HookDecision, ...]:
+    """PreToolUse 裁决映射:非 allowed 一律 deny;allowed 结构上无裁决。
+
+    allow 不进入 ``PermissionContext.hook_decisions``——没有任何"hook 放行"
+    可以豁免规则/bypass/地板/沙箱;hook 只能收紧。
+    """
+    decisions: list[HookDecision] = []
+    for spec in _matching_hook_specs(hooks, "PreToolUse", tool.definition.name, use.effects):
+        invocation_id = hook_invocation_id(ctx.turn_id, "PreToolUse", spec.name, digest)
+        request = _hook_request(
+            ctx, call, tool.definition.name, use, args, invocation_id, "PreToolUse"
+        )
+        outcome = await _settle_hook(ctx, hooks, spec, request, invocation_id, items)
+        if outcome.status != "allowed":
+            decisions.append(
+                HookDecision(
+                    source=f"{spec.name}:{outcome.status}",
+                    verdict="deny",
+                    feedback=outcome.feedback,
+                )
+            )
+    return tuple(decisions)
+
+
+async def _apply_post_hooks(
+    ctx: ExecCtx,
+    hooks: HookSetup,
+    call: ToolCall,
+    tool: Tool,
+    use: ResolvedUse,
+    args: Mapping[str, JsonValue],
+    digest: str,
+    items: Sequence[Item],
+    raw: ToolResult,
+) -> ToolResult:
+    """PostToolUse 只观察:结论进 metadata,绝不改 status/content,绝不阻断。"""
+    summary: HookOutcome | None = None
+    for spec in _matching_hook_specs(hooks, "PostToolUse", tool.definition.name, use.effects):
+        invocation_id = hook_invocation_id(ctx.turn_id, "PostToolUse", spec.name, digest)
+        request = _hook_request(
+            ctx, call, tool.definition.name, use, args, invocation_id, "PostToolUse"
+        )
+        outcome = await _settle_hook(ctx, hooks, spec, request, invocation_id, items)
+        if summary is None or _POST_SEVERITY[outcome.status] > _POST_SEVERITY[summary.status]:
+            summary = outcome
+    if summary is None:
+        return raw
+    metadata: dict[str, JsonValue] = dict(raw.metadata)
+    metadata["post_tool_hook"] = {
+        "status": summary.status,
+        "feedback": _bounded(summary.feedback),
+    }
+    return replace(raw, metadata=metadata)
+
+
+# ---------------------------------------------------------------------------
 # 审批重入(摘要绑定)
 # ---------------------------------------------------------------------------
 
@@ -414,7 +629,16 @@ async def execute(call: ToolCall, ctx: ExecCtx) -> ToolResult:
     digest = args_digest(args)
     items = ctx.store.read_turn_items(ctx.turn_id)
 
-    decision = permission.decide(tool, use, ctx.permissions)
+    # 步序 2 的 hook 扩展:PreToolUse 在唯一 decide 之前结算;allow 不产生裁决,
+    # 因此规则/bypass/地板/沙箱对该调用仍然完全有效(allow 丝毫不豁免)。
+    decide_permissions = ctx.permissions
+    if ctx.hooks is not None:
+        decisions = await _pre_hook_decisions(
+            ctx, ctx.hooks, call, tool, use, args, digest, items
+        )
+        decide_permissions = replace(ctx.permissions, hook_decisions=decisions)
+
+    decision = permission.decide(tool, use, decide_permissions)
     bound = _latest_approval_decision(items, call.tool_call_id)
     # R5(a):新鲜 deny 是终局——bound allow 只能把 ask/fallback 带入执行,
     # 绝不覆盖规则 deny/地板 deny/sandbox_unavailable。
@@ -483,6 +707,12 @@ async def execute(call: ToolCall, ctx: ExecCtx) -> ToolResult:
         raw = _synthetic_result(
             tool, status=ResultStatus.ERROR, error_code="tool_error",
             message=f"sandbox finalize failed: {finalize_failure}",
+        )
+    # PostToolUse 在工具返回后、_finalize/result item 之前:只写观察摘要,
+    # status/content 逐字不变,绝不阻断(旧 observed 语义)。
+    if ctx.hooks is not None:
+        raw = await _apply_post_hooks(
+            ctx, ctx.hooks, call, tool, use, args, digest, items, raw
         )
     result = _finalize(raw, call=call, tool=tool, artifacts=ctx.artifacts)
     _append_result_item(ctx, result)
