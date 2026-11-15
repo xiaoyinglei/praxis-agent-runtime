@@ -41,12 +41,30 @@ from typing import Any
 import yaml
 
 from praxis.protocol.json import JsonValue
+from praxis.protocol.sandbox import ToolExecContext
 from praxis.protocol.skills import (
+    MAX_INVOKE_ARGS_CHARS,
+    MAX_SKILL_INSTRUCTIONS_CHARS,
+    MAX_SKILL_NAME_CHARS,
     SOURCE_PRIORITY,
     SkillCatalog,
+    SkillErrorCode,
     SkillManifest,
     SkillSource,
 )
+from praxis.protocol.tools import (
+    CancellationMode,
+    InterruptBehavior,
+    ResolvedUse,
+    ResultStatus,
+    Tool,
+    ToolContentBlock,
+    ToolDefinition,
+    ToolResult,
+    ToolTarget,
+    json_schema_input,
+)
+from praxis.tools.builtins.filesystem import PENDING_TOOL_CALL_ID
 
 logger = logging.getLogger(__name__)
 
@@ -326,3 +344,167 @@ def load_skill_catalog(workspace: Path) -> SkillCatalog:
 
     manifests.sort(key=lambda manifest: (SOURCE_PRIORITY[manifest.source], manifest.name))
     return SkillCatalog(tuple(manifests))
+
+
+# ── invoke_skill(T8;T9 的 materialize_skill_asset 追加在本节之后) ──────
+
+_INVOKE_SKILL_NAME = "invoke_skill"
+
+# 旧 integrations/skills.py:39-51 的 InvokeSkillInput(extra=forbid)逐字段移植。
+# 有意差异:不复制旧 available_skill_ids 的 name enum——目录已由 T7 注入上下文。
+_INVOKE_INPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": MAX_SKILL_NAME_CHARS,
+            "description": "Exact skill name as listed in the skill catalog.",
+        },
+        "args": {
+            "type": ["string", "null"],
+            "maxLength": MAX_INVOKE_ARGS_CHARS,
+            "description": "Optional value substituted for the skill's $ARGUMENTS placeholder.",
+        },
+    },
+    "required": ["name"],
+    "additionalProperties": False,
+}
+
+_validate_invoke_input = json_schema_input(_INVOKE_INPUT_SCHEMA)
+
+# 旧 skills/runtime.py:14-15:word-boundary 正则 + lambda 替换,替换文本是
+# 字面数据(路径/用户参数),绝不被当正则模板解释(无 \1 反引用)。
+_SKILL_DIR_RE = re.compile(r"\$SKILL_DIR\b")
+_ARGUMENTS_RE = re.compile(r"\$ARGUMENTS\b")
+
+
+def _activation_error(code: SkillErrorCode, message: str) -> ToolResult:
+    """激活失败的固定有界消息;错误结果不带 ``metadata``(T9 只投影成功项)。"""
+    return ToolResult(
+        tool_call_id=PENDING_TOOL_CALL_ID,
+        tool_name=_INVOKE_SKILL_NAME,
+        content=(ToolContentBlock(type="text", data={"text": f"{code}: {message}"}),),
+        status=ResultStatus.ERROR,
+        is_error=True,
+        error_code=code,
+        error_message=message,
+    )
+
+
+def _substitute_skill_instructions(instructions: str, root_dir: str, args: str | None) -> str:
+    """旧 ``skills/runtime.py:90-93`` 的替换序:字面 ``${SKILL_DIR}`` 先,
+    再 word-boundary ``$SKILL_DIR``;``$ARGUMENTS`` 仅在 args 非 None 时替换。"""
+    text = instructions.replace("${SKILL_DIR}", root_dir)
+    text = _SKILL_DIR_RE.sub(lambda _match: root_dir, text)
+    if args is not None:
+        text = _ARGUMENTS_RE.sub(lambda _match: args, text)
+    return text
+
+
+def create_invoke_skill_tool(catalog: SkillCatalog) -> Tool:
+    """创建 ``invoke_skill``:纯进程内读取,每次激活重读文件重算指纹。
+
+    激活期指纹 procedure(R-T6-1):重读 ``manifest.skill_file`` → 用 loader 的
+    同一 parse helpers 解析 → 置 ``frontmatter["name"] = manifest.name``(清单名
+    已含命名空间前缀)→ :func:`skill_fingerprint`;不等即 ``skill_content_changed``。
+    直接对原始解析重算会让命名空间 skill 误报漂移。
+
+    错误码可达性(R-T8-2):带非空 ``allowed_tools``/``paths`` 的 skill 被 loader
+    排除出目录 ⇒ 正常调用是 ``skill_not_found``;``unsupported_skill_constraints``
+    只能经"装载后文件被改成带约束"的漂移到达。
+    """
+
+    async def run(
+        arguments: Mapping[str, JsonValue],
+        exec_ctx: ToolExecContext,  # noqa: ARG001 — pure in-process read, no sandbox
+    ) -> ToolResult:
+        raw_name = arguments.get("name")
+        name = raw_name if isinstance(raw_name, str) else ""
+        manifest = catalog.get(name)
+        if manifest is None:
+            return _activation_error(
+                "skill_not_found", "skill is not available in the active catalog"
+            )
+        if manifest.disable_model_invocation:
+            return _activation_error(
+                "skill_disabled", "skill is not available for model invocation"
+            )
+
+        skill_file = Path(manifest.skill_file)
+        try:
+            content = skill_file.read_text(encoding="utf-8")
+        except OSError:
+            return _activation_error("skill_not_found", "skill file is no longer available")
+
+        try:
+            frontmatter, body = _parse_frontmatter(content, skill_file)
+            # 约束漂移先于指纹比较:R-T8-2 要求该码在"文件已带约束"时可达。
+            if _string_list(frontmatter, "allowed_tools", skill_file) or _string_list(
+                frontmatter, "paths", skill_file
+            ):
+                return _activation_error(
+                    "unsupported_skill_constraints",
+                    "skill now declares unsupported allowed_tools/paths constraints",
+                )
+        except _SkillLoadError:
+            return _activation_error(
+                "skill_content_changed", "skill file is no longer a valid SKILL.md"
+            )
+
+        frontmatter["name"] = manifest.name
+        if skill_fingerprint(frontmatter, body) != manifest.fingerprint:
+            return _activation_error(
+                "skill_content_changed", "skill content changed since the catalog was loaded"
+            )
+
+        raw_args = arguments.get("args")
+        args = raw_args if isinstance(raw_args, str) else None
+        instructions = _substitute_skill_instructions(body, manifest.root_dir, args)
+        truncated = len(instructions) > MAX_SKILL_INSTRUCTIONS_CHARS
+        if truncated:
+            instructions = instructions[:MAX_SKILL_INSTRUCTIONS_CHARS]
+
+        return ToolResult(
+            tool_call_id=PENDING_TOOL_CALL_ID,
+            tool_name=_INVOKE_SKILL_NAME,
+            content=(
+                ToolContentBlock(
+                    type="text",
+                    data={"text": f"skill activated: {manifest.name}\n{instructions}"},
+                ),
+            ),
+            status=ResultStatus.OK,
+            truncated=truncated,
+            metadata={
+                "skill_id": manifest.name,
+                "source": manifest.source.value,
+                "fingerprint": manifest.fingerprint,
+                "truncated": truncated,
+            },
+        )
+
+    return Tool(
+        definition=ToolDefinition(
+            name=_INVOKE_SKILL_NAME,
+            description=(
+                "Load one skill listed in the skill catalog and return its bounded "
+                "instructions. Invoke the matching skill before following that workflow; "
+                "never guess an unlisted skill name."
+            ),
+            input_schema=_INVOKE_INPUT_SCHEMA,
+        ),
+        validate_input=_validate_invoke_input,
+        run=run,
+        static_effects=frozenset(),
+        resolve_use=lambda resolved: ResolvedUse(
+            frozenset(),
+            (ToolTarget(kind="skill", value=str(resolved.get("name", ""))),),
+        ),
+        idempotent=True,
+        concurrency_safe=False,
+        cancellation_mode=CancellationMode.COOPERATIVE,
+        interrupt_behavior=InterruptBehavior.CANCEL,
+        timeout_seconds=5.0,
+        max_model_output_bytes=300_000,
+    )
