@@ -36,6 +36,9 @@ _PLATFORM = sys.platform
 
 _KEYCHAIN_ACCOUNT = "praxis"
 _SERVICE_PREFIX = "praxis.model."
+# Task 13:web 搜索凭据与模型凭据共用同一套机制,仅 Keychain service 前缀不同
+# (``praxis.web.<identity>``),identity 仍是 sha256(config_dir\\napi_key_env\\nendpoint)。
+_WEB_SERVICE_PREFIX = "praxis.web."
 _MAX_FILE_BYTES = 1_048_576
 
 _FILE_ERROR = "Credential file must be private, bounded, and owned by the current user"
@@ -44,6 +47,10 @@ _KEYCHAIN_READ_ERROR = "Unable to read model credential from Keychain"
 _KEYCHAIN_WRITE_ERROR = "Unable to save model credential in Keychain"
 _KEYCHAIN_DELETE_ERROR = "Unable to remove model credential from Keychain"
 _KEYCHAIN_VERIFY_ERROR = "Model credential storage verification failed"
+_WEB_KEYCHAIN_READ_ERROR = "Unable to read web search credential from Keychain"
+_WEB_KEYCHAIN_WRITE_ERROR = "Unable to save web search credential in Keychain"
+_WEB_KEYCHAIN_DELETE_ERROR = "Unable to remove web search credential from Keychain"
+_WEB_KEYCHAIN_VERIFY_ERROR = "Web search credential storage verification failed"
 _UNSUPPORTED_PLATFORM = (
     "Saved model credentials require macOS or POSIX; provide the named environment variable"
 )
@@ -58,8 +65,8 @@ def credential_identity(name: str, endpoint: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-def _service(identity: str) -> str:
-    return _SERVICE_PREFIX + identity
+def _service(identity: str, prefix: str = _SERVICE_PREFIX) -> str:
+    return prefix + identity
 
 
 def _validate_key(key: object) -> str:
@@ -172,8 +179,10 @@ def _atomic_write_keys(path: Path, keys: dict[str, str]) -> None:
         raise
 
 
-def load_model_credential(api_key_env: str, endpoint: str) -> str | None:
-    """读取已保存的凭据值;未保存返回 None。"""
+def _load_stored(
+    api_key_env: str, endpoint: str, *, service_prefix: str, read_error: str
+) -> str | None:
+    """通用读取(模型/搜索共用):Keychain(darwin)或 0600 文件;未保存返回 None。"""
     identity = credential_identity(api_key_env, endpoint)
     if _PLATFORM == "darwin":
         result = subprocess.run(
@@ -183,7 +192,7 @@ def load_model_credential(api_key_env: str, endpoint: str) -> str | None:
                 "-a",
                 _KEYCHAIN_ACCOUNT,
                 "-s",
-                _service(identity),
+                _service(identity, service_prefix),
                 "-w",
             ],
             capture_output=True,
@@ -194,7 +203,7 @@ def load_model_credential(api_key_env: str, endpoint: str) -> str | None:
         if result.returncode == 44:
             return None
         if result.returncode != 0:
-            raise ValueError(_KEYCHAIN_READ_ERROR) from None
+            raise ValueError(read_error) from None
         return _validate_key(result.stdout.strip())
     if _PLATFORM == "win32":
         raise ValueError(_UNSUPPORTED_PLATFORM) from None
@@ -202,6 +211,98 @@ def load_model_credential(api_key_env: str, endpoint: str) -> str | None:
     if not directory.exists() and not directory.is_symlink():
         return None
     return _read_keys(_private_directory() / "models.json").get(identity)
+
+
+def _save_stored(
+    api_key_env: str,
+    endpoint: str,
+    value: str,
+    *,
+    service_prefix: str,
+    write_error: str,
+    verify_error: str,
+    read_error: str,
+) -> None:
+    """通用保存 + 回读校验;值绝不进入 argv(Keychain 走 stdin,文件走 0600 原子写)。"""
+    identity = credential_identity(api_key_env, endpoint)
+    key = _validate_key(value)
+    if _PLATFORM == "darwin":
+        # security 的交互输入把密钥留在 stdin,不进进程参数表。
+        command = (
+            "add-generic-password -U -a "
+            + shlex.quote(_KEYCHAIN_ACCOUNT)
+            + " -s "
+            + shlex.quote(_service(identity, service_prefix))
+            + " -w "
+            + shlex.quote(key)
+            + "\n"
+        )
+        result = subprocess.run(
+            ["/usr/bin/security", "-i"],
+            input=command,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if result.returncode != 0 or "SecKeychain" in result.stderr:
+            raise ValueError(write_error) from None
+        if (
+            _load_stored(api_key_env, endpoint, service_prefix=service_prefix, read_error=read_error)
+            != key
+        ):
+            raise ValueError(verify_error) from None
+        return
+    if _PLATFORM == "win32":
+        raise ValueError(_UNSUPPORTED_PLATFORM) from None
+    path = _private_directory() / "models.json"
+    with _exclusive(path.parent):
+        keys = _read_keys(path)
+        keys[identity] = key
+        _atomic_write_keys(path, keys)
+
+
+def _delete_stored(
+    api_key_env: str, endpoint: str, *, service_prefix: str, delete_error: str
+) -> None:
+    """通用删除;不存在是 no-op。"""
+    identity = credential_identity(api_key_env, endpoint)
+    if _PLATFORM == "darwin":
+        result = subprocess.run(
+            [
+                "/usr/bin/security",
+                "delete-generic-password",
+                "-a",
+                _KEYCHAIN_ACCOUNT,
+                "-s",
+                _service(identity, service_prefix),
+            ],
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+        if result.returncode not in {0, 44}:
+            raise ValueError(delete_error) from None
+        return
+    if _PLATFORM == "win32":
+        raise ValueError(_UNSUPPORTED_PLATFORM) from None
+    directory = _credential_directory()
+    if not directory.exists() and not directory.is_symlink():
+        return
+    private = _private_directory()
+    path = private / "models.json"
+    with _exclusive(private):
+        keys = _read_keys(path)
+        if keys.pop(identity, None) is None:
+            return
+        _atomic_write_keys(path, keys)
+
+
+def load_model_credential(api_key_env: str, endpoint: str) -> str | None:
+    """读取已保存的凭据值;未保存返回 None。"""
+    return _load_stored(
+        api_key_env, endpoint, service_prefix=_SERVICE_PREFIX, read_error=_KEYCHAIN_READ_ERROR
+    )
 
 
 def resolve_model_credential(api_key_env: str, endpoint: str) -> str | None:
@@ -229,73 +330,82 @@ def credential_source(api_key_env: str, endpoint: str) -> CredentialSource:
 
 def save_model_credential(api_key_env: str, endpoint: str, value: str) -> None:
     """保存凭据值并回读校验;值绝不进入 argv。"""
-    identity = credential_identity(api_key_env, endpoint)
-    key = _validate_key(value)
-    if _PLATFORM == "darwin":
-        # security 的交互输入把密钥留在 stdin,不进进程参数表。
-        command = (
-            "add-generic-password -U -a "
-            + shlex.quote(_KEYCHAIN_ACCOUNT)
-            + " -s "
-            + shlex.quote(_service(identity))
-            + " -w "
-            + shlex.quote(key)
-            + "\n"
-        )
-        result = subprocess.run(
-            ["/usr/bin/security", "-i"],
-            input=command,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-        if result.returncode != 0 or "SecKeychain" in result.stderr:
-            raise ValueError(_KEYCHAIN_WRITE_ERROR) from None
-        if load_model_credential(api_key_env, endpoint) != key:
-            raise ValueError(_KEYCHAIN_VERIFY_ERROR) from None
-        return
-    if _PLATFORM == "win32":
-        raise ValueError(_UNSUPPORTED_PLATFORM) from None
-    path = _private_directory() / "models.json"
-    with _exclusive(path.parent):
-        keys = _read_keys(path)
-        keys[identity] = key
-        _atomic_write_keys(path, keys)
+    _save_stored(
+        api_key_env,
+        endpoint,
+        value,
+        service_prefix=_SERVICE_PREFIX,
+        write_error=_KEYCHAIN_WRITE_ERROR,
+        verify_error=_KEYCHAIN_VERIFY_ERROR,
+        read_error=_KEYCHAIN_READ_ERROR,
+    )
 
 
 def delete_model_credential(api_key_env: str, endpoint: str) -> None:
     """删除已保存的凭据;不存在是 no-op。"""
-    identity = credential_identity(api_key_env, endpoint)
-    if _PLATFORM == "darwin":
-        result = subprocess.run(
-            [
-                "/usr/bin/security",
-                "delete-generic-password",
-                "-a",
-                _KEYCHAIN_ACCOUNT,
-                "-s",
-                _service(identity),
-            ],
-            capture_output=True,
-            timeout=15,
-            check=False,
-        )
-        if result.returncode not in {0, 44}:
-            raise ValueError(_KEYCHAIN_DELETE_ERROR) from None
-        return
-    if _PLATFORM == "win32":
-        raise ValueError(_UNSUPPORTED_PLATFORM) from None
-    directory = _credential_directory()
-    if not directory.exists() and not directory.is_symlink():
-        return
-    private = _private_directory()
-    path = private / "models.json"
-    with _exclusive(private):
-        keys = _read_keys(path)
-        if keys.pop(identity, None) is None:
-            return
-        _atomic_write_keys(path, keys)
+    _delete_stored(
+        api_key_env,
+        endpoint,
+        service_prefix=_SERVICE_PREFIX,
+        delete_error=_KEYCHAIN_DELETE_ERROR,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Web 搜索凭据(Task 13;留档③):同一套 env→Keychain/0600 机制,service 前缀
+# ``praxis.web.``。endpoint 是 provider API base URL(search.SEARCH_ENDPOINTS),
+# 使同一 env 名在不同 provider 下互不串用。
+# ---------------------------------------------------------------------------
+
+
+def load_web_search_credential(api_key_env: str, endpoint: str) -> str | None:
+    """读取已保存的搜索凭据;未保存返回 None。"""
+    return _load_stored(
+        api_key_env, endpoint, service_prefix=_WEB_SERVICE_PREFIX, read_error=_WEB_KEYCHAIN_READ_ERROR
+    )
+
+
+def resolve_web_search_credential(api_key_env: str, endpoint: str) -> str | None:
+    """解析运行期搜索凭据:非空环境变量优先,其次已保存的 Keychain/0600 文件。"""
+    value = os.environ.get(api_key_env)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return load_web_search_credential(api_key_env, endpoint)
+
+
+def web_search_credential_source(api_key_env: str, endpoint: str) -> CredentialSource:
+    """搜索凭据来源归因(只判存在性,不返回值):env / store / missing。"""
+    value = os.environ.get(api_key_env)
+    if isinstance(value, str) and value.strip():
+        return "env"
+    return (
+        "store"
+        if load_web_search_credential(api_key_env, endpoint) is not None
+        else "missing"
+    )
+
+
+def save_web_search_credential(api_key_env: str, endpoint: str, value: str) -> None:
+    """保存搜索凭据并回读校验;值绝不进入 argv。"""
+    _save_stored(
+        api_key_env,
+        endpoint,
+        value,
+        service_prefix=_WEB_SERVICE_PREFIX,
+        write_error=_WEB_KEYCHAIN_WRITE_ERROR,
+        verify_error=_WEB_KEYCHAIN_VERIFY_ERROR,
+        read_error=_WEB_KEYCHAIN_READ_ERROR,
+    )
+
+
+def delete_web_search_credential(api_key_env: str, endpoint: str) -> None:
+    """删除已保存的搜索凭据;不存在是 no-op。"""
+    _delete_stored(
+        api_key_env,
+        endpoint,
+        service_prefix=_WEB_SERVICE_PREFIX,
+        delete_error=_WEB_KEYCHAIN_DELETE_ERROR,
+    )
 
 
 __all__ = [
@@ -303,7 +413,12 @@ __all__ = [
     "credential_identity",
     "credential_source",
     "delete_model_credential",
+    "delete_web_search_credential",
     "load_model_credential",
+    "load_web_search_credential",
     "resolve_model_credential",
+    "resolve_web_search_credential",
     "save_model_credential",
+    "save_web_search_credential",
+    "web_search_credential_source",
 ]

@@ -21,12 +21,21 @@ from pathlib import Path
 
 from praxis.protocol.floor import host_config_dir
 
-__all__ = ["WebLimits", "load_web_limits"]
+__all__ = ["WebLimits", "load_web_limits", "web_configuration_path"]
 
 # legacy cli._load_web_limits:read(4097) 判 >4096。
 _LIMITS_FILE_MAX_BYTES = 4096
 # legacy web_config.resolve_web_configuration:web.json 整体 16 KiB 上限。
 _WEB_JSON_MAX_BYTES = 16_384
+
+
+def web_configuration_path() -> Path:
+    """宿主 ``web.json`` 的唯一路径构造点(Task 13/T20 规则⑳)。
+
+    ``load_web_limits`` 与 ``search.load_web_search_config`` 共用;任何其他
+    模块(含 CLI/搜索)不得自行拼 ``host_config_dir()/web.json``。
+    """
+    return host_config_dir() / "web.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,7 +97,7 @@ def load_web_limits(path: Path | None = None) -> WebLimits:
         except FileNotFoundError:
             raise ValueError(f"web limits file not found: {env_path}") from None
         return _limits_from_mapping(data, env_path)
-    source = path if path is not None else host_config_dir() / "web.json"
+    source = path if path is not None else web_configuration_path()
     try:
         data = _read_bounded_json(source, _WEB_JSON_MAX_BYTES)
     except FileNotFoundError:

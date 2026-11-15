@@ -36,8 +36,12 @@ from __future__ import annotations
 
 from praxis.adapters.config.credentials import (
     credential_source,
+    delete_web_search_credential,
     resolve_model_credential,
+    resolve_web_search_credential,
     save_model_credential,
+    save_web_search_credential,
+    web_search_credential_source,
 )
 from praxis.adapters.config.store import (
     ConfigVersionConflict,
@@ -48,6 +52,13 @@ from praxis.adapters.config.store import (
 from praxis.adapters.models.openai_compat import OpenAICompatAdapter
 from praxis.adapters.models.probe import ProbeOutcome, probe_model
 from praxis.adapters.models.scripted import ScriptedAdapter
+from praxis.adapters.web.limits import web_configuration_path
+from praxis.adapters.web.search import (
+    SEARCH_ENDPOINTS,
+    SearchProvider,
+    SearchProviderConfig,
+    load_web_search_config,
+)
 from praxis.composition import build_session, model_adapter_for, validate_model_spec
 from praxis.core.events import Subscription
 from praxis.core.locks import ThreadBusy
@@ -106,7 +117,10 @@ __all__ = [
     "PlanSnapshot",
     "ProbeOutcome",
     "ResumeNotConfirmed",
+    "SEARCH_ENDPOINTS",
     "ScriptedAdapter",
+    "SearchProvider",
+    "SearchProviderConfig",
     "Session",
     "Subscription",
     "ThreadBusy",
@@ -119,11 +133,17 @@ __all__ = [
     "apply_update",
     "assemble_model_events",
     "credential_source",
+    "delete_web_search_credential",
     "latest_plan",
+    "load_web_search_config",
     "model_adapter_for",
     "open_session",
     "probe_model",
     "resolve_model_credential",
+    "resolve_web_search_credential",
     "save_model_credential",
+    "save_web_search_credential",
     "validate_model_spec",
+    "web_configuration_path",
+    "web_search_credential_source",
 ]
