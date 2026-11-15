@@ -54,6 +54,7 @@ from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.types import Tool as McpTool
 
+from praxis.adapters.mcp.catalog import list_all_tools
 from praxis.adapters.mcp.config import StdioServerConfig
 from praxis.adapters.sandbox.base import BACKEND_CONFIGURATION_HINT
 from praxis.protocol.sandbox import EnvBuilder, SandboxRefusal, SandboxSpec
@@ -70,9 +71,8 @@ class McpConnection:
     """一条**已就绪**的 stdio 连接:initialize + list_tools 都已完成。
 
     ``session`` 的生命周期由 owner task 独占(调用方只调用它,不关闭它);
-    ``tools`` 是就绪前一次 ``list_tools`` 取回的目录(T17 据此造 descriptor)。
-    分页与目录资源上限(旧 ``_list_all_tools``)不在本任务范围:多页 server
-    的续取由 T17/T19 接手,本模块不做第二套目录机器。
+    ``tools`` 是**完整**目录:T17 的 ``catalog.list_all_tools`` 在就绪前完成
+    cursor 分页并施加 4096 工具 / 256 页 / 4 MiB 上限,绝不会只交第一页。
     """
 
     server_name: str
@@ -118,10 +118,10 @@ async def owned_stdio_connection(
                     streams = await resources.enter_async_context(stdio_client(params))
                     session = await resources.enter_async_context(ClientSession(streams[0], streams[1]))
                     await session.initialize()
-                    listed = await session.list_tools()
+                    catalog = await list_all_tools(session)
                 if not ready.done():
                     ready.set_result(
-                        McpConnection(server_name=config.name, session=session, tools=tuple(listed.tools))
+                        McpConnection(server_name=config.name, session=session, tools=catalog)
                     )
                 await stop.wait()
         except BaseException as error:
