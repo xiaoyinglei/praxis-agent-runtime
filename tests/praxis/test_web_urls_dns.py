@@ -726,6 +726,23 @@ def test_redirect_location_4097_rejected() -> None:
     assert len(backend.connects) == 1
 
 
+def test_redirect_malformed_location_invalid_redirect() -> None:
+    # R-T10-2:攻击者可控 Location 的 URL 解析抛裸 ValueError("https://[::1"
+    # ⇒ Invalid IPv6 URL)必须映射 invalid_redirect,消息静态不回显 Location,
+    # 且绝不连接坏目标。
+    hop1 = FakeStream(response_chunks("302 Found", headers=[("Location", "https://[::1")]))
+    backend = FakeBackend([hop1, FakeStream(response_chunks(body=b"never"))])
+    client, calls = make_client(resolver=FakeResolver([PUBLIC_IP]), backend=backend)
+    with pytest.raises(PublicWebError) as excinfo:
+        asyncio.run(client.fetch("https://a.example/"))
+    assert excinfo.value.code == "invalid_redirect"
+    message = str(excinfo.value)
+    assert "::1" not in message
+    assert "[" not in message
+    assert calls == ["https://a.example/"]
+    assert len(backend.connects) == 1
+
+
 def test_redirect_missing_location_invalid() -> None:
     hop1 = FakeStream(response_chunks("302 Found"))
     backend = FakeBackend([hop1])

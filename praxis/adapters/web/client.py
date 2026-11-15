@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import math
 import os
 import socket
 import ssl
@@ -453,8 +454,9 @@ class PublicHttpClient:
         headers: Mapping[str, str] | None = None,
         json_body: Mapping[str, Any] | None = None,
         max_bytes: int | None = None,
+        timeout_seconds: float | None = None,
     ) -> WebFetchResponse:
-        """有界抓取;max_bytes 是可信调用方的逐请求覆盖(默认取 limits)。
+        """有界抓取;max_bytes/timeout_seconds 是可信调用方的逐请求覆盖(默认取 limits)。
 
         json_body 须为 JSON 安全值(T12 控制请求体):NaN/Infinity 抛裸 ValueError
         (legacy web_http.py:415 allow_nan=False parity,调用方输入类,不属于
@@ -463,6 +465,9 @@ class PublicHttpClient:
         limit = self._limits.max_bytes if max_bytes is None else max_bytes
         if limit < 1:
             raise ValueError("Response byte limit must be positive.")
+        timeout = self._limits.timeout_seconds if timeout_seconds is None else timeout_seconds
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("Request timeout must be a positive finite number.")
         content: bytes | None = None
         request_headers = httpx.Headers(headers)
         if json_body is not None:
@@ -472,8 +477,8 @@ class PublicHttpClient:
             request_headers["Content-Type"] = "application/json"
         request_headers["Accept-Encoding"] = "gzip, identity"
         try:
-            async with asyncio.timeout(self._limits.timeout_seconds):
-                return await self._fetch_loop(url, method, request_headers, content, limit)
+            async with asyncio.timeout(timeout):
+                return await self._fetch_loop(url, method, request_headers, content, limit, timeout)
         except _AuthorizeAbortError as abort:
             raise abort.original from None
         except PublicWebError:
@@ -502,6 +507,7 @@ class PublicHttpClient:
         headers: httpx.Headers,
         content: bytes | None,
         limit: int,
+        timeout: float,
     ) -> WebFetchResponse:
         target = url
         wire_bytes = 0
@@ -521,7 +527,7 @@ class PublicHttpClient:
                 content=content,
                 extensions={
                     "timeout": dict.fromkeys(
-                        ("connect", "read", "write", "pool"), self._limits.timeout_seconds
+                        ("connect", "read", "write", "pool"), timeout
                     )
                 },
             )
@@ -542,7 +548,14 @@ class PublicHttpClient:
                     location = response.headers.get("Location")
                     if not location:
                         raise PublicWebError("invalid_redirect", "The redirect has no valid destination.")
-                    joined = urljoin(canonical, location)
+                    try:
+                        joined = urljoin(canonical, location)
+                    except ValueError:
+                        # R-T10-2:攻击者可控 Location(如 "https://[::1")的 URL 解析会抛
+                        # 裸 ValueError;有界错误面一律 invalid_redirect,消息静态、不回显 Location。
+                        raise PublicWebError(
+                            "invalid_redirect", "The redirect has no valid destination."
+                        ) from None
                     if len(joined) > _MAX_LOCATION_CHARS:
                         raise PublicWebError("invalid_redirect", "The redirect has no valid destination.")
                     target = joined
