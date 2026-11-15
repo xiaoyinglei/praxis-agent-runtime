@@ -491,6 +491,11 @@ def test_decision_matrix_all_entries(
         ("real-write-allow", Call("write", {"path": "out.txt", "content": "real\n"}), Scenario(PermissionPolicy(), None), "executed"),
         ("real-read-allow", Call("read", {"path": "note.txt"}), Scenario(PermissionPolicy(), None), "executed"),
         ("real-floor-git-write", Call("write", {"path": ".git/config", "content": "x"}), Scenario(PermissionPolicy(), None), "denied"),
+        # N-3:矩阵与真沙箱子集必须有一条**真正跑成功**的 search(前面广度矩阵的
+        # executed 只是"已 dispatch 但业务失败"。network allow 清掉 command-network
+        # 闸,让沙箱 allow / 地板 deny 成为决策。
+        ("real-search-text-allow", Call("search_text", {"pattern": "seed"}), Scenario(_NET_ALLOW, None), "executed"),
+        ("real-search-text-floor-deny", Call("search_text", {"pattern": "x", "path": ".praxis"}), Scenario(_NET_ALLOW, None), "denied"),
     ],
 )
 def test_real_sandbox_three_entries(

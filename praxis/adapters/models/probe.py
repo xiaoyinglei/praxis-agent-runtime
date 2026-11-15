@@ -33,6 +33,7 @@ from praxis.adapters.config.credentials import CredentialSource
 from praxis.adapters.models.retry import classify_failure
 from praxis.protocol.models import (
     DROPPED_TOOL_ARGUMENTS_MARKER,
+    DROPPED_TOOL_CALL_NO_ID_MARKER,
     ModelAdapter,
     ModelMessage,
     ModelResponse,
@@ -206,6 +207,19 @@ async def probe_model(
                 detail=(
                     f"{_TOOL_STEP} step failed: "
                     "provider returned malformed tool call arguments"
+                ),
+                usage=usage,
+            )
+        if DROPPED_TOOL_CALL_NO_ID_MARKER in tool_response.content:
+            # K-3 提示:无 call_id 的调用装配期被丢弃。content 因此非空——
+            # 若不显式检查,两个失败分支都会被跳过,探针会给"工具步全丢"的
+            # 模型发合格证(N-2)。
+            return ProbeOutcome(
+                ok=False,
+                steps=tuple(steps),
+                detail=(
+                    f"{_TOOL_STEP} step failed: "
+                    "provider returned a tool call without an id (tool protocol violation)"
                 ),
                 usage=usage,
             )

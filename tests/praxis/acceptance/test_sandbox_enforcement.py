@@ -605,5 +605,36 @@ def test_s1_search_worker_runs_inside_sandbox_and_cannot_escape(
     assert not leaked.exists() or "TOP-SECRET" not in leaked.read_text(encoding="utf-8")
 
 
+@pytest.mark.skipif(not _AVAILABLE.available, reason="bwrap deferred / no sandbox backend")
+def test_n1_search_worker_imports_praxis_from_outside_workspace(tmp_path: Path) -> None:
+    """N-1:工作区**不含** praxis 时,真实座位带下 search_text 仍能 import 自身。
+
+    源码 checkout / editable 安装的包在仓库根、而不在工作区；修复前 profile
+    不放行 package_root，worker 报 ModuleNotFoundError → search_worker_failed。
+    """
+    workspace = tmp_path / "plain-ws"
+    workspace.mkdir()
+    (workspace / "data.txt").write_text("needle outside layout\n", encoding="utf-8")
+    assert not (workspace / "praxis").exists()
+
+    tool = create_search_text_tool(workspace)
+    permissions = PermissionContext(
+        workspace=str(workspace), policy=PermissionPolicy(), mode="on-request", sandbox=_AVAILABLE
+    )
+    use = tool.resolve_use({"pattern": "needle", "path": "data.txt"})
+    spec = compile_sandbox(permissions, use, workspace)
+    try:
+        result = asyncio.run(
+            tool.run(
+                {"pattern": "needle", "path": "data.txt"},
+                ToolExecContext(sandbox=spec, permissions=permissions),
+            )
+        )
+    finally:
+        finalize_sandbox(spec, workspace)
+    assert result.status is ResultStatus.OK, (result.text, result.metadata)
+    assert "data.txt:1: needle outside layout" in result.text
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))

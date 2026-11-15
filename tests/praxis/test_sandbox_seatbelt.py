@@ -207,6 +207,28 @@ def test_workspace_rendered_as_realpath(tmp_path: Path):
     assert f'(subpath "{link}")' not in text
 
 
+def test_praxis_package_root_is_trusted_read_only(tmp_path: Path) -> None:
+    """N-1 静态断言:package_root 只读放行,绝不变成可写区。"""
+    import praxis
+
+    package_root = Path(praxis.__file__).resolve().parent.parent
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    resolved = resolve_policy(PermissionPolicy(), ws)
+    text = render_profile(
+        resolved,
+        workspace=ws,
+        scratch=tmp_path / "sc",
+        allow_network=False,
+        allow_write=True,
+        private_paths=(),
+    )
+    # 在只读受信根段里(praxis worker 在沙箱内 import 自身)。
+    assert f'(subpath "{package_root}")' in text
+    # 但没有对应的写授权行(workspace 写规则只覆盖 workspace 本身)。
+    assert f'(allow file-write* (subpath "{package_root}"))' not in text
+
+
 # ---------------------------------------------------------------------------
 # 真实 seatbelt 强制测试(darwin only;subprocess 直跑 sandbox-exec)
 # ---------------------------------------------------------------------------

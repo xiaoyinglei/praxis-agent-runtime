@@ -89,6 +89,55 @@ def _compat(
     )
 
 
+def _tool_call_without_id_sse(name: str) -> bytes:
+    """工具步响应:带工具名与参数、但没有 call_id 的分片(装配期被丢弃)。"""
+    return b"".join(
+        [
+            _chunk(
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "type": "function",
+                            "function": {"name": name, "arguments": "{}"},
+                        }
+                    ],
+                }
+            ),
+            _chunk({}, finish="tool_calls"),
+            _chunk({}, usage={"prompt_tokens": 5, "completion_tokens": 6, "total_tokens": 11}),
+            b"data: [DONE]\n\n",
+        ]
+    )
+
+
+def test_probe_rejects_tool_call_without_id() -> None:
+    """N-2:无 call_id 的 tool call 被丢弃后 content 非空,探针必须判失败。
+
+    修复前:K-3 的 `[tool call without id dropped: 1]` 让
+    ``tool_calls == ()`` 且 ``content.strip()`` 非空,两个失败分支都跳过 ⇒
+    ``ok=True``,给一个工具协议完全不可用的模型发合格证。
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body.get("tools"):
+            return httpx.Response(
+                200, content=_tool_call_without_id_sse("__probe_noop"), headers=_SSE_HEADERS
+            )
+        return httpx.Response(200, content=_text_sse("ok"), headers=_SSE_HEADERS)
+
+    spec = ModelSpec(model_id="m", base_url=_BASE)
+    outcome = asyncio.run(probe_model(_compat(spec, handler)))
+
+    assert outcome.ok is False
+    assert outcome.steps == ("text", "tools")
+    assert outcome.detail is not None
+    assert "without an id" in outcome.detail
+    assert "tool protocol" in outcome.detail
+
+
 def test_probe_passes_provider_options_without_typeerror() -> None:
     """B6 回归:探针与 turn 共用同一构造器,不存在"探针自己拼 SDK 参数"的路径。"""
     seen: list[dict[str, Any]] = []

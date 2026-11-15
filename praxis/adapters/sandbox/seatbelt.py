@@ -26,6 +26,7 @@ import sys
 from pathlib import Path
 from typing import Literal
 
+import praxis
 from praxis.protocol.floor import FLOOR_ENTRIES
 from praxis.protocol.policy import ResolvedPolicy
 from praxis.protocol.sandbox import SandboxRefusal, SandboxSpec
@@ -310,6 +311,25 @@ def _runtime_interpreter_roots() -> tuple[Path, ...]:
     return tuple(sorted(roots, key=str))
 
 
+def _praxis_package_root() -> Path | None:
+    """只读受信根:``search.py:_bootstrap`` 注入 sys.path 的包父目录(N-1)。
+
+    源码 checkout / editable 安装时 ``sys.prefix`` 在 ``<repo>/.venv``,而
+    praxis 包在 ``<repo>/praxis``——工作区在仓库之外时 worker 在沙箱内
+    import 不到自己(``ModuleNotFoundError``)。这个目录是**运维选择的安装
+    位置**(不是代理可选的),与 ``_runtime_interpreter_roots`` 同一论证:
+    只读放行不扩大可写面。必须与 ``search._bootstrap`` 的 parents[3] 同源。
+    """
+    try:
+        module = getattr(praxis, "__file__", None)
+        if not module:
+            return None
+        # praxis/__init__.py -> parents[1] == search.py parents[3]
+        return Path(module).resolve().parent.parent
+    except (OSError, TypeError, ValueError):
+        return None
+
+
 def _trusted_toolchain_roots(workspace_root: Path) -> tuple[Path, ...]:
     """Resolve recognized read-only toolchains used by a workspace venv.
 
@@ -321,7 +341,9 @@ def _trusted_toolchain_roots(workspace_root: Path) -> tuple[Path, ...]:
 
     R-T17-4 always adds the interpreter running Praxis itself (see
     ``_runtime_interpreter_roots``): workspaces without ``.venv`` must still be
-    able to execute ``run_python``.
+    able to execute ``run_python``. N-1 also adds the praxis package root
+    (``_praxis_package_root``) read-only so the sandboxed search worker can
+    import ``praxis`` from a source checkout outside the workspace.
     """
     workspace = Path(workspace_root).resolve()
     uv_python_roots = tuple(
@@ -333,6 +355,10 @@ def _trusted_toolchain_roots(workspace_root: Path) -> tuple[Path, ...]:
         if path.is_dir()
     )
     trusted: set[Path] = set(_runtime_interpreter_roots())
+    # N-1:praxis 自身安装位置只读放行(worker 在沙箱内 import praxis)。
+    package_root = _praxis_package_root()
+    if package_root is not None:
+        trusted.add(package_root)
     for name in ("python", "python3"):
         executable = workspace / ".venv" / "bin" / name
         if not executable.exists():
