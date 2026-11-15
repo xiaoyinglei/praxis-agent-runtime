@@ -23,6 +23,7 @@ class ItemKind(StrEnum):
     TOOL_RESULT = "tool_result"
     APPROVAL_REQUEST = "approval_request"
     APPROVAL_DECISION = "approval_decision"
+    HOOK_INVOCATION = "hook_invocation"
     TURN_STATUS = "turn_status"
     SUMMARY = "summary"
     COMPACTION_BOUNDARY = "compaction_boundary"

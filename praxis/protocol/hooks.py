@@ -13,15 +13,22 @@ handler-callable 双入口两种信任模型;这里只保留 **command hook** �
 - ``HookOutcome`` 是运行期结算事实的唯一形状;feedback 在构造期截断到
   ``MAX_FEEDBACK_BYTES``(旧 ``HookDecision`` 是抛错;这里是"截断"语义,
   避免运行器把超长宿主输出变成异常)。
+- ``hook_invocation_id`` 与 ``fold_hook_items`` 是纯数据函数(设计 3B 笔记 §4):
+  幂等身份只由 ``turn_id|event|hook_name|digest`` 决定;``started``/``settled``
+  item 的投影在协议层完成,core 与 adapters 都可消费。运行器的实际 spawn 在
+  ``adapters/hooks/runner.py``,不触达 store。
 """
 
 from __future__ import annotations
 
+import hashlib
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from praxis.protocol.items import Item
 from praxis.protocol.tools import ToolEffect
 
 HookEvent = Literal["PreToolUse", "PostToolUse"]
@@ -156,3 +163,49 @@ class HookOutcome:
             object.__setattr__(
                 self, "feedback", _truncate_utf8(self.feedback, MAX_FEEDBACK_BYTES)
             )
+
+
+def hook_invocation_id(
+    turn_id: str, event: HookEvent, hook_name: str, digest: str
+) -> str:
+    """稳定的 hook 调用身份:``"hook_" + sha256(turn_id|event|name|digest)[:32]``。
+
+    同一 Turn 内重入(审批恢复)必须得到同一身份,才能用 ``fold_hook_items``
+    复用已结算结论、不重复 spawn。``digest`` 在 Pre 是参数摘要,在 Post 是
+    结果摘要(由调用方 T5 计算)。
+    """
+    payload = "|".join((turn_id, event, hook_name, digest))
+    return "hook_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+def fold_hook_items(items: Sequence[Item], invocation_id: str) -> HookOutcome | None:
+    """从 append-only items 投影一次 hook 调用的结算结论。
+
+    - 有合法 ``settled`` 记录 ⇒ 返回其 ``status``/``feedback``(settled 优先,
+      与顺序无关);
+    - 仅 ``started`` 无 ``settled`` ⇒ ``HookOutcome("unknown", "crash before
+      settlement")``——调用方必须按**阻断**处理(fail-closed);
+    - 无匹配记录 ⇒ ``None``(从未发生,可安全 spawn)。
+
+    malformed payload(非 mapping/未知 phase/非法 status/非 str feedback)
+    一律跳过,绝不抛异常:损坏的宿主数据不是当前调用的崩溃点。
+    """
+    saw_started = False
+    for item in items:
+        payload = item.payload
+        if not isinstance(payload, Mapping):
+            continue
+        if payload.get("invocation_id") != invocation_id:
+            continue
+        phase = payload.get("phase")
+        if phase == "settled":
+            status = payload.get("status")
+            feedback = payload.get("feedback", "")
+            if status in _STATUSES and isinstance(feedback, str):
+                return HookOutcome(status, feedback)
+            continue
+        if phase == "started":
+            saw_started = True
+    if saw_started:
+        return HookOutcome("unknown", "crash before settlement")
+    return None
