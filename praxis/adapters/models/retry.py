@@ -73,8 +73,10 @@ def _identifier(value: object) -> str | None:
 
 
 def _diagnostic(exc: BaseException) -> str:
-    """原文摘要:SDK 异常只留类型名;其余只接受有界白名单字符。"""
-    if isinstance(exc, openai.APIError):
+    """原文摘要:SDK 异常与本地构造/编码异常只留类型名;其余只接受有界白名单字符。"""
+    # B34:h11 的 Illegal header value 原样 repr header 字节,可能含凭据值;
+    # UnicodeEncodeError 的原文本也可能带出凭据字符。两者只留类型名。
+    if isinstance(exc, (openai.APIError, httpx.LocalProtocolError, UnicodeEncodeError)):
         return type(exc).__name__
     text = str(exc).strip().splitlines()[0] if str(exc).strip() else ""
     if text and _SAFE_DIAGNOSTIC.fullmatch(text):
@@ -212,6 +214,24 @@ def classify_failure(
             output_started=output_started,
             diagnostic=diagnostic,
         )
+
+    # B34:发送期的本地请求构造/编码失败(非 ASCII 凭据、非法 header 等)发生在
+    # 请求真正发出之前,与 provider 应答无关。必须在 transport 因果链与兜底之前
+    # 识别,否则 UnicodeEncodeError 会落进 protocol_error(冤枉 provider),
+    # 裸 LocalProtocolError 会落进 transport_unknown。与下面同一 seen 防环模式。
+    local_cause: BaseException | None = exc
+    local_seen: set[int] = set()
+    while local_cause is not None and id(local_cause) not in local_seen:
+        local_seen.add(id(local_cause))
+        if isinstance(local_cause, (UnicodeEncodeError, httpx.LocalProtocolError)):
+            return _failure(
+                kind="local_request_error",
+                retryable=False,
+                retry_at=None,
+                output_started=output_started,
+                diagnostic=diagnostic,
+            )
+        local_cause = local_cause.__cause__
 
     # 连接失败只在"请求尚未发出"时可安全重放;读/写中途失败一律不重试。
     # 必须先于 openai.APIError 分支:APIConnectionError 也是 APIError,但它的

@@ -35,6 +35,7 @@ FailureKind = Literal[
     "server_error",
     "transport_not_sent",
     "transport_unknown",
+    "local_request_error",
     "protocol_error",
 ]
 FailurePhase = Literal["request", "stream"]
@@ -52,6 +53,11 @@ _MESSAGES: dict[FailureKind, str] = {
     "server_error": "Provider server failed.",
     "transport_not_sent": "Provider connection failed before the request was sent.",
     "transport_unknown": "Provider transport failed; request outcome is unknown.",
+    # B34:发送期的本地构造/编码失败不是 provider 违约,文案指向自身配置。
+    "local_request_error": (
+        "Local request construction failed before contacting the provider; "
+        "check model and credential configuration (values must be ASCII-safe)."
+    ),
     "protocol_error": "Provider response violated the model protocol.",
 }
 
