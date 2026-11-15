@@ -366,7 +366,9 @@ def test_run_model_id_escape_hatch_reports_missing_key(workspace: Path, tmp_path
         },
     )
     assert result.exit_code == 1, result.output
-    assert "API key" in result.output
+    # M-1:缺凭据文案点名模型/provider 与下一步(逃生门没有 api_key_env)。
+    assert "no credential for model 'gpt-from-env'" in result.output
+    assert "praxis models add gpt-from-env --api-key-env" in result.output
     assert "Traceback" not in result.output
 
 
@@ -1576,6 +1578,43 @@ def test_models_login_requires_api_key_env(tmp_path: Path) -> None:
     result = _invoke_models(["login", "local"], _env(tmp_path))
     assert result.exit_code == 1, result.output
     assert "api_key_env" in result.output
+
+
+def test_models_check_missing_credential_names_env_and_next_step(tmp_path: Path) -> None:
+    """M-1:缺凭据报错必须点名模型/provider、api_key_env 与两条可执行出路。"""
+    assert _add_openai(tmp_path).exit_code == 0
+    result = _invoke_models(["check", "ds"], _env(tmp_path, REGISTRY_KEY=None))
+    assert result.exit_code == 1, result.output
+    output = result.output
+    assert "ds" in output
+    assert "openai-compatible" in output
+    assert "REGISTRY_KEY" in output
+    assert "export REGISTRY_KEY=" in output
+    assert "praxis models login ds" in output
+    assert "sk-test" not in output  # 凭据值绝不出现
+
+
+def test_models_check_missing_api_key_env_points_at_models_add(tmp_path: Path) -> None:
+    """M-1:api_key_env is None 时如实说明,并指向 models add --api-key-env。"""
+    added = _invoke_models(
+        [
+            "add",
+            "glm-5.3",
+            "--provider",
+            "openai-compatible",
+            "--base-url",
+            "https://unit.test/v1",
+        ],
+        _env(tmp_path),
+    )
+    assert added.exit_code == 0, added.output
+    result = _invoke_models(["check", "glm-5.3"], _env(tmp_path))
+    assert result.exit_code == 1, result.output
+    output = result.output
+    assert "glm-5.3" in output
+    assert "openai-compatible" in output
+    assert "no api_key_env configured" in output
+    assert "praxis models add glm-5.3 --api-key-env" in output
 
 
 def test_models_check_exit_codes(

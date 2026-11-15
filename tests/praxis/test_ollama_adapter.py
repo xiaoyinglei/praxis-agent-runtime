@@ -485,7 +485,7 @@ def test_composition_dispatches_adapters_by_provider() -> None:
         ModelSpec(model_id="m", base_url="https://unit.test/v1"), "k"
     )
     assert isinstance(compat, OpenAICompatAdapter)
-    with pytest.raises(ValueError, match="requires an API key"):
+    with pytest.raises(ValueError, match="no credential for model"):
         _adapter_for(ModelSpec(model_id="m", base_url="https://unit.test/v1"))
     with pytest.raises(ValueError, match="base_url"):
         _adapter_for(ModelSpec(model_id="m"), "k")

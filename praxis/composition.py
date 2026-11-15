@@ -84,6 +84,27 @@ _VALID_MODES: tuple[PermissionMode, ...] = ("on-request", "never", "bypass")
 logger = logging.getLogger(__name__)
 
 
+def missing_credential_message(spec: ModelSpec) -> str:
+    """缺凭据的唯一文案产地(D6/R-T6-6):模型/provider、环境变量名、下一步。
+
+    只拼配置事实(spec 里的变量名,绝不是值),因此 ``models add`` 的干跑、
+    ``build_session`` 与 ``models check`` 的报错天然同源。``api_key_env`` 未配置时
+    如实说明并指向 ``models add --api-key-env``;否则给出 export 与 keychain 两条
+    出路。凭据值永远不进入消息。
+    """
+    head = f"no credential for model {spec.model_id!r} (provider {spec.provider})"
+    if spec.api_key_env is None:
+        return (
+            f"{head}: no api_key_env configured; "
+            f"register one with: praxis models add {spec.model_id} --api-key-env <NAME>"
+        )
+    env = spec.api_key_env
+    return (
+        f"{head}: set environment variable {env} (export {env}=...), "
+        f"or run: praxis models login {spec.model_id}"
+    )
+
+
 def _validate_thread_id(thread_id: str) -> None:
     if not thread_id:
         raise ValueError("thread_id must be non-empty")
@@ -121,9 +142,7 @@ def _adapter_for(
                 f"got {spec.base_url!r}"
             )
         if api_key is None:
-            raise ValueError(
-                f"provider openai-compatible requires an API key for model {spec.model_id!r}"
-            )
+            raise ValueError(missing_credential_message(spec))
         return OpenAICompatAdapter(spec, api_key=api_key, http_client=http_client)
     raise ValueError(
         f"provider {spec.provider!r} must be injected explicitly (scripted), "
