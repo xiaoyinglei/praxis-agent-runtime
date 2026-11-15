@@ -16,6 +16,7 @@ from __future__ import annotations
 import signal
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -27,6 +28,14 @@ _MAX_REFUSAL_REASON_CHARS = 512
 # composition 绑定 ``tools.builtins.process.signal_group``;core 只经此签名消费
 # (R-T15-7:与 SandboxCompiler/RetryingStream 同一注入纪律)。
 type ProcessSignaler = Callable[[int, signal.Signals], bool]
+
+# T16 同族(R-T15-7 注入纪律):adapters 不得 import tools,而 MCP stdio 与
+# bash/run_python 一样需要"子进程最小环境"与"执行可写临时区"。两者在此只留
+# 结构签名,composition(T19/T20)绑定 ``tools.builtins.child_env`` 的**唯一**
+# 实现注入;``child_env``/``scratch_dir_for`` 的定义点仍只有一份(T20 规则⑲)。
+# EnvBuilder 的两个入参依次是 scratch_dir 与 workspace(与 child_env 同序)。
+type EnvBuilder = Callable[[Path, Path], dict[str, str]]
+type ScratchLocator = Callable[[SandboxSpec | None], Path]
 
 
 class SandboxRefusal(RuntimeError):  # noqa: N818 — 异常名由阶段 2 计划 ACI 固定(后续任务编译器/管道同名引用)

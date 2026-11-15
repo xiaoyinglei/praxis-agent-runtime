@@ -1,7 +1,7 @@
-"""Praxis MCP 适配器:名字唯一拼装 + ``mcp_servers.yaml`` 加载/信任门/漂移(T15)。
+"""Praxis MCP 适配器:名字唯一拼装 + 配置加载/信任门(T15)+ stdio 生命周期(T16)。
 
-后续任务在此包内扩展:stdio 生命周期(T16)、descriptor→Tool(T17)、HTTP
-传输(T18)、manager/CLI 接线(T19)。
+后续任务在此包内扩展:descriptor→Tool(T17)、HTTP 传输(T18)、manager/CLI
+接线(T19)。
 """
 
 from praxis.adapters.mcp.config import (
@@ -14,6 +14,7 @@ from praxis.adapters.mcp.config import (
     load_mcp_configs,
     resolve_mcp_config_path,
 )
+from praxis.adapters.mcp.lifecycle import McpConnection, owned_stdio_connection
 from praxis.adapters.mcp.names import (
     canonical_tool_name,
     global_wildcard,
@@ -24,6 +25,7 @@ from praxis.adapters.mcp.names import (
 __all__ = [
     "HttpServerConfig",
     "McpConfigTrustDecision",
+    "McpConnection",
     "McpServerConfig",
     "StdioServerConfig",
     "canonical_tool_name",
@@ -32,6 +34,7 @@ __all__ = [
     "global_wildcard",
     "load_mcp_configs",
     "normalize_mcp_name",
+    "owned_stdio_connection",
     "resolve_mcp_config_path",
     "server_wildcard",
 ]
