@@ -75,6 +75,7 @@ __all__ = [
     "SEARCH_ENDPOINTS",
     "SEARCH_PROVIDERS",
     "TOOL_TIMEOUT_SECONDS",
+    "WEB_SEARCH_PROVIDER_ENV",
     "WEB_SEARCH_TOOL_NAME",
     "SearchProvider",
     "SearchProviderConfig",
@@ -106,7 +107,9 @@ TOOL_TIMEOUT_SECONDS = 45.0
 MAX_MODEL_OUTPUT_BYTES = 65_536
 
 _WEB_JSON_MAX_BYTES = 16_384
-_PROVIDER_ENV = "PRAXIS_WEB_SEARCH_PROVIDER"
+# provider 覆盖 env 名的**唯一定义点**(T20 规则 23):CLI 归因展示经 sdk
+# 复用该名字,不得再写第二份字面量。
+WEB_SEARCH_PROVIDER_ENV = "PRAXIS_WEB_SEARCH_PROVIDER"
 _CONFIG_KEYS = frozenset({"version", "provider", "api_key_env", "limits"})
 _MAX_ERROR_CHARACTERS = 1_000
 _MAX_TITLE_CHARACTERS = 500
@@ -178,13 +181,13 @@ def load_web_search_config(
         )
 
     environment = os.environ if environ is None else environ
-    env_provider = environment.get(_PROVIDER_ENV) or None
+    env_provider = environment.get(WEB_SEARCH_PROVIDER_ENV) or None
     provider: object = env_provider if env_provider is not None else data.get("provider")
     api_key_env: object = data.get("api_key_env")
     if provider is None and api_key_env is None:
         # 仅含 "limits" 块的共享 web.json:合法,但不是搜索配置。
         return None
-    where = f"{source} ({_PROVIDER_ENV})" if env_provider is not None else str(source)
+    where = f"{source} ({WEB_SEARCH_PROVIDER_ENV})" if env_provider is not None else str(source)
     if not isinstance(provider, str) or provider not in SEARCH_PROVIDERS:
         raise ValueError(
             f"web search provider must be deepseek, brave or tavily in {where}"

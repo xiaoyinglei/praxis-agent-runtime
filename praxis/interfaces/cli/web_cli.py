@@ -29,6 +29,7 @@ from praxis.interfaces.sdk import (
     API_KEY_ENV_NAME,
     SEARCH_ENDPOINTS,
     SEARCH_PROVIDERS,
+    WEB_SEARCH_PROVIDER_ENV,
     SearchProvider,
     SearchProviderConfig,
     load_web_search_config,
@@ -40,7 +41,7 @@ from praxis.interfaces.sdk import (
 EXIT_COMPLETED = 0
 EXIT_FAILED = 1
 
-_PROVIDER_ENV = "PRAXIS_WEB_SEARCH_PROVIDER"
+_PROVIDER_ENV = WEB_SEARCH_PROVIDER_ENV
 _PROVIDER_TEXT = ", ".join(SEARCH_PROVIDERS[:-1]) + " or " + SEARCH_PROVIDERS[-1]
 
 app = typer.Typer(

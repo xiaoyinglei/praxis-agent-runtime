@@ -38,6 +38,22 @@ Also scans praxis/ for architecture hard-rule violations (阶段1 CI 硬规则):
  17. def put( artifact 落盘)只允许 store/artifacts.py;
  18. MAX_PLAN_STEPS 定义只允许 protocol/plan.py。
 
+阶段3B 追加(Task 20:CI 单一来源硬规则与工具表收口):
+ 19. ``mcp__`` 字符串字面量只允许 adapters/mcp/names.py(旧 6 处拼装漂移的
+     结构预防;代码字符串,docstring 排除);
+ 20. S7 argv 密钥重置形态全仓禁止:代码字符串含 ``/usr/bin/env``,或同一
+     序列字面量里 ``-i`` 与 env 可执行名共现(``/usr/bin/env -i`` 形态);
+ 21. B33 宿主 env 直接进子进程:``env={**os.environ}``、``os.environ.copy()``、
+     ``dict(os.environ)`` 与 ``env=os.environ`` 全仓禁止(常量白名单之外无路);
+ 22. 唯一定义点:child_env/signal_group/await_main_exit/drain_stream/
+     skill_fingerprint/atomic_write_bytes/atomic_write_text/load_host_hooks/
+     spawn_hook/connect_mcp_servers/web_configuration_path 各自唯一
+     (retry 机制三项沿用规则 14,不重复登记);
+ 23. 宿主配置文件读取面(host_config_dir() 调用与
+     PRAXIS_{MCP_CONFIG,HOOKS_CONFIG,WEB_LIMITS,WEB_SEARCH_PROVIDER}
+     字面量)只允许适配器配置层(adapters/{hooks,config}/、web limits/search、
+     mcp config)与 protocol/floor.py(路径定义点)。
+
 ``--praxis-only``:只扫 praxis 硬规则、跳过 rag 存量扫描(CI 门 R5:阶段1 只强制 praxis 规则)。
 
 Exit code 0: no anti-patterns found.
@@ -168,6 +184,63 @@ _RETRY_POLICY_CLASSES = frozenset(
 _CREDENTIAL_COMMAND_MARKERS = ("find-generic-password",)
 _SECURITY_BASENAMES = frozenset({"security", "/usr/bin/security"})
 
+# 阶段3B(Task 20)单一来源白名单:同样严格等于"相对 praxis 根的路径"。
+_PRAXIS_MCP_NAMES_FILE = ("adapters", "mcp", "names.py")
+_PRAXIS_CHILD_ENV_FILE = ("tools", "builtins", "child_env.py")
+_PRAXIS_PROCESS_FILE = ("tools", "builtins", "process.py")
+_PRAXIS_SKILLS_FILE = ("tools", "builtins", "skills.py")
+_PRAXIS_PATHS_FILE = ("tools", "builtins", "paths.py")
+_PRAXIS_WEB_LIMITS_FILE = ("adapters", "web", "limits.py")
+_PRAXIS_HOOKS_CONFIG_FILE = ("adapters", "hooks", "config.py")
+_PRAXIS_HOOKS_RUNNER_FILE = ("adapters", "hooks", "runner.py")
+_PRAXIS_MCP_MANAGER_FILE = ("adapters", "mcp", "manager.py")
+
+# 规则 20(S7):argv 密钥重置形态的两个字面量。``-i`` 单独出现(如
+# ``security -i`` 的 stdin 模式)不是重置形态——只有与 env 可执行名共处同一
+# 序列字面量时才拒绝;``/usr/bin/env`` 本身在任何代码字符串里都拒绝。
+_S7_ENV_RESET_BINARY = "/usr/bin/env"
+_S7_ENV_NAME = "env"
+_S7_RESET_FLAG = "-i"
+
+# 规则 22(阶段3B):单一定义点。retry 机制三项已由 _RETRY_MECHANISM_FUNCS
+# (规则 14)钉住,这里不重复登记。connect_mcp_servers 的**唯一实现**在
+# adapters/mcp/manager.py;composition.py 是注入绑定 facade(R-T15-7,env_builder/
+# sandbox_compiler 的唯一绑定点),同属允许面。
+_SINGLE_DEFINITION_SITES: dict[str, frozenset[tuple[str, ...]]] = {
+    "child_env": frozenset({_PRAXIS_CHILD_ENV_FILE}),
+    "signal_group": frozenset({_PRAXIS_PROCESS_FILE}),
+    "await_main_exit": frozenset({_PRAXIS_PROCESS_FILE}),
+    "drain_stream": frozenset({_PRAXIS_PROCESS_FILE}),
+    "skill_fingerprint": frozenset({_PRAXIS_SKILLS_FILE}),
+    "atomic_write_bytes": frozenset({_PRAXIS_PATHS_FILE}),
+    "atomic_write_text": frozenset({_PRAXIS_PATHS_FILE}),
+    "load_host_hooks": frozenset({_PRAXIS_HOOKS_CONFIG_FILE}),
+    "spawn_hook": frozenset({_PRAXIS_HOOKS_RUNNER_FILE}),
+    "connect_mcp_servers": frozenset({_PRAXIS_MCP_MANAGER_FILE, _PRAXIS_SESSION_FILE}),
+    "web_configuration_path": frozenset({_PRAXIS_WEB_LIMITS_FILE}),
+}
+
+# 规则 23(阶段3B):宿主配置文件读取面。adapters/{hooks,config}/ 是整包允许
+# (hooks.json 与 config.sqlite/credentials 同属宿主配置层);web 的两个加载器
+# 与 mcp 配置各自唯一;protocol/floor.py 是 host_config_dir 的定义点。
+_HOST_CONFIG_DIR_PACKAGE_PREFIXES = frozenset(
+    {("adapters", "hooks"), ("adapters", "config")}
+)
+_HOST_CONFIG_DIR_FILES = frozenset(
+    {
+        _PRAXIS_WEB_LIMITS_FILE,
+        ("adapters", "web", "search.py"),
+        ("adapters", "mcp", "config.py"),
+        _PRAXIS_FLOOR_FILE,
+    }
+)
+_HOST_CONFIG_ENV_LITERALS = (
+    "PRAXIS_MCP_CONFIG",
+    "PRAXIS_HOOKS_CONFIG",
+    "PRAXIS_WEB_LIMITS",
+    "PRAXIS_WEB_SEARCH_PROVIDER",
+)
+
 
 def _rel_to_praxis_parts(path: Path, praxis_root: Path | None) -> tuple[str, ...]:
     if praxis_root is not None:
@@ -242,6 +315,13 @@ def _enclosing_function(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
             return True
         cur = parents.get(cur)
     return False
+
+
+def _host_config_reader_allowed(rel_parts: tuple[str, ...]) -> bool:
+    """规则 23:宿主配置文件读取面白名单(包前缀或精确文件)。"""
+    if rel_parts[:2] in _HOST_CONFIG_DIR_PACKAGE_PREFIXES:
+        return True
+    return rel_parts in _HOST_CONFIG_DIR_FILES
 
 
 def scan_praxis_file(path: Path, praxis_root: Path | None = None) -> list[str]:
@@ -488,6 +568,99 @@ def scan_praxis_file(path: Path, praxis_root: Path | None = None) -> list[str]:
                     f"line {node.lineno}: MAX_PLAN_STEPS definition outside protocol/plan.py — "
                     "计划上限只允许 protocol/plan.py 单一来源"
                 )
+
+    # 规则 19-23(阶段3B/Task 20):MCP 名字、S7 argv 重置、B33 宿主 env、
+    # 单一定义点与宿主配置文件读取面。纯增:不改上方旧规则。
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if id(node) in docstrings:
+                continue
+            # 规则 19:MCP 工具名前缀只允许 names.py 唯一拼装
+            if "mcp__" in node.value and rel_parts != _PRAXIS_MCP_NAMES_FILE:
+                violations.append(
+                    f"line {node.lineno}: MCP tool-name literal outside adapters/mcp/names.py — "
+                    "mcp__ 前缀只允许 names.py(canonical_tool_name/server_wildcard/global_wildcard)"
+                )
+            # 规则 20(S7):env 重置可执行名本身全仓禁止
+            if _S7_ENV_RESET_BINARY in node.value:
+                violations.append(
+                    f"line {node.lineno}: S7 argv env reset outside the envp-only posture — "
+                    f"代码字符串含 {_S7_ENV_RESET_BINARY!r};配置 env 只允许经 StdioServerParameters(env=...)"
+                )
+            # 规则 23:宿主配置 env 名只允许配置层读取
+            if not _host_config_reader_allowed(rel_parts):
+                for literal in _HOST_CONFIG_ENV_LITERALS:
+                    if literal in node.value:
+                        violations.append(
+                            f"line {node.lineno}: host configuration env read outside the "
+                            f"config adapters — {literal} 只允许宿主配置加载层"
+                        )
+        elif isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            # 规则 20(S7):``/usr/bin/env -i`` / ``env -i`` 的 argv 重置形态
+            values = [
+                element.value
+                for element in node.elts
+                if isinstance(element, ast.Constant) and isinstance(element.value, str)
+            ]
+            if _S7_RESET_FLAG in values and (
+                any(_S7_ENV_RESET_BINARY in value for value in values)
+                or _S7_ENV_NAME in values
+            ):
+                violations.append(
+                    f"line {node.lineno}: S7 argv env reset outside the envp-only posture — "
+                    "argv 序列里的 env -i 形态把配置密钥暴露给 ps;envp 之外无路"
+                )
+        elif isinstance(node, ast.Dict):
+            # 规则 21(B33):``{**os.environ}`` 直接展开进子进程 env
+            for key, value in zip(node.keys, node.values, strict=True):
+                if key is None and _dotted_chain(value) == ["os", "environ"]:
+                    violations.append(
+                        f"line {node.lineno}: host environment inherited into a subprocess (B33) — "
+                        "**os.environ 展开全仓禁止;子进程 env 只允许常量白名单/child_env"
+                    )
+        elif isinstance(node, ast.Call):
+            chain = _dotted_chain(node.func)
+            # 规则 21(B33):os.environ.copy() / dict(os.environ)
+            if chain == ["os", "environ", "copy"]:
+                violations.append(
+                    f"line {node.lineno}: host environment inherited into a subprocess (B33) — "
+                    "os.environ.copy() 全仓禁止;子进程 env 只允许常量白名单/child_env"
+                )
+            if chain == ["dict"] and any(
+                _dotted_chain(argument) == ["os", "environ"] for argument in node.args
+            ):
+                violations.append(
+                    f"line {node.lineno}: host environment inherited into a subprocess (B33) — "
+                    "dict(os.environ) 全仓禁止;子进程 env 只允许常量白名单/child_env"
+                )
+            for keyword in node.keywords:
+                if keyword.arg == "env" and _dotted_chain(keyword.value) == ["os", "environ"]:
+                    violations.append(
+                        f"line {node.lineno}: host environment inherited into a subprocess (B33) — "
+                        "env=os.environ 全仓禁止;子进程 env 只允许常量白名单/child_env"
+                    )
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # 规则 22:单一定义点
+            allowed_sites = _SINGLE_DEFINITION_SITES.get(node.name)
+            if allowed_sites is not None and rel_parts not in allowed_sites:
+                sites = ", ".join("/".join(site) for site in sorted(allowed_sites))
+                violations.append(
+                    f"line {node.lineno}: def {node.name}() outside its single definition site — "
+                    f"只允许 {sites}"
+                )
+
+    # 规则 23:host_config_dir() 调用只允许配置加载层与 floor.py(定义点)。
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and _call_is(node, "host_config_dir")
+            and not _host_config_reader_allowed(rel_parts)
+        ):
+            violations.append(
+                f"line {node.lineno}: host configuration path constructed outside the config "
+                "adapters — host_config_dir() 只允许 adapters/{hooks,config}/、web、mcp config "
+                "与 protocol/floor.py"
+            )
 
     return list(dict.fromkeys(violations))
 

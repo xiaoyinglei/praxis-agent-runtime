@@ -531,5 +531,238 @@ def test_max_plan_steps_allowed_in_plan_module(tmp_path):
 
 # --- 真实树:新规则零误报(与 CI 门同源,钉住 adapters/sandbox 豁免+注释/docstring 排除) ---
 
-def test_real_praxis_tree_clean_under_new_rules():
+# ===========================================================================
+# 阶段3B 新增硬规则(Task 20):CI 单一来源收口
+#
+# ⑯ mcp__ 字面量只允许 adapters/mcp/names.py;
+# ⑰ S7 argv env 重置形态(/usr/bin/env、env -i)全仓禁止;
+# ⑱ B33 宿主 env 直接进子进程 env 全仓禁止;
+# ⑲ child_env/signal_group/... 唯一定义点;
+# ⑳ 宿主配置文件读取面(host_config_dir / PRAXIS_* env 名)白名单。
+# ===========================================================================
+
+
+# --- 规则⑯:MCP 工具名前缀只允许 names.py 唯一拼装 ---
+
+def test_mcp_name_literal_outside_names_rejected(tmp_path):
+    f = _write(tmp_path, "praxis/core/evil.py", 'PREFIX = "mcp__probe__echo"\n')
+    assert any("MCP tool-name literal" in v for v in scan_praxis_file(f))
+
+
+def test_mcp_name_literal_allowed_in_names_module(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/adapters/mcp/names.py",
+        'def canonical_tool_name(server, tool):\n'
+        '    return f"mcp__{server}__{tool}"\n\n\n'
+        'def global_wildcard():\n    return "mcp__*"\n',
+    )
+    assert scan_praxis_file(f) == []
+
+
+def test_mcp_name_literal_in_docstring_not_flagged(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/adapters/mcp/output.py",
+        '"""canonical 名为 ``mcp__server__tool``;``mcp__*`` 是全域通配。"""\nX = 1\n',
+    )
+    assert scan_praxis_file(f) == []
+
+
+# --- 规则⑰:S7 argv env 重置形态全仓禁止 ---
+
+def test_s7_env_reset_shape_rejected(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/adapters/mcp/lifecycle.py",
+        'argv = ["/usr/bin/env", "-i", "SECRET_MCP_KEY=value", "server"]\n',
+    )
+    assert any("S7 argv env reset" in v for v in scan_praxis_file(f))
+
+
+def test_s7_env_binary_literal_rejected(tmp_path):
+    f = _write(tmp_path, "praxis/core/evil.py", 'RESET = "/usr/bin/env"\n')
+    assert any("/usr/bin/env" in v and "S7" in v for v in scan_praxis_file(f))
+
+
+def test_s7_env_name_reset_shape_rejected(tmp_path):
+    f = _write(tmp_path, "praxis/core/evil.py", 'argv = ["env", "-i", "K=V", "cmd"]\n')
+    assert any("S7 argv env reset" in v for v in scan_praxis_file(f))
+
+
+def test_s7_mentions_in_docstring_not_flagged(tmp_path):
+    # 真实树 lifecycle.py 用 docstring 解释 S7 病灶:文档不是构造器
+    f = _write(
+        tmp_path,
+        "praxis/adapters/mcp/lifecycle.py",
+        '"""旧 ``/usr/bin/env -i KEY=VALUE ... cmd`` argv 重置形态已删除。"""\nX = 1\n',
+    )
+    assert scan_praxis_file(f) == []
+
+
+def test_security_stdin_flag_is_not_s7_reset_shape(tmp_path):
+    # credentials 的 ``security -i`` 是 stdin 模式,没有 env 可执行名共现
+    f = _write(
+        tmp_path,
+        "praxis/adapters/config/credentials.py",
+        'CMD = ["/usr/bin/security", "-i"]\n',
+    )
+    assert scan_praxis_file(f) == []
+
+
+# --- 规则⑱:B33 宿主 env 直接进子进程 ---
+
+@pytest.mark.parametrize(
+    "source",
+    (
+        'proc = create_subprocess_exec("x", env={**os.environ})\n',
+        'env = os.environ.copy()\nproc = create_subprocess_exec("x", env=env)\n',
+        'env = dict(os.environ)\nproc = create_subprocess_exec("x", env=env)\n',
+        'proc = create_subprocess_exec("x", env=os.environ)\n',
+    ),
+)
+def test_host_environment_inheritance_rejected(tmp_path, source):
+    f = _write(tmp_path, "praxis/tools/builtins/evil.py", source)
+    assert any("B33" in v for v in scan_praxis_file(f))
+
+
+def test_constant_environment_whitelist_allowed(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/adapters/hooks/runner.py",
+        'import os\nproc = create_subprocess_exec("x", env={"PATH": os.defpath})\n',
+    )
+    assert scan_praxis_file(f) == []
+
+
+def test_b33_pattern_in_docstring_not_flagged(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/tools/builtins/child_env.py",
+        '"""Never pass ``env={**os.environ}`` to a child process."""\nX = 1\n',
+    )
+    assert scan_praxis_file(f) == []
+
+
+# --- 规则⑲:单一定义点 ---
+
+@pytest.mark.parametrize(
+    "func",
+    (
+        "child_env",
+        "signal_group",
+        "await_main_exit",
+        "drain_stream",
+        "skill_fingerprint",
+        "atomic_write_bytes",
+        "atomic_write_text",
+        "load_host_hooks",
+        "spawn_hook",
+        "connect_mcp_servers",
+        "web_configuration_path",
+    ),
+)
+def test_single_definition_outside_its_site_rejected(tmp_path, func):
+    f = _write(tmp_path, "praxis/core/evil.py", f"def {func}(*args):\n    return None\n")
+    assert any(f"def {func}()" in v and "single definition" in v for v in scan_praxis_file(f))
+
+
+def test_single_definitions_allowed_at_their_sites(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/tools/builtins/process.py",
+        "def signal_group(pgid, sig):\n    return True\n\n\n"
+        "async def await_main_exit(proc, timeout):\n    return 0\n\n\n"
+        "async def drain_stream(proc):\n    return None\n",
+    )
+    assert scan_praxis_file(f) == []
+    paths = _write(
+        tmp_path,
+        "praxis/tools/builtins/paths.py",
+        "def atomic_write_bytes(path, data, *, mode=None):\n    return None\n\n\n"
+        "def atomic_write_text(path, content):\n    return None\n",
+    )
+    assert scan_praxis_file(paths) == []
+    hooks = _write(
+        tmp_path,
+        "praxis/adapters/hooks/config.py",
+        "def load_host_hooks(workspace, path=None):\n    return ()\n",
+    )
+    assert scan_praxis_file(hooks) == []
+    runner = _write(
+        tmp_path,
+        "praxis/adapters/hooks/runner.py",
+        "async def spawn_hook(spec, request, *, kill_group=None):\n    return None\n",
+    )
+    assert scan_praxis_file(runner) == []
+    skills = _write(
+        tmp_path,
+        "praxis/tools/builtins/skills.py",
+        "def skill_fingerprint(frontmatter, body):\n    return ''\n",
+    )
+    assert scan_praxis_file(skills) == []
+    child = _write(
+        tmp_path,
+        "praxis/tools/builtins/child_env.py",
+        "def child_env(scratch_dir, workspace):\n    return {}\n",
+    )
+    assert scan_praxis_file(child) == []
+    limits = _write(
+        tmp_path,
+        "praxis/adapters/web/limits.py",
+        "def web_configuration_path():\n    return None\n",
+    )
+    assert scan_praxis_file(limits) == []
+
+
+def test_connect_mcp_servers_facade_allowed_in_composition(tmp_path):
+    # manager.py 是唯一实现;composition.py 是唯一的注入绑定 facade。
+    manager = _write(
+        tmp_path,
+        "praxis/adapters/mcp/manager.py",
+        "async def connect_mcp_servers(workspace, **kwargs):\n    return None\n",
+    )
+    assert scan_praxis_file(manager) == []
+    facade = _write(
+        tmp_path,
+        "praxis/composition.py",
+        "async def connect_mcp_servers(workspace, **kwargs):\n    return None\n",
+    )
+    assert scan_praxis_file(facade) == []
+
+
+# --- 规则⑳:宿主配置文件读取面白名单 ---
+
+def test_host_config_dir_outside_config_adapters_rejected(tmp_path):
+    f = _write(tmp_path, "praxis/core/evil.py", 'path = host_config_dir() / "web.json"\n')
+    assert any("host configuration path" in v for v in scan_praxis_file(f))
+
+
+def test_host_config_env_literal_outside_config_adapters_rejected(tmp_path):
+    f = _write(tmp_path, "praxis/interfaces/cli/evil.py", 'ENV = "PRAXIS_MCP_CONFIG"\n')
+    assert any("PRAXIS_MCP_CONFIG" in v and "host configuration env" in v for v in scan_praxis_file(f))
+
+
+@pytest.mark.parametrize(
+    "relpath",
+    (
+        "praxis/adapters/config/store.py",
+        "praxis/adapters/config/credentials.py",
+        "praxis/adapters/hooks/config.py",
+        "praxis/adapters/web/limits.py",
+        "praxis/adapters/web/search.py",
+        "praxis/adapters/mcp/config.py",
+        "praxis/protocol/floor.py",
+    ),
+)
+def test_host_config_reader_allowed_at_config_layers(tmp_path, relpath):
+    f = _write(
+        tmp_path,
+        relpath,
+        'ENV = "PRAXIS_WEB_SEARCH_PROVIDER"\npath = host_config_dir() / "config.json"\n',
+    )
+    assert scan_praxis_file(f) == []
+
+
+def test_real_praxis_tree_clean_under_3b_rules():
     assert capi.scan_praxis_tree(capi._PRAXIS_DIR) == []

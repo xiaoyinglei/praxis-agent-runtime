@@ -47,7 +47,11 @@ from praxis.adapters.mcp.config import (
 from praxis.adapters.mcp.descriptors import mcp_tools_for_connection
 from praxis.adapters.mcp.http_transport import owned_http_connection
 from praxis.adapters.mcp.lifecycle import McpConnection, owned_stdio_connection
-from praxis.adapters.mcp.names import canonical_tool_name, normalize_mcp_name, server_wildcard
+from praxis.adapters.mcp.names import (
+    canonical_tool_name,
+    global_wildcard,
+    server_wildcard,
+)
 from praxis.adapters.sandbox.base import probe_backend
 from praxis.adapters.sandbox.compile import finalize_sandbox
 from praxis.protocol.permission import PermissionContext
@@ -289,7 +293,7 @@ def _skip_reason(config: McpServerConfig, resolved: ResolvedPolicy) -> str | Non
     bounded_name = bounded_message(config.name, fallback="?")
     wildcard_denied = tool_decision(resolved, server_wildcard(config.name))
     if wildcard_denied == "deny":
-        wildcard = bounded_message(server_wildcard(config.name), fallback="mcp__*")
+        wildcard = bounded_message(server_wildcard(config.name), fallback=global_wildcard())
         return bounded_message(
             f"MCP server {bounded_name!r} is denied by the permission policy "
             f"({wildcard}); remove the deny rule to enable it",
@@ -301,11 +305,10 @@ def _skip_reason(config: McpServerConfig, resolved: ResolvedPolicy) -> str | Non
             for tool in config.tools_allowlist
         ]
         if decisions and all(decision == "deny" for decision in decisions):
-            normalized = bounded_message(normalize_mcp_name(config.name), fallback="?")
             return bounded_message(
                 f"every allowlisted tool of MCP server {bounded_name!r} is denied by the "
-                "permission policy; grant at least one mcp__"
-                f"{normalized}__<tool> rule to enable it",
+                "permission policy; grant at least one "
+                f"{server_wildcard(config.name)} rule to enable it",
                 fallback="MCP server skipped: all allowlisted tools are denied",
             )
     if isinstance(config, HttpServerConfig):

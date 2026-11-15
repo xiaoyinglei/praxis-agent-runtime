@@ -28,6 +28,9 @@ decide_mcp_config_trust/mcp_config_write_path/normalize_mcp_name)与
 save_mcp_bearer。宿主构造 typed ``extra_tools``/hooks/skills 面所需的
 ``ToolSource``/``SkillCatalog``/``load_host_hooks`` 一并出口(修复轮 #1;
 无豁免)。CLI 因此不直依 adapters(契约 praxis_cli_via_sdk)。
+Task 20 扩展:web 宿主配置面 ``WebLimits``/``load_web_limits`` 与 provider
+覆盖 env 名 ``WEB_SEARCH_PROVIDER_ENV`` 经 sdk 出口(宿主配置限度、CLI
+归因展示都不直依 adapters)。
 
 ``ConversationBusy``/``ResumeNotConfirmed`` 定义在 core.session 并由这里
 re-export:core 不得 import interfaces(import-linter praxis_core_purity),
@@ -72,11 +75,12 @@ from praxis.adapters.mcp.names import normalize_mcp_name
 from praxis.adapters.models.openai_compat import OpenAICompatAdapter
 from praxis.adapters.models.probe import ProbeOutcome, probe_model
 from praxis.adapters.models.scripted import ScriptedAdapter
-from praxis.adapters.web.limits import web_configuration_path
+from praxis.adapters.web.limits import WebLimits, load_web_limits, web_configuration_path
 from praxis.adapters.web.search import (
     API_KEY_ENV_NAME,
     SEARCH_ENDPOINTS,
     SEARCH_PROVIDERS,
+    WEB_SEARCH_PROVIDER_ENV,
     SearchProvider,
     SearchProviderConfig,
     load_web_search_config,
@@ -111,11 +115,12 @@ from praxis.protocol.models import (
 from praxis.protocol.permission import PermissionMode, PermissionNotice, PermissionUpdate
 from praxis.protocol.plan import PlanSnapshot
 from praxis.protocol.policy import NetworkRule, PathRule, PermissionPolicy, ToolRule
-from praxis.protocol.skills import SkillCatalog
+from praxis.protocol.skills import SkillCatalog, SkillManifest
 from praxis.protocol.tools import ToolSource
 from praxis.store.artifacts import ArtifactStore
 from praxis.store.turns import Turn
 from praxis.store.verify import VerifyReport
+from praxis.tools.builtins.skills import load_skill_catalog
 
 open_session = build_session
 
@@ -159,6 +164,7 @@ __all__ = [
     "SearchProviderConfig",
     "Session",
     "SkillCatalog",
+    "SkillManifest",
     "StdioServerConfig",
     "Subscription",
     "ThreadBusy",
@@ -169,6 +175,8 @@ __all__ = [
     "TurnStatus",
     "Usage",
     "VerifyReport",
+    "WEB_SEARCH_PROVIDER_ENV",
+    "WebLimits",
     "apply_update",
     "assemble_model_events",
     "connect_mcp_servers",
@@ -178,6 +186,8 @@ __all__ = [
     "latest_plan",
     "load_host_hooks",
     "load_mcp_configs",
+    "load_skill_catalog",
+    "load_web_limits",
     "load_web_search_config",
     "mcp_config_write_path",
     "model_adapter_for",
