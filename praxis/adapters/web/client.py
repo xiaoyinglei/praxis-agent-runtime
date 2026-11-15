@@ -55,6 +55,7 @@ __all__ = [
     "Resolver",
     "WebFetchResponse",
     "authorize_callback",
+    "public_http_transport",
     "validate_proxy_url",
     "web_proxy_configuration",
 ]
@@ -369,6 +370,21 @@ class _PublicTransport(httpx.AsyncBaseTransport):
 
     async def aclose(self) -> None:
         await self._pool.aclose()
+
+
+def public_http_transport(
+    *,
+    resolver: Resolver | None = None,
+    backend: httpcore.AsyncNetworkBackend | None = None,
+) -> httpx.AsyncBaseTransport:
+    """DNS 固定、仅公共地址的直连传输(旧 ``web_http.public_http_transport``)。
+
+    供非 web 的宿主自有 HTTP 集成复用同一连接期校验(T18 的 MCP HTTP);
+    ``resolver``/``backend`` 是确定性测试接缝,绝不暴露给模型。
+    """
+    inner = httpcore.AnyIOBackend() if backend is None else backend
+    pinned = _PinnedNetworkBackend(_default_resolver if resolver is None else resolver, inner)
+    return _PublicTransport(pinned)
 
 
 @dataclass(frozen=True, slots=True)

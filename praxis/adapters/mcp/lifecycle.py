@@ -37,15 +37,16 @@ argv 重置在本姿势下没有必要,且它本身就是密钥进 ps 的病灶)
   测试用 ``ps`` 独立复查(含超时/取消两条路径)。
 - ``cwd`` 逐字取 ``config.cwd``(T15 已保证落在 workspace 之内);为 None 时
   由 SDK 用进程 cwd,装配侧(T19)负责给 workspace 默认值。
-- ``McpConnection`` 就定义在本模块:一个三字段数据类不值得再开 types.py。
-  T18(HTTP)若需要 ``InitializeResult`` 再按只增不改扩展。
+- ``McpConnection`` 就定义在本模块:一个数据类不值得再开 types.py。
+  T18(HTTP)只按只增不改加了可选 ``credential_revision`` 字段;owner 骨架
+  抽成 ``owned_connection``,stdio 与 HTTP 共用同一实现(行为不变)。
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -68,16 +69,76 @@ _NO_SANDBOX_REASON = f"mcp stdio server requires a sandbox backend; {BACKEND_CON
 
 @dataclass(frozen=True, slots=True)
 class McpConnection:
-    """一条**已就绪**的 stdio 连接:initialize + list_tools 都已完成。
+    """一条**已就绪**的连接:initialize + list_tools 都已完成。
 
     ``session`` 的生命周期由 owner task 独占(调用方只调用它,不关闭它);
     ``tools`` 是**完整**目录:T17 的 ``catalog.list_all_tools`` 在就绪前完成
     cursor 分页并施加 4096 工具 / 256 页 / 4 MiB 上限,绝不会只交第一页。
+
+    ``credential_revision`` 只有 HTTP 连接设置(T16 只管进程 envp,无凭据
+    修订概念):sha256(canonical JSON:headers 展开值 + bearer 是否存在)。
+    刻意**不含** bearer 值本身(controller 裁决:OAuth 存储不读、秘密不进
+    修订),供 T19 判断"凭据形状变了 ⇒ 需要重连"。
     """
 
     server_name: str
     session: ClientSession
     tools: tuple[McpTool, ...]
+    credential_revision: str | None = None
+
+
+type ConnectFn = Callable[[AsyncExitStack], Awaitable[McpConnection]]
+
+
+@asynccontextmanager
+async def owned_connection(
+    server_name: str,
+    connect: ConnectFn,
+    *,
+    startup_timeout_seconds: float,
+    close_timeout_seconds: float,
+) -> AsyncIterator[McpConnection]:
+    """**stdio 与 HTTP 共用的 owner-task 骨架**(本包唯一实现)。
+
+    MCP SDK 的 ``stdio_client``/``ClientSession``/``streamable_http_client``
+    内部都是 AnyIO cancel scope + task group,而 AnyIO 的 cancel scope 是
+    **任务局部**的——进入与退出必须发生在同一个 task 里。``connect`` 闭包在
+    owner task 内用调用方给的 ``AsyncExitStack`` 装配资源,``ready`` future
+    把就绪/失败交给外层;外层 ``finally`` 一律 ``stop.set()``,await 前被
+    取消(``ready.cancelled()``)⇒ ``task.cancel()``;关闭走
+    ``asyncio.shield(task)`` + ``wait_for(close_timeout)``,超时再 ``cancel``
+    + ``gather``。**无自动重试**;单个 owner 只关自己的栈,异常原样上抛
+    (T19 逐 server 捕获转 ``mcp_server_unavailable``)。
+    """
+    ready: asyncio.Future[McpConnection] = asyncio.get_running_loop().create_future()
+    stop = asyncio.Event()
+
+    async def serve() -> None:
+        try:
+            async with AsyncExitStack() as resources:
+                async with asyncio.timeout(startup_timeout_seconds):
+                    connection = await connect(resources)
+                if not ready.done():
+                    ready.set_result(connection)
+                await stop.wait()
+        except BaseException as error:
+            if not ready.done():
+                ready.set_exception(error)
+            elif not isinstance(error, asyncio.CancelledError):
+                logger.warning("MCP connection %s closed: %s", server_name, type(error).__name__)
+
+    task = asyncio.create_task(serve(), name=f"mcp-owner:{server_name}")
+    try:
+        yield await ready
+    finally:
+        stop.set()
+        if ready.cancelled():
+            task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), close_timeout_seconds)
+        except TimeoutError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 @asynccontextmanager
@@ -106,42 +167,21 @@ async def owned_stdio_connection(
     if sandbox_spec is None:
         raise SandboxRefusal(_NO_SANDBOX_REASON)
     params = _stdio_parameters(config, workspace=workspace, spec=sandbox_spec, env_builder=env_builder)
-    # MCP SDK contexts use task-local AnyIO cancel scopes. The owning task must
-    # enter and leave them, including when discovery fails or shutdown is bounded.
-    ready: asyncio.Future[McpConnection] = asyncio.get_running_loop().create_future()
-    stop = asyncio.Event()
 
-    async def serve() -> None:
-        try:
-            async with AsyncExitStack() as resources:
-                async with asyncio.timeout(config.startup_timeout_seconds):
-                    streams = await resources.enter_async_context(stdio_client(params))
-                    session = await resources.enter_async_context(ClientSession(streams[0], streams[1]))
-                    await session.initialize()
-                    catalog = await list_all_tools(session)
-                if not ready.done():
-                    ready.set_result(
-                        McpConnection(server_name=config.name, session=session, tools=catalog)
-                    )
-                await stop.wait()
-        except BaseException as error:
-            if not ready.done():
-                ready.set_exception(error)
-            elif not isinstance(error, asyncio.CancelledError):
-                logger.warning("MCP connection %s closed: %s", config.name, type(error).__name__)
+    async def connect(resources: AsyncExitStack) -> McpConnection:
+        streams = await resources.enter_async_context(stdio_client(params))
+        session = await resources.enter_async_context(ClientSession(streams[0], streams[1]))
+        await session.initialize()
+        catalog = await list_all_tools(session)
+        return McpConnection(server_name=config.name, session=session, tools=catalog)
 
-    task = asyncio.create_task(serve(), name=f"mcp-owner:{config.name}")
-    try:
-        yield await ready
-    finally:
-        stop.set()
-        if ready.cancelled():
-            task.cancel()
-        try:
-            await asyncio.wait_for(asyncio.shield(task), close_timeout_seconds)
-        except TimeoutError:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+    async with owned_connection(
+        config.name,
+        connect,
+        startup_timeout_seconds=config.startup_timeout_seconds,
+        close_timeout_seconds=close_timeout_seconds,
+    ) as connection:
+        yield connection
 
 
 def _stdio_parameters(
@@ -183,4 +223,4 @@ def _stdio_parameters(
     )
 
 
-__all__ = ["McpConnection", "owned_stdio_connection"]
+__all__ = ["McpConnection", "owned_connection", "owned_stdio_connection"]
