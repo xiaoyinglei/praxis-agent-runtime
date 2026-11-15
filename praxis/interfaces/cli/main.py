@@ -32,6 +32,7 @@ from praxis.interfaces.sdk import (
     ModelResponse,
     ModelToolCall,
     PermissionMode,
+    PermissionNotice,
     PermissionPolicy,
     ResumeNotConfirmed,
     ScriptedAdapter,
@@ -281,8 +282,19 @@ def _open_read_only(workspace: Path | None, thread: str | None) -> Session:
 # ---------------------------------------------------------------------------
 
 
+def _echo_notices(notices: tuple[PermissionNotice, ...]) -> None:
+    """权限更新披露的单行渲染(D9 等);空元组零输出,退出码不变。"""
+    for notice in notices:
+        typer.echo(f"notice: {notice.text}")
+
+
 def _report_turn(result: TurnResult) -> int:
-    """turn 终态 → 打印 + 统一退出码:0 完成 / 1 失败或取消 / 2 暂停待输入。"""
+    """turn 终态 → 打印 + 统一退出码:0 完成 / 1 失败或取消 / 2 暂停待输入。
+
+    权限披露(如 NetworkRule 授权的 D9 联动)在终态之前打印:它是更新生效
+    的事实,不是 turn 结局的一部分,绝不改变退出码。
+    """
+    _echo_notices(result.notices)
     status = result.status
     if status is TurnStatus.COMPLETED:
         if result.output:

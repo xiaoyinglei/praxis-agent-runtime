@@ -33,6 +33,19 @@ class PermissionUpdate:
 
 
 @dataclass(frozen=True, slots=True)
+class PermissionNotice:
+    """权限更新生效后的如实披露(D9;阶段 2 留档②)。
+
+    ``kind`` 是唯一机器可读分支面,``text`` 是人类可读的单行文案。当前唯一
+    产者:session/always 的 NetworkRule 授权使命令网络 fail-closed(旧代码
+    静默,是运维陷阱)。UI 只渲染、不据此改行为。
+    """
+
+    kind: str
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
 class Decision:
     """一次权限判定的不可变结论。构造一律走 allow/ask/deny 三个 classmethod。"""
 

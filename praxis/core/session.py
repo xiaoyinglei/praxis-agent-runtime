@@ -67,7 +67,12 @@ from praxis.protocol.hooks import HookSetup
 from praxis.protocol.items import Item, ItemKind
 from praxis.protocol.json import JsonValue
 from praxis.protocol.models import ModelAdapter, ModelSettings, ModelToolCall, WireRequest
-from praxis.protocol.permission import PermissionContext, PermissionUpdate
+from praxis.protocol.permission import (
+    PermissionContext,
+    PermissionNotice,
+    PermissionUpdate,
+)
+from praxis.protocol.policy import NetworkRule, command_network_decision, resolve_policy
 from praxis.protocol.retry import RetryingStream
 from praxis.protocol.skills import SkillCatalog
 from praxis.protocol.tools import ResultStatus, Tool
@@ -86,6 +91,13 @@ _OUTCOME_UNKNOWN_TEXT = "[outcome unknown: process died during execution]"
 
 _APPROVAL_VERDICTS = frozenset({"allow", "deny"})
 _RECONCILE_OUTCOMES = frozenset({"ok", "failed"})
+
+# 阶段 2 留档②:D9 授权披露的逐字文案(旧代码静默是运维陷阱)。
+_D9_NOTICE_KIND = "command_network_blocked"
+_D9_NOTICE_TEXT = (
+    "granting this network rule makes bash command network fail-closed (D9); "
+    "approvals for bash will be required as whole-tool asks"
+)
 
 
 class ConversationBusy(RuntimeError):  # noqa: N818 — 设计 §5.8/plan 钉死的名字
@@ -345,6 +357,15 @@ class Session:
     def thread_id(self) -> str:
         return self._thread_id
 
+    @property
+    def permissions(self) -> PermissionContext:
+        """当前 live 权限上下文的只读快照。
+
+        composition 的 web authorizer 经它读取**实时**策略(每次调用重新取,
+        绝不缓存快照):session 中途授权后,下一跳/下一次请求立刻按新策略裁决。
+        """
+        return self._permissions
+
     def subscribe(self) -> Subscription:
         """订阅本会话的事件总线(UI 提示通道,§5.6;事件非事实,item 日志才是)。"""
         return self._bus.subscribe()
@@ -369,7 +390,7 @@ class Session:
 
     # -- 权限更新(Task 8:once/session/always;设计 §5.3/§5.12;裁决 R6)-----
 
-    def update_permission(self, update: PermissionUpdate) -> None:
+    def update_permission(self, update: PermissionUpdate) -> PermissionNotice | None:
         """权限更新的会话级唯一入口:经 apply_update 纯代数落地,always 同批落盘。
 
         once/session 只改内存(once 由 _execute 在下一批结束时清除;session
@@ -378,12 +399,19 @@ class Session:
         session→always),原子写 ``.praxis/permissions.json``——该文件即策略
         声明,composition 下次打开时按"显式参数 > 文件 > 默认"加载。
 
-        D9 提醒:session/always 的 NetworkRule 授权只对 URL 级工具(web 类)
-        放行;bash(EXECUTE_PROCESS)的命令网络因规则在场而 fail-closed deny。
+        D9 披露(阶段 2 留档②):NetworkRule 以 session/always 落地后,若 live
+        策略的 ``command_network_decision`` 为 deny(存在任何域过滤即 fail
+        closed),返回 ``PermissionNotice`` 如实告知 bash 后续将走整工具 ask。
+        其余路径返回 None——零行为变化。
         """
         self._permissions = apply_update(self._permissions, update)
         if update.destination == "always":
             self._persist_policy()
+        if isinstance(update.rule, NetworkRule) and update.destination in ("session", "always"):
+            live = resolve_policy(self._permissions.policy, Path(self._permissions.workspace))
+            if command_network_decision(live) == "deny":
+                return PermissionNotice(kind=_D9_NOTICE_KIND, text=_D9_NOTICE_TEXT)
+        return None
 
     def _persist_policy(self) -> None:
         """R13 落盘真值 = base 声明 ⊕ always_rules 顺序折叠;session/once 绝不上盘。
@@ -400,6 +428,31 @@ class Session:
         praxis_dir = self._workspace / ".praxis"
         praxis_dir.mkdir(parents=True, exist_ok=True)
         _atomic_write_text(praxis_dir / "permissions.json", persisted.model_dump_json(indent=2))
+
+    # -- 审批流携带的权限更新(resume 的可选面)------------------------------
+
+    def _validate_permission_updates(
+        self, updates: Sequence[PermissionUpdate]
+    ) -> None:
+        """对全部更新做一次纯代数折叠预验:任何非法 grant 在 transition 前抛出。
+
+        与 ``update_permission`` 走同一 ``apply_update`` 代数(R11 完整重验),
+        只算不提交——要么整批合法,要么零写入。
+        """
+        probe = self._permissions
+        for update in updates:
+            probe = apply_update(probe, update)
+
+    def _apply_permission_updates(
+        self, updates: Sequence[PermissionUpdate]
+    ) -> tuple[PermissionNotice, ...]:
+        """逐条提交(always 落盘)并收集 D9 披露;空输入 = 空元组。"""
+        notices: list[PermissionNotice] = []
+        for update in updates:
+            notice = self.update_permission(update)
+            if notice is not None:
+                notices.append(notice)
+        return tuple(notices)
 
     # -- submit ---------------------------------------------------------------
 
@@ -431,8 +484,16 @@ class Session:
         confirm: bool = False,
         approval: Mapping[str, Literal["allow", "deny"]] | None = None,
         reconcile: Mapping[str, Literal["ok", "failed"]] | None = None,
+        permission_updates: Sequence[PermissionUpdate] = (),
     ) -> TurnResult:
-        """续跑 interrupted/paused turn——每一步都以 item 为事实,决策全部显式落库。"""
+        """续跑 interrupted/paused turn——每一步都以 item 为事实,决策全部显式落库。
+
+        ``permission_updates`` 是审批流里人类**显式选择**的建议落地(例如 URL
+        ask 的域级 NetworkRule):先纯代数预验(零写入),再逐条经
+        ``update_permission`` 提交(always 同批落盘),产生的 D9 披露收集进
+        TurnResult.notices 供 CLI 打印。审批本身仍是 once 决策——绝不因批准
+        一次调用而自动放宽权限。
+        """
         turn = get_turn(self._store, turn_id)
         if turn is None:
             raise ValueError(f"unknown turn_id: {turn_id!r}")
@@ -464,6 +525,8 @@ class Session:
                 _validate_reconcile(turn_id, probe_items, reconcile)
             if approval:
                 _validate_approval(turn_id, probe_items, approval)
+        # 建议落地先纯代数预验(R11:非法 grant 在 transition 之前抛,零写入)。
+        self._validate_permission_updates(permission_updates)
 
         transition(
             self._store,
@@ -472,6 +535,9 @@ class Session:
             TurnStatus.RUNNING,
             reason=self._resume_reason(status, approval, reconcile),
         )
+        # 授权先于 approval_decision 落笔:decision 必须 stamp 更新后的 revision,
+        # 否则重入按 revision 绑定判旧批准作废,刚批准的动作会被 re-ask。
+        notices = self._apply_permission_updates(permission_updates)
         # reconcile 先写(对账是给"已有 tool_call 无结果"的调用一个结论);
         # approval 写决策,digest 一律取自匹配的 approval_request item(摘要绑定)。
         if reconcile:
@@ -492,8 +558,9 @@ class Session:
                     items, policy_revision=self._permissions.policy.revision
                 ),
                 unknown_calls=tuple(unknown_ids),
+                notices=notices,
             )
-        return await self._execute(turn_id, resume_calls)
+        return replace(await self._execute(turn_id, resume_calls), notices=notices)
 
     @staticmethod
     def _resume_reason(

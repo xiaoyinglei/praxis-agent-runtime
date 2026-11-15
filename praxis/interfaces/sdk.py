@@ -10,6 +10,8 @@ R14 扩展:只读面 ``Session.items/turns/verify`` 配套 re-export
 Item/ItemKind/Turn/VerifyReport——CLI 的 log/status/verify 命令仍不直依 core/store。
 Task 8(R6-7)扩展:权限更新面 re-export PermissionUpdate/PathRule/ToolRule/
 NetworkRule/PermissionMode/apply_update——宿主/UI 构造与合并更新只经此出口。
+Task 11 扩展:权限更新披露 PermissionNotice(update_permission 的 D9 提示/
+TurnResult.notices)同经 sdk 暴露。
 D9 提醒:session/always 的 NetworkRule 授权放行 URL 级工具,但 bash
 (EXECUTE_PROCESS)的命令网络因规则在场一律 deny(阶段 3 web 前无命令网络授权)。
 Task 6 扩展:全局模型注册表与凭据面 re-export——ModelConfigStore/ModelEntry/
@@ -67,7 +69,7 @@ from praxis.protocol.models import (
     Usage,
     assemble_model_events,
 )
-from praxis.protocol.permission import PermissionMode, PermissionUpdate
+from praxis.protocol.permission import PermissionMode, PermissionNotice, PermissionUpdate
 from praxis.protocol.plan import PlanSnapshot
 from praxis.protocol.policy import NetworkRule, PathRule, PermissionPolicy, ToolRule
 from praxis.store.artifacts import ArtifactStore
@@ -98,6 +100,7 @@ __all__ = [
     "OpenAICompatAdapter",
     "PathRule",
     "PermissionMode",
+    "PermissionNotice",
     "PermissionPolicy",
     "PermissionUpdate",
     "PlanSnapshot",

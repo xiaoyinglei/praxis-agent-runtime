@@ -29,6 +29,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import replace
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from praxis.protocol.floor import floor_reason, host_private_paths
 from praxis.protocol.permission import (
@@ -127,7 +128,14 @@ def _path_denial(use: ResolvedUse, ctx: PermissionContext, *, write: bool) -> st
     return ""
 
 
-def _network_verdict(ctx: PermissionContext, url: str) -> PolicyVerdict:
+def network_verdict(ctx: PermissionContext, url: str) -> PolicyVerdict:
+    """一个 URL 的最终网络裁决(公开唯一 fold;decide 步骤与 web authorizer 共用)。
+
+    与 decide 第 1/2/6 步**同一**来源折叠:policy + ceilings + session/once
+    规则层逐一 resolve、决策时最严者胜;八步皆无意见时按 deny(fail-closed)。
+    主机归一化完全委托 ``protocol.policy.network_decision``(urlsplit.hostname
+    小写去尾点)——调用方不得在闭包里再写第二套归一化。
+    """
     return _most_restrictive(network_decision(source, url) for source in _all_sources(ctx)) or "deny"
 
 
@@ -153,16 +161,51 @@ def _hook_reason(hook: HookDecision) -> str:
     return f"hook:{hook.source}"
 
 
-def _tool_ask(tool: Tool, reason: str) -> Decision:
-    """ask 附 ToolRule allow 建议(session/always 两条);deny 不建议放宽。"""
+def _tool_ask(
+    tool: Tool, reason: str, *, leading: tuple[PermissionUpdate, ...] = ()
+) -> Decision:
+    """ask 附 ToolRule allow 建议(session/always 两条);deny 不建议放宽。
+
+    ``leading`` 只给 URL ask 用:域级建议排在工具级之前(推荐更窄的授权);
+    其余 ask 来源(工具规则/hook/地板/沙箱/命令网络/fallback)零改动。
+    """
     rule = ToolRule(pattern=tool.definition.name, decision="allow")
     return replace(
         Decision.ask(reason),
         suggestions=(
+            *leading,
             PermissionUpdate(rule=rule, destination="session"),
             PermissionUpdate(rule=rule, destination="always"),
         ),
     )
+
+
+def _host_suggestions(url: str) -> tuple[PermissionUpdate, ...]:
+    """URL ask 的域级建议(阶段 2 留档①):只授权**这一个主机**,比整工具窄。
+
+    主机归一化与 ``network_decision`` 完全同源(urlsplit.hostname 小写去尾点),
+    不发明第二套归一化。NetworkRule 只接受主机名(IPv6 字面量/非 ASCII 无法
+    表达)⇒ 该 URL 只保留工具级建议,绝不因建议构造失败而把 ask 变成 deny。
+    """
+    try:
+        host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return ()
+    if not host:
+        return ()
+    try:
+        rule = NetworkRule(domain=host, decision="allow")
+    except ValueError:
+        return ()
+    return (
+        PermissionUpdate(rule=rule, destination="session"),
+        PermissionUpdate(rule=rule, destination="always"),
+    )
+
+
+def _url_ask(tool: Tool, reason: str, url: str) -> Decision:
+    """URL ask:suggestions = 域级 NetworkRule(两条,**最前**=推荐窄授权)+ 工具级。"""
+    return _tool_ask(tool, reason, leading=_host_suggestions(url))
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +221,7 @@ def deny_rules(tool: Tool, use: ResolvedUse, ctx: PermissionContext) -> Decision
     if reason:
         return Decision.deny(f"rule: {reason}")
     for url in _url_targets(use):
-        if _network_verdict(ctx, url) == "deny":
+        if network_verdict(ctx, url) == "deny":
             return Decision.deny(f"rule: network denied: {url}")
     if ToolEffect.EXECUTE_PROCESS in use.effects and _command_network_verdict(ctx) == "deny":
         return Decision.deny("rule: command network denied")
@@ -193,8 +236,8 @@ def ask_rules(tool: Tool, use: ResolvedUse, ctx: PermissionContext) -> Decision 
     if _tool_verdict(tool, ctx) == "ask":
         return _tool_ask(tool, f"rule: tool '{tool.definition.name}' requires approval")
     for url in _url_targets(use):
-        if _network_verdict(ctx, url) == "ask":
-            return _tool_ask(tool, f"rule: network requires approval: {url}")
+        if network_verdict(ctx, url) == "ask":
+            return _url_ask(tool, f"rule: network requires approval: {url}", url)
     if ToolEffect.EXECUTE_PROCESS in use.effects and _command_network_verdict(ctx) == "ask":
         return _tool_ask(tool, "rule: command network requires approval")
     hook = _hook_decision(ctx, "ask")
@@ -261,7 +304,7 @@ def allow_rules(tool: Tool, use: ResolvedUse, ctx: PermissionContext) -> Decisio
         urls = _url_targets(use)
         if not urls:
             return None  # NETWORK 无 url target ⇒ 覆盖不成立 ⇒ fallback ask(正常可达路径)
-        if any(_network_verdict(ctx, url) != "allow" for url in urls):
+        if any(network_verdict(ctx, url) != "allow" for url in urls):
             return None
     return Decision.allow("policy-grant")
 

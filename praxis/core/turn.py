@@ -74,7 +74,7 @@ from praxis.protocol.models import (
     collect_events,
     usage_payload,
 )
-from praxis.protocol.permission import PermissionContext
+from praxis.protocol.permission import PermissionContext, PermissionNotice
 from praxis.protocol.retry import (
     AttemptOutcome,
     AttemptRecord,
@@ -163,7 +163,11 @@ class ApprovalSummary:
 
 @dataclass(frozen=True)
 class TurnResult:
-    """run_turn 的终结结果:status 即 TurnStatus,reason 即状态机的 reason。"""
+    """run_turn 的终结结果:status 即 TurnStatus,reason 即状态机的 reason。
+
+    ``notices`` 是本次续跑**落地权限更新**时的如实披露(如 NetworkRule 授权
+    使 bash 命令网络 fail-closed 的 D9 提示);空元组 = 无披露,既有构造零改动。
+    """
 
     turn_id: str
     status: TurnStatus
@@ -171,6 +175,7 @@ class TurnResult:
     reason: str | None
     pending_approvals: tuple[ApprovalSummary, ...] = ()
     unknown_calls: tuple[str, ...] = ()
+    notices: tuple[PermissionNotice, ...] = ()
 
 
 # ---------------------------------------------------------------------------

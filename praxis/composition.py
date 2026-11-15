@@ -24,7 +24,7 @@ import asyncio
 import logging
 import os
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -40,6 +40,7 @@ from praxis.adapters.models.retry import make_retry_stream
 from praxis.adapters.models.tokenization import measure_request
 from praxis.adapters.sandbox.base import probe_backend
 from praxis.adapters.sandbox.compile import compile_sandbox, finalize_sandbox
+from praxis.adapters.web.client import PublicWebError
 from praxis.core.compaction import (
     SUMMARY_MAX_OUTPUT_TOKENS,
     SUMMARY_PROMPT_MAX_CHARS,
@@ -48,6 +49,7 @@ from praxis.core.compaction import (
     default_summary_prompt_max_chars,
 )
 from praxis.core.events import EventBus
+from praxis.core.permission import network_verdict
 from praxis.core.recovery import sweep, sweep_orphan_command_jobs
 from praxis.core.session import Session
 from praxis.protocol.hooks import HookOutcome, HookSetup, HookSpec
@@ -244,6 +246,44 @@ def _adapter_and_spec_from_registry(
 def _measure_request_tokens(req: WireRequest) -> int:
     """D2 唯一测量入口的注入形式(core 不得 import adapters)。"""
     return measure_request(req).count
+
+
+def make_web_authorizer(
+    permissions_provider: Callable[[], PermissionContext],
+) -> Callable[[str], None]:
+    """T10 公共 web 客户端的 authorize 回调生产点(唯一组合根;T12 注入)。
+
+    ``permissions_provider`` 每次调用都重新取 live 权限上下文——绝不缓存策略
+    快照:session 中途授权后,下一次/下一跳立刻按新策略裁决。裁决与 decide
+    第 1/2/6 步共用 ``core.permission.network_verdict``(同一 fold,无第二套代数)。
+
+    契约(T10 authorize:任意异常原样传播、先于 validate/connect):
+    - allow ⇒ 返回 None;
+    - ask ⇒ raise ``PublicWebError("denied", "approval required for <host>")``
+      ——逐跳/子资源是**执行期检查点**:ask 不再被无视放行,而是中止本次请求
+      并指向 NetworkRule 授权路径;初始 URL 的 ask 由 decide 正常暂停审批;
+    - deny ⇒ raise ``PublicWebError("denied")``。
+    URL 原样交给 ``network_verdict``(归一化完全由 protocol.policy 承担);
+    闭包内不再改写/重解析待裁决的 URL 串。
+    """
+
+    def authorize(url: str) -> None:
+        verdict = network_verdict(permissions_provider(), url)
+        if verdict == "allow":
+            return
+        if verdict == "ask":
+            raise PublicWebError("denied", f"approval required for {_web_url_host(url)}")
+        raise PublicWebError("denied")
+
+    return authorize
+
+
+def _web_url_host(url: str) -> str:
+    """仅用于拒绝对话文案的主机名(不参与规则匹配——那是 network_decision 的事)。"""
+    try:
+        return (urlsplit(url).hostname or "").lower().rstrip(".") or url
+    except ValueError:
+        return url
 
 
 async def _spawn_host_hook(
