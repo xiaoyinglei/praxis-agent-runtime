@@ -74,7 +74,15 @@ class ToolExecContext:
     是唯一裁决函数,这里只是把已由 ``decide`` 授权的目录级 target 细化为逐条目
     检查(规则代数复用 ``protocol.policy.path_access``,不是第二套决策入口)。
     None = 无快照(单测直跑路径),不做逐条目过滤。
+
+    ``active_skill_ids``(T9):本回合**已提交成功**的 ``invoke_skill`` 结果投影
+    出的 skill id 集合(``core.skill_state.latest_active_skill_ids``)。它是
+    ``materialize_skill_asset`` 的执行侧事实查询输入——与 ``permissions`` 的
+    目录型过滤同构(D16):``decide`` 仍是唯一裁决入口,这里只回答"该 skill 在
+    本回合是否已被激活"这一事实,不是第二决策入口。默认空集 = 无激活(单测直跑
+    路径/空回合),既有 ``ToolExecContext()`` 构造零改动。
     """
 
     sandbox: SandboxSpec | None = None
     permissions: PermissionContext | None = None
+    active_skill_ids: frozenset[str] = frozenset()

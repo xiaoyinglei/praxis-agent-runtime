@@ -26,7 +26,9 @@ execute 步骤序(与代码一一对应):
    **先编译沙箱**再写 tool_call item(SandboxRefusal → ERROR/sandbox_refused,
    不写 tool_call,未 dispatch 语义同 invalid_input;read/write 进程内工具不编译);
 7. ``run_with_timeout``(移植旧 executor 超时/取消语义,任务全程被持有;
-   透传 ``ToolExecContext(sandbox=spec, permissions=ctx.permissions)``)→
+   透传 ``ToolExecContext(sandbox=spec, permissions=ctx.permissions,
+   active_skill_ids=...)``——后者从本回合已提交 item 重算,供
+   ``materialize_skill_asset`` 做执行侧激活态事实查询)→
    **finally: finalize_sandbox**
    (commit/清理;超时/取消路径也执行;finalize 异常归一 tool_error,不炸穿);
 8. 占位符替换 + 超 ``max_model_output_bytes`` 的**写时外部化**(注入
@@ -60,6 +62,7 @@ from typing import cast
 
 from praxis.core import permission  # 唯一决策入口:经模块属性调用,测试 monkeypatch 此处
 from praxis.core.events import EventBus
+from praxis.core.skill_state import latest_active_skill_ids
 from praxis.core.statemachine import TurnStatus, transition
 from praxis.protocol.events import ApprovalRequested, ToolFinished, ToolStarted
 from praxis.protocol.floor import floor_reason, host_private_paths
@@ -693,8 +696,16 @@ async def execute(call: ToolCall, ctx: ExecCtx) -> ToolResult:
     finalize_failure: str | None = None
     try:
         # R-T11-2:权限快照随执行上下文进入工具,供目录型读取工具逐条目过滤 deny。
+        # T9:激活态同样从本回合已提交 item 重算(与审批同一份 items 列表)——
+        # materialize_skill_asset 以它为唯一激活事实,不是第二决策入口。
         raw = await run_with_timeout(
-            tool, args, ToolExecContext(sandbox=spec, permissions=ctx.permissions)
+            tool,
+            args,
+            ToolExecContext(
+                sandbox=spec,
+                permissions=ctx.permissions,
+                active_skill_ids=latest_active_skill_ids(items),
+            ),
         )
     finally:
         # commit/清理在超时/取消路径也执行;异常归一为 tool_error,绝不炸穿管道。

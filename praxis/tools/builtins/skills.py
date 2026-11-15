@@ -34,9 +34,10 @@ import hashlib
 import logging
 import os
 import re
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import yaml
 
@@ -60,11 +61,14 @@ from praxis.protocol.tools import (
     Tool,
     ToolContentBlock,
     ToolDefinition,
+    ToolEffect,
     ToolResult,
     ToolTarget,
+    ToolValidationError,
     json_schema_input,
 )
 from praxis.tools.builtins.filesystem import PENDING_TOOL_CALL_ID
+from praxis.tools.builtins.paths import checked_path
 
 logger = logging.getLogger(__name__)
 
@@ -507,4 +511,274 @@ def create_invoke_skill_tool(catalog: SkillCatalog) -> Tool:
         interrupt_behavior=InterruptBehavior.CANCEL,
         timeout_seconds=5.0,
         max_model_output_bytes=300_000,
+    )
+
+
+# ── materialize_skill_asset(T9;Q8 落点:.scratch 而非 .praxis) ─────────
+
+_MATERIALIZE_SKILL_NAME = "materialize_skill_asset"
+
+# 旧 integrations/skills.py:70-83 的 MaterializeSkillAssetInput(extra=forbid)。
+_MAX_ASSET_RELATIVE_PATH_CHARS = 4096
+# 旧 integrations/skills.py:335-339:资产只允许 scripts/ 与 references/ 两个子树。
+_SKILL_ASSET_ROOT_SEGMENTS = frozenset({"scripts", "references"})
+
+# Q8 有意差异(相对旧 ``workspace/.praxis/runtime/scratch``):``.praxis`` 是
+# FLOOR_ENTRIES 的 ``deny`` 条目——沙箱内的 bash/run_python 读不到它会白拿一份
+# 资产;``.scratch`` 位于工作区内、不是地板,执行类工具可以直接消费。代价是
+# ``.scratch`` 不会被 git 自动忽略:工具描述里明确要求用户在 git 仓库中自行
+# gitignore 它(测试也钉住这一文案)。
+_SKILL_SCRATCH_DIRNAME = ".scratch"
+
+_MATERIALIZE_INPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "skill_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": MAX_SKILL_NAME_CHARS,
+            "description": "Exact id of a skill already activated in this turn.",
+        },
+        "relative_path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": _MAX_ASSET_RELATIVE_PATH_CHARS,
+            "description": "Skill-local file under scripts/ or references/.",
+        },
+    },
+    "required": ["skill_id", "relative_path"],
+    "additionalProperties": False,
+}
+
+_validate_materialize_schema = json_schema_input(_MATERIALIZE_INPUT_SCHEMA)
+
+
+def _validate_asset_relative_path(value: str) -> Path:
+    """旧 :func:`_validate_asset_path` 逐条移植:相对、无 ``..``、首段白名单、≥2 段。"""
+    path = Path(value)
+    if path.is_absolute() or value.strip() in {"", "."} or ".." in path.parts:
+        raise ToolValidationError(
+            path="$.relative_path",
+            message="skill asset path must be relative without parent traversal",
+        )
+    if not path.parts or path.parts[0] not in _SKILL_ASSET_ROOT_SEGMENTS:
+        raise ToolValidationError(
+            path="$.relative_path",
+            message="skill asset must be under scripts/ or references/",
+        )
+    if len(path.parts) < 2:
+        raise ToolValidationError(
+            path="$.relative_path",
+            message="skill asset path must include a file name",
+        )
+    return path
+
+
+def _validate_materialize_input(arguments: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
+    """schema 校验 + 路径形状校验(两道都在 ``validate_input``:管道统一转 invalid_input)。"""
+    canonical = _validate_materialize_schema(arguments)
+    relative_path = canonical.get("relative_path")
+    _validate_asset_relative_path(relative_path if isinstance(relative_path, str) else "")
+    return canonical
+
+
+def _safe_skill_id(skill_id: str) -> str:
+    """Q8 指定公式:``re.sub(r"[^a-z0-9_-]", "_", skill_id.lower())[:64]``。
+
+    命名空间 skill 的 ``ns:name`` 落成 ``ns_name``;截断只为目录名有界,
+    不承担唯一性(同名前缀 skill 会共享目录,与旧 ``_safe_skill_id`` 同性质)。
+    """
+    return re.sub(r"[^a-z0-9_-]", "_", skill_id.lower())[:64]
+
+
+def _scratch_relative_destination(skill_id: str, relative: Path) -> Path:
+    return Path(_SKILL_SCRATCH_DIRNAME) / "skills" / _safe_skill_id(skill_id) / relative
+
+
+def _asset_destination(workspace: Path, skill_id: str, relative: Path) -> Path:
+    return workspace.resolve() / _scratch_relative_destination(skill_id, relative)
+
+
+def _checked_destination(workspace: Path, skill_id: str, relative: Path) -> Path:
+    """目标围栏:与 write/read 同一 ``checked_path``(符号链接解析后仍须在 workspace 内)。
+
+    目标路径由本工具拼装(``safe_id`` + 已校验相对路径),但 ``.scratch`` 本身
+    可能是代理事先放置的越界符号链接——执行侧仍走唯一围栏,不信任自己的拼接。
+    """
+    return checked_path(workspace, str(_asset_destination(workspace, skill_id, relative)), write=True)
+
+
+def _within_skill_root(root: Path, candidate: Path) -> bool:
+    """``commonpath`` 越权防护(旧 :func:`_ensure_within` 逐字):resolved 源必须在根下。"""
+    try:
+        common = Path(os.path.commonpath((str(root), str(candidate))))
+    except ValueError:
+        return False
+    return common == root
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """同目录 tmp + ``os.replace`` 的字节原子写(与 ``paths.atomic_write_text`` 同语义)。
+
+    ``paths.atomic_write_text`` 只接受 str;skill 资产可能是二进制,这里保留
+    一份最小的字节版而不是把二进制伪装成文本。失败时清理 tmp,绝不留下半写文件。
+    """
+    directory = path.parent
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(directory))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _materialize_error(code: str, message: str) -> ToolResult:
+    """materialize 的固定有界错误结果(同 :func:`_activation_error` 形状)。"""
+    bounded = message[:512]
+    return ToolResult(
+        tool_call_id=PENDING_TOOL_CALL_ID,
+        tool_name=_MATERIALIZE_SKILL_NAME,
+        content=(ToolContentBlock(type="text", data={"text": f"{code}: {bounded}"}),),
+        status=ResultStatus.ERROR,
+        is_error=True,
+        error_code=code,
+        error_message=bounded,
+    )
+
+
+def create_materialize_skill_asset_tool(workspace: Path) -> Tool:
+    """创建 ``materialize_skill_asset``:把已激活 skill 的 scripts/references 资产复制进工作区。
+
+    **唯一权限耦合(与目录型过滤 D16 同构)**:``resolve_use`` 照常产出
+    ``(skill:<id>, path:<dest>)`` 目标并交 ``decide`` 裁决(``skill`` 目标不匹配
+    任何 path/url 规则,也不进地板评估);``skill_id`` 是否已激活**不是权限裁决**,
+    而是执行侧事实查询——``run`` 检查 ``exec_ctx.active_skill_ids``(本回合已提交
+    ``invoke_skill`` 成功结果的投影,见 ``core.skill_state``),不在其中即
+    ``ERROR / skill_not_active``。目标自身带 ``skill`` target 绝不构成激活证明。
+
+    清单来源:签名按计划固定为 ``(workspace)``,故构造时用同一 loader 从该
+    workspace 装载一份目录快照(与 T7/T8 组合根装载同源同序);``run`` 只做
+    id 查询,不重扫文件系统。
+
+    落点(Q8):``<workspace>/.scratch/skills/<safe_id>/<relative_path>``。理由见
+    :data:`_SKILL_SCRATCH_DIRNAME` 注释:``.praxis`` 是地板,沙箱内执行工具读不到;
+    ``.scratch`` 是普通工作区目录,但需要用户自行 gitignore(描述里告知模型)。
+    """
+
+    catalog = load_skill_catalog(workspace)
+
+    async def run(
+        arguments: Mapping[str, JsonValue],
+        exec_ctx: ToolExecContext,
+    ) -> ToolResult:
+        args = _validate_materialize_input(arguments)
+        skill_id = cast("str", args["skill_id"])
+        relative = _validate_asset_relative_path(cast("str", args["relative_path"]))
+
+        # 激活态事实查询:决定"能不能做",与 decide 的"允许做什么"正交。
+        if skill_id not in exec_ctx.active_skill_ids:
+            return _materialize_error(
+                "skill_not_active",
+                f"skill is not active in this turn: {skill_id}",
+            )
+
+        manifest = catalog.get(skill_id)
+        if manifest is None:
+            return _materialize_error(
+                "skill_not_found", "skill is not available in the catalog"
+            )
+
+        root = Path(manifest.root_dir).resolve()
+        source = root / relative
+        try:
+            resolved_source = source.resolve()
+        except (OSError, RuntimeError, ValueError):
+            return _materialize_error(
+                "asset_not_found", f"skill asset path cannot be resolved: {relative.as_posix()}"
+            )
+        # 源围栏:解析后的源必须仍在 skill root 内(越界符号链接一律拒绝)。
+        if not _within_skill_root(root, resolved_source):
+            return _materialize_error(
+                "asset_not_found", f"skill asset path escapes its skill root: {relative.as_posix()}"
+            )
+
+        # O_NOFOLLOW:拒绝末尾符号链接(即使其目标在根内)——资产是普通文件,
+        # 不跟随。commonpath 已覆盖中间目录的符号链接逃逸。
+        try:
+            fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError:
+            return _materialize_error(
+                "asset_not_found", f"skill asset is not a readable file: {relative.as_posix()}"
+            )
+        try:
+            with os.fdopen(fd, "rb") as stream:
+                data = stream.read()
+        except OSError:
+            return _materialize_error(
+                "asset_not_found", f"skill asset is not a readable file: {relative.as_posix()}"
+            )
+
+        destination = _checked_destination(workspace, skill_id, relative)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_bytes(destination, data)
+
+        workspace_path = _scratch_relative_destination(skill_id, relative).as_posix()
+        return ToolResult(
+            tool_call_id=PENDING_TOOL_CALL_ID,
+            tool_name=_MATERIALIZE_SKILL_NAME,
+            content=(
+                ToolContentBlock(
+                    type="text", data={"text": f"materialized skill asset: {workspace_path}"}
+                ),
+            ),
+            status=ResultStatus.OK,
+            metadata={
+                "workspace_path": workspace_path,
+                "source_fingerprint": hashlib.sha256(data).hexdigest(),
+                "size_bytes": len(data),
+            },
+        )
+
+    def resolve_use(arguments: Mapping[str, JsonValue]) -> ResolvedUse:
+        skill_id = cast("str", arguments["skill_id"])
+        relative = _validate_asset_relative_path(cast("str", arguments["relative_path"]))
+        destination = _checked_destination(workspace, skill_id, relative)
+        return ResolvedUse(
+            effects=frozenset({ToolEffect.READ_WORKSPACE, ToolEffect.WRITE_WORKSPACE}),
+            targets=(
+                ToolTarget(kind="skill", value=skill_id),
+                ToolTarget(kind="path", value=str(destination)),
+            ),
+        )
+
+    return Tool(
+        definition=ToolDefinition(
+            name=_MATERIALIZE_SKILL_NAME,
+            description=(
+                "Copy one scripts/ or references/ file from an already activated skill "
+                "(call invoke_skill for that skill first) into "
+                ".scratch/skills/<skill_id>/ in the workspace. Use the returned "
+                "workspace path with file or command tools. .scratch is a normal "
+                "workspace directory (not .praxis, which is floor-protected and "
+                "unreadable to the sandbox), and it is NOT git-ignored automatically: "
+                "add .scratch/ to .gitignore if the workspace is a git repository. "
+                "Arbitrary skill-root and parent traversal is rejected."
+            ),
+            input_schema=_MATERIALIZE_INPUT_SCHEMA,
+        ),
+        validate_input=_validate_materialize_input,
+        run=run,
+        static_effects=frozenset({ToolEffect.READ_WORKSPACE, ToolEffect.WRITE_WORKSPACE}),
+        resolve_use=resolve_use,
+        idempotent=True,
+        concurrency_safe=False,
+        cancellation_mode=CancellationMode.COOPERATIVE,
+        interrupt_behavior=InterruptBehavior.CANCEL,
+        timeout_seconds=5.0,
+        max_model_output_bytes=50_000,
     )
