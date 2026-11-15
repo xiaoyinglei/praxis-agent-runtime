@@ -306,13 +306,14 @@ def _web_url_host(url: str) -> str:
 
 
 def _playwright_importable() -> bool:
-    """T20 renderer 探针:只看可选依赖是否可导入,**绝不 import playwright**。
+    """T20 renderer 探针:查 ``playwright.async_api`` 子模块是否存在。
 
-    ``find_spec`` 不执行模块;composition 模块级因此没有可选 extra 的 import
-    链(纯文本安装仍可打开会话)。探针函数本身是 monkeypatch 接缝(测试用它
-    钉住 render-capable / 纯文本两种装配结果)。
+    ``find_spec`` 不执行目标模块(dotted 名会导入父包,但不 import
+    async_api);composition 模块级因此没有 playwright import 链(纯文本安装
+    仍可打开会话)。探针函数本身是 monkeypatch 接缝(测试用它钉住
+    render-capable / 纯文本两种装配结果)。
     """
-    return importlib.util.find_spec("playwright") is not None
+    return importlib.util.find_spec("playwright.async_api") is not None
 
 
 def _browser_renderer_factory(

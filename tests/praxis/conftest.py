@@ -25,6 +25,14 @@ _UNSET: object = object()
 # N-6 可断言证据:本进程最近一次隔离决策(供 test_host_isolation 读取)。
 _ISOLATION_DECISIONS: dict[str, Any] = {}
 
+# TMPDIR 会被本 fixture 重定向,而 tiktoken 的默认 blob 缓存是
+# ``tempfile.gettempdir()/data-gym-cache``。M5 又剥掉了操作员代理:若每次
+# 测试都从冷缓存重新下载,离线/代理依赖环境下 token 测量会永久退回 heuristic
+# (test_compaction 的 BPE 口径断言会因此误红)。这里在 fixture 改写前捕获
+# 宿主临时缓存目录,per-test 钉到 ``TIKTOKEN_CACHE_DIR``(已有 blob 直接复用;
+# 无 blob 时 tiktoken 仍按自身语义下载到该目录)。
+_HOST_TIKTOKEN_CACHE = Path(tempfile.gettempdir()) / "data-gym-cache"
+
 
 @pytest.fixture(autouse=True)
 def _isolate_host_state(
@@ -64,6 +72,7 @@ def _isolate_host_state(
     # (fixture 先执行,per-test monkeypatch 仍可覆盖)。
     for name in _HOST_ENV_NAMES:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TIKTOKEN_CACHE_DIR", str(_HOST_TIKTOKEN_CACHE))
     # 不在此删除 per-test host 目录:``child_env.scratch_dir_for`` 会把无沙箱
     # 单测路径的 fallback scratch 缓存在进程级;删掉旧 test 的目录会让后续
     # 测试拿到断链路径。目录都在 pytest basetemp 内,由 pytest 回收旧会话。
@@ -72,6 +81,9 @@ def _isolate_host_state(
 
 # T20 隔离名单:技能/宿主配置文件选择、web 限制与搜索 provider 覆盖,
 # 以及测试套件使用的 *SEARCH_KEY 凭据哨兵(env→Keychain 解析会读它们)。
+# M5:默认 open 现在每次都会构造 web client,``web_proxy_configuration`` 会读
+# 代理 env;操作员代理设置不得渗进单测。运维授权 live 运行若需要代理/密钥,
+# 在具体测试内自行 setenv(fixture 先执行,per-test monkeypatch 可覆盖)。
 _HOST_ENV_NAMES: tuple[str, ...] = (
     "SKILL_PATH",
     "PRAXIS_MCP_CONFIG",
@@ -81,6 +93,13 @@ _HOST_ENV_NAMES: tuple[str, ...] = (
     "DEEPSEEK_SEARCH_KEY",
     "BRAVE_SEARCH_KEY",
     "TAVILY_SEARCH_KEY",
+    "PRAXIS_WEB_PROXY",
+    "https_proxy",
+    "HTTPS_PROXY",
+    "http_proxy",
+    "HTTP_PROXY",
+    "no_proxy",
+    "NO_PROXY",
 )
 
 

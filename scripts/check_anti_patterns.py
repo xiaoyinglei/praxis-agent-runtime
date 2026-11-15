@@ -198,6 +198,9 @@ _PRAXIS_MCP_MANAGER_FILE = ("adapters", "mcp", "manager.py")
 # 规则 20(S7):argv 密钥重置形态的两个字面量。``-i`` 单独出现(如
 # ``security -i`` 的 stdin 模式)不是重置形态——只有与 env 可执行名共处同一
 # 序列字面量时才拒绝;``/usr/bin/env`` 本身在任何代码字符串里都拒绝。
+# 盲区(文档化,非静默):拆分为多个字面量再拼("exe" + "nv")、或把
+# ``"/usr/bin/env"`` 与 ``"-i"`` 分两次 append 进同一列表,静态字面量扫描
+# 无法跨表达式/跨语句关联——与规则 8 的代码字符串口径同类的固有限制。
 _S7_ENV_RESET_BINARY = "/usr/bin/env"
 _S7_ENV_NAME = "env"
 _S7_RESET_FLAG = "-i"
@@ -206,6 +209,8 @@ _S7_RESET_FLAG = "-i"
 # (规则 14)钉住,这里不重复登记。connect_mcp_servers 的**唯一实现**在
 # adapters/mcp/manager.py;composition.py 是注入绑定 facade(R-T15-7,env_builder/
 # sandbox_compiler 的唯一绑定点),同属允许面。
+# 盲区(文档化,非静默):``f = lambda ...:`` 形式的同名重绑定不是 def 节点,
+# 静态 def 扫描看不到——与旧规则 4/5/7 同一机制口径,交给整分支审查台账。
 _SINGLE_DEFINITION_SITES: dict[str, frozenset[tuple[str, ...]]] = {
     "child_env": frozenset({_PRAXIS_CHILD_ENV_FILE}),
     "signal_group": frozenset({_PRAXIS_PROCESS_FILE}),
@@ -322,6 +327,73 @@ def _host_config_reader_allowed(rel_parts: tuple[str, ...]) -> bool:
     if rel_parts[:2] in _HOST_CONFIG_DIR_PACKAGE_PREFIXES:
         return True
     return rel_parts in _HOST_CONFIG_DIR_FILES
+
+
+def _is_environment_items(node: ast.AST, aliases: set[str]) -> bool:
+    """``os.environ.items()`` / ``<alias>.items()``(dict-comp 与 dict(...) 的源)。"""
+    if not isinstance(node, ast.Call):
+        return False
+    chain = _dotted_chain(node.func)
+    if chain == ["os", "environ", "items"]:
+        return True
+    return chain is not None and len(chain) == 2 and chain[0] in aliases and chain[1] == "items"
+
+
+def _is_environment_source(node: ast.AST, aliases: set[str]) -> bool:
+    """规则 21(B33):宿主 env 源判定(含一层别名,无数据流:保守失败方向)。
+
+    覆盖 ``os.environ`` 本身及其别名、``.copy()``、``dict(...)``、
+    ``{**...}``、``|`` 合并(BinOp BitOr)与 ``dict(os.environ.items())``。
+    别名检测是单遍、无作用域/重赋值追踪的保守近似:宁可拒绝一次合法复用,
+    也不放过宿主 env 进子进程;别名后又被常量覆盖的误报面已由测试记录。
+    """
+    chain = _dotted_chain(node)
+    if chain == ["os", "environ"]:
+        return True
+    if chain is not None and len(chain) == 1 and chain[0] in aliases:
+        return True
+    if isinstance(node, ast.Call):
+        call_chain = _dotted_chain(node.func)
+        if call_chain == ["os", "environ", "copy"]:
+            return True
+        if (
+            call_chain is not None
+            and len(call_chain) == 2
+            and call_chain[0] in aliases
+            and call_chain[1] == "copy"
+        ):
+            return True
+        if call_chain == ["dict"] and node.args:
+            first = node.args[0]
+            if _is_environment_source(first, aliases) or _is_environment_items(first, aliases):
+                return True
+    if isinstance(node, ast.Dict):
+        return any(
+            key is None and _is_environment_source(value, aliases)
+            for key, value in zip(node.keys, node.values, strict=True)
+        )
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return _is_environment_source(node.left, aliases) or _is_environment_source(
+            node.right, aliases
+        )
+    if isinstance(node, ast.DictComp):
+        return any(_is_environment_items(generator.iter, aliases) for generator in node.generators)
+    return False
+
+
+def _environment_aliases(tree: ast.Module) -> set[str]:
+    """收集 ``x = <宿主 env 源>`` 的别名(规则 21 的一层别名面)。"""
+    aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)) or node.value is None:
+            continue
+        if not _is_environment_source(node.value, aliases):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name):
+                aliases.add(target.id)
+    return aliases
 
 
 def scan_praxis_file(path: Path, praxis_root: Path | None = None) -> list[str]:
@@ -571,11 +643,14 @@ def scan_praxis_file(path: Path, praxis_root: Path | None = None) -> list[str]:
 
     # 规则 19-23(阶段3B/Task 20):MCP 名字、S7 argv 重置、B33 宿主 env、
     # 单一定义点与宿主配置文件读取面。纯增:不改上方旧规则。
+    environment_aliases = _environment_aliases(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             if id(node) in docstrings:
                 continue
             # 规则 19:MCP 工具名前缀只允许 names.py 唯一拼装
+            # 盲区(文档化,非静默):拼接/格式化("mcp_" + "_x")可绕开字面量
+            # 扫描——与规则 8 的代码字符串口径同类的固有限制,不是遗漏。
             if "mcp__" in node.value and rel_parts != _PRAXIS_MCP_NAMES_FILE:
                 violations.append(
                     f"line {node.lineno}: MCP tool-name literal outside adapters/mcp/names.py — "
@@ -611,33 +686,48 @@ def scan_praxis_file(path: Path, praxis_root: Path | None = None) -> list[str]:
                     "argv 序列里的 env -i 形态把配置密钥暴露给 ps;envp 之外无路"
                 )
         elif isinstance(node, ast.Dict):
-            # 规则 21(B33):``{**os.environ}`` 直接展开进子进程 env
+            # 规则 21(B33):``{**os.environ}`` / ``{**alias}`` 直接展开进子进程 env
             for key, value in zip(node.keys, node.values, strict=True):
-                if key is None and _dotted_chain(value) == ["os", "environ"]:
+                if key is None and _is_environment_source(value, environment_aliases):
                     violations.append(
                         f"line {node.lineno}: host environment inherited into a subprocess (B33) — "
-                        "**os.environ 展开全仓禁止;子进程 env 只允许常量白名单/child_env"
+                        "宿主 env 展开/copy/dict/union/别名全仓禁止;子进程 env 只允许常量白名单/child_env"
                     )
-        elif isinstance(node, ast.Call):
-            chain = _dotted_chain(node.func)
-            # 规则 21(B33):os.environ.copy() / dict(os.environ)
-            if chain == ["os", "environ", "copy"]:
-                violations.append(
-                    f"line {node.lineno}: host environment inherited into a subprocess (B33) — "
-                    "os.environ.copy() 全仓禁止;子进程 env 只允许常量白名单/child_env"
-                )
-            if chain == ["dict"] and any(
-                _dotted_chain(argument) == ["os", "environ"] for argument in node.args
+        elif isinstance(node, ast.BinOp):
+            # 规则 21(B33):``os.environ | {...}`` / ``{...} | os.environ``(BitOr 合并)
+            if isinstance(node.op, ast.BitOr) and (
+                _is_environment_source(node.left, environment_aliases)
+                or _is_environment_source(node.right, environment_aliases)
             ):
                 violations.append(
                     f"line {node.lineno}: host environment inherited into a subprocess (B33) — "
-                    "dict(os.environ) 全仓禁止;子进程 env 只允许常量白名单/child_env"
+                    "宿主 env 展开/copy/dict/union/别名全仓禁止;子进程 env 只允许常量白名单/child_env"
+                )
+        elif isinstance(node, ast.DictComp):
+            # 规则 21(B33):``{k: v for k, v in os.environ.items()}``
+            if any(
+                _is_environment_items(generator.iter, environment_aliases)
+                for generator in node.generators
+            ):
+                violations.append(
+                    f"line {node.lineno}: host environment inherited into a subprocess (B33) — "
+                    "宿主 env 展开/copy/dict/union/别名全仓禁止;子进程 env 只允许常量白名单/child_env"
+                )
+        elif isinstance(node, ast.Call):
+            # 规则 21(B33):os.environ.copy() / dict(os.environ[.items()]) /
+            # 别名的同类形态;env= 关键字再覆盖 Attribute/Name/BinOp/Dict 值。
+            if _is_environment_source(node, environment_aliases):
+                violations.append(
+                    f"line {node.lineno}: host environment inherited into a subprocess (B33) — "
+                    "宿主 env 展开/copy/dict/union/别名全仓禁止;子进程 env 只允许常量白名单/child_env"
                 )
             for keyword in node.keywords:
-                if keyword.arg == "env" and _dotted_chain(keyword.value) == ["os", "environ"]:
+                if keyword.arg == "env" and _is_environment_source(
+                    keyword.value, environment_aliases
+                ):
                     violations.append(
                         f"line {node.lineno}: host environment inherited into a subprocess (B33) — "
-                        "env=os.environ 全仓禁止;子进程 env 只允许常量白名单/child_env"
+                        "宿主 env 展开/copy/dict/union/别名全仓禁止;子进程 env 只允许常量白名单/child_env"
                     )
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             # 规则 22:单一定义点

@@ -20,12 +20,15 @@ import pytest
 
 import praxis.composition as composition
 from praxis.adapters.models.scripted import ScriptedAdapter
+from praxis.adapters.web.client import PublicHttpClient, PublicWebError
 from praxis.interfaces.sdk import (
     TurnStatus,
     load_web_search_config,
     open_session,
 )
 from praxis.protocol.models import ModelResponse, Usage
+from praxis.protocol.permission import PermissionUpdate
+from praxis.protocol.policy import NetworkRule
 from praxis.protocol.tools import ToolEffect
 from praxis.tools.builtins.filesystem import create_read_tool
 
@@ -132,3 +135,35 @@ def test_host_search_provider_env_does_not_leak_into_default_config(
     """隔离 fixture 剥掉宿主 env;默认配置读取只看到 per-test 空配置目录。"""
     assert os.environ.get("PRAXIS_WEB_SEARCH_PROVIDER") is None
     assert load_web_search_config() is None
+
+
+def test_wired_default_authorize_reads_live_session_policy(workspace: Path) -> None:
+    """默认表**实际装配**的 authorize 必须是 live 视图,不是打开时快照(S8)。
+
+    Reach path(整分支审查可复核):``session._integrations`` 里的
+    ``PublicHttpClient``(T20 把 web client 作为 integration 注入)→
+    ``client._authorize``(即 ``make_web_authorizer`` 产出的同一闭包)。
+    默认策略 ask ⇒ 先 denied;``update_permission`` 授域后**同一实例**立即
+    allow。若未来在 ``_default_tools`` 把 provider 改成策略快照,本测试失败。
+    """
+    session = open_session(workspace, ScriptedAdapter([]))
+    try:
+        client = next(
+            item
+            for item in session._integrations  # noqa: SLF001 — 装配契约:client 收尾面
+            if isinstance(item, PublicHttpClient)
+        )
+        authorize = client._authorize  # noqa: SLF001 — 唯一授权闭包的接线点
+        url = "https://live.example/path"
+        with pytest.raises(PublicWebError):
+            authorize(url)
+
+        session.update_permission(
+            PermissionUpdate(
+                rule=NetworkRule(domain="live.example", decision="allow"),
+                destination="session",
+            )
+        )
+        assert authorize(url) is None
+    finally:
+        session.close()

@@ -619,10 +619,41 @@ def test_security_stdin_flag_is_not_s7_reset_shape(tmp_path):
         'env = os.environ.copy()\nproc = create_subprocess_exec("x", env=env)\n',
         'env = dict(os.environ)\nproc = create_subprocess_exec("x", env=env)\n',
         'proc = create_subprocess_exec("x", env=os.environ)\n',
+        # BitOr 合并(现代惯用写法,同样是把宿主 env 带进子进程)
+        'proc = create_subprocess_exec("x", env=os.environ | {"PATH": "/bin"})\n',
+        'proc = create_subprocess_exec("x", env={"PATH": "/bin"} | os.environ)\n',
+        # dict-comp over items()
+        'env = {key: value for key, value in os.environ.items()}\n'
+        'proc = create_subprocess_exec("x", env=env)\n',
+        'proc = create_subprocess_exec("x", env=dict(os.environ.items()))\n',
+        # 一层别名再展开/再 copy/dict
+        'source = os.environ\nproc = create_subprocess_exec("x", env={**source})\n',
+        'source = os.environ.copy()\nproc = create_subprocess_exec("x", env=dict(source))\n',
     ),
 )
 def test_host_environment_inheritance_rejected(tmp_path, source):
     f = _write(tmp_path, "praxis/tools/builtins/evil.py", source)
+    assert any("B33" in v for v in scan_praxis_file(f))
+
+
+def test_plain_dict_union_is_not_environment_inheritance(tmp_path):
+    # 两个常量 dict 的 | 合并没有宿主 env 源,不得误报
+    f = _write(
+        tmp_path,
+        "praxis/tools/builtins/evil.py",
+        'proc = create_subprocess_exec("x", env={"PATH": "/bin"} | {"LANG": "C"})\n',
+    )
+    assert scan_praxis_file(f) == []
+
+
+def test_environment_alias_conservative_after_reassignment(tmp_path):
+    """记录保守近似:单遍无数据流,别名后重绑定为常量仍命中(B33 失败方向)。"""
+    f = _write(
+        tmp_path,
+        "praxis/tools/builtins/evil.py",
+        'source = os.environ\nsource = {"PATH": "/bin"}\n'
+        'proc = create_subprocess_exec("x", env={**source})\n',
+    )
     assert any("B33" in v for v in scan_praxis_file(f))
 
 
