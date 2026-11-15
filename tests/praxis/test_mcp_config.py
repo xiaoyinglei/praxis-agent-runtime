@@ -23,6 +23,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 import yaml
 
@@ -35,6 +36,7 @@ from praxis.adapters.mcp.config import (
 )
 from praxis.adapters.mcp.names import (
     canonical_tool_name,
+    global_wildcard,
     normalize_mcp_name,
     server_wildcard,
 )
@@ -176,6 +178,11 @@ def test_server_wildcard_rejects_empty_normalization() -> None:
         server_wildcard("---")
 
 
+def test_global_wildcard_matches_legacy_session_assembly_sites() -> None:
+    # 旧 harness/session.py:141/1367 的形状。
+    assert global_wildcard() == "mcp__*"
+
+
 # ---------------------------------------------------------------------------
 # defaults
 # ---------------------------------------------------------------------------
@@ -286,6 +293,16 @@ def test_duplicate_names_are_rejected(workspace: Path) -> None:
         load_mcp_configs(workspace, path)
 
 
+@pytest.mark.parametrize("name", ["___", "名字", "!!!"])
+def test_server_name_must_normalize_to_non_empty(workspace: Path, name: str) -> None:
+    """M3:加载期拒绝规范化后为空的名字(旧实现到运行期才拼出垃圾通配)。"""
+    path = _write_config(
+        workspace.parent / "outside", {"servers": [_stdio(name=name)]}
+    )
+    with pytest.raises(ValueError, match="must normalize to a non-empty value"):
+        load_mcp_configs(workspace, path)
+
+
 def test_duplicate_disabled_name_only_conflicts_when_included(workspace: Path) -> None:
     payload = {"servers": [_stdio(), _http(name="files", enabled=False)]}
     path = _write_config(workspace.parent / "outside", payload)
@@ -343,6 +360,18 @@ def test_http_url_rejections(workspace: Path, url: str) -> None:
         load_mcp_configs(workspace, path)
 
 
+def test_url_error_never_echoes_credentials_or_endpoint(workspace: Path) -> None:
+    path = _write_config(
+        workspace.parent / "outside",
+        {"servers": [_http(url="https://user:secret@example.com/mcp")]},
+    )
+    with pytest.raises(ValueError) as excinfo:
+        load_mcp_configs(workspace, path)
+    message = str(excinfo.value)
+    assert "user:secret" not in message
+    assert "example.com" not in message
+
+
 @pytest.mark.parametrize(
     ("raw", "normalized"),
     [
@@ -353,11 +382,21 @@ def test_http_url_rejections(workspace: Path, url: str) -> None:
         ("https://example.com:80/mcp", "https://example.com:80/mcp"),
         ("HTTPS://Example.COM/mcp", "https://example.com/mcp"),
         ("https://bücher.example/mcp", "https://xn--bcher-kva.example/mcp"),
+        # 非 ASCII path 按旧 httpx.URL 百分号编码。
+        ("https://example.com/über", "https://example.com/%C3%BCber"),
+        # 公网 IPv6 字面量:方括号必须保留(否则存储的 endpoint 自身非法)。
+        (
+            "https://[2606:4700:4700::1111]/mcp",
+            "https://[2606:4700:4700::1111]/mcp",
+        ),
     ],
 )
 def test_http_url_normalization(workspace: Path, raw: str, normalized: str) -> None:
     config = _single(workspace, _http(url=raw))
     assert config.url == normalized
+    # 旧 str(httpx.URL) 同源 + 幂等:T18 endpoint 逐字相等守卫可直接比较。
+    assert config.url == str(httpx.URL(raw))
+    assert str(httpx.URL(config.url)) == config.url
 
 
 def test_http_headers_must_map_strings_to_strings(workspace: Path) -> None:
@@ -476,6 +515,19 @@ def test_expanded_values_never_appear_in_later_errors(
     assert "supersecret-value" not in message
 
 
+def test_expanded_secrets_are_not_repr_able(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M5:env/headers 字段 repr=False——展开值不能被 repr 带出。"""
+    monkeypatch.setenv("PRAXIS_T15_SECRET", "supersecret-value")
+    stdio_config = _single(workspace, _stdio(env={"TOKEN": "${PRAXIS_T15_SECRET}"}))
+    assert "supersecret-value" not in repr(stdio_config)
+    http_config = _single(
+        workspace, _http(headers={"Authorization": "${PRAXIS_T15_SECRET}"})
+    )
+    assert "supersecret-value" not in repr(http_config)
+
+
 def test_oauth_fields_are_explicitly_rejected(workspace: Path) -> None:
     for overrides in (
         {"oauth": True},
@@ -509,6 +561,21 @@ def test_payload_must_be_mapping_and_servers_list(workspace: Path, outside: Path
     path = _write_config(outside, {"servers": ["entry"]})
     with pytest.raises(ValueError, match="entries must be mappings"):
         load_mcp_configs(workspace, path)
+
+    # M6:旧 ``yaml.safe_load(...) or {}`` 语义——falsy 非 None payload 走同一文案。
+    path = _write_config(outside, [])
+    with pytest.raises(ValueError, match="servers must be a list"):
+        load_mcp_configs(workspace, path)
+
+
+@pytest.mark.skipif(os.getuid() == 0, reason="root 可读任意文件")
+def test_unreadable_config_raises_bounded_error(workspace: Path, outside: Path) -> None:
+    """M1:0o200 文件 ⇒ 有界 ValueError,不裸泄 PermissionError。"""
+    path = _write_config(outside, {"servers": [_stdio()]}, mode=0o200)
+    with pytest.raises(ValueError, match="could not be read"):
+        load_mcp_configs(workspace, path)
+    with pytest.raises(ValueError, match="could not be read"):
+        config_sha256(path)
 
 
 def test_invalid_yaml_does_not_echo_file_body(workspace: Path, outside: Path) -> None:

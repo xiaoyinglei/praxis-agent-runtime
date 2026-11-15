@@ -30,7 +30,14 @@ True、HTTP URL 仅 https 且无凭证/query/fragment(``validate_public_url``
   解析,不再相对配置文件目录):沙箱编译只授权 workspace+scratch。
 - (Q6)OAuth 族键(``oauth``/``oauth_*``)在 3B 明确拒绝,不静默忽略。
 - HTTP ``headers`` 值也支持 ``${VAR}`` 展开(加载期一次性),使密钥不必
-  写进 YAML;展开值绝不进入消息。
+  写进 YAML;展开值绝不进入消息,且 ``env``/``headers`` 字段 ``repr=False``
+  (展开后的秘密不可被 repr 带出)。``${VAR}`` 与旧实现一样**没有转义形态**
+  (在 ``$`` 前加反斜杠仍会被展开;要写字面量就不要使用该形状)。
+- URL 存储形态取旧实现同源:``str(httpx.URL(...))``(host 小写/IDNA、
+  IPv6 保留方括号、非 ASCII path 百分号编码、省略 443);``validate_public_url``
+  仍只承担拒绝语义。T18 的 endpoint 逐字相等守卫因此与请求侧同源。
+- (M3)server 名必须能规范化为非空串(全 unicode/全标点 ⇒ 加载期可诊断
+  拒绝);这是相对旧实现"到运行期才拼出 ``mcp____*`` 垃圾"的有意收紧。
 - ``StdioServerConfig``/``HttpServerConfig`` 字段逐一对齐旧两型,唯末位
   新增 ``enabled``(默认 True):默认加载仍只返回 enabled 条目,CLI 需要
   disabled 的可见状态时经 ``include_disabled=True`` 取完整记录。
@@ -44,13 +51,14 @@ import os
 import re
 import stat
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlsplit
 
+import httpx
 import yaml
 
+from praxis.adapters.mcp.names import normalize_mcp_name
 from praxis.adapters.web.urls import PublicWebError, validate_public_url
 from praxis.protocol.floor import host_config_dir
 
@@ -82,11 +90,14 @@ class StdioServerConfig:
     name: str
     command: str
     args: tuple[str, ...]
-    env: Mapping[str, str]
+    # 展开后的值可能含秘密:不得被 repr 带出(加载期值只进内存)。
+    env: Mapping[str, str] = field(repr=False)
     cwd: str | None
     tools_allowlist: frozenset[str]
     allow_all_tools: bool
     startup_timeout_seconds: float
+    # 解析层默认 enabled=False(旧语义);直接构造(测试/T16-T18)默认 True。
+    # 经 load_mcp_configs 的条目永远携带显式状态。
     enabled: bool = True
 
 
@@ -96,13 +107,16 @@ class HttpServerConfig:
 
     name: str
     url: str
-    headers: Mapping[str, str]
+    # 展开后的值可能含秘密:不得被 repr 带出(加载期值只进内存)。
+    headers: Mapping[str, str] = field(repr=False)
     bearer_token_env_var: str | None
     keychain: bool
     read_only: bool
     tools_allowlist: frozenset[str]
     allow_all_tools: bool
     startup_timeout_seconds: float
+    # 解析层默认 enabled=False(旧语义);直接构造(测试/T17/T18)默认 True。
+    # 经 load_mcp_configs 的条目永远携带显式状态。
     enabled: bool = True
 
 
@@ -119,8 +133,15 @@ class McpConfigTrustDecision:
 
 
 def config_sha256(path: Path) -> str:
-    """配置字节的 sha256(调用期漂移比较的唯一实现)。"""
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    """配置字节的 sha256(调用期漂移比较的唯一实现)。
+
+    读失败收敛为有界 ``ValueError``(权限/IO 错误不裸泄为原异常)。
+    """
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        raise ValueError(_READ_ERROR) from None
+    return hashlib.sha256(data).hexdigest()
 
 
 def decide_mcp_config_trust(
@@ -257,14 +278,16 @@ def _check_hygiene(source: Path) -> None:
 def _read_payload(source: Path) -> object:
     try:
         text = source.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         raise ValueError(_READ_ERROR) from None
     try:
         payload = yaml.safe_load(text)
     except yaml.YAMLError:
         # 固定文案:YAML 解析错误会带出文件片段,可能包含展开前的敏感值。
         raise ValueError(_YAML_ERROR) from None
-    return {} if payload is None else payload
+    # 旧 ``yaml.safe_load(...) or {}``:falsy 但非 None 的 payload(``[]``/``""``)
+    # 也归一到 ``{}``,由同一 "servers must be a list" 文案拒绝。
+    return payload or {}
 
 
 def _parse_servers(
@@ -288,6 +311,11 @@ def _parse_servers(
         if not enabled and not include_disabled:
             continue
         name = _required_text(raw, "name")
+        if not normalize_mcp_name(name):
+            # M3:边界拒绝,不让运行期拼出空名字的通配/工具名。
+            raise ValueError(
+                f"MCP server name must normalize to a non-empty value: {_bounded(name)}"
+            )
         if name in names:
             raise ValueError(f"duplicate MCP server: {_bounded(name)}")
         names.add(name)
@@ -398,24 +426,19 @@ def _validate_http_url(value: str) -> str:
     """旧 ``validate_http_mcp_url`` 的等价物:仅 https、无凭证/query/fragment。
 
     端口限制在 ``validate_public_url`` 内部(``{None,80,443}``),与旧实现
-    所调的同一函数一致;输出按旧 ``str(httpx.URL(...))`` 的形状归一
-    (host 小写/IDNA、省略 443、保留显式路径)。
+    所调的同一函数一致;存储形态直接取 ``str(httpx.URL(...))``(旧实现同源):
+    host 小写/IDNA、IPv6 保留方括号、非 ASCII path 百分号编码、省略 443。
     """
     try:
-        parts = urlsplit(value)
-        if parts.fragment or parts.query:
+        raw = httpx.URL(value)
+        if raw.fragment or raw.query:
             raise ValueError
-        host, port, _target = validate_public_url(value)
-        if parts.scheme.casefold() != "https":
+        _host, _port, _target = validate_public_url(value)
+        if raw.scheme != "https":
             raise ValueError
-    except (PublicWebError, ValueError):
+        return str(raw)
+    except (PublicWebError, ValueError, httpx.InvalidURL):
         raise ValueError(_URL_ERROR) from None
-    try:
-        ascii_host = host if host.isascii() else host.encode("idna").decode("ascii")
-    except UnicodeError:
-        raise ValueError(_URL_ERROR) from None
-    port_suffix = "" if port == 443 else f":{port}"
-    return f"https://{ascii_host}{port_suffix}{parts.path}"
 
 
 def _cwd(value: object, *, workspace: Path, server_name: str) -> str | None:

@@ -2,9 +2,10 @@
 
 旧实现有 6 处各自拼装:``tools/integrations/mcp.py:83`` 的 canonical 名,
 ``runtime/mcp.py:219/441`` 与 ``runtime/mcp_catalog.py:256`` 的 server
-通配,``harness/session.py:141/1367`` 的全域通配。它们逐字收敛到本模块:
-任何其他模块都不得再写字面量拼装(T20 静态规则钉死),分类/展示一律消费
-``tool.source`` 而不是前缀字符串。
+通配,``harness/session.py:141/1367`` 的**全域**通配。它们逐字收敛到本模块
+的三个函数:``canonical_tool_name``、``server_wildcard`` 与
+``global_wildcard``。任何其他模块都不得再写字面量拼装(T20 静态规则钉死),
+分类/展示一律消费 ``tool.source`` 而不是前缀字符串。
 
 规范化步骤逐字移植旧 ``normalize_mcp_name``(``tools/integrations/mcp.py:
 70-75``):strip → lower → ``-``/空格 → ``_`` → 非法字符 → ``_`` → **折叠
@@ -45,4 +46,9 @@ def server_wildcard(server: str) -> str:
     return f"mcp__{server_name}__*"
 
 
-__all__ = ["canonical_tool_name", "normalize_mcp_name", "server_wildcard"]
+def global_wildcard() -> str:
+    """全部 MCP 工具的通配名(策略预检的唯一拼装点,旧 ``mcp__*``)。"""
+    return "mcp__*"
+
+
+__all__ = ["canonical_tool_name", "global_wildcard", "normalize_mcp_name", "server_wildcard"]

@@ -16,6 +16,7 @@ from praxis.adapters.mcp.config import (
 )
 from praxis.adapters.mcp.names import (
     canonical_tool_name,
+    global_wildcard,
     normalize_mcp_name,
     server_wildcard,
 )
@@ -28,6 +29,7 @@ __all__ = [
     "canonical_tool_name",
     "config_sha256",
     "decide_mcp_config_trust",
+    "global_wildcard",
     "load_mcp_configs",
     "normalize_mcp_name",
     "resolve_mcp_config_path",
