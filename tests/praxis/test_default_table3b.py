@@ -1,0 +1,134 @@
+"""Task 20:默认工具表 15 builtin + web 装配 + 渲染探针 + 宿主隔离。
+
+钉住四件事:
+1. 默认表恰好 15 个 builtin(集合),MCP 动态工具不进入(只经 extra_tools);
+2. scripted turn 的 wire tools 里同时有 web_fetch/web_search(不触网),
+   证明默认装配把 web 工具真的交给了模型;
+3. renderer 探针是 monkeypatch 接缝:False ⇒ 纯文本面(无 EXECUTE_PROCESS),
+   True ⇒ render-capable(T14 形状);
+4. ``tools=`` 整体替换时不构造 web client(capability coupling,廉价路径),
+   以及宿主 ``PRAXIS_WEB_SEARCH_PROVIDER`` 不会漏进默认配置读取。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+from pathlib import Path
+
+import pytest
+
+import praxis.composition as composition
+from praxis.adapters.models.scripted import ScriptedAdapter
+from praxis.interfaces.sdk import (
+    TurnStatus,
+    load_web_search_config,
+    open_session,
+)
+from praxis.protocol.models import ModelResponse, Usage
+from praxis.protocol.tools import ToolEffect
+from praxis.tools.builtins.filesystem import create_read_tool
+
+_EXPECTED_BUILTINS = {
+    "read",
+    "write",
+    "bash",
+    "manage_command",
+    "list_files",
+    "search_text",
+    "inspect_data_file",
+    "apply_patch",
+    "update_plan",
+    "run_python",
+    "read_artifact",
+    "web_fetch",
+    "web_search",
+    "invoke_skill",
+    "materialize_skill_asset",
+}
+
+
+def _resp(content: str) -> ModelResponse:
+    return ModelResponse(
+        content=content,
+        tool_calls=(),
+        usage=Usage(input_tokens=1, output_tokens=1),
+        finish_reason="stop",
+    )
+
+
+def test_default_table_has_exactly_fifteen_builtins(workspace: Path) -> None:
+    session = open_session(workspace, ScriptedAdapter([]))
+    try:
+        names = set(session._tools)  # noqa: SLF001 — 装配契约:集合可断言
+        assert names == _EXPECTED_BUILTINS
+        assert len(names) == 15
+        assert not any(name.startswith("mcp__") for name in names)
+    finally:
+        session.close()
+
+
+def test_scripted_turn_offers_web_tools_without_network(workspace: Path) -> None:
+    """MCP 缺席 + web 工具在场:wire tools 含两件 web 工具,剧本零网络。"""
+    adapter = ScriptedAdapter([_resp("done")])
+    session = open_session(workspace, adapter)
+    try:
+        result = asyncio.run(session.submit("hello"))
+        assert result.status is TurnStatus.COMPLETED
+        assert adapter.last_request is not None
+        wire_names = {tool.name for tool in adapter.last_request.tools}
+        assert {"web_fetch", "web_search"} <= wire_names
+        assert {"invoke_skill", "materialize_skill_asset"} <= wire_names
+        assert not any(name.startswith("mcp__") for name in wire_names)
+    finally:
+        session.close()
+
+
+def test_renderer_probe_false_keeps_text_only_surface(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(composition, "_playwright_importable", lambda: False)
+    session = open_session(workspace, ScriptedAdapter([]))
+    try:
+        tool = session._tools["web_fetch"]  # noqa: SLF001 — 装配契约
+        assert ToolEffect.EXECUTE_PROCESS not in tool.static_effects
+    finally:
+        session.close()
+
+
+def test_renderer_probe_true_wires_render_capable_tool(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(composition, "_playwright_importable", lambda: True)
+    session = open_session(workspace, ScriptedAdapter([]))
+    try:
+        tool = session._tools["web_fetch"]  # noqa: SLF001 — 装配契约
+        assert ToolEffect.EXECUTE_PROCESS in tool.static_effects
+    finally:
+        session.close()
+
+
+def test_full_replacement_skips_web_client_construction(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``tools=`` 整体替换 ⇒ 默认装配路径不执行(不读 web limits/web.json)。"""
+
+    def explode() -> None:
+        raise AssertionError("web limits must not load when tools are replaced")
+
+    monkeypatch.setattr(composition, "load_web_limits", explode)
+    session = open_session(
+        workspace, ScriptedAdapter([]), tools=(create_read_tool(workspace),)
+    )
+    try:
+        assert set(session._tools) == {"read"}  # noqa: SLF001 — 装配契约
+    finally:
+        session.close()
+
+
+def test_host_search_provider_env_does_not_leak_into_default_config(
+    workspace: Path,
+) -> None:
+    """隔离 fixture 剥掉宿主 env;默认配置读取只看到 per-test 空配置目录。"""
+    assert os.environ.get("PRAXIS_WEB_SEARCH_PROVIDER") is None
+    assert load_web_search_config() is None

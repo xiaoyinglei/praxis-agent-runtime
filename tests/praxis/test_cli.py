@@ -151,7 +151,7 @@ def test_sdk_reexports_artifact_plan_and_event_surface() -> None:
 
 
 def test_default_tool_table_is_stable(workspace: Path) -> None:
-    """Task 17:默认工具表的成员与顺序是稳定契约(tools 参数仍可整体替换)。"""
+    """Task 17/T20:默认工具表的成员与顺序是稳定契约(tools 参数仍可整体替换)。"""
     session = open_session(workspace, ScriptedAdapter([_resp("ok")]))
     try:
         assert list(session._tools) == [  # noqa: SLF001 — 装配契约:顺序可断言
@@ -166,6 +166,10 @@ def test_default_tool_table_is_stable(workspace: Path) -> None:
             "update_plan",
             "run_python",
             "read_artifact",
+            "web_fetch",
+            "web_search",
+            "invoke_skill",
+            "materialize_skill_asset",
         ]
     finally:
         session.close()
@@ -1757,3 +1761,48 @@ def test_build_session_without_registry_is_actionable(
             composition.build_session(workspace, config_store=store)
     finally:
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# Task 20:chat daemon 输入线程硬化 + SDK 面收口
+# ---------------------------------------------------------------------------
+
+
+def test_chat_input_daemon_settles_on_revoked_tty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """吊销 tty 后 ``input()`` 抛 OSError:daemon 线程必须以 None 结算 future。
+
+    未硬化时线程死在异常里、future 永不完成 ⇒ ``await`` 挂死(CI 必须靠外部
+    超时才发现)。这里用 ``wait_for`` 直接证明结算。
+    """
+
+    def revoked_input(prompt: str = "") -> str:
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr("builtins.input", revoked_input)
+
+    async def run() -> str | None:
+        return await asyncio.wait_for(cli_main._read_answer_async("> "), timeout=5)
+
+    assert asyncio.run(run()) is None
+
+
+def test_sdk_all_sorted_and_includes_task20_surface() -> None:
+    """SDK 出口有序,且 3B 收口面(权限/MCP/web limits/技能/hooks)都在。"""
+    assert sdk_pkg.__all__ == sorted(sdk_pkg.__all__)
+    for name in (
+        "PermissionNotice",
+        "McpBundle",
+        "McpServerStatus",
+        "connect_mcp_servers",
+        "WebLimits",
+        "load_web_limits",
+        "SkillCatalog",
+        "SkillManifest",
+        "load_skill_catalog",
+        "ToolSource",
+        "load_host_hooks",
+    ):
+        assert name in sdk_pkg.__all__, f"sdk.__all__ missing {name}"
+        assert hasattr(sdk_pkg, name), f"sdk missing attribute {name}"

@@ -774,7 +774,13 @@ async def _read_answer_async(prompt_text: str) -> str | None:
     future: asyncio.Future[str | None] = loop.create_future()
 
     def read() -> None:
-        value = _read_answer(prompt_text)
+        try:
+            value = _read_answer(prompt_text)
+        except BaseException:  # noqa: BLE001 — T20:吊销 tty 的 OSError 等异常
+            # daemon 线程无法把异常带出:若 future 不结算,``await`` 会永久挂起。
+            # 一律以 None 哨兵结算(_chat_loop_async 把 None 当 EOF 退出),异常
+            # 类型不进入控制流。
+            value = None
         try:
             loop.call_soon_threadsafe(_resolve_future, future, value)
         except RuntimeError:

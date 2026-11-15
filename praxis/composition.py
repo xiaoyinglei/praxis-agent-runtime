@@ -6,7 +6,8 @@ build_session 把分层组件装配成一个可用会话,顺序即依赖序:
 → **CommandSessions + 孤儿命令进程组清扫**(Task 15:同一实例注入 bash 与
 manage_command;marker 清扫结果只记日志) → 默认内置工具(read/write/bash/
 manage_command/list_files/search_text/inspect_data_file/apply_patch/
-update_plan/run_python/read_artifact;顺序稳定,可由 tools 参数整体替换)
+update_plan/run_python/read_artifact/web_fetch/web_search/invoke_skill/
+materialize_skill_asset = 15 builtin;顺序稳定,可由 tools 参数整体替换)
 → PermissionContext(``probe_backend()`` 真实沙箱探测)→ 线程 ensure/create →
 Session(注入 ``compile_sandbox``/``finalize_sandbox``、后台会话收尾面与唯一
 重试机制 ``retry_stream``——core 经结构签名消费,不 import adapters)。
@@ -21,16 +22,21 @@ thread_id 是外部输入且直接参与 lockfile 命名:在这里(边界)先验
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import logging
 import os
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
 
-from praxis.adapters.config.credentials import resolve_model_credential
+from praxis.adapters.config.credentials import (
+    resolve_model_credential,
+    resolve_web_search_credential,
+)
 from praxis.adapters.config.store import ModelConfigStore
 from praxis.adapters.hooks.config import load_host_hooks
 from praxis.adapters.hooks.runner import spawn_hook
@@ -42,7 +48,15 @@ from praxis.adapters.models.retry import make_retry_stream
 from praxis.adapters.models.tokenization import measure_request
 from praxis.adapters.sandbox.base import probe_backend
 from praxis.adapters.sandbox.compile import compile_sandbox, finalize_sandbox
-from praxis.adapters.web.client import PublicWebError
+from praxis.adapters.web.client import PublicHttpClient, PublicWebError
+from praxis.adapters.web.limits import WebLimits, load_web_limits
+from praxis.adapters.web.search import (
+    SEARCH_ENDPOINTS,
+    SearchProviderConfig,
+    create_web_search_tools,
+    load_web_search_config,
+)
+from praxis.adapters.web.tools import create_web_fetch_tools
 from praxis.core.compaction import (
     SUMMARY_MAX_OUTPUT_TOKENS,
     SUMMARY_PROMPT_MAX_CHARS,
@@ -88,7 +102,11 @@ from praxis.tools.builtins.planning import create_update_plan_tool
 from praxis.tools.builtins.process import signal_group
 from praxis.tools.builtins.python_tool import create_run_python_tool
 from praxis.tools.builtins.search import create_search_text_tool
-from praxis.tools.builtins.skills import load_skill_catalog
+from praxis.tools.builtins.skills import (
+    create_invoke_skill_tool,
+    create_materialize_skill_asset_tool,
+    load_skill_catalog,
+)
 
 _VALID_MODES: tuple[PermissionMode, ...] = ("on-request", "never", "bypass")
 
@@ -287,6 +305,92 @@ def _web_url_host(url: str) -> str:
     return url_host(url) or url
 
 
+def _playwright_importable() -> bool:
+    """T20 renderer 探针:只看可选依赖是否可导入,**绝不 import playwright**。
+
+    ``find_spec`` 不执行模块;composition 模块级因此没有可选 extra 的 import
+    链(纯文本安装仍可打开会话)。探针函数本身是 monkeypatch 接缝(测试用它
+    钉住 render-capable / 纯文本两种装配结果)。
+    """
+    return importlib.util.find_spec("playwright") is not None
+
+
+def _browser_renderer_factory(
+    client: PublicHttpClient,
+    authorize: Callable[[str], None],
+    limits: WebLimits,
+) -> Callable[[], Any] | None:
+    """按探针结果绑定 T14 渲染器工厂(同一 client/authorize/limits 实例)。
+
+    browser 模块的 import 推迟到工厂构造时(规则①禁止函数内 import 语句,
+    故用 ``importlib.import_module``);playwright 缺失 ⇒ ``None``,web_fetch
+    保持纯文本面、render 请求如实 ``render_unavailable``。chromium 二进制
+    缺失但模块在的情况由 T14 的渲染 start 相位映射 ``render_unavailable``。
+    """
+    if not _playwright_importable():
+        return None
+    browser: Any = importlib.import_module("praxis.adapters.web.browser")
+    return lambda: browser.PageRenderer(
+        client, authorize=authorize, limits=limits, signal_process_group=signal_group
+    )
+
+
+def _web_search_credential(cfg: SearchProviderConfig) -> str | None:
+    """R-T13-1:provider 与 endpoint 取自**同一个 live cfg**,原子绑定。"""
+    return resolve_web_search_credential(cfg.api_key_env, SEARCH_ENDPOINTS[cfg.provider])
+
+
+def _default_tools(
+    root: Path,
+    sessions: CommandSessions,
+    artifact_store: ArtifactStore,
+    skills_catalog: SkillCatalog,
+    session_holder: list[Session],
+) -> tuple[tuple[Tool, ...], PublicHttpClient]:
+    """T20 默认工具表(15 builtin)与配套 web client。
+
+    顺序是稳定契约(测试钉死)。web client 与 web_fetch/web_search 共用**同一**
+    ``WebLimits`` 与**同一** authorize 闭包;authorize 经 ``session.permissions``
+    读取 live 权限(与 T11/T12 同一单源,不缓存策略快照)。``session_holder``
+    是延迟绑定:Session 在工具表之后构造,填充后权限更新立即可见(web 工具只
+    在 submit 内被调用)。
+
+    web_search 的 ``config_provider`` 每次调用现读宿主 web.json(live),
+    凭据面按 R-T13-1 由 cfg 原子解析。``tools=`` 整体替换时本函数不执行
+    ——不构造 web client、不装渲染器,保持替换路径廉价(capability coupling
+    先例:没有 web 工具就不需要 web 能力)。
+    """
+    limits = load_web_limits()
+    authorize = make_web_authorizer(lambda: session_holder[0].permissions)
+    client = PublicHttpClient(authorize=authorize, limits=limits)
+    tools: tuple[Tool, ...] = (
+        create_read_tool(root),
+        create_write_tool(root),
+        create_bash_tool(root, sessions=sessions),
+        create_manage_command_tool(sessions),
+        create_list_files_tool(root),
+        create_search_text_tool(root),
+        create_inspect_data_file_tool(root),
+        create_apply_patch_tool(root),
+        create_update_plan_tool(),
+        create_run_python_tool(root),
+        create_read_artifact_tool(artifact_store),
+        *create_web_fetch_tools(
+            client,
+            limits=limits,
+            renderer_factory=_browser_renderer_factory(client, authorize, limits),
+        ),
+        *create_web_search_tools(
+            client,
+            config_provider=load_web_search_config,
+            credential_provider=_web_search_credential,
+        ),
+        create_invoke_skill_tool(skills_catalog),
+        create_materialize_skill_asset_tool(root),
+    )
+    return tools, client
+
+
 async def _spawn_host_hook(
     spec: HookSpec, request: Mapping[str, JsonValue]
 ) -> HookOutcome:
@@ -388,6 +492,12 @@ def build_session(
     这里边界拒绝(跨 server 同名也在 merge 处暴露,T18 交接);``integrations``
     (MCP bundle)注入 Session,``close()/aclose()`` 在 command_sessions 之后、
     store 之前收尾。
+
+    T20:默认表 15 builtin(web_fetch/web_search/invoke_skill/
+    materialize_skill_asset 在此装配)。web 面与 Session 同源:client 的
+    authorize 闭包读 live ``session.permissions``;``tools`` 整体替换时**不**
+    构造 web client、不装渲染器(capability coupling:没有 web 工具就没有 web
+    能力,替换路径保持廉价)。web client 自身作为 integration 收尾。
     """
     if thread_id is not None:
         _validate_thread_id(thread_id)
@@ -446,23 +556,16 @@ def build_session(
             )
         # 内容寻址 artifact 目录(D10):.praxis 是地板,模型只能经 read_artifact 回读。
         artifact_store = ArtifactStore(praxis_dir / "artifacts")
-        tool_seq = (
-            tools
-            if tools is not None
-            else (
-                create_read_tool(root),
-                create_write_tool(root),
-                create_bash_tool(root, sessions=sessions),
-                create_manage_command_tool(sessions),
-                create_list_files_tool(root),
-                create_search_text_tool(root),
-                create_inspect_data_file_tool(root),
-                create_apply_patch_tool(root),
-                create_update_plan_tool(),
-                create_run_python_tool(root),
-                create_read_artifact_tool(artifact_store),
+        # T20:web 工具需要 web client;authorize 经 session_holder 延迟绑定到
+        # live ``session.permissions``。tools 整体替换 ⇒ 两个都不构造。
+        session_holder: list[Session] = []
+        web_client: PublicHttpClient | None = None
+        if tools is not None:
+            tool_seq = tools
+        else:
+            tool_seq, web_client = _default_tools(
+                root, sessions, artifact_store, resolved_skills, session_holder
             )
-        )
         tool_map: dict[str, Tool] = {tool.definition.name: tool for tool in tool_seq}
         # T19:MCP 工具在仓库边界并入;任何重名都是装配错误(extra↔builtin 或
         # 跨 server canonical 名冲突)。先查后写,错误点名字与双方来源,绝不
@@ -495,7 +598,12 @@ def build_session(
         )
         resolved_thread = thread_id if thread_id is not None else store.create_thread()
         store.ensure_thread(resolved_thread)
-        return Session(
+        # T20:web client 是 Session 的 integration(aclose 在 command_sessions
+        # 之后、store 之前;与 MCP bundle 同一条收尾链)。
+        effective_integrations: tuple[AsyncCloser, ...] = tuple(integrations) + (
+            (web_client,) if web_client is not None else ()
+        )
+        session = Session(
             store,
             bus,
             root,
@@ -518,8 +626,12 @@ def build_session(
             command_sessions=sessions,
             hooks=hook_setup,
             skills_catalog=resolved_skills,
-            integrations=tuple(integrations),
+            integrations=effective_integrations,
         )
+        # 延迟绑定完成:此后 web authorize 闭包读到的就是 live 权限上下文
+        # (Session.update_permission 替换 _permissions,property 每次现取)。
+        session_holder.append(session)
+        return session
     except BaseException:
         store.close()
         raise

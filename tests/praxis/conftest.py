@@ -59,10 +59,29 @@ def _isolate_host_state(
     if "TMPDIR" in updates:
         # tempfile.gettempdir() 缓存模块级 tempdir;仅改 env 不够。
         monkeypatch.setattr(tempfile, "tempdir", updates["TMPDIR"], raising=False)
+    # T20 累积转记:宿主配置/技能/搜索凭据的显式环境一律从测试进程剥掉,
+    # 否则真实宿主文件/密钥会经默认加载路径漏进单测。测试需要时自行 setenv
+    # (fixture 先执行,per-test monkeypatch 仍可覆盖)。
+    for name in _HOST_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
     # 不在此删除 per-test host 目录:``child_env.scratch_dir_for`` 会把无沙箱
     # 单测路径的 fallback scratch 缓存在进程级;删掉旧 test 的目录会让后续
     # 测试拿到断链路径。目录都在 pytest basetemp 内,由 pytest 回收旧会话。
     yield
+
+
+# T20 隔离名单:技能/宿主配置文件选择、web 限制与搜索 provider 覆盖,
+# 以及测试套件使用的 *SEARCH_KEY 凭据哨兵(env→Keychain 解析会读它们)。
+_HOST_ENV_NAMES: tuple[str, ...] = (
+    "SKILL_PATH",
+    "PRAXIS_MCP_CONFIG",
+    "PRAXIS_HOOKS_CONFIG",
+    "PRAXIS_WEB_LIMITS",
+    "PRAXIS_WEB_SEARCH_PROVIDER",
+    "DEEPSEEK_SEARCH_KEY",
+    "BRAVE_SEARCH_KEY",
+    "TAVILY_SEARCH_KEY",
+)
 
 
 def host_isolation_updates(base: Path, environ: Mapping[str, str]) -> dict[str, str]:
