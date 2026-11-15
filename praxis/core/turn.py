@@ -46,7 +46,12 @@ from praxis.core.compaction import (
     CompactionOutcome,
     maybe_compact,
 )
-from praxis.core.context import build_context, elide_old_tool_outputs, to_messages
+from praxis.core.context import (
+    append_skill_catalog,
+    build_context,
+    elide_old_tool_outputs,
+    to_messages,
+)
 from praxis.core.events import EventBus
 from praxis.core.pipeline import ExecCtx, SandboxCompiler, SandboxFinalizer, execute
 from praxis.core.statemachine import TurnStatus, transition
@@ -77,6 +82,7 @@ from praxis.protocol.retry import (
     RetryingStream,
     clock_floor,
 )
+from praxis.protocol.skills import SkillCatalog
 from praxis.protocol.tools import ResultStatus, Tool, ToolCall, ToolResult
 from praxis.store.artifacts import ArtifactStore
 from praxis.store.log import ItemEntry, Store
@@ -125,6 +131,10 @@ class TurnDeps:
     summary_prompt_max_chars: int = SUMMARY_PROMPT_MAX_CHARS
     # None = 不接 hook(单测路径);生产 composition 装配 Host hook 并注入。
     hooks: HookSetup | None = None
+    # None/空目录 = 恒等路径(既有 scripted/单测 item 序列零变化);生产
+    # composition 注入 loader 产出的 catalog。目录只经 append_skill_catalog
+    # 这一个纯函数步骤进入本轮消息组装(§5.14/R-T7-1)。
+    skills_catalog: SkillCatalog | None = None
 
 
 @dataclass
@@ -438,6 +448,11 @@ async def run_turn(
                 # D11 读侧固定链:先按 boundary 折叠,再省略旧工具输出,最后投影。
                 *to_messages(elide_old_tool_outputs(build_context(items))),
             ]
+            # R-T7-1:skill 目录注入是本轮消息组装的**唯一** application point。
+            # 同一份 enriched messages 既进 build_request,也进下面的压缩判定
+            # (measure_request 测的就是真实出站体,不存在阈值盲区)。
+            if deps.skills_catalog is not None:
+                messages = list(append_skill_catalog(messages, deps.skills_catalog))
             definitions = [tool.definition for tool in deps.tools.values()]
             # 步序 3:构建请求 → 补全 → 落 model_response item → emit 预览事件。
             req = deps.adapter.build_request(messages, definitions, ModelSettings())

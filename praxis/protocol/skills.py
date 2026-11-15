@@ -55,6 +55,9 @@ MAX_SKILL_NAME_CHARS = 500
 MAX_SKILL_DESCRIPTION_CHARS = 200
 MAX_INVOKE_ARGS_CHARS = 4000
 MAX_SKILL_INSTRUCTIONS_CHARS = 40_000
+# 上下文目录列表(header + 每行 skill + 省略 marker)的字符总预算(T7 消费;
+# 设计 §5.14)。超出时只裁整条尾部条目,绝不留半截行。
+MAX_CATALOG_LISTING_CHARS = 4000
 
 # ── 错误码(T8 的 invoke_skill 按此映射结果) ────────────────────────
 

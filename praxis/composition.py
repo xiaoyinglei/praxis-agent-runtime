@@ -62,6 +62,7 @@ from praxis.protocol.models import (
 from praxis.protocol.permission import PermissionContext, PermissionMode
 from praxis.protocol.policy import PermissionPolicy
 from praxis.protocol.retry import RetryPolicy
+from praxis.protocol.skills import SkillCatalog
 from praxis.protocol.tools import Tool
 from praxis.store.artifacts import ArtifactStore
 from praxis.store.log import Store
@@ -82,6 +83,7 @@ from praxis.tools.builtins.planning import create_update_plan_tool
 from praxis.tools.builtins.process import signal_group
 from praxis.tools.builtins.python_tool import create_run_python_tool
 from praxis.tools.builtins.search import create_search_text_tool
+from praxis.tools.builtins.skills import load_skill_catalog
 
 _VALID_MODES: tuple[PermissionMode, ...] = ("on-request", "never", "bypass")
 
@@ -291,6 +293,7 @@ def build_session(
     tools: Sequence[Tool] | None = None,
     max_steps: int = 50,
     hooks: HookSetup | None = None,
+    skills_catalog: SkillCatalog | None = None,
 ) -> Session:
     """装配一个 Session:唯一组合根。CLI/TUI/host 一律经 sdk.open_session 走到这里。
 
@@ -307,6 +310,11 @@ def build_session(
     artifact 外部化与回读能力耦合:``tools`` 整体替换后的工具表里没有
     ``read_artifact`` 时,**不**注入 ArtifactStore,管道自动退回旧字节截断
     语义——不会给模型一个无法回读的指针。
+
+    skill 目录(§5.14):``skills_catalog=None``(缺省)⇒ 本组合根从 workspace
+    双根调用 ``load_skill_catalog``(PROJECT 上溯 + ``$SKILL_PATH``);显式参数
+    (测试)完全绕过文件系统扫描。空目录是常态,注入步骤在 core 里自然恒等——
+    不设 ``SKILLS_ENABLED`` 开关。composition 可 import tools,core 不可。
     """
     if thread_id is not None:
         _validate_thread_id(thread_id)
@@ -337,6 +345,11 @@ def build_session(
     # T5:默认从 Host 配置装配 command hooks(显式 hooks 参数=测试路径,完全
     # 绕过加载)。workspace 传已 resolve 的绝对路径(T3 相对路径角落收口)。
     hook_setup = hooks if hooks is not None else _host_hook_setup(root)
+    # §5.14:skill 目录缺省从 workspace 双根装载;显式参数(测试)绕过 fs 扫描。
+    # 默认开启、空目录自然恒等——不需要 SKILLS_ENABLED 总开关。
+    resolved_skills = (
+        skills_catalog if skills_catalog is not None else load_skill_catalog(root)
+    )
     praxis_dir = root / ".praxis"
     praxis_dir.mkdir(parents=True, exist_ok=True)
     store = Store(praxis_dir / "praxis.sqlite")
@@ -415,6 +428,7 @@ def build_session(
             summary_prompt_max_chars=summary_prompt_max_chars,
             command_sessions=sessions,
             hooks=hook_setup,
+            skills_catalog=resolved_skills,
         )
     except BaseException:
         store.close()

@@ -69,6 +69,7 @@ from praxis.protocol.json import JsonValue
 from praxis.protocol.models import ModelAdapter, ModelSettings, ModelToolCall, WireRequest
 from praxis.protocol.permission import PermissionContext, PermissionUpdate
 from praxis.protocol.retry import RetryingStream
+from praxis.protocol.skills import SkillCatalog
 from praxis.protocol.tools import ResultStatus, Tool
 from praxis.store.artifacts import ArtifactStore
 from praxis.store.log import ItemEntry, Store
@@ -306,6 +307,7 @@ class Session:
         summary_prompt_max_chars: int = SUMMARY_PROMPT_MAX_CHARS,
         command_sessions: CommandSessionsCloser | None = None,
         hooks: HookSetup | None = None,
+        skills_catalog: SkillCatalog | None = None,
     ) -> None:
         self._store = store
         self._bus = bus
@@ -334,6 +336,8 @@ class Session:
         self._summary_prompt_max_chars = summary_prompt_max_chars
         self._command_sessions = command_sessions
         self._hooks = hooks
+        # None = 不注入 skill 目录(既有测试/单测路径);composition 注入 loader 产出。
+        self._skills_catalog = skills_catalog
 
     # -- 身份与生命周期 -------------------------------------------------------
 
@@ -642,6 +646,7 @@ class Session:
             summary_max_output_tokens=self._summary_max_output_tokens,
             summary_prompt_max_chars=self._summary_prompt_max_chars,
             hooks=self._hooks,
+            skills_catalog=self._skills_catalog,
         )
         try:
             with thread_execution_lock(self._workspace, self._thread_id):

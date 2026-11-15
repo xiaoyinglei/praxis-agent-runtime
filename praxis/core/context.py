@@ -18,6 +18,11 @@ from typing import Final, TypeGuard
 from praxis.protocol.items import Item, ItemKind
 from praxis.protocol.json import JsonValue
 from praxis.protocol.models import ModelMessage, ModelToolCall
+from praxis.protocol.skills import (
+    MAX_CATALOG_LISTING_CHARS,
+    MAX_SKILL_DESCRIPTION_CHARS,
+    SkillCatalog,
+)
 
 _SUPPORTED_BOUNDARY_VERSION: Final = "v1"
 _SUMMARY_PREFIX: Final = "[conversation summary]\n"
@@ -209,6 +214,97 @@ def to_messages(items: Sequence[Item]) -> list[ModelMessage]:
                 )
             messages.append(result_message)
     return messages
+
+
+# ---------------------------------------------------------------------------
+# skill 目录注入(设计 §5.14;R-T7-1:turn 消息组装的唯一 application point)
+# ---------------------------------------------------------------------------
+
+_CATALOG_HEADER_LINE: Final = "Available skills (invoke with invoke_skill, name exactly as listed):"
+_CATALOG_ELISION_MARKER: Final = "[… more skills elided]"
+_DESCRIPTION_ELLIPSIS: Final = "…"
+
+
+def append_skill_catalog(
+    messages: Sequence[ModelMessage], catalog: SkillCatalog
+) -> tuple[ModelMessage, ...]:
+    """把 skill 目录作为**一条** system 消息插入消息序列;纯函数、幂等、永不抛。
+
+    设计 §5.14:目录只经这一个纯函数步骤进入上下文,正文仍只由 ``invoke_skill``
+    工具结果交付——旧实现"schema enum + 死掉的 prompt listing"两条注入路径
+    收敛为这一条。
+
+    - 空目录(或全部 ``disable_model_invocation=True``,即无可列 skill)⇒ 原样
+      返回:既有 scripted/turn 测试的消息序列逐字不变;
+    - 插入位置:第一条 ``role == "system"`` 的消息**之后**(无 system 消息时
+      插到最前)——目录是系统级提示,不能落在对话历史中间;
+    - 幂等:已存在目录消息(内容以 header 行开头)时直接返回,二次应用不重复;
+    - 每条 ``- {name}: {description}``,description 超过
+      ``MAX_SKILL_DESCRIPTION_CHARS`` 截断并带 ``…`` 标记;整份列表
+      (header + 各行 + 省略 marker)受 ``MAX_CATALOG_LISTING_CHARS`` 约束,
+      溢出时只裁掉**整条**尾部条目,并以固定 marker 收尾。
+
+    返回 tuple(新内容;空/已注入时元素与输入同一对象)。不修改输入。
+    """
+    materialized = tuple(messages)
+    if any(_is_catalog_message(message) for message in materialized):
+        return materialized
+    listing = _catalog_listing(catalog)
+    if listing is None:
+        return materialized
+    catalog_message = ModelMessage(role="system", content=listing)
+    for position, message in enumerate(materialized):
+        if message.role == "system":
+            return (
+                *materialized[: position + 1],
+                catalog_message,
+                *materialized[position + 1 :],
+            )
+    return (catalog_message, *materialized)
+
+
+def _is_catalog_message(message: ModelMessage) -> bool:
+    """幂等判据:目录消息的 header 行逐字匹配(系统提示不可能偶然以它开头)。"""
+    return message.role == "system" and (
+        message.content == _CATALOG_HEADER_LINE
+        or message.content.startswith(_CATALOG_HEADER_LINE + "\n")
+    )
+
+
+def _catalog_listing(catalog: SkillCatalog) -> str | None:
+    """渲染目录列表;无可列 skill 返回 ``None``(调用方走恒等路径)。"""
+    lines = [
+        f"- {manifest.name}: {_truncate_description(manifest.description)}"
+        for manifest in catalog.skills
+        if not manifest.disable_model_invocation
+    ]
+    if not lines:
+        return None
+    listing = _render_listing(lines, elided=False)
+    if len(listing) <= MAX_CATALOG_LISTING_CHARS:
+        return listing
+    # 溢出:保留尽可能长的**整条**前缀,尾部条目整条裁掉并以 marker 收尾。
+    # lines 全量 + marker 必然超预算(全量本身已超),循环最多保留到倒数第二条。
+    kept: list[str] = []
+    for index in range(len(lines)):
+        candidate = _render_listing(lines[: index + 1], elided=True)
+        if len(candidate) > MAX_CATALOG_LISTING_CHARS:
+            break
+        kept = lines[: index + 1]
+    return _render_listing(kept, elided=True)
+
+
+def _render_listing(lines: Sequence[str], *, elided: bool) -> str:
+    parts = [_CATALOG_HEADER_LINE, *lines]
+    if elided:
+        parts.append(_CATALOG_ELISION_MARKER)
+    return "\n".join(parts)
+
+
+def _truncate_description(description: str) -> str:
+    if len(description) <= MAX_SKILL_DESCRIPTION_CHARS:
+        return description
+    return description[:MAX_SKILL_DESCRIPTION_CHARS] + _DESCRIPTION_ELLIPSIS
 
 
 # ---------------------------------------------------------------------------
