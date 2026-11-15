@@ -10,8 +10,11 @@
    ``.agents/skills/`` → :attr:`SkillSource.PROJECT`。
 
 与旧 ``skills/loader.py`` 的有意差异:旧实现从 ``os.getcwd()`` 上溯,praxis
-的 loader 必须 cwd 无关——workspace 由调用方传入(CLI resume/composition 不会
-因为 cwd 不同得到不同目录)。文件布局与指纹/去重/排序语义逐字移植:
+的 **PROJECT walk 与 cwd 无关**——workspace 由调用方传入(CLI resume/
+composition 不会因为 cwd 不同得到不同目录)。例外:``$SKILL_PATH`` 里的**相对**
+目录仍按进程 cwd ``resolve()``(沿用环境变量旧语义);绝对路径与 ``~`` 展开
+不受影响。文件布局与指纹/去重/排序语义逐字移植(旧 loader 在 name 缺失时回退
+目录名——brief 要求 name 必填,该回退**不移植**,有意差异):
 
 - ``<root>/<name>/SKILL.md`` 与一层命名空间 ``<root>/<ns>/<name>/SKILL.md``
   (后者 name 前缀 ``<ns>:``);
@@ -31,11 +34,13 @@ import hashlib
 import logging
 import os
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from praxis.protocol.json import JsonValue
 from praxis.protocol.skills import (
     SOURCE_PRIORITY,
     SkillCatalog,
@@ -109,8 +114,18 @@ def _boolean_field(frontmatter: dict[str, Any], field_name: str, skill_file: Pat
     return value
 
 
-def _compute_fingerprint(frontmatter: dict[str, Any], body: str) -> str:
-    """稳定指纹:frontmatter 键序规范化后与正文拼接再 sha256。"""
+def skill_fingerprint(frontmatter: Mapping[str, JsonValue], body: str) -> str:
+    """SKILL.md 的稳定指纹(loader 与激活期重算共用的唯一配方)。
+
+    ``sha256(yaml.dump(sorted frontmatter, sort_keys=True,
+    default_flow_style=False) + "\\n" + body)``,UTF-8。
+
+    **激活期重算 procedure(R-T6-1)**:重读 SKILL.md → 解析 frontmatter
+    mapping → 置 ``frontmatter["name"] = manifest.name``(清单名已含命名空间
+    前缀)→ 调用本函数。结果等于 ``manifest.fingerprint`` 当且仅当文件未变;
+    直接对**原始解析**的 frontmatter 重算会让命名空间 skill 误报
+    ``skill_content_changed``。仅凭 ``(skill_file, manifest)`` 即可复现。
+    """
     canonical = yaml.dump(
         {key: frontmatter[key] for key in sorted(frontmatter)},
         sort_keys=True,
@@ -152,7 +167,7 @@ def _build_manifest(
         skill_file=str(skill_file.resolve()),
         root_dir=str(skill_file.parent.resolve()),
         source=source,
-        fingerprint=_compute_fingerprint(frontmatter, body),
+        fingerprint=skill_fingerprint(frontmatter, body),
         disable_model_invocation=_boolean_field(
             frontmatter, "disable_model_invocation", skill_file
         ),
@@ -215,15 +230,27 @@ def _scan_skill_dir(root: Path) -> list[Path]:
 
 
 def _external_roots() -> list[Path]:
-    """``$SKILL_PATH`` 冒号分隔目录(expanduser + resolve;不存在则忽略)。"""
+    """``$SKILL_PATH`` 冒号分隔目录(expanduser+resolve;不存在/不可用则 log+skip)。
+
+    相对条目按**进程 cwd** ``resolve()``(旧环境变量语义;PROJECT walk 才与
+    cwd 无关)。单个毒条目(未知 ``~user`` 的 ``RuntimeError``、resolve 的
+    ``OSError``)只跳过该根,绝不炸整个 catalog;重复根只保留首次。
+    """
     roots: list[Path] = []
+    seen: set[Path] = set()
     for part in os.environ.get("SKILL_PATH", "").split(":"):
         part = part.strip()
         if not part:
             continue
-        path = Path(part).expanduser().resolve()
-        if path.is_dir():
-            roots.append(path)
+        try:
+            path = Path(part).expanduser().resolve()
+        except (OSError, RuntimeError):
+            logger.warning("Skipping unusable SKILL_PATH entry: %s", part)
+            continue
+        if not path.is_dir() or path in seen:
+            continue
+        seen.add(path)
+        roots.append(path)
     return roots
 
 
@@ -261,9 +288,11 @@ def load_skill_catalog(workspace: Path) -> SkillCatalog:
     """扫描双根并返回按 ``(SOURCE_PRIORITY, name)`` 排序的目录。
 
     ``workspace`` 是显式传入的装载基点(绝对化后向上找 repo root),**不是
-    ``os.getcwd()``**——同一 workspace 在任何 cwd 下得到同一目录。单个坏
-    skill 只 ``log+skip``;重复 resolved 路径只保留扫描序首个(``$SKILL_PATH``
-    先于 project walk ⇒ 同一物理文件双见时记 EXTERNAL)。
+    ``os.getcwd()``**——PROJECT walk 在任何 cwd 下得到同一目录。例外:
+    ``$SKILL_PATH`` 的**相对**条目仍按 cwd resolve(见
+    :func:`_external_roots`)。单个坏 skill 只 ``log+skip``;重复 resolved 路径
+    只保留扫描序首个(``$SKILL_PATH`` 先于 project walk ⇒ 同一物理文件双见时
+    记 EXTERNAL)。
     """
     roots: list[tuple[Path, SkillSource]] = [
         (path, SkillSource.EXTERNAL) for path in _external_roots()

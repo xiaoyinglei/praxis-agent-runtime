@@ -39,7 +39,7 @@ from praxis.protocol.skills import (
     SkillManifest,
     SkillSource,
 )
-from praxis.tools.builtins.skills import load_skill_catalog
+from praxis.tools.builtins.skills import load_skill_catalog, skill_fingerprint
 
 _LOGGER = "praxis.tools.builtins.skills"
 
@@ -425,3 +425,82 @@ def test_manifest_validation_and_catalog_lookup(tmp_path: Path) -> None:
     catalog = SkillCatalog((manifest,))
     assert catalog.get("n") is manifest
     assert catalog.get("missing") is None
+
+
+# ---------------------------------------------------------------------------
+# R-T6-1:命名空间 skill 的激活期指纹重算 procedure(仅凭 skill_file+manifest)
+# ---------------------------------------------------------------------------
+
+
+def _parse_skill_file(manifest: SkillManifest) -> tuple[dict[str, object], str]:
+    content = Path(manifest.skill_file).read_text(encoding="utf-8")
+    match = re.match(r"^---\n(.*?)\n---\n", content, re.DOTALL)
+    assert match is not None
+    frontmatter = yaml.safe_load(match.group(1))
+    assert isinstance(frontmatter, dict)
+    return frontmatter, content[match.end():]
+
+
+def _recompute_fingerprint(manifest: SkillManifest) -> str:
+    """文档化的重算 procedure:解析原始 frontmatter 后先恢复 manifest.name。"""
+    frontmatter, body = _parse_skill_file(manifest)
+    frontmatter["name"] = manifest.name
+    return skill_fingerprint(frontmatter, body)
+
+
+def test_namespaced_fingerprint_recompute_is_reproducible_per_file(tmp_path: Path) -> None:
+    workspace = _standalone_workspace(tmp_path)
+    skill_dir = workspace / ".agents" / "skills" / "acme" / "pdf-tool"
+    _write_skill(
+        skill_dir,
+        frontmatter="name: pdf-tool\ndescription: d",
+        body="body one\n",
+    )
+
+    manifest = load_skill_catalog(workspace).get("acme:pdf-tool")
+    assert manifest is not None
+    assert manifest.name == "acme:pdf-tool"
+
+    # 未改动 ⇒ 文档化 procedure 精确复现 loader 指纹。
+    assert _recompute_fingerprint(manifest) == manifest.fingerprint
+    # 未经 name 恢复的"原始解析"重算必然不同——这正是 procedure 存在的理由。
+    raw_frontmatter, raw_body = _parse_skill_file(manifest)
+    assert skill_fingerprint(raw_frontmatter, raw_body) != manifest.fingerprint
+
+    # 改正文 ⇒ 文档化重算与旧清单指纹不同(T8 据此报 skill_content_changed)。
+    _write_skill(
+        skill_dir,
+        frontmatter="name: pdf-tool\ndescription: d",
+        body="body two\n",
+    )
+    assert _recompute_fingerprint(manifest) != manifest.fingerprint
+
+
+# ---------------------------------------------------------------------------
+# R-T6-2:$SKILL_PATH 空段/重复/缺失/毒条目都不炸 catalog
+# ---------------------------------------------------------------------------
+
+
+def test_skill_path_is_robust_to_empty_duplicate_missing_and_poison_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    workspace = _standalone_workspace(tmp_path)
+    _write_named_skill(workspace / ".agents" / "skills", "good", "good")
+
+    existing = tmp_path / "external"
+    _write_named_skill(existing, "ext", "ext")
+    missing = tmp_path / "missing"
+    poison = "~praxis-no-such-user-xyz/skills"
+    monkeypatch.setenv(
+        "SKILL_PATH",
+        f": {existing} ::{existing}:{missing}:{poison}: ",
+    )
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER):
+        catalog = load_skill_catalog(workspace)
+
+    assert [m.name for m in catalog.skills] == ["good", "ext"]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "Skipping unusable SKILL_PATH entry" in warnings[0]
+    assert "praxis-no-such-user-xyz" in warnings[0]

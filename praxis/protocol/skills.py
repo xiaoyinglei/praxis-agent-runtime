@@ -13,6 +13,14 @@
 
 ``SkillManifest`` 字段面固定为 loader 的产出形状;``skill_file``/``root_dir``
 是**绝对路径字符串**(T8 用它重读文件重算指纹,T9 用它落 asset)。
+
+**激活期指纹重算的唯一正确 procedure(R-T6-1)**:重读 SKILL.md → 解析
+frontmatter mapping → 置 ``frontmatter["name"] = manifest.name``(清单名已含
+命名空间前缀)→ ``skill_fingerprint(frontmatter, body)``;结果等于
+``manifest.fingerprint`` 当且仅当文件未变。若直接对**原始解析**的
+frontmatter 重算,命名空间 skill(loader 曾把 name 改成 ``<ns>:<raw>``)会
+误报 ``skill_content_changed``。仅凭 ``(skill_file, manifest)`` 即可复现。
+
 ``fingerprint`` 上限 128 字符(旧 ``SkillActivationEvent.fingerprint`` 的
 ``Field(max_length=128)``),loader 实际产出 sha256 64 位小写 hex。
 ``MAX_SKILL_DESCRIPTION_CHARS``/``MAX_INVOKE_ARGS_CHARS``/
@@ -69,7 +77,10 @@ class SkillManifest:
 
     ``when_to_use``/``version`` 可缺省(``None``);``skill_file`` 是 SKILL.md
     的绝对路径,``root_dir`` 是其父目录的绝对路径。指纹覆盖 frontmatter
-    (键序规范化)与正文,由 loader 计算;T8 激活时重读并比对。
+    (键序规范化)与正文,由 loader 计算;T8 激活时按 R-T6-1 procedure
+    重算:解析原始 frontmatter 后先置 ``frontmatter["name"] = manifest.name``
+    (清单名已含命名空间前缀),再调用 ``skill_fingerprint``;否则命名空间
+    skill 会假报 ``skill_content_changed``。
     """
 
     name: str
