@@ -71,12 +71,18 @@ def _bounded_event(value: object) -> str:
 
 @dataclass(frozen=True, slots=True)
 class HookSpec:
-    """一个已校验的 command hook;``revision`` 是配置内容的规范化摘要。"""
+    """一个已校验的 command hook。
+
+    ``directory`` 是配置文件父目录(绝对路径):它是 T4 运行器的 spawn cwd,
+    也是 revision identity 的输入之一。``revision`` 是配置内容的规范化摘要
+    (由 ``adapters/hooks/config.py`` 唯一计算)。
+    """
 
     name: str
     revision: str
     event: HookEvent
     argv: tuple[str, ...]
+    directory: str
     tool_names: frozenset[str] = frozenset()
     effects: frozenset[str] = frozenset()
     timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS
@@ -89,6 +95,13 @@ class HookSpec:
             for value in (self.name, self.revision)
         ):
             raise ValueError("hook name and revision must have 1–128 characters")
+        if (
+            not isinstance(self.directory, str)
+            or not self.directory
+            or "\0" in self.directory
+            or not Path(self.directory).is_absolute()
+        ):
+            raise ValueError("hook directory must be a non-empty absolute path")
 
         argv = self.argv
         if not isinstance(argv, (list, tuple)) or not argv:

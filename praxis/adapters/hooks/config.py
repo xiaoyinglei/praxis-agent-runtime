@@ -1,9 +1,15 @@
 """hooks.json 的唯一加载与校验入口(设计 §5.14;Q1 库外配置;3B 笔记 §4)。
 
 路径来源序:**显式参数 > ``PRAXIS_HOOKS_CONFIG`` > ``host_config_dir()/hooks.json``**。
-没有配置文件返回 ``()``。配置必须落在 workspace(进程 cwd,与旧 CLI
-``chdir(workspace)`` 同口径)之外,且通过旧 ``decide_mcp_config_trust`` 的
-个人配置卫生标准:文件与其目录都属当前 uid、非 group/world 可写。
+``workspace`` 是调用方给出的真实工作区(realpath 规范化);配置必须落在它之外,
+**绝不**用 ``Path.cwd()`` 代替。缺失语义(裁决 R-T3-c):显式参数或环境变量
+指向的文件不存在 ⇒ 带路径的 ``ValueError``(边界上尽早失败,避免拼写错误被
+静默吞掉);只有隐式默认路径 ``host_config_dir()/hooks.json`` 不存在才返回 ``()``。
+每个 ``HookSpec.directory`` 都是配置文件父目录(绝对路径),供 T4 作为 spawn cwd。
+
+配置必须通过旧 ``decide_mcp_config_trust`` 的个人配置卫生标准:文件与其目录
+都属当前 uid、非 group/world 可写(因此直接放在 world-writable 目录如 /tmp
+会被拒绝)。
 
 拒绝面逐条对齐旧 ``agent_runtime/hooks.py:110-153``:
 - 绝对路径、``resolve(strict=True)``、workspace 之外、≤64 KiB(读 65_537 判越界);
@@ -60,39 +66,57 @@ _MAX_CONTENT_BYTES = MAX_HOOKS_CONFIG_BYTES - 1
 _EVENTS: tuple[str, ...] = ("PreToolUse", "PostToolUse")
 
 
-def load_host_hooks(path: Path | None = None) -> tuple[HookSpec, ...]:
-    """加载并校验 command hook 配置;无文件 ⇒ ``()``。
+def load_host_hooks(workspace: Path, path: Path | None = None) -> tuple[HookSpec, ...]:
+    """加载并校验 command hook 配置。
 
     Parameters:
+        workspace: 真实工作区(realpath 规范化)。配置与 ``argv[0]`` 都必须
+            位于其之外;绝不用进程 cwd 代替。
         path: 显式配置路径(优先于环境变量)。``None`` 时依次看
             ``PRAXIS_HOOKS_CONFIG`` 与 ``host_config_dir()/hooks.json``。
 
+    Missing-file semantics:
+        显式 ``path`` / ``PRAXIS_HOOKS_CONFIG`` 指向不存在的文件 ⇒ 带路径的
+        ``ValueError``;只有隐式默认 ``host_config_dir()/hooks.json`` 缺失
+        才返回 ``()``。
+
     Raises:
-        ValueError: 路径/大小/JSON 形状/条目/卫生任一校验失败。
+        ValueError: 路径/缺失/大小/JSON 形状/条目/卫生任一校验失败。
     """
-    source = _select_source(path)
+    root = _normalize_workspace(workspace)
+    source = _select_source(path, root)
     if source is None:
         return ()
-    return _load(source)
+    return _load(source, root)
 
 
-def _select_source(path: Path | None) -> Path | None:
-    workspace = Path.cwd().resolve()
+def _normalize_workspace(workspace: Path) -> Path:
+    try:
+        return Path(workspace).expanduser().resolve()
+    except (OSError, RuntimeError):
+        raise ValueError("workspace must be an absolute directory") from None
+
+
+def _select_source(path: Path | None, workspace: Path) -> Path | None:
     if path is not None:
-        return _prepare_source(Path(path), workspace)
+        return _prepare_source(Path(path), workspace, explicit=True)
     configured = os.environ.get(_ENV_VAR)
     if configured:
-        return _prepare_source(Path(configured), workspace)
-    return _prepare_source(host_config_dir() / _DEFAULT_FILENAME, workspace)
+        return _prepare_source(Path(configured), workspace, explicit=True)
+    return _prepare_source(host_config_dir() / _DEFAULT_FILENAME, workspace, explicit=False)
 
 
-def _prepare_source(candidate: Path, workspace: Path) -> Path | None:
+def _prepare_source(candidate: Path, workspace: Path, *, explicit: bool) -> Path | None:
     expanded = candidate.expanduser()
     if not expanded.is_absolute():
         raise ValueError(_PATH_ERROR)
     try:
         source = expanded.resolve(strict=True)
     except FileNotFoundError:
+        if explicit:
+            raise ValueError(
+                f"hook configuration does not exist: {_bounded_path(expanded)}"
+            ) from None
         return None
     except (OSError, RuntimeError):
         raise ValueError(_PATH_ERROR) from None
@@ -120,7 +144,7 @@ def _check_hygiene(source: Path) -> None:
         raise ValueError(_HYGIENE_ERROR)
 
 
-def _load(source: Path) -> tuple[HookSpec, ...]:
+def _load(source: Path, workspace: Path) -> tuple[HookSpec, ...]:
     try:
         with source.open("rb") as handle:
             raw = handle.read(MAX_HOOKS_CONFIG_BYTES)
@@ -136,11 +160,11 @@ def _load(source: Path) -> tuple[HookSpec, ...]:
     if not isinstance(entries, list) or len(entries) > MAX_HOOKS:
         raise ValueError(_SHAPE_ERROR)
 
-    hooks = tuple(_build_spec(entry, source.parent) for entry in entries)
+    hooks = tuple(_build_spec(entry, source.parent, workspace) for entry in entries)
     return _validate_hooks(hooks)
 
 
-def _build_spec(entry: object, directory: Path) -> HookSpec:
+def _build_spec(entry: object, directory: Path, workspace: Path) -> HookSpec:
     if not isinstance(entry, dict):
         raise ValueError(_ENTRY_ERROR)
     keys = entry.keys()
@@ -153,7 +177,7 @@ def _build_spec(entry: object, directory: Path) -> HookSpec:
     if not isinstance(event, str) or event not in _EVENTS:
         raise ValueError(f"invalid hook event: {_bounded(event)}")
 
-    argv = _validate_argv(entry["argv"])
+    argv = _validate_argv(entry["argv"], workspace)
     declared_revision = entry.get("revision", "1")
     if (
         not isinstance(declared_revision, str)
@@ -173,14 +197,14 @@ def _build_spec(entry: object, directory: Path) -> HookSpec:
         revision=_canonical_revision(command, directory, declared_revision),
         event=cast(HookEvent, event),
         argv=command,
+        directory=str(directory),
         tool_names=entry.get("tool_names", ()),
         effects=entry.get("effects", ()),
         timeout_seconds=entry.get("timeout_seconds", 5.0),
     )
 
 
-def _validate_argv(value: object) -> tuple[str, ...]:
-    workspace = Path.cwd().resolve()
+def _validate_argv(value: object, workspace: Path) -> tuple[str, ...]:
     if (
         not isinstance(value, (list, tuple))
         or not value
@@ -219,6 +243,11 @@ def _bounded(value: object) -> str:
     text = value if isinstance(value, str) else type(value).__name__
     text = " ".join(text.split())
     return text if len(text) <= 64 else f"{text[:63]}…"
+
+
+def _bounded_path(path: Path, limit: int = 256) -> str:
+    text = " ".join(str(path).split())
+    return text if len(text) <= limit else f"{text[: limit - 1]}…"
 
 
 __all__ = ["load_host_hooks"]
