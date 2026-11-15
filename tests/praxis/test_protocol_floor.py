@@ -95,6 +95,26 @@ def test_host_private_denied(tmp_path: Path) -> None:
 # ── S-3:私有根的词法形态与 realpath 形态都被拒绝 ──────────────────────
 
 
+def test_path_forms_cache_reuses_constant_private_root(tmp_path: Path) -> None:
+    """N-5:逐条目判定复用私有根的 realpath 计算(有界缓存,单一实现)。"""
+    from praxis.protocol import floor as floor_module
+
+    floor_module._cached_path_forms.cache_clear()
+    private = tmp_path / "private-root"
+    private.mkdir()
+    for index in range(200):
+        assert (
+            floor_reason(
+                tmp_path / f"file-{index}", write=False, private_paths=(str(private),)
+            )
+            == ""
+        )
+    info = floor_module._cached_path_forms.cache_info()
+    # 200 个不同候选 = 200 misses;常量私有根只 resolve 一次 = 1 miss。
+    assert info.misses <= 202, info
+    assert info.hits >= 199, info
+
+
 def test_private_root_alias_and_realpath_forms_both_denied(tmp_path: Path) -> None:
     """S-3:``host_private_paths()`` 返回值保持词法形态,containment 双向比。
 

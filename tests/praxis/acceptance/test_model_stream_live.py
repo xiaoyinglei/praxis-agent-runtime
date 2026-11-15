@@ -72,6 +72,15 @@ def _model_id() -> str:
     model_id = os.environ.get("PRAXIS_LIVE_MODEL_ID")
     if not model_id:
         pytest.skip("set PRAXIS_LIVE_MODEL_ID to an id registered in the model store")
+    # N-6:默认套件把 PRAXIS_CONFIG_DIR 隔离到 per-test 空目录;授权 live 冒烟
+    # 必须由运维显式给出注册库(fixture 会原样尊重),否则这里只会看到空库。
+    from tests.praxis.conftest import _ISOLATION_DECISIONS  # noqa: PLC0415
+
+    if not _ISOLATION_DECISIONS.get("reused_operator_env", False):
+        pytest.skip(
+            "live smoke requires an operator-provided PRAXIS_CONFIG_DIR "
+            "(test isolation would otherwise hide the model registry)"
+        )
     return model_id
 
 

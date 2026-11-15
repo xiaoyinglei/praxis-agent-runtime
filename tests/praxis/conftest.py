@@ -7,8 +7,9 @@ loop-body import that was hiding inside the for-loop.
 
 from __future__ import annotations
 
+import os
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 from uuid import uuid4
@@ -20,6 +21,66 @@ from praxis.store.turns import Turn, create_turn, get_turn
 
 # Sentinel — default "no status given" becomes RUNNING inside the function.
 _UNSET: object = object()
+
+# N-6 可断言证据:本进程最近一次隔离决策(供 test_host_isolation 读取)。
+_ISOLATION_DECISIONS: dict[str, Any] = {}
+
+
+@pytest.fixture(autouse=True)
+def _isolate_host_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
+    """N-6:每条测试都不能读写真实宿主目录(运维显式环境除外)。
+
+    隔离两处全局状态:
+    - ``PRAXIS_CONFIG_DIR``:``ModelConfigStore()``/凭据库的默认位置
+      (``~/.config/praxis``);eager mkdir+建表会污染真实注册库。
+    - ``TMPDIR``/``TEMP``/``TMP`` + ``tempfile.tempdir``:同时重定向
+      ``command_jobs_dir()``(崩溃 marker 目录)、``compile_sandbox`` 的
+      ``praxis-scratch-*`` 与一切 ``mkdtemp``(子进程经环境继承)。
+
+    **运维显式设置 ``PRAXIS_CONFIG_DIR``(例如授权 live 冒烟指向自己的临时
+    注册库)时一律尊重原环境,不注入任何重定向**——否则模型注册表会被换到
+    空目录,live 冒烟永远找不到模型。这就是 ``host_isolation_updates`` 的
+    纯函数契约(可单测,不依赖 fixture 时序)。
+    """
+    updates = host_isolation_updates(tmp_path, os.environ)
+    if updates:
+        Path(updates["TMPDIR"]).mkdir(parents=True, exist_ok=True)
+        Path(updates["PRAXIS_CONFIG_DIR"]).mkdir(parents=True, exist_ok=True)
+    _ISOLATION_DECISIONS.clear()
+    _ISOLATION_DECISIONS.update(
+        reused_operator_env=not updates,
+        operator_config_dir=os.environ.get("PRAXIS_CONFIG_DIR"),
+        updates=updates,
+    )
+    for key, value in updates.items():
+        monkeypatch.setenv(key, value)
+    if "TMPDIR" in updates:
+        # tempfile.gettempdir() 缓存模块级 tempdir;仅改 env 不够。
+        monkeypatch.setattr(tempfile, "tempdir", updates["TMPDIR"], raising=False)
+    # 不在此删除 per-test host 目录:``child_env.scratch_dir_for`` 会把无沙箱
+    # 单测路径的 fallback scratch 缓存在进程级;删掉旧 test 的目录会让后续
+    # 测试拿到断链路径。目录都在 pytest basetemp 内,由 pytest 回收旧会话。
+    yield
+
+
+def host_isolation_updates(base: Path, environ: Mapping[str, str]) -> dict[str, str]:
+    """计算 per-test 隔离要注入的环境。
+
+    外部已给 ``PRAXIS_CONFIG_DIR`` 时返回空 dict(运维授权运行:live 冒烟使用
+    自己的注册库;TMPDIR 也一并尊重)。否则注入 per-test 的 config 与 tmp,
+    覆盖 ``PRAXIS_CONFIG_DIR`` / ``TMPDIR`` / ``TEMP`` / ``TMP``。
+    """
+    if environ.get("PRAXIS_CONFIG_DIR"):
+        return {}
+    host_root = base.with_name(f"{base.name}-host-state")
+    return {
+        "PRAXIS_CONFIG_DIR": str(host_root / "config"),
+        "TMPDIR": str(host_root / "tmp"),
+        "TEMP": str(host_root / "tmp"),
+        "TMP": str(host_root / "tmp"),
+    }
 
 if TYPE_CHECKING:
     # Stubs for type-hints only; resolved at runtime inside functions.

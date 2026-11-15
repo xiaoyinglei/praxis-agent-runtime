@@ -17,6 +17,7 @@ import os
 import tempfile
 import unicodedata
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
@@ -57,13 +58,18 @@ def _normalize_component(name: str) -> str:
     return unicodedata.normalize("NFC", name).casefold()
 
 
-def _path_forms(value: Path | str) -> tuple[Path, ...]:
+@lru_cache(maxsize=8192)
+def _cached_path_forms(value: str) -> tuple[Path, ...]:
     """一个路径的两种容器形态:词法(expanduser+abspath)与内核 realpath。
 
     S-3:``host_private_paths()`` 刻意不 resolve env 分支(返回值逐字不变),
     但 macOS 的 ``/var/folders`` ↔ ``/private/var/folders`` 意味着「父目录给的
     词法形态」与「目标 realpath 形态」可能不同。containment 判定必须两种形态
     都比——单一词法比较会让进程内工具绕过私有目录地板。
+
+    N-5:逐条目过滤会为每个文件重复判定同一份私有根;``resolve()`` 是 syscall
+    密集操作。这里按路径字符串做**有界**缓存(唯一实现仍在本函数),把常量
+    root 的 realpath 计算摊薄到每条目一次候选 resolve。
 
     non-strict:broken symlink / 缺失目标不抛(``Path.resolve`` 默认 strict=False)。
     """
@@ -79,6 +85,15 @@ def _path_forms(value: Path | str) -> tuple[Path, ...]:
     if real is not None:
         forms.append(real)
     return tuple(dict.fromkeys(forms))
+
+
+def _path_forms(value: Path | str) -> tuple[Path, ...]:
+    """``_cached_path_forms`` 的 Path/str 入口(缓存键统一为 str)。"""
+    try:
+        key = os.fspath(value)
+    except TypeError:
+        return ()
+    return _cached_path_forms(key)
 
 
 def _is_under(candidate: Path, root_str: str) -> bool:
