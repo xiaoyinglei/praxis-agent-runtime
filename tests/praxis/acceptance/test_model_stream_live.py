@@ -11,9 +11,11 @@
       uv run pytest tests/praxis/acceptance/test_model_stream_live.py -v -s
 
 断言口径（brief Step 2）：
-- 真增量(H-3):至少 2 个 ``Model*Delta`` 事件,且首个 delta 到达时刻相对
-  请求起点的耗时 < 总耗时的 50%(全缓冲实现无法满足;旧 ``delta[0] <
-  finished[-1]`` 对缓冲实现也成立,不是可失败断言);
+- 真增量(H-3):内容长度 ≥ 40 字符(证明 prompt 真的产出了多段内容)、至少
+  2 个 ``Model*Delta`` 事件,且首个 delta 到达时刻相对请求起点的耗时 < 总耗时
+  的 50%(全缓冲实现无法满足;旧 ``delta[0] < finished[-1]`` 对缓冲实现也成立,
+  不是可失败断言)。判据实现在 ``acceptance/incrementality.py``,由
+  ``test_model_stream_incremental_offline.py`` 以 MockTransport 离线验证其鉴别力;
 - ``usage.source == "provider"``（provider 未回 usage 时实现会标 estimated）；
 - ``measure_request``（praxis 唯一估算入口）与 provider ``input_tokens`` 偏差
   < 25%:仅对 ``openai-compatible`` 作硬门；``ollama`` 属"本地模型",偏差只打印
@@ -54,6 +56,7 @@ from praxis.protocol.models import (
 from praxis.protocol.policy import NetworkPolicy, PermissionPolicy
 from praxis.protocol.tools import ToolDefinition
 from praxis.tools.builtins.filesystem import create_read_tool
+from tests.praxis.acceptance.incrementality import incrementality_problem
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("PRAXIS_LIVE_SMOKE") != "1",
@@ -62,6 +65,9 @@ pytestmark = pytest.mark.skipif(
 
 _DELTA_TYPES = (ModelTextDelta, ModelReasoningDelta, ModelToolCallDelta)
 _SYSTEM = "You are a terse workspace agent. Use tools when asked."
+# 增量性判据要求至少两帧;单字回答("ready")本来就只会来一帧,因此提示词
+# 必须要求必然多 token 的输出(M-2:此前用单字提示词,把测试自己写坏了)。
+_INCREMENTAL_PROMPT = "Output the numbers 1 to 20, one per line, with no explanation."
 _TURN_PROMPT = (
     "Read a.txt with the read tool, then read b.txt with the read tool, "
     "then answer with one short sentence summarizing both files. You must call tools."
@@ -116,7 +122,7 @@ def test_live_stream_is_incremental_and_usage_is_provider(tmp_path: Path) -> Non
     request = adapter.build_request(
         [
             ModelMessage(role="system", content=_SYSTEM),
-            ModelMessage(role="user", content="Reply with the single word: ready"),
+            ModelMessage(role="user", content=_INCREMENTAL_PROMPT),
         ],
         definitions,
         ModelSettings(),
@@ -139,15 +145,17 @@ def test_live_stream_is_incremental_and_usage_is_provider(tmp_path: Path) -> Non
     delta_times = [at for at, event in event_timings if isinstance(event, _DELTA_TYPES)]
     finished_times = [at for at, event in event_timings if isinstance(event, ModelStreamFinished)]
     assert delta_times, "no incremental delta event observed"
+    # H-3 判据的唯一实现(与 test_model_stream_incremental_offline.py 共用):
+    # 内容长度下限 → delta 帧数 → 首个 delta 落在总时长的前 50%。全缓冲实现
+    # 也会让 delta[0] < finished[-1],旧断言无法失败,所以比例判据必须保留。
     assert finished_times, "no ModelStreamFinished event observed"
-    # H-3:相对请求起点的比例判据(全缓冲实现也会让 delta[0] < finished[-1],
-    # 旧断言无法失败)。要求 ≥2 个 delta,且首个 delta 在总耗时的前 50% 到达。
-    assert len(delta_times) >= 2, "need at least two delta events to prove incrementality"
-    elapsed = finished_times[-1] - started
-    assert elapsed > 0, "stream finished immediately; timing measurement is unreliable"
-    assert delta_times[0] - started < elapsed * 0.5, (
-        "first delta arrived after 50% of the stream duration; likely buffered, not incremental"
+    problem = incrementality_problem(
+        content_length=len(response.content),
+        delta_times=delta_times,
+        started=started,
+        finished_at=finished_times[-1],
     )
+    assert problem is None, problem
     assert response.usage.source == "provider", (
         f"provider did not report usage (source={response.usage.source!r})"
     )
