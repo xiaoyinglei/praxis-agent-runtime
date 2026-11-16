@@ -46,10 +46,12 @@ _DIMENSIONS: Final[tuple[str, ...]] = (
 # 禁止 import)。T15 的 dispatch gate 复用同一集合。
 WEB_TOOL_NAMES: Final[frozenset[str]] = frozenset({"web_fetch", "web_search"})
 
-# 一条 web tool_result 证明请求已完成的 status 集合(T2 brief 原文)。denied /
-# paused / not_executed 都发生在 dispatch 之前,不占请求配额。
+# 一条 web tool_result 证明请求已占用配额的 status 集合。denied / paused /
+# not_executed 都发生在 dispatch 之前，不占请求配额；outcome_unknown 是
+# dispatch 后失联（session 补偿写 unknown），按旧 reserve-before-IO 语义仍计 1
+# ——brief 的 {ok,error,timeout,cancelled} 是计划笔误，控制器裁决 R-T2-1 覆盖。
 _BILLABLE_WEB_STATUSES: Final[frozenset[str]] = frozenset(
-    {"ok", "error", "timeout", "cancelled"}
+    {"ok", "error", "timeout", "cancelled", "outcome_unknown"}
 )
 
 _MICROS_PER_MILLION: Final[int] = 1_000_000
@@ -691,13 +693,16 @@ class BudgetTracker:
         if name not in WEB_TOOL_NAMES:
             return Admission(True, "")
         node = self.refresh()
+        # 与 admit_dispatch 同口径:exposure 是唯一预算占用面(含 active 子分配
+        # 从父额度切走的 web/browser 未用份额),不能只看 node.used。
+        used = exposure(node)
         web_limit = node.limits.web_requests
-        used_web = node.used.web_requests + self._inflight_web
+        used_web = used.web_requests + self._inflight_web
         if web_limit is not None and used_web >= web_limit:
             return Admission(False, "budget_exhausted")
         if browser:
             browser_limit = node.limits.browser_requests
-            used_browser = node.used.browser_requests + self._inflight_browser
+            used_browser = used.browser_requests + self._inflight_browser
             if browser_limit is not None and used_browser >= browser_limit:
                 return Admission(False, "budget_exhausted")
         self._inflight_web += 1

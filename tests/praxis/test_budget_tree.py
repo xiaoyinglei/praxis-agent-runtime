@@ -402,6 +402,27 @@ def test_fold_web_counts_only_completed_web_tool_dispatches() -> None:
     assert facts.browser_requests == 0
 
 
+def test_fold_outcome_unknown_web_result_counts_conservatively() -> None:
+    # R-T2-1:dispatch 后失联(outcome_unknown)按旧 reserve-before-IO 语义计 1。
+    items = [_web_result(1, status="outcome_unknown", call_id="lost")]
+    assert fold_turn_facts(items, unit_costs=None).web_requests == 1
+
+
+def test_fold_resume_compensated_unknown_web_counts_once() -> None:
+    # 真实 resume 形状:tool_call 已落库 + 补偿结果 outcome_unknown ⇒ 恰好 1 次。
+    items = [
+        _tool_call(1, call_id="lost"),
+        _web_result(2, status="outcome_unknown", call_id="lost"),
+    ]
+    assert fold_turn_facts(items, unit_costs=None).web_requests == 1
+
+
+def test_fold_not_executed_web_result_not_billed() -> None:
+    # not_executed 是"从未 dispatch"的补偿结论,不占请求配额。
+    items = [_web_result(1, status="not_executed", call_id="never")]
+    assert fold_turn_facts(items, unit_costs=None).web_requests == 0
+
+
 def test_fold_web_result_without_tool_call_still_counts() -> None:
     # 防御面:旧日志/外部写入可能只有结果事实;结果本身即证明请求发生。
     items = [_web_result(1, status="ok", call_id="solo", metadata={"browser_render": True})]
@@ -1054,6 +1075,33 @@ def test_tracker_note_result_without_admit_never_goes_negative(store: Store) -> 
     tracker.note_result("web_fetch", browser=False)
     tracker.note_result("web_fetch", browser=False)
     assert tracker.admit_web_request("web_fetch", browser=False).allowed
+
+
+def test_tracker_web_gate_sees_active_child_reserved_share(store: Store) -> None:
+    # R-T2-1:active 子分配的 web 未用份额在 exposure 里,父 gate 必须看见,
+    # 否则父会超发把总 exposure 推过限额。
+    store.append_items(
+        PARENT_THREAD,
+        TURN,
+        [ItemEntry(ItemKind.CHILD_ALLOCATION, _allocation(1, grant={"web_requests": 5}).payload)],
+    )
+    store.append_items(
+        "child-thread",
+        "child-turn",
+        [
+            ItemEntry(
+                ItemKind.TURN_STATUS,
+                _turn_status(1, "running", thread_id="child-thread", turn_id="child-turn").payload,
+            )
+        ],
+    )
+    tracker = _tracker(store, limits=Limits(web_requests=10))
+    # exposure.web = 0 已用 + 5 active 子未用份额 = 5;父只剩 5 个请求额度。
+    for _ in range(5):
+        assert tracker.admit_web_request("web_fetch", browser=False).allowed
+    assert tracker.admit_web_request("web_fetch", browser=False) == Admission(
+        allowed=False, reason="budget_exhausted"
+    )
 
 
 # ---------------------------------------------------------------------------
