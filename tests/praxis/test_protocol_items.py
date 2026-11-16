@@ -42,7 +42,7 @@ def test_item_is_frozen() -> None:
         item.seq = 2
 
 
-def test_item_kind_values_are_the_twelve_agreed() -> None:
+def test_item_kind_values_are_the_fifteen_agreed() -> None:
     assert {kind.value for kind in ItemKind} == {
         "user_message",
         "steering",
@@ -56,6 +56,9 @@ def test_item_kind_values_are_the_twelve_agreed() -> None:
         "turn_status",
         "summary",
         "compaction_boundary",
+        "cancel_request",
+        "budget_extension",
+        "child_allocation",
     }
 
 

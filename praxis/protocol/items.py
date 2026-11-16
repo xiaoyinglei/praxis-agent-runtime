@@ -27,6 +27,10 @@ class ItemKind(StrEnum):
     TURN_STATUS = "turn_status"
     SUMMARY = "summary"
     COMPACTION_BOUNDARY = "compaction_boundary"
+    # 阶段4:预算/取消/子分配(设计 §5.5/§5.13)。追加在末尾,既有顺序不变。
+    CANCEL_REQUEST = "cancel_request"
+    BUDGET_EXTENSION = "budget_extension"
+    CHILD_ALLOCATION = "child_allocation"
 
 
 @dataclass(frozen=True, slots=True)
