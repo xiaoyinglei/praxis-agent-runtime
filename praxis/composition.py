@@ -57,6 +57,7 @@ from praxis.adapters.web.search import (
     load_web_search_config,
 )
 from praxis.adapters.web.tools import create_web_fetch_tools
+from praxis.adapters.workspaces.git import GitWorktreeProvisioner
 from praxis.core.agents import SubagentManager
 from praxis.core.compaction import (
     SUMMARY_MAX_OUTPUT_TOKENS,
@@ -760,10 +761,18 @@ def build_session(
         # T6:manager 此刻才有 parent 引用;holder 填充后工具面与收尾链同时
         # 生效(工具只在 submit 内被调用,与 web authorizer 同延迟绑定纪律)。
         if enable_subagents:
+            # T7:write 子隔离由 git worktree 快照承载;child_env 唯一实现在此
+            # 注入(adapters 不 import tools,R-T15-7)。
+            provisioner = GitWorktreeProvisioner(child_env)
             manager_holder.append(
-                SubagentManager(parent=session, store=store)
+                SubagentManager(parent=session, store=store, provisioner=provisioner)
                 if subagent_limits is None
-                else SubagentManager(parent=session, store=store, limits_cfg=subagent_limits)
+                else SubagentManager(
+                    parent=session,
+                    store=store,
+                    provisioner=provisioner,
+                    limits_cfg=subagent_limits,
+                )
             )
         # 延迟绑定完成:此后 web authorize 闭包读到的就是 live 权限上下文
         # (Session.update_permission 替换 _permissions,property 每次现取)。

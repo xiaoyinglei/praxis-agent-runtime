@@ -194,6 +194,9 @@ _PRAXIS_WEB_LIMITS_FILE = ("adapters", "web", "limits.py")
 _PRAXIS_HOOKS_CONFIG_FILE = ("adapters", "hooks", "config.py")
 _PRAXIS_HOOKS_RUNNER_FILE = ("adapters", "hooks", "runner.py")
 _PRAXIS_MCP_MANAGER_FILE = ("adapters", "mcp", "manager.py")
+# T7:子工作区 provisioner 的落点 base 读 host_config_dir()(worktrees/ 在
+# 宿主配置目录下、地板内);它是 git worktree 适配器的唯一实现点。
+_PRAXIS_WORKSPACES_GIT_FILE = ("adapters", "workspaces", "git.py")
 
 # 规则 20(S7):argv 密钥重置形态的两个字面量。``-i`` 单独出现(如
 # ``security -i`` 的 stdin 模式)不是重置形态——只有与 env 可执行名共处同一
@@ -236,6 +239,7 @@ _HOST_CONFIG_DIR_FILES = frozenset(
         _PRAXIS_WEB_LIMITS_FILE,
         ("adapters", "web", "search.py"),
         ("adapters", "mcp", "config.py"),
+        _PRAXIS_WORKSPACES_GIT_FILE,
         _PRAXIS_FLOOR_FILE,
     }
 )
