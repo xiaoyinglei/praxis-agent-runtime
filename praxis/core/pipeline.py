@@ -35,7 +35,9 @@ execute 步骤序(与代码一一对应):
    不写 tool_call、未 dispatch;拒绝结果 fold 豁免计费)——deny/ask/地板路径
    都在 gate 之前,不计数;``budget=None`` 零扰动 → EXECUTE_PROCESS
    **先编译沙箱**再写 tool_call item(SandboxRefusal → ERROR/sandbox_refused,
-   不写 tool_call,未 dispatch 语义同 invalid_input;read/write 进程内工具不编译);
+   不写 tool_call,未 dispatch 语义同 invalid_input;read/write 进程内工具不编译;
+   拒绝早退同样 note_result 释放 gate 准入的 in-flight——非终态路径,turn 继续,
+   不释放会与 fold 双计误拒后续 web 请求,R-T15-1);
 7. ``run_with_timeout``(移植旧 executor 超时/取消语义,任务全程被持有;
    透传 ``ToolExecContext(sandbox=spec, permissions=ctx.permissions,
    active_skill_ids=...)``——后者从本回合已提交 item 重算,供
@@ -790,6 +792,11 @@ async def execute(call: ToolCall, ctx: ExecCtx) -> ToolResult:
                 call, status=ResultStatus.ERROR, error_code="sandbox_refused", message=exc.reason,
             )
             _append_result_item(ctx, result)
+            # R-T15-1:沙箱拒绝是非终态早退(turn 继续,模型可重试/再调 web),
+            # gate 已准入的 in-flight 必须与成功路径成对释放——否则残留与
+            # fold 对 sandbox_refused(error)的保守计费双计,边界误拒后续请求。
+            if ctx.budget is not None:
+                ctx.budget.note_result(tool.definition.name, browser=web_browser)
             return result
 
     _append_call_item(ctx, call, tool, use, args, digest)

@@ -49,7 +49,7 @@ from praxis.protocol.json import JsonValue
 from praxis.protocol.models import ModelResponse, ModelToolCall, Usage
 from praxis.protocol.permission import PermissionContext, SandboxAvailability
 from praxis.protocol.policy import NetworkPolicy, PermissionPolicy, ToolRule
-from praxis.protocol.sandbox import ToolExecContext
+from praxis.protocol.sandbox import SandboxRefusal, SandboxSpec, ToolExecContext
 from praxis.protocol.tools import (
     CancellationMode,
     InterruptBehavior,
@@ -298,6 +298,7 @@ def _ctx(
     budget: BudgetTracker | None,
     mode: str = "bypass",
     turn_id: str = TURN,
+    compiler: Any = None,
 ) -> ExecCtx:
     _turn(store, turn_id=turn_id)
     # network allow:EXECUTE_PROCESS 的命令网络姿态门控放行(D9 默认 ask 会
@@ -318,6 +319,7 @@ def _ctx(
         thread_id=THREAD,
         policy_revision=policy.revision,
         budget=budget,
+        compile_sandbox=compiler,
     )
 
 
@@ -351,6 +353,51 @@ def test_pipeline_browser_flag_from_execute_process_effect(store: Store, workspa
     assert second.error_code == "web_request_budget_exceeded"
     assert "browser_requests" in (second.error_message or "")
     assert tracker.refresh().used.browser_requests == 1  # 拒绝不占 browser 配额
+
+
+def test_sandbox_refusal_releases_inflight_no_double_count(store: Store, workspace: Path) -> None:
+    """R-T15-1(审查 fix1):sandbox_refused 是非终态早退(turn 继续),in-flight 必须释放。
+
+    限额 3:1 ok + 1 sandbox_refused(fold 按 error 保守计 1,T2 既有计费不动)
+    → fold=2;若 in-flight 泄漏 +1,第 3 次真实请求被 2+1≥3 **双计误拒**
+    (修前必红=翻转实证)。释放后第 3 次放行、第 4 次恰按 fold=3 拒绝。
+    browser 旗标成对:render 面拒绝同样释放 browser in-flight。
+    """
+    compiles = {"n": 0}
+
+    def compiler(permissions: PermissionContext, use: ResolvedUse, root: Path) -> SandboxSpec:
+        compiles["n"] += 1
+        if compiles["n"] == 2:
+            raise SandboxRefusal("boundary not representable")
+        return SandboxSpec(
+            backend="seatbelt",
+            argv_prefix=("/usr/bin/sandbox-exec",),
+            scratch_dir=str(workspace / "scratch"),
+        )
+
+    render_effects = frozenset({ToolEffect.NETWORK, ToolEffect.EXECUTE_PROCESS})
+    tracker = _tracker(store, Limits(web_requests=3, browser_requests=3))
+    ctx = _ctx(
+        store, workspace, {"web_fetch": _web_toy(effects=render_effects)}, budget=tracker, compiler=compiler
+    )
+
+    def call(call_id: str) -> ToolResult:
+        return asyncio.run(execute(ToolCall(tool_call_id=call_id, tool_name="web_fetch", arguments={}), ctx))
+
+    assert call("c1").status is ResultStatus.OK
+    refused = call("c2")
+    assert refused.status is ResultStatus.ERROR and refused.error_code == "sandbox_refused"
+    # 早退分支与成功路径成对释放(web+browser 两维 in-flight 归零)。
+    assert tracker._inflight_web == 0  # noqa: SLF001 — in-flight 不变量探针
+    assert tracker._inflight_browser == 0  # noqa: SLF001
+    # 翻转点:修前 fold(2)+泄漏(1)=3≥3 误拒;修后 fold(2)<3 放行。
+    assert call("c3").status is ResultStatus.OK
+    # 计数与 fold 不相交:used 恰 3(refused 保守计 1 在内),无泄漏叠加。
+    assert tracker.refresh().used.web_requests == 3
+    assert tracker._inflight_web == 0  # noqa: SLF001
+    fourth = call("c4")
+    assert fourth.status is ResultStatus.ERROR
+    assert fourth.error_code == "web_request_budget_exceeded"  # 恰 3≥3,非 4≥3
 
 
 def test_pipeline_budget_none_zero_disturbance(store: Store, workspace: Path) -> None:
