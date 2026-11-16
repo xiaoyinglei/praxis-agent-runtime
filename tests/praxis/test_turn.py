@@ -372,6 +372,10 @@ def test_resume_calls_execute_then_complete(
     # Task 14 语义:approval_decision item + 回合回 RUNNING,然后带 resume_calls 重入
     # Task 7 R5(b) 迁移:决策必须 stamp 批准时刻的 policy_revision(与 _deps 的
     # 默认策略一致),否则按 legacy 缺 revision fail-closed 作废 → re-ask。
+    # Task 14 接口适配:决策携带声明窗口(声明 c1 的 model_response seq,与
+    # Session._write_approval_decisions 从 request 携带窗口的真实落笔一致),
+    # 否则缺维 fail-closed 作废 → re-ask。
+    declaration_seq = next(i.seq for i in store.read_turn_items(TURN) if i.kind == ItemKind.MODEL_RESPONSE)
     store.append_items(
         THREAD,
         TURN,
@@ -384,6 +388,7 @@ def test_resume_calls_execute_then_complete(
                     "args_digest": args_digest(args),
                     "destination": "session",
                     "policy_revision": PermissionPolicy().revision,
+                    "window_seq": declaration_seq,
                 },
             )
         ],

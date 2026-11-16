@@ -22,8 +22,9 @@ Session 是 turn 循环之上的会话门面:它不执行任何东西,只负责"
 resume 的处理序(与代码一一对应):守卫 → 映射校验(目标存在、verdict/outcome
 合法、extend 维度名/非负 int——在**任何** transition 之前,失败即零写入,绝不
 把 turn 留在无执行者的 RUNNING 等 sweep 误标 interrupted)→ transition(RUNNING,
-真实 reason) → reconcile 写结果(先) → approval 写决策(摘要从 approval_request
-item 取,绑定 digest;policy_revision stamp 当前策略——R5(b) 批准时刻绑定)→
+真实 reason) → reconcile 写结果(先) → approval 写决策(摘要与声明窗口从
+approval_request item 取,绑定 digest/window_seq;policy_revision stamp 当前
+策略——R5(b) 批准时刻绑定)→
 budget_extension 写增量(T3)→ unclosed_windows
 分类(**先 started 后 decision**:未 started 且有
 matching decision 的调用进重放队列承接审批重入;已 started 的决策一律失效于
@@ -191,14 +192,14 @@ def _latest_payloads(items: Sequence[Item], kind: str) -> dict[str, Mapping[str,
 
     B31 判断(交档):
     - 审批**选择/落笔**面(last-wins 无害):``_validate_approval`` 与
-      ``_write_approval_decisions`` 取最近一条 approval_request 的 digest——裸
-      call_id 重入只可能指向最近声明窗口,与管道 ``_latest_approval_decision``
-      的窗口无关绑定同口径;取最新正是重入要绑定/执行的动作。
+      ``_write_approval_decisions`` 取最近一条 approval_request 的 digest 与
+      window_seq——裸 call_id 重入只可能指向最近声明窗口;取最新正是重入要
+      绑定/执行的动作(Task 14 起管道按声明窗口等值校验绑定)。
     - ``_pending_approvals`` 的哈希键仍是裸 call_id,但抑制判据由
-      ``turn.pending_approval_summaries`` 单点实现(C-1 + K-2):
-      ``(call_id, args_digest)`` 且决策 revision 等于当前 revision。裸 id
-      审批映射在"同 id 两轮同时待批"时仍只能呈现一条(取最新),这是 resume
-      API 的固有边界,窗口化属阶段 4。
+      ``turn.pending_approval_summaries`` 单点实现(C-1 + K-2 + Task 14):
+      ``(window_seq, call_id, args_digest)`` 且决策 revision 等于当前 revision。
+      裸 id 审批映射在"同 id 两轮同时待批"时仍只能呈现一条(取最新),这是
+      resume API 的固有边界(窗口化 reconcile/approval 映射 API 不在本任务)。
     """
     latest: dict[str, Mapping[str, JsonValue]] = {}
     for item in items:
@@ -216,10 +217,11 @@ def _pending_approvals(
     """本 turn 内没有**当前 revision 有效**决策的 approval_request(镜像 turn 层口径)。
 
     K-2:判据集中在 ``turn.pending_approval_summaries``——两处不再各写一份。
-    C-1:抑制条件 = 同 ``(call_id, args_digest)`` **且决策 revision 等于当前
-    revision**。否则同 turn 跨轮复用 call_id、第二轮不同参数 re-ask 时(或
-    批准后策略修订使旧批准作废、管道 re-ask 时),旧决策会把新一轮请求藏掉,
-    PAUSED 的 pending_approvals 为空 → 人类无可批项(B32 同族)。
+    C-1 + Task 14:抑制条件 = 同 ``(window_seq, call_id, args_digest)`` **且
+    决策 revision 等于当前 revision**。否则同 turn 跨轮复用 call_id、第二轮
+    re-ask 时(参数不同、声明窗口不同,或批准后策略修订使旧批准作废),旧决策
+    会把新一轮请求藏掉,PAUSED 的 pending_approvals 为空 → 人类无可批项
+    (B32 同族)。
     """
     return pending_approval_summaries(items, policy_revision=policy_revision)
 
@@ -809,6 +811,11 @@ class Session:
                 # 策略变更使旧批准作废(fail-closed re-ask)。
                 "policy_revision": self._permissions.policy.revision,
             }
+            # Task 14:声明窗口从对应 approval_request 携带进 decision(管道按
+            # window 等值校验)。presence 保持:legacy request 缺 window 键 →
+            # decision 同样缺维 → 重入 fail-closed 作废(re-ask),绝不静默继承。
+            if "window_seq" in request:
+                payload["window_seq"] = request["window_seq"]
             entries.append(ItemEntry(kind=ItemKind.APPROVAL_DECISION, payload=payload))
         self._store.append_items(self._thread_id, turn_id, entries)
 

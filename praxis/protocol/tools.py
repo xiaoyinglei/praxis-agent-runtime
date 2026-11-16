@@ -213,15 +213,25 @@ class ToolDefinition:
 
 @dataclass(frozen=True, slots=True)
 class ToolCall:
-    """一次工具调用请求;旧 origin/argument_error 随 fencing 一并删除。"""
+    """一次工具调用请求;旧 origin/argument_error 随 fencing 一并删除。
+
+    ``window_seq``(Task 14,尾部默认零破坏)= 声明该调用的 model_response item
+    的 seq(模型路径,审批的声明窗口绑定键);None = CLI/工具直调域,天然无
+    "跨窗继承"面。
+    """
 
     tool_call_id: str
     tool_name: str
     arguments: Mapping[str, JsonValue]
+    window_seq: int | None = None
 
     def __post_init__(self) -> None:
         _require_non_empty_string(self.tool_call_id, field_name="tool_call_id")
         _require_non_empty_string(self.tool_name, field_name="tool_name")
+        if self.window_seq is not None and (
+            isinstance(self.window_seq, bool) or not isinstance(self.window_seq, int) or self.window_seq < 0
+        ):
+            raise TypeError("window_seq must be a non-negative int or None")
         object.__setattr__(
             self,
             "arguments",

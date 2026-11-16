@@ -356,6 +356,9 @@ def test_approval_reentry_reuses_settled_hook_without_respawn(
                     "args_digest": _digest(tool, {"path": "note.txt"}),
                     "destination": "once",
                     "policy_revision": ctx.policy_revision,
+                    # Task 14 接口适配:_run 直构 ToolCall 处 None 域(CLI/工具
+                    # 直调),决策携带同域窗口(与 Session 真实落笔同形)。
+                    "window_seq": None,
                 },
             )
         ],

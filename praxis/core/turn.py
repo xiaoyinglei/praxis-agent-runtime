@@ -63,7 +63,7 @@ from praxis.core.compaction import (
     CompactionOutcome,
     maybe_compact,
 )
-from praxis.core.compensation import close_unresolved
+from praxis.core.compensation import close_unresolved, unclosed_windows
 from praxis.core.context import (
     append_memory_navigation,
     append_skill_catalog,
@@ -233,8 +233,11 @@ def _exec_ctx(deps: TurnDeps, state: TurnState) -> ExecCtx:
     )
 
 
-def _model_call(call: ModelToolCall) -> ToolCall:
-    return ToolCall(tool_call_id=call.call_id, tool_name=call.name, arguments=call.arguments)
+def _model_call(call: ModelToolCall, window_seq: int | None = None) -> ToolCall:
+    """模型路径调用一律携带声明窗口(审批绑定键,Task 14);None 仅限直调域。"""
+    return ToolCall(
+        tool_call_id=call.call_id, tool_name=call.name, arguments=call.arguments, window_seq=window_seq
+    )
 
 
 def _model_response_entry(resp: ModelResponse) -> ItemEntry:
@@ -383,26 +386,31 @@ def pending_approval_summaries(
     内存状态:item 日志是唯一事实源;同 call_id 多条请求取最新一条(re-ask 的
     摘要用新参数 digest)。
 
-    抑制条件(C-1 + K-2):一个请求只有在**同** ``(call_id, args_digest)`` 且
-    决策的 ``policy_revision`` 等于当前 revision 时才算已决策。与管道
-    ``_bound_decision_valid`` 同口径——陈旧 revision 的批准在重入时作废并
-    re-ask,若展示面仍按裸 digest 抑制,就会停在 PAUSED 且
-    ``pending_approvals == ()``(B32 同族卡死)。digest 不同即另一个动作,
-    必须呈现。
+    抑制条件(C-1 + K-2 + Task 14):一个请求只有在**同**
+    ``(window_seq, call_id, args_digest)`` 且决策的 ``policy_revision`` 等于
+    当前 revision 时才算已决策。与管道 ``_bound_decision_valid`` 同口径——
+    陈旧 revision/跨窗的批准在重入时作废并 re-ask,若展示面仍按裸 digest
+    抑制,就会停在 PAUSED 且 ``pending_approvals == ()``(B32 同族卡死)。
+    digest 不同即另一个动作,窗口不同即另一次声明,都必须呈现。legacy
+    decision 缺 window_seq 键一律不算已决策(fail-closed,与管道 presence
+    判据逐字一致);畸形 window 值同理排除。
     """
-    decided: set[tuple[str, str]] = set()
+    decided: set[tuple[int | None, str, str]] = set()
     for item in items:
         if item.kind != ItemKind.APPROVAL_DECISION:
             continue
         call_id = item.payload.get("call_id")
         digest = item.payload.get("args_digest")
         revision = item.payload.get("policy_revision")
+        window = item.payload.get("window_seq")
         if (
             isinstance(call_id, str)
             and isinstance(digest, str)
             and revision == policy_revision
+            and "window_seq" in item.payload
+            and (window is None or type(window) is int)
         ):
-            decided.add((call_id, digest))
+            decided.add((window, call_id, digest))
     latest_requests: dict[str, Mapping[str, JsonValue]] = {}
     for item in items:
         if item.kind != ItemKind.APPROVAL_REQUEST:
@@ -416,7 +424,7 @@ def pending_approval_summaries(
         digest = payload.get("args_digest")
         if not isinstance(tool_name, str) or not isinstance(digest, str):
             continue
-        if (call_id, digest) in decided:
+        if (payload.get("window_seq"), call_id, digest) in decided:
             continue
         effects: tuple[str, ...] = ()
         raw_effects = payload.get("effects")
@@ -544,8 +552,18 @@ async def run_turn(
         turn_items = [item for item in deps.store.read_items(state.thread_id) if item.turn_id == state.turn_id]
         state.steps = fold_turn_facts(turn_items, unit_costs=None).steps
         # 步序 1:审批重入——先重放已批准的调用,再进模型循环。
+        # Task 14:重放调用的声明窗口 = 声明它的 model_response seq,经判据层
+        # unclosed_windows 取(不另写窗口匹配);升序输出 last-wins = 最近声明,
+        # 与 pair_tool_results 的结果归属同纪律。审批 decision 携带同一窗口,
+        # 同窗重入绑定成立(K-2 零回退)。
+        declaration_windows: dict[str, int] = {}
+        if resume_calls:
+            declaration_windows = {
+                unresolved.call.call_id: unresolved.declaration_seq
+                for unresolved in unclosed_windows(turn_items, deps.tools)
+            }
         for call in resume_calls:
-            result = await execute(_model_call(call), ctx)
+            result = await execute(_model_call(call, declaration_windows.get(call.call_id)), ctx)
             if result.status is ResultStatus.PAUSED:
                 return _paused_result(deps, state, last_content, unknown_calls)
             _note_unknown(result, unknown_calls)
@@ -673,7 +691,10 @@ async def run_turn(
             resp = assemble_model_events(events)
             _emit_output_deltas(deps, state, events)
             last_content = resp.content
-            deps.store.append_items(state.thread_id, state.turn_id, [_model_response_entry(resp)])
+            # Task 14:返回即所写(B12)——model_response 的 seq 就是本轮工具
+            # 调用的声明窗口,审批 request/decision 按它绑定。
+            appended = deps.store.append_items(state.thread_id, state.turn_id, [_model_response_entry(resp)])
+            window_seq = appended[0].seq
             deps.bus.emit(
                 ModelResponseReceived(
                     turn_id=state.turn_id,
@@ -703,7 +724,7 @@ async def run_turn(
                 )
             # 步序 5:唯一工具管道逐个执行;PAUSED 的转换已由 pipeline 完成。
             for call in resp.tool_calls:
-                result = await execute(_model_call(call), ctx)
+                result = await execute(_model_call(call, window_seq), ctx)
                 if result.status is ResultStatus.PAUSED:
                     return _paused_result(deps, state, last_content, unknown_calls)
                 _note_unknown(result, unknown_calls)

@@ -2,8 +2,9 @@
 
 模型调用、CLI、子代理、resume 一律经 ``execute()`` 执行工具——不存在第二条
 路径。审批按 item 记录(approval_request / approval_decision),结论与
-``args_digest`` 互相绑定:参数变化即作废旧批准(重新 ask),杜绝
-"批准 A 参数、执行 B 参数"。
+``args_digest`` + 声明窗口 ``window_seq`` 互相绑定:参数变化或跨窗复用
+call_id 即作废旧批准(重新 ask),杜绝"批准 A 参数、执行 B 参数"与
+"批准这一次、沿用下一次"(R-T7-2 闭合)。
 
 execute 步骤序(与代码一一对应):
 1. 未知工具 / 输入校验失败 → 直接写 tool_result(error_code
@@ -17,12 +18,14 @@ execute 步骤序(与代码一一对应):
    按 ``hook_invocation_id`` 幂等折叠(审批重入不重复 spawn),非 allowed 的
    hook 结论作为 HookDecision 进入唯一 decide——**hook allow 结构上无裁决,
    规则/bypass/地板/沙箱依旧完全生效**;
-3. 审批重入(R5 硬化):**新鲜 deny 是终局**,任何 bound 决策不得翻案;
-   bound 决策仅在 args_digest 一致 **且** policy_revision 等于当前 revision
-   时有效(legacy item 缺 revision = 作废,fail-closed)→ 按 allow/deny 陈述;
-   不一致 → 作废,按新鲜决策处理(re-ask);
-4. ask → approval_request item(同 call_id+digest 幂等,不重复写)→
-   transition(PAUSED) → emit ApprovalRequested → 返回 PAUSED;
+3. 审批重入(R5 硬化 + Task 14 窗口化):**新鲜 deny 是终局**,任何 bound
+   决策不得翻案;bound 决策仅在 args_digest 一致 **且** policy_revision 等于
+   当前 revision **且** window_seq 等于本调用声明窗口时有效(legacy item 缺
+   revision/缺 window 键 = 作废,fail-closed)→ 按 allow/deny 陈述;
+   不一致 → 作废,按新鲜决策处理(re-ask)——跨窗复用同 call_id+digest 不再
+   继承 once 批准(R-T7-2 闭合);
+4. ask → approval_request item(同 window+call_id+digest+revision 幂等,
+   不重复写)→ transition(PAUSED) → emit ApprovalRequested → 返回 PAUSED;
 5. deny → tool_result(DENIED, error_code ``permission_denied``);
 6. allow → 执行时地板守卫(R5(c):floor_reason 双候选,命中 → DENIED,
    不写 tool_call、不 dispatch——地板在任何入口都不可批准)→ EXECUTE_PROCESS
@@ -497,18 +500,23 @@ async def _apply_post_hooks(
 # ---------------------------------------------------------------------------
 
 
-def _latest_approval_decision(items: list[Item], call_id: str) -> Item | None:
-    """最近一条 approval_decision(裸 call_id;窗口无关绑定,已知边界见下)。
+def _latest_approval_decision(items: list[Item], call_id: str, window_seq: int | None) -> Item | None:
+    """最近一条绑定**声明窗口**的 approval_decision(R-T7-2 闭合)。
 
-    R-T7-2:绑定键是 call_id + args_digest + policy_revision,不含"声明窗口"。
-    同 turn 跨轮复用 call_id 时,参数与策略修订都相同的旧批准会被视为同一动作
-    而沿用(窗口化批准属阶段 4;本阶段把它作为**已知且被测试钉住的**语义:
-    同 revision 下同 id 同参数的重复调用沿用 once 批准)。参数不同则 digest
-    不匹配,必然重新 ask。真正按声明窗口绑定属阶段 4 子代理审批面统一处理,
-    本函数保持窗口无关语义。
+    绑定键 = (window_seq, call_id, args_digest, policy_revision):window_seq 是
+    声明该调用的 model_response item 的 seq(None = CLI/工具直调域)。同 turn
+    跨窗复用 call_id 时,即使参数与策略修订都相同,旧窗口的 once 批准也不再
+    沿用——新声明窗口必须重新 ask。legacy item 缺 window_seq 键一律视作不匹配
+    (fail-closed,与缺 revision 同纪律:读端 fail-open 只保护渲染,决策面
+    缺维=无效)。
     """
     for item in reversed(items):
-        if item.kind == ItemKind.APPROVAL_DECISION and item.payload.get("call_id") == call_id:
+        if (
+            item.kind == ItemKind.APPROVAL_DECISION
+            and item.payload.get("call_id") == call_id
+            and "window_seq" in item.payload
+            and item.payload["window_seq"] == window_seq
+        ):
             return item
     return None
 
@@ -520,13 +528,19 @@ def _decision_reason(item: Item) -> str:
     return f"approval_decision {item.payload.get('verdict')} bound to args digest"
 
 
-def _bound_decision_valid(bound: Item, digest: str, policy_revision: str) -> bool:
-    """R5(b):digest 绑定 + 批准时刻 policy_revision 绑定,二者缺一不可。
+def _bound_decision_valid(bound: Item, digest: str, policy_revision: str, window_seq: int | None) -> bool:
+    """R5(b) + Task 14:digest / 批准时刻 policy_revision / 声明窗口三维绑定,缺一不可。
 
     revision 从 approval_decision item 读取(Session 落笔时 stamp);legacy item
     缺 revision → None != 当前 revision → 作废(fail-closed,重新 ask)。
+    window_seq 同理:缺键 = 无效(即使调用处于 None 域),等值才放行。
     """
-    return bound.payload.get("args_digest") == digest and bound.payload.get("policy_revision") == policy_revision
+    return (
+        bound.payload.get("args_digest") == digest
+        and bound.payload.get("policy_revision") == policy_revision
+        and "window_seq" in bound.payload
+        and bound.payload["window_seq"] == window_seq
+    )
 
 
 def _execution_floor_reason(use: ResolvedUse) -> str:
@@ -572,9 +586,14 @@ def _pause_for_approval(
         # 新 revision 的 request,否则展示面按陈旧 revision 抑制既有 request
         # ⇒ PAUSED 且 pending_approvals 为空(B32 同族)。
         and item.payload.get("policy_revision") == ctx.policy_revision
+        # Task 14:window 维升级 B32 抑制判据 (call_id,digest) →
+        # (window,call_id,digest)。缺 window 键的 legacy request 不算重复
+        # (presence 判据)——否则 re-ask 写不出带窗新请求,新批准永远绑不上。
+        and "window_seq" in item.payload
+        and item.payload["window_seq"] == call.window_seq
         for item in items
     )
-    if not duplicate:  # 幂等重入:同 call_id + digest + revision 不重复写请求
+    if not duplicate:  # 幂等重入:同 window + call_id + digest + revision 不重复写请求
         payload: dict[str, JsonValue] = {
             "call_id": call.tool_call_id,
             "tool_name": tool.definition.name,
@@ -583,6 +602,7 @@ def _pause_for_approval(
             "targets": _target_dicts(use),
             "args_digest": digest,
             "policy_revision": ctx.policy_revision,
+            "window_seq": call.window_seq,
         }
         ctx.store.append_items(
             ctx.thread_id,
@@ -699,10 +719,14 @@ async def execute(call: ToolCall, ctx: ExecCtx) -> ToolResult:
         decide_permissions = replace(ctx.permissions, hook_decisions=decisions)
 
     decision = permission.decide(tool, use, decide_permissions)
-    bound = _latest_approval_decision(items, call.tool_call_id)
+    bound = _latest_approval_decision(items, call.tool_call_id, call.window_seq)
     # R5(a):新鲜 deny 是终局——bound allow 只能把 ask/fallback 带入执行,
     # 绝不覆盖规则 deny/地板 deny/sandbox_unavailable。
-    if not decision.is_deny and bound is not None and _bound_decision_valid(bound, digest, ctx.policy_revision):
+    if (
+        not decision.is_deny
+        and bound is not None
+        and _bound_decision_valid(bound, digest, ctx.policy_revision, call.window_seq)
+    ):
         verdict = bound.payload.get("verdict")
         if verdict == "allow":
             decision = Decision.allow("approval_decision: args digest bound")

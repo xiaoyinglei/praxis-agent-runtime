@@ -85,6 +85,9 @@ def _decision_item(ctx: ExecCtx, verdict: str, digest: str, *, revision: str | N
     Task 7 R5(b) 迁移:决策必须携带批准时刻的 policy_revision(缺省=当前 ctx
     revision,与 Session._write_approval_decisions 的真实落笔一致);revision
     参数用于构造过期批准的负例。
+
+    Task 14 接口适配:决策携带声明窗口 window_seq——本文件直构 ToolCall 均处
+    None 域(CLI/工具直调),与 Session 从 request 携带窗口的真实落笔同形。
     """
     ctx.store.append_items(
         ctx.thread_id,
@@ -98,6 +101,7 @@ def _decision_item(ctx: ExecCtx, verdict: str, digest: str, *, revision: str | N
                     "args_digest": digest,
                     "destination": "session",
                     "policy_revision": ctx.policy_revision if revision is None else revision,
+                    "window_seq": None,
                 },
             )
         ],
@@ -205,9 +209,11 @@ def test_second_round_same_call_id_different_args_never_inherits_approval(
 ) -> None:
     """R-T7-2:同 turn 第二轮复用 c1 但参数不同 → 绝不继承第一轮 allow,必须重新 ask。
 
-    批准绑定是 call_id + args_digest + policy_revision(窗口无关)。参数不同时
-    digest 必然不匹配,旧批准作废;这里用完整两轮 item 流钉死该边界(第一轮
-    请求→批准→执行→结果,第二轮同 id 新参数)。
+    批准绑定是 window_seq + call_id + args_digest + policy_revision(Task 14 起
+    含声明窗口;本例直构调用均处 None 域,窗口维恒等)。参数不同时 digest
+    必然不匹配,旧批准作废;这里用完整两轮 item 流钉死该边界(第一轮
+    请求→批准→执行→结果,第二轮同 id 新参数)。跨窗同 digest 的 re-ask
+    由 test_approval_window.py 钉死。
     """
     monkeypatch.setattr(permission, "decide", lambda *a: Decision.ask("test"))
     _model_response_item(ctx, "c1", "read", dict(ARGS_A))
@@ -402,11 +408,12 @@ def test_reentry_with_stale_revision_reasks(ctx: ExecCtx, monkeypatch: pytest.Mo
 def test_same_revision_repeated_call_reuses_once_approval(
     ctx: ExecCtx, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """R-T7-2(K-3):同 revision 下同 id 同参数的重复调用沿用 once 批准。
+    """None 域(CLI/工具直调)语义钉:同域同 revision 同 id 同参数沿用 once 批准。
 
-    这是本阶段的**已知语义**(窗口化批准属阶段 4):绑定键是
-    call_id + args_digest + policy_revision,不含声明窗口。测试钉住它,避免
-    后续重构静默改变安全面而不被发现。
+    Task 14 起绑定键含声明窗口(window_seq + call_id + args_digest +
+    policy_revision):模型路径跨窗复用同 id 同参数**不再**沿用(R-T7-2 闭合,
+    见 test_approval_window.py)。本例直构调用均处 None 域——无声明窗口,
+    天然无跨窗继承面,同域重复调用沿用批准仍是合法语义。
     """
     monkeypatch.setattr(permission, "decide", lambda *a: Decision.ask("test"))
     assert asyncio.run(execute(ToolCall("c1", "read", dict(ARGS_A)), ctx)).status is ResultStatus.PAUSED
