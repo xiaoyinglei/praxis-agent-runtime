@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -1198,3 +1199,241 @@ def test_conservation_exposure_equals_used_plus_active_unused(
     assert node.under_accounted is expected_under
     # 预算不凭空归零:已发生的事实永远在 exposure 里。
     assert exposure(node).tokens >= expected_used
+
+
+# ---------------------------------------------------------------------------
+# 守恒属性补强(阶段4 T9 / T2 minor②):kill 点前缀截断 + 孙代嵌套
+# ---------------------------------------------------------------------------
+
+
+@settings(
+    max_examples=60,
+    deadline=None,
+    derandomize=True,
+    suppress_health_check=[HealthCheck.too_slow],
+)
+@given(
+    limit_tokens=st.integers(min_value=0, max_value=5_000),
+    web_limit=st.integers(min_value=0, max_value=10),
+    parent_tokens=st.integers(min_value=0, max_value=500),
+    parent_declares_calls=st.booleans(),
+    children=st.lists(
+        st.tuples(
+            st.integers(min_value=0, max_value=300),  # grant tokens
+            st.integers(min_value=0, max_value=5),  # grant web_requests
+            st.integers(min_value=0, max_value=300),  # 子已用 tokens
+            st.booleans(),  # 子是否声明并 dispatch 一个 web 调用(未闭合)
+            st.sampled_from(["completed", "failed", "cancelled", "running", "paused", "interrupted"]),
+        ),
+        min_size=1,
+        max_size=2,
+    ),
+    extensions=st.lists(st.integers(min_value=0, max_value=200), max_size=2),
+)
+def test_conservation_every_prefix_truncation_rebuilds(
+    limit_tokens: int,
+    web_limit: int,
+    parent_tokens: int,
+    parent_declares_calls: bool,
+    children: list[tuple[int, int, int, bool, str]],
+    extensions: list[int],
+) -> None:
+    """kill 点前缀截断:父日志在**每个 seq 切一刀**、子日志各自任意前缀,
+    重建的预算树仍守恒(exposure = Σ可见事实 + Σactive 子未用份额)。
+
+    假设空间(写清以便定位反例):
+    - 父 = 1 条 model_response(可选声明轮)+ 1..2 条 allocation + 0..2 条扩展;
+    - 子 = model_response(used tokens,可选声明 web 轮)+ 可选未闭合 web tool_call
+      + turn_status;子的 grant 覆盖 tokens/web_requests 两维(steps 无限);
+    - 截断 = 崩溃现场:父前缀 k ∈ [0, len],每个可见子的前缀 j ∈ [0, len] 全组合
+      (allocation 不可见 ⇒ 子线程根本不进折叠;allocation 可见但子前缀为空 ⇒
+      保守 active 全额占用——与 build_tree fail-open 同向);
+    - 期望值全部**手算**(不调 fold_turn_facts),属性钉的是折叠本身而非同义反复。
+    """
+    parent_items: list[Item] = [
+        _model_response(
+            1,
+            usage=_usage_payload(input_tokens=parent_tokens),
+            tool_calls=({"call_id": "p1", "name": "read", "arguments": {}},) if parent_declares_calls else (),
+        )
+    ]
+    child_threads: dict[str, list[Item]] = {}
+    seq = 2
+    for index, (grant, grant_web, used, has_web, state) in enumerate(children):
+        child_thread = f"child-{index}"
+        child_turn = f"child-turn-{index}"
+        parent_items.append(
+            _allocation(
+                seq,
+                allocation_id=f"alloc-{index}",
+                child_thread_id=child_thread,
+                child_root_turn_id=child_turn,
+                grant={"tokens": grant, "web_requests": grant_web},
+            )
+        )
+        seq += 1
+        items = [
+            _model_response(
+                1,
+                usage=_usage_payload(input_tokens=used),
+                tool_calls=({"call_id": "w1", "name": "web_fetch", "arguments": {}},) if has_web else (),
+                thread_id=child_thread,
+                turn_id=child_turn,
+            )
+        ]
+        if has_web:
+            items.append(_tool_call(2, call_id="w1", thread_id=child_thread, turn_id=child_turn))
+        items.append(_turn_status(3 if has_web else 2, state, thread_id=child_thread, turn_id=child_turn))
+        child_threads[child_thread] = items
+    for delta in extensions:
+        parent_items.append(_extension(seq, {"tokens": delta}))
+        seq += 1
+
+    active_states = {"running", "paused", "interrupted"}
+    cuts = 0
+    for k in range(len(parent_items) + 1):
+        visible = parent_items[:k]
+        visible_allocs = [i for i in visible if i.kind == ItemKind.CHILD_ALLOCATION]
+        exp_limit = limit_tokens + sum(
+            int(i.payload["limits_delta"]["tokens"])  # type: ignore[index]
+            for i in visible
+            if i.kind == ItemKind.BUDGET_EXTENSION
+        )
+        # 可见子的前缀全组合(每个子独立切一刀)。
+        visible_children = [
+            (i, child_threads[str(i.payload["child_thread_id"])]) for i in visible_allocs
+        ]
+        for combo in itertools.product(*(range(len(items) + 1) for _j, items in visible_children)):
+            # 手算期望:每个组合独立重算(父可见事实 + 各子前缀事实)。
+            exp_tokens = parent_tokens if k >= 1 else 0
+            exp_steps = 1 if (k >= 1 and parent_declares_calls) else 0
+            exp_web = 0
+            exp_reserved_tokens = 0
+            exp_reserved_web = 0
+            exp_under = False
+            threads: dict[str, list[Item]] = {PARENT_THREAD: visible}
+            for (alloc, items), j in zip(visible_children, combo, strict=True):
+                threads[str(alloc.payload["child_thread_id"])] = items[:j]
+                grant = int(alloc.payload["grant"]["tokens"])  # type: ignore[index]
+                grant_web = int(alloc.payload["grant"]["web_requests"])  # type: ignore[index]
+                index = int(str(alloc.payload["allocation_id"]).rsplit("-", 1)[1])
+                _g, _gw, used, has_web, state = children[index]
+                child_tokens = used if j >= 1 else 0
+                child_steps = 1 if (j >= 1 and has_web) else 0
+                child_web = 1 if (j >= 2 and has_web) else 0
+                status_seq = 3 if has_web else 2
+                # 子终态事实可见才结算;前缀截断可能在 turn_status 之前(保守 active)。
+                active = state in active_states or j < status_seq
+                exp_tokens += child_tokens
+                exp_steps += child_steps
+                exp_web += child_web
+                if active:
+                    exp_reserved_tokens += max(grant - child_tokens, 0)
+                    exp_reserved_web += max(grant_web - child_web, 0)
+                    exp_under = exp_under or child_tokens > grant or child_web > grant_web
+            node = build_tree(
+                _ThreadStore(threads),
+                thread_id=PARENT_THREAD,
+                turn_id=TURN,
+                root_limits=Limits(tokens=limit_tokens, web_requests=web_limit),
+                unit_costs=None,
+            )
+            expected_used = UsageFacts(tokens=exp_tokens, steps=exp_steps, web_requests=exp_web)
+            expected_reserved = UsageFacts(tokens=exp_reserved_tokens, web_requests=exp_reserved_web)
+            assert node.used == expected_used, (k, combo)
+            assert node.reserved == expected_reserved, (k, combo)
+            assert exposure(node) == expected_used + expected_reserved, (k, combo)
+            assert node.under_accounted is exp_under, (k, combo)
+            assert node.limits.tokens == exp_limit, (k, combo)
+            assert remaining(node).tokens == max(exp_limit - exposure(node).tokens, 0)
+            assert remaining(node).web_requests == max(web_limit - exposure(node).web_requests, 0)
+            cuts += 1
+    assert cuts > len(parent_items)  # 非空泛:每个父 seq 切点都真实重建过
+
+
+@settings(
+    max_examples=80,
+    deadline=None,
+    derandomize=True,
+    suppress_health_check=[HealthCheck.too_slow],
+)
+@given(
+    limit_tokens=st.integers(min_value=0, max_value=5_000),
+    parent_tokens=st.integers(min_value=0, max_value=500),
+    child_grant=st.integers(min_value=0, max_value=600),
+    child_tokens=st.integers(min_value=0, max_value=300),
+    child_state=st.sampled_from(["completed", "failed", "cancelled", "running", "paused", "interrupted"]),
+    grand_grant=st.integers(min_value=0, max_value=300),
+    grand_tokens=st.integers(min_value=0, max_value=300),
+    grand_state=st.sampled_from(["completed", "failed", "cancelled", "running", "paused", "interrupted"]),
+    extension=st.integers(min_value=0, max_value=200),
+)
+def test_conservation_nested_grandchild_allocation(
+    limit_tokens: int,
+    parent_tokens: int,
+    child_grant: int,
+    child_tokens: int,
+    child_state: str,
+    grand_grant: int,
+    grand_tokens: int,
+    grand_state: str,
+    extension: int,
+) -> None:
+    """孙代嵌套守恒:父→子→孙三层 allocation,每层 exposure = 本层已用(含全部
+    后代事实)+ **本层** active 直接子的未用份额。
+
+    承重区分:孙代的未用份额只在子层 reserved(子的 grant 已在父层占用);
+    父层 reserved 绝不重复计孙代 grant。子终态 ⇒ 父层份额推导式归还,即便孙
+    仍 active(子的预算节点随子终态不再准入,孙占用留在子层账上)。
+    """
+    parent_items = [
+        _model_response(1, usage=_usage_payload(input_tokens=parent_tokens)),
+        _allocation(
+            2, allocation_id="alloc-c", child_thread_id="child", child_root_turn_id="child-turn",
+            grant={"tokens": child_grant},
+        ),
+        _extension(3, {"tokens": extension}),
+    ]
+    child_items = [
+        _model_response(
+            1, usage=_usage_payload(input_tokens=child_tokens), thread_id="child", turn_id="child-turn"
+        ),
+        _allocation(
+            2, allocation_id="alloc-g", child_thread_id="grand", child_root_turn_id="grand-turn",
+            grant={"tokens": grand_grant}, thread_id="child", turn_id="child-turn",
+        ),
+        _turn_status(3, child_state, thread_id="child", turn_id="child-turn"),
+    ]
+    grand_items = [
+        _model_response(1, usage=_usage_payload(input_tokens=grand_tokens), thread_id="grand", turn_id="grand-turn"),
+        _turn_status(2, grand_state, thread_id="grand", turn_id="grand-turn"),
+    ]
+    store = _ThreadStore({PARENT_THREAD: parent_items, "child": child_items, "grand": grand_items})
+    active_states = {"running", "paused", "interrupted"}
+    child_active = child_state in active_states
+    grand_active = grand_state in active_states
+
+    root = build_tree(
+        store, thread_id=PARENT_THREAD, turn_id=TURN, root_limits=Limits(tokens=limit_tokens), unit_costs=None
+    )
+    subtree_used = parent_tokens + child_tokens + grand_tokens
+    root_reserved = max(child_grant - (child_tokens + grand_tokens), 0) if child_active else 0
+    assert root.used.tokens == subtree_used
+    assert root.reserved.tokens == root_reserved  # 孙代 grant 不在父层重复占用
+    assert exposure(root).tokens == subtree_used + root_reserved
+    assert root.under_accounted is (child_active and child_tokens + grand_tokens > child_grant)
+    assert root.limits.tokens == limit_tokens + extension
+    assert root.children["alloc-c"].used.tokens == child_tokens + grand_tokens
+
+    child_node = build_tree(
+        store, thread_id="child", turn_id="child-turn", root_limits=Limits(tokens=child_grant), unit_costs=None
+    )
+    child_reserved = max(grand_grant - grand_tokens, 0) if grand_active else 0
+    assert child_node.used.tokens == child_tokens + grand_tokens
+    assert child_node.reserved.tokens == child_reserved
+    assert exposure(child_node).tokens == child_tokens + grand_tokens + child_reserved
+    assert child_node.under_accounted is (grand_active and grand_tokens > grand_grant)
+    # 子终态 + 孙 active:父层已归还(settle 推导),孙占用仍留在子层账上。
+    if not child_active:
+        assert root.reserved.tokens == 0
+        assert exposure(root).tokens == subtree_used
