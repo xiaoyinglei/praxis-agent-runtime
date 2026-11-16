@@ -7,6 +7,7 @@ freeze_json 把任意输入规范化为不可变 JSON 值(Mapping→mappingproxy
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Mapping
 from types import MappingProxyType
@@ -62,3 +63,20 @@ def thaw_json(value: JsonValue) -> _MutableJsonValue:
     if isinstance(value, tuple):
         return [thaw_json(item) for item in value]
     return value
+
+
+def canonical_json(value: object) -> str:
+    """稳定 JSON 文本:键序无关、紧凑分隔符、拒绝非 JSON/非有限值。
+
+    digest 与持久化的唯一规范口径(store.memory 的 sha256 包络消费)。先经
+    ``freeze_json`` 规范化并拒绝不合规值(Mapping→mappingproxy、序列→tuple、
+    非有限 float→ValueError),再 thaw 回可变结构交给 ``json.dumps``。
+    """
+    frozen = freeze_json(value, path="$")
+    return json.dumps(
+        thaw_json(frozen),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )

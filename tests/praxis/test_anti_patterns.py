@@ -795,5 +795,43 @@ def test_host_config_reader_allowed_at_config_layers(tmp_path, relpath):
     assert scan_praxis_file(f) == []
 
 
+# --- 规则㉑(阶段4/T10&T16):UPDATE/DELETE store_metadata 只在 store/memory.py ---
+
+def test_update_store_metadata_outside_store_memory_rejected(tmp_path):
+    f = _write(tmp_path, "praxis/core/evil.py", 'SQL = "UPDATE store_metadata SET value = ?"\n')
+    assert any("store_metadata" in v for v in scan_praxis_file(f))
+
+
+def test_delete_store_metadata_outside_store_memory_rejected(tmp_path):
+    f = _write(tmp_path, "praxis/store/turns.py", 'SQL = "DELETE FROM store_metadata WHERE key = ?"\n')
+    assert any("store_metadata" in v for v in scan_praxis_file(f))
+
+
+def test_metadata_write_lowercase_rejected(tmp_path):
+    f = _write(tmp_path, "praxis/core/evil.py", 'SQL = "delete from store_metadata where key = ?"\n')
+    assert any("store_metadata" in v for v in scan_praxis_file(f))
+
+
+def test_metadata_write_allowed_in_store_memory(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/store/memory.py",
+        'UPDATE_SQL = "UPDATE store_metadata SET value = ? WHERE key = ?"\n'
+        'DELETE_SQL = "DELETE FROM store_metadata WHERE key = ?"\n',
+    )
+    assert scan_praxis_file(f) == []
+
+
+def test_metadata_write_in_comment_or_docstring_not_flagged(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/core/ok.py",
+        '"""Docstring may mention UPDATE store_metadata and DELETE store_metadata."""\n'
+        "# UPDATE store_metadata / DELETE FROM store_metadata in a comment is not SQL.\n"
+        "X = 1\n",
+    )
+    assert scan_praxis_file(f) == []
+
+
 def test_real_praxis_tree_clean_under_3b_rules():
     assert capi.scan_praxis_tree(capi._PRAXIS_DIR) == []

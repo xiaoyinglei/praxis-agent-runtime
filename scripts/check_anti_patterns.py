@@ -54,6 +54,11 @@ Also scans praxis/ for architecture hard-rule violations (阶段1 CI 硬规则):
      字面量)只允许适配器配置层(adapters/{hooks,config}/、web limits/search、
      mcp config)与 protocol/floor.py(路径定义点)。
 
+阶段4 追加(Task 10/T16 计划编号㉑):
+ 24. ``UPDATE store_metadata``/``DELETE store_metadata`` SQL 只允许
+     store/memory.py——memory 状态写入唯一缝(设计 §5.14 字面授权);
+     docstring/注释提及不算写入面。
+
 ``--praxis-only``:只扫 praxis 硬规则、跳过 rag 存量扫描(CI 门 R5:阶段1 只强制 praxis 规则)。
 
 Exit code 0: no anti-patterns found.
@@ -147,6 +152,7 @@ def _scan_file(path: Path) -> list[str]:
 # ---------------------------------------------------------------------------
 
 _PRAXIS_TURN_SQL_FILE = ("store", "turns.py")
+_PRAXIS_METADATA_SQL_FILE = ("store", "memory.py")
 _PRAXIS_WRITE_STATUS_FILE = ("core", "statemachine.py")
 _PRAXIS_INTERRUPTED_FILE = ("core", "recovery.py")
 _PRAXIS_SESSION_FILE = ("composition.py",)
@@ -270,6 +276,30 @@ def _has_update_turns_literal(tree: ast.Module) -> bool:
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             if re.search(r"UPDATE\s+turns", node.value):
                 return True
+    return False
+
+
+# 规则 24(阶段4/T10&T16 计划编号㉑):store_metadata 的 UPDATE/DELETE 只允许
+# store/memory.py。docstring/注释提及不算 SQL 写入面(同规则 8/19 口径)。
+# 盲区(文档化,非静默):拆分为多个字面量再拼("UPDATE store_" + "metadata")、
+# 或经变量/格式化动态构造的 SQL 无法被字符串字面量扫描看到——与规则 8/20 的
+# 代码字符串口径同类的固有限制,交给架构审查台账。
+_METADATA_WRITE_PATTERN = re.compile(
+    r"\bUPDATE\s+store_metadata\b|\bDELETE\s+(?:FROM\s+)?store_metadata\b",
+    re.IGNORECASE,
+)
+
+
+def _has_metadata_write_literal(tree: ast.Module) -> bool:
+    docstrings = _docstring_constant_ids(tree)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in docstrings
+            and _METADATA_WRITE_PATTERN.search(node.value)
+        ):
+            return True
     return False
 
 
@@ -468,6 +498,14 @@ def scan_praxis_file(path: Path, praxis_root: Path | None = None) -> list[str]:
     # 规则 3:UPDATE turns 只允许 store/turns.py(仅字符串字面量)
     if rel_parts != _PRAXIS_TURN_SQL_FILE and _has_update_turns_literal(tree):
         violations.append("UPDATE turns SQL outside store/turns.py — turn 状态写入只允许 store 层唯一入口")
+
+    # 规则 24(阶段4/T10&T16 ㉑):UPDATE/DELETE store_metadata 只允许
+    # store/memory.py——memory 状态写入唯一缝(设计 §5.14 字面授权面)。
+    if rel_parts != _PRAXIS_METADATA_SQL_FILE and _has_metadata_write_literal(tree):
+        violations.append(
+            "UPDATE/DELETE store_metadata SQL outside store/memory.py — "
+            "store_metadata 写入唯一缝(设计 §5.14)"
+        )
 
     # 规则 8(阶段2/S1):沙箱 profile 构造字面量只允许 adapters/sandbox/(代码字符串,排除 docstring)
     if rel_parts[:2] != _PRAXIS_SANDBOX_PKG:
