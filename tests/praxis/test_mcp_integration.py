@@ -1004,15 +1004,22 @@ def test_single_loop_run_pauses_on_mcp_tool_ask(workspace: Path, tmp_path: Path)
     assert _ps_lines(token) == []
 
 
-def test_chat_input_uses_daemon_thread_not_default_executor(
+def test_chat_input_and_prompts_use_daemon_thread_not_default_executor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """R-T19-2:输入线程必须 daemon 且不占默认 executor(否则 Ctrl+C 挂住)。"""
-    source = inspect.getsource(cli_main._read_answer_async)
-    assert "await asyncio.to_thread" not in source
-    assert "loop.create_future()" in source
-    assert "daemon=True" in source
-    assert "to_thread" not in inspect.getsource(cli_main._chat_loop_async)
+    """R-T19-2:主提示与审批/对账提示都必须 daemon 读,不占默认 executor。"""
+    read_source = inspect.getsource(cli_main._read_answer_async)
+    assert "loop.create_future()" in read_source
+    assert "daemon=True" in read_source
+    assert "await _read_answer_async(" in inspect.getsource(cli_main._ask_verdict_async)
+    # to_thread 的 worker 阻塞在 input() 上 ⇒ Ctrl+C 后 Runner.close() join 挂死。
+    # 钉住 REPL 全部提问腿(主循环 + 审批/对账),防止回退到默认 executor。
+    for func in (
+        cli_main._ask_verdict_async,
+        cli_main._chat_result_async,
+        cli_main._chat_loop_async,
+    ):
+        assert "to_thread" not in inspect.getsource(func), func.__name__
 
     monkeypatch.setattr(cli_main, "_read_answer", lambda _prompt: "line")
     assert asyncio.run(cli_main._read_answer_async("> ")) == "line"

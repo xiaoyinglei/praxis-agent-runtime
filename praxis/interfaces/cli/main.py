@@ -657,12 +657,17 @@ def _read_answer(prompt_text: str) -> str | None:
         return None
 
 
+def _parse_verdict(answer: str, choices: Mapping[str, str]) -> str | None:
+    """一行回答 → verdict(大小写/首尾空白不敏感);不匹配返回 None。"""
+    return choices.get(answer.strip().lower())
+
+
 def _ask_verdict(question: str, choices: Mapping[str, str]) -> str | None:
     while True:
         answer = _read_answer(question)
         if answer is None:
             return None
-        verdict = choices.get(answer.strip().lower())
+        verdict = _parse_verdict(answer, choices)
         if verdict is not None:
             return verdict
         typer.echo(f"please answer one of: {', '.join(choices)}")
@@ -769,6 +774,9 @@ async def _read_answer_async(prompt_text: str) -> str | None:
     专起 daemon 线程并用 ``call_soon_threadsafe`` 结算 future:第一次 Ctrl+C
     取消 ``await`` 即可干净返回,阻塞中的 daemon 线程随进程退出(它可能仍
     握着终端提示符;这是本方案已知的提示符回显角落,不阻塞退出)。
+
+    同一机制服务全部 REPL 提问:主提示 ``> ``、审批 y/n 与对账 ok/failed
+    (见 ``_ask_verdict_async``)。EOF/Ctrl+C 一律结算 ``None``。
     """
     loop = asyncio.get_running_loop()
     future: asyncio.Future[str | None] = loop.create_future()
@@ -790,6 +798,25 @@ async def _read_answer_async(prompt_text: str) -> str | None:
     return await future
 
 
+async def _ask_verdict_async(question: str, choices: Mapping[str, str]) -> str | None:
+    """R-T19-2 同族:审批/对账提示经 daemon 读,**不占默认 executor**。
+
+    审批提示曾把 ``_ask_verdict`` 丢进默认 executor:turn PAUSED 后 Ctrl+C 取消
+    ``await``,``asyncio.run`` 收尾仍会 join 默认 executor 里阻塞在 ``input()``
+    的 worker ⇒ 与主 REPL 同一挂死。此函数逐次提问走 ``_read_answer_async``,
+    语义与同步 ``_ask_verdict`` 一致:EOF/Ctrl+C 时 daemon 线程结算 ``None`` →
+    返回 ``None``(调用方输出 ``cancelled`` 并返回,不 resume)。
+    """
+    while True:
+        answer = await _read_answer_async(question)
+        if answer is None:
+            return None
+        verdict = _parse_verdict(answer, choices)
+        if verdict is not None:
+            return verdict
+        typer.echo(f"please answer one of: {', '.join(choices)}")
+
+
 async def _chat_turn_async(session: Session, text: str) -> None:
     """异步版单 turn 错误边界(与 ``_chat_turn`` 同一 C1 语义)。"""
     try:
@@ -807,15 +834,14 @@ async def _chat_turn_async(session: Session, text: str) -> None:
 
 
 async def _chat_result_async(session: Session, result: TurnResult) -> None:
-    """异步版审批循环;输入提示放到线程,submit/resume 仍在 MCP owner loop。"""
+    """异步版审批循环;提问走 daemon 读(不占默认 executor),resume 留在 owner loop。"""
     while True:
         code = _report_turn(result)
         if code != EXIT_PAUSED:
             return
         approval: dict[str, Literal["allow", "deny"]] = {}
         for summary in result.pending_approvals:
-            verdict = await asyncio.to_thread(
-                _ask_verdict,
+            verdict = await _ask_verdict_async(
                 f"allow {summary.tool_name} (call {summary.call_id}, digest {summary.args_digest[:12]})? [y/n] ",
                 _VERDICTS_YES_NO,
             )
@@ -825,8 +851,7 @@ async def _chat_result_async(session: Session, result: TurnResult) -> None:
             approval[summary.call_id] = cast("Literal['allow', 'deny']", verdict)
         reconcile: dict[str, Literal["ok", "failed"]] = {}
         for call_id in result.unknown_calls:
-            outcome = await asyncio.to_thread(
-                _ask_verdict,
+            outcome = await _ask_verdict_async(
                 f"call {call_id} side effect already happened? [ok/failed] ",
                 _VERDICTS_OUTCOME,
             )

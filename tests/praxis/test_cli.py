@@ -8,11 +8,12 @@ CliRunner 直调 typer app;RULING R14 先测(Session.items/turns/verify + sdk re
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import re
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from typer.testing import CliRunner
@@ -26,6 +27,7 @@ from praxis.interfaces.cli import main as cli_main
 from praxis.interfaces.cli.render import render_item
 from praxis.interfaces.cli.slash import REGISTRY
 from praxis.interfaces.sdk import (
+    ApprovalSummary,
     ConversationBusy,
     ModelResponse,
     ModelToolCall,
@@ -1786,6 +1788,103 @@ def test_chat_input_daemon_settles_on_revoked_tty(
         return await asyncio.wait_for(cli_main._read_answer_async("> "), timeout=5)
 
     assert asyncio.run(run()) is None
+
+
+class _ExplodingExecutor(concurrent.futures.ThreadPoolExecutor):
+    """默认 executor 哨兵:任何 submit 都算回归(提示腿占用了线程池)。
+
+    ``asyncio`` 会校验默认 executor 必须是 ``ThreadPoolExecutor`` 实例,
+    所以继承而不是鸭子类型;submit 在真正起 worker 前就失败。
+    """
+
+    def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("approval prompt must not submit to the default executor")
+
+
+def _paused_approval_result() -> TurnResult:
+    return TurnResult(
+        turn_id="paused1",
+        status=TurnStatus.PAUSED,
+        output="",
+        reason="approval_required",
+        pending_approvals=(
+            ApprovalSummary(
+                call_id="c1",
+                tool_name="bash",
+                args_digest="0" * 32,
+                effects=("execute_process",),
+            ),
+        ),
+    )
+
+
+def test_chat_approval_prompt_does_not_touch_default_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R-T19-2 审批腿回归:提示期 Ctrl+C 不再因默认 executor 里阻塞的 input() 挂死。
+
+    旧实现 ``await asyncio.to_thread(_ask_verdict, ...)`` 的 worker 阻塞在
+    ``input()``;``asyncio.run`` 收尾会 join 默认 executor ⇒ MCP chat 在 turn
+    PAUSED 后按 Ctrl+C 挂住。这里把默认 executor 换成"一 submit 就炸"的哨兵:
+    提示腿回退到 to_thread 会立刻失败,而不是在 CI 里静默挂住。
+    """
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "y")
+    resumed: list[tuple[str, Any, Any]] = []
+
+    class _Session:
+        thread_id = "approval"
+
+        async def resume(
+            self, turn_id: str, *, approval: Any = None, reconcile: Any = None
+        ) -> TurnResult:
+            resumed.append((turn_id, approval, reconcile))
+            return TurnResult(
+                turn_id=turn_id,
+                status=TurnStatus.COMPLETED,
+                output="approved done",
+                reason="model_finished",
+            )
+
+    async def run() -> None:
+        asyncio.get_running_loop().set_default_executor(_ExplodingExecutor())
+        await asyncio.wait_for(
+            cli_main._chat_result_async(cast("Any", _Session()), _paused_approval_result()),
+            timeout=5,
+        )
+
+    asyncio.run(run())
+    assert resumed == [("paused1", {"c1": "allow"}, None)]
+
+
+def test_chat_approval_prompt_eof_cancels_without_resume(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """审批提示 EOF/首次 Ctrl+C 与同步路径一致:结算 None → cancelled,不 resume。"""
+
+    def eof_input(_prompt: str = "") -> str:
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", eof_input)
+
+    class _Session:
+        thread_id = "approval"
+        resumed = False
+
+        async def resume(self, *args: Any, **kwargs: Any) -> TurnResult:
+            self.resumed = True
+            raise AssertionError("resume must not run after EOF at the approval prompt")
+
+    session = _Session()
+
+    async def run() -> None:
+        await asyncio.wait_for(
+            cli_main._chat_result_async(cast("Any", session), _paused_approval_result()),
+            timeout=5,
+        )
+
+    asyncio.run(run())
+    assert session.resumed is False
+    assert "cancelled" in capsys.readouterr().out
 
 
 def test_sdk_all_sorted_and_includes_task20_surface() -> None:

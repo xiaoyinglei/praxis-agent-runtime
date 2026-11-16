@@ -139,7 +139,8 @@ _WEB_FETCH_INPUT_SCHEMA: dict[str, Any] = {
             "default": DEFAULT_TIMEOUT_SECONDS,
             "description": (
                 "Per-request HTTP fetch timeout in seconds (default 45, hard tool cap 75); "
-                "the render path uses the host-configured 30-second render deadline instead."
+                "the render path uses a fixed 30-second render deadline (not configurable "
+                "in this phase) instead."
             ),
         },
         "start_line": {
@@ -429,9 +430,9 @@ def create_web_fetch_tools(
         "passes the same permission check at request time: ask and deny both abort that "
         "sub-resource (counts appear as blocked_ask/blocked_deny); nothing is silently passed. "
         "Rendering is bounded to 64 requests, 8000000 network bytes (8000000 per single "
-        "response, main document included), a 2000000-byte DOM and 30 seconds by default; "
-        "host web.json browser limits may lower or raise the request/byte ceilings within "
-        "their validated ranges. The 30-second render deadline is host-configured; "
+        "response, main document included), a 2000000-byte DOM and a fixed 30-second "
+        "render deadline (not configurable in this phase); host web.json browser limits "
+        "may lower or raise the request/byte ceilings within their validated ranges. "
         "timeout_seconds applies only to HTTP text reads. Over-budget renders stop "
         "fetching and return the partial DOM (budget_stopped=true, truncated=true). Rendered "
         "results add metadata: rendered, requests_used, bytes_used, dom_bytes, blocked_ask, "
