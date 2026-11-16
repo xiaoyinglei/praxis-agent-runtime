@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-from praxis.adapters.workspaces.git import GitWorktreeProvisioner
+from praxis.adapters.workspaces.git import GitWorktreeProvisioner, _encode_bundle
 from praxis.composition import build_session
 from praxis.interfaces.sdk import ScriptedAdapter
 from praxis.protocol.floor import host_config_dir
@@ -167,8 +167,101 @@ def test_apply_preimage_mismatch_keeps_both_sides_and_writes_nothing(
     assert not (repo / "new.txt").exists()
 
 
+def test_apply_conflicts_when_untracked_target_is_existing_directory(
+    repo: Path, provisioner: GitWorktreeProvisioner
+) -> None:
+    """R-T7-2:父仓在该路径已有目录 → conflict 先于任何写入(不派生半写)。"""
+    ws = provisioner.prepare(repo, "child-1", "write")
+    (ws / "a.txt").write_text("child\n", encoding="utf-8")
+    (ws / "new.txt").write_text("new\n", encoding="utf-8")
+    bundle = provisioner.diff(ws)
+
+    (repo / "new.txt").mkdir()  # 与子 untracked 同名的父目录
+    result = provisioner.apply(
+        repo,
+        bundle,
+        preimages={"a.txt": _sha(b"base\n"), "new.txt": None},
+    )
+
+    assert result.applied == []
+    assert result.conflicts == ["new.txt"]
+    # tracked 与 untracked 都未写:parent 字节与目录原样。
+    assert (repo / "a.txt").read_text(encoding="utf-8") == "base\n"
+    assert (repo / "new.txt").is_dir()
+
+
 # ---------------------------------------------------------------------------
-# git apply 失败:patch_failed 整组拒
+# R-T7-1:apply 校验 tracked diff 载荷本身(header 自报之外)
+# ---------------------------------------------------------------------------
+
+
+def test_tracked_praxis_addition_is_excluded_from_bundle(
+    repo: Path, provisioner: GitWorktreeProvisioner
+) -> None:
+    """子侧 git add 的 .praxis 文件会进 tracked diff——diff bundle 必须排除。"""
+    ws = provisioner.prepare(repo, "child-1", "write")
+    (ws / ".praxis").mkdir()
+    (ws / ".praxis" / "permissions.json").write_text('{"always": []}\n', encoding="utf-8")
+    _git(ws, "add", ".praxis/permissions.json")
+    # 反证:无排除 pathspec 时它确实出现在 tracked diff。
+    raw_diff = _git(
+        ws, "diff", "--no-renames", "HEAD", "--", ".praxis/permissions.json"
+    ).stdout
+    assert b"permissions.json" in raw_diff
+
+    bundle = provisioner.diff(ws)
+    assert b".praxis" not in bundle
+
+    result = provisioner.apply(repo, bundle, preimages={})
+    assert result.applied == []
+    assert result.conflicts == []
+    assert not (repo / ".praxis").exists()
+
+
+def test_apply_rejects_tracked_payload_outside_header_paths(
+    repo: Path, provisioner: GitWorktreeProvisioner
+) -> None:
+    """header 自报 a.txt,载荷实际改 bin.dat → 整组拒零写入。"""
+    ws = provisioner.prepare(repo, "child-1", "write")
+    (ws / "bin.dat").write_bytes(b"\x00child-bytes")
+    payload = _git(ws, "diff", "--binary", "--no-renames", "HEAD", "--", "bin.dat").stdout
+    assert payload
+    forged = _encode_bundle(payload, ["a.txt"], [])
+
+    with pytest.raises(ValueError, match="header"):
+        provisioner.apply(
+            repo,
+            forged,
+            preimages={"a.txt": _sha(b"base\n"), "bin.dat": _sha(b"\x00base-bytes")},
+        )
+
+    assert (repo / "a.txt").read_text(encoding="utf-8") == "base\n"
+    assert (repo / "bin.dat").read_bytes() == b"\x00base-bytes"
+
+
+def test_apply_rejects_excluded_paths_in_tracked_payload(
+    repo: Path, provisioner: GitWorktreeProvisioner
+) -> None:
+    """header 合法、载荷改 .praxis → 载荷级排除拒绝,父 .praxis 不落盘。"""
+    ws = provisioner.prepare(repo, "child-1", "write")
+    (ws / ".praxis").mkdir()
+    (ws / ".praxis" / "permissions.json").write_text('{"always": ["*"]}\n', encoding="utf-8")
+    _git(ws, "add", ".praxis/permissions.json")
+    payload = _git(
+        ws, "diff", "--binary", "--no-renames", "HEAD", "--", ".praxis/permissions.json"
+    ).stdout
+    assert payload
+    forged = _encode_bundle(payload, ["a.txt"], [])
+
+    with pytest.raises(ValueError, match="excluded path"):
+        provisioner.apply(repo, forged, preimages={"a.txt": _sha(b"base\n")})
+
+    assert (repo / "a.txt").read_text(encoding="utf-8") == "base\n"
+    assert not (repo / ".praxis").exists()
+
+
+# ---------------------------------------------------------------------------
+# patch_failed:git apply 失败整组拒
 # ---------------------------------------------------------------------------
 
 

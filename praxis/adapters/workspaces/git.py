@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import struct
 import subprocess
 import tempfile
@@ -96,13 +97,25 @@ def _validated_child_id(child_thread_id: str) -> str:
 
 
 def _file_digest(path: Path) -> str | None:
-    """preimage 摘要;缺失/非普通文件 → None(与 preimages 的 None 语义一致)。"""
+    """preimage 摘要;区分"真缺失"与"已存在但非普通文件"。
+
+    None 只在 lstat ENOENT 时返回;目录/悬空 symlink/fifo/无权限等已存在但
+    不可作为普通文件写的目标返回空串——空串与任何 sha256/None 都不相等,
+    因此 apply 会把它计入 conflicts(整体零写),不会先 apply tracked patch
+    再在 untracked 写入时炸出半写。
+    """
     try:
-        if not path.is_file():
-            return None
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return ""
+    if not stat.S_ISREG(mode):
+        return ""
+    try:
         return _sha256(path.read_bytes())
     except OSError:
-        return None
+        return ""
 
 
 def _untracked_paths(status: bytes) -> tuple[str, ...]:
@@ -230,6 +243,42 @@ class GitWorktreeProvisioner:
                 timeout=_GIT_TIMEOUT_SECONDS,
             )
 
+    # -- tracked patch 载荷对账 ----------------------------------------------
+
+    def _tracked_payload_paths(self, parent: Path, tracked_diff: bytes) -> tuple[str, ...]:
+        """解析 tracked diff 载荷的真实路径(``git apply --numstat -z``)。
+
+        header 的 tracked_paths 是自报清单;真正写父仓的是 diff 载荷。apply 前
+        必须逐条校验载荷路径(排除 .praxis/.git、不越界)并与 header 对账——
+        否则构造 header 合法、载荷改 ``.praxis`` 的 bundle 会绕过排除。
+        """
+        if not tracked_diff:
+            return ()
+        numstat = self._git(parent, parent, ("apply", "--numstat", "-z"), stdin=tracked_diff)
+        if numstat.returncode != 0:
+            raise RuntimeError(
+                f"patch_failed: git apply --numstat rejected the bundle: {_bounded(numstat.stderr)}"
+            )
+        summary = self._git(parent, parent, ("apply", "--summary"), stdin=tracked_diff)
+        if summary.returncode != 0:
+            raise RuntimeError(
+                f"patch_failed: git apply --summary rejected the bundle: {_bounded(summary.stderr)}"
+            )
+        for line in summary.stdout.decode("utf-8", errors="replace").splitlines():
+            # 本模块生成 diff 时固定 --no-renames;rename/copy 载荷的旧路径
+            # 不在 numstat 清单里,无法对账——整组拒绝(不引入 branch/rename 面)。
+            if line.strip().startswith(("rename ", "copy ")):
+                raise ValueError("workspace bundle must not contain rename/copy payloads")
+        paths: list[str] = []
+        for record in numstat.stdout.split(b"\0"):
+            if not record:
+                continue
+            fields = record.split(b"\t", 2)
+            if len(fields) != 3:
+                raise RuntimeError(f"patch_failed: malformed numstat record: {record!r}")
+            paths.append(os.fsdecode(fields[2]))
+        return tuple(paths)
+
     # -- prepare -------------------------------------------------------------
 
     def prepare(self, parent_root: Path, child_thread_id: str, mode: str) -> Path:
@@ -338,6 +387,20 @@ class GitWorktreeProvisioner:
             _repo_relative(raw_path)
             if _is_excluded(raw_path):
                 raise ValueError(f"workspace bundle must not contain excluded path: {raw_path!r}")
+        # 安全面承重:header 自报之外,逐条校验 tracked diff 载荷路径并对账。
+        payload_paths = self._tracked_payload_paths(parent, tracked_diff)
+        for raw_path in payload_paths:
+            _repo_relative(raw_path)
+            if _is_excluded(raw_path):
+                raise ValueError(
+                    f"workspace bundle patch must not touch excluded path: {raw_path!r}"
+                )
+        undeclared = sorted(set(payload_paths) - set(tracked_paths))
+        if undeclared:
+            raise ValueError(
+                "workspace bundle tracked diff paths do not match bundle header: "
+                f"undeclared={undeclared}"
+            )
         touched = sorted(set(bundle_paths))
 
         conflicts: list[str] = []
