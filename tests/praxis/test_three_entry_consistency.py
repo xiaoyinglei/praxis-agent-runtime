@@ -37,29 +37,44 @@ resume(approval={call: allow}) 重入,断言重入后执行成功且 args_digest
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
+import subprocess
+import sys
+import uuid
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 from hypothesis import HealthCheck, example, given, settings
 from hypothesis import strategies as st
+from mcp.types import CallToolResult, TextContent
+from mcp.types import Tool as McpTool
 from typer.testing import CliRunner
 
 from praxis import composition
+from praxis.adapters.mcp.config import StdioServerConfig
+from praxis.adapters.mcp.descriptors import mcp_tools_for_connection
+from praxis.adapters.mcp.lifecycle import McpConnection
 from praxis.adapters.models.scripted import ScriptedAdapter
 from praxis.adapters.sandbox.base import probe_backend
+from praxis.adapters.web.client import PublicHttpClient
+from praxis.adapters.web.limits import WebLimits
+from praxis.adapters.web.search import create_web_search_tools, load_web_search_config
+from praxis.adapters.web.tools import create_web_fetch_tools
 from praxis.core import permission
 from praxis.interfaces.cli import app
 from praxis.interfaces.sdk import open_session
+from praxis.protocol.floor import host_config_dir
 from praxis.protocol.items import Item, ItemKind
 from praxis.protocol.models import ModelResponse, ModelToolCall, Usage
 from praxis.protocol.permission import PermissionContext, PermissionMode, SandboxAvailability
 from praxis.protocol.policy import NetworkPolicy, PathRule, PermissionPolicy, ToolRule
-from praxis.protocol.tools import Tool
+from praxis.protocol.tools import Tool, ToolSource
 from praxis.store.log import Store
 from praxis.tools.builtins.command import create_bash_tool
 from praxis.tools.builtins.command_sessions import CommandSessions, create_manage_command_tool
@@ -68,6 +83,18 @@ from praxis.tools.builtins.patch import create_apply_patch_tool
 from praxis.tools.builtins.planning import create_update_plan_tool
 from praxis.tools.builtins.python_tool import create_run_python_tool
 from praxis.tools.builtins.search import create_search_text_tool
+from praxis.tools.builtins.skills import (
+    create_invoke_skill_tool,
+    create_materialize_skill_asset_tool,
+    load_skill_catalog,
+)
+from tests.praxis.test_web_urls_dns import (
+    PUBLIC_IP,
+    FakeBackend,
+    FakeResolver,
+    FakeStream,
+    response_chunks,
+)
 
 CALL_ID = "c1"
 _TOOL_NAMES = (
@@ -79,6 +106,11 @@ _TOOL_NAMES = (
     "update_plan",
     "manage_command",
     "run_python",
+    # T21 扩展:3B 四个新 builtin 纳入同一一致性属性(默认表 T20 已装配)。
+    "web_fetch",
+    "web_search",
+    "invoke_skill",
+    "materialize_skill_asset",
 )
 _FAKE_SANDBOX = SandboxAvailability(backend="seatbelt", available=True)
 _AVAILABLE = probe_backend()
@@ -86,12 +118,16 @@ _CLEAN_ENV = {"PRAXIS_MODEL": None, "PRAXIS_BASE_URL": None, "PRAXIS_API_KEY": N
 _runner = CliRunner()
 
 # 预置 read 目标(保证 read 执行即 ok,不落入 not_found);write/bash 目标见策略。
+# T21 扩展:demo skill(含 scripts/ 资产)供 invoke_skill/materialize 用例;
+# 内容不含 "seed"/"x" 模式,既有 search_text 用例的匹配面不变。
 _SEED_FILES = {
     "note.txt": "seed note\n",
     ".git/config": "orig\n",
     ".praxis/state.json": "{}\n",
     ".agent_memory/mem.txt": "memory\n",
     "sub/deep.txt": "deep\n",
+    ".agents/skills/demo/SKILL.md": "---\nname: demo\ndescription: demo skill\n---\ndemo instructions\n",
+    ".agents/skills/demo/scripts/run.py": "print('demo')\n",
 }
 
 
@@ -147,6 +183,14 @@ def call_strategy(draw: st.DrawFn) -> Call:
         return Call(tool, {"plan": [{"step": "check state", "status": "in_progress"}]})
     if tool == "manage_command":
         return Call(tool, {"session_id": _CMD_ID, "action": "status"})
+    if tool == "web_fetch":
+        return Call(tool, {"url": "https://example.com/"})
+    if tool == "web_search":
+        return Call(tool, {"query": draw(st.sampled_from(("praxis", "public docs")))})
+    if tool == "invoke_skill":
+        return Call(tool, {"name": draw(st.sampled_from(("demo", "absent")))})
+    if tool == "materialize_skill_asset":
+        return Call(tool, {"skill_id": "demo", "relative_path": "scripts/run.py"})
     return Call(tool, {"code": "print('praxis property')"})
 
 
@@ -242,6 +286,90 @@ def _assert_reentry_outcome(items: list[Item], call_id: str, policy: PermissionP
 
 
 # ---------------------------------------------------------------------------
+# T21 扩展装置:离线 web client / MCP 形状样本 / MCP 真 harness 接线槽
+# ---------------------------------------------------------------------------
+
+
+class _UnlimitedBackend(FakeBackend):
+    """每次 connect 都返回一条新的 200 HTML 假流(属性测试绝不触网)。"""
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: object = None,
+    ) -> FakeStream:
+        self.connects.append((host, port, timeout))
+        stream = FakeStream(
+            response_chunks(body=b"<p>praxis offline</p>", headers=[("Content-Type", "text/html")])
+        )
+        self.issued.append(stream)
+        return stream
+
+
+def _offline_http_client(*, authorize: Callable[[str], None], limits: WebLimits) -> PublicHttpClient:
+    """composition.PublicHttpClient 的离线替身(签名兼容组合根装配点)。
+
+    web_fetch 加入工具集后,executed 类用例会真实 dispatch 抓取——必须经
+    T10 的 resolver/backend 接缝注入假答案,属性测试保持零网络。authorize
+    仍由组合根传入**生产闭包**(make_web_authorizer 读 live 权限),裁决面
+    不被替身绕过。
+    """
+    return PublicHttpClient(
+        authorize=authorize,
+        limits=limits,
+        resolver=FakeResolver([PUBLIC_IP]),
+        backend=_UnlimitedBackend(),
+        environ={},
+    )
+
+
+def _mcp_shape_tool() -> Tool:
+    """ONE source=MCP 形状样本:经 ``mcp_tools_for_connection`` 在 fake
+    McpConnection 上构造(T21 派单口径)。echo schema 与真 fixture server
+    (tests/praxis/fixtures/mcp_probe_server.py)逐字一致,validate/resolve
+    行为与真连接投影不可区分;decide 不得因 source 特殊对待(见下方等价测试)。
+    """
+
+    class _Session:
+        async def call_tool(self, name: str, arguments: Mapping[str, Any] | None = None) -> CallToolResult:
+            message = (arguments or {}).get("message", "")
+            return CallToolResult(content=[TextContent(type="text", text=f"echo: {message}")], isError=False)
+
+    config = StdioServerConfig(
+        name="probe",
+        command="/bin/echo",
+        args=(),
+        env={},
+        cwd=None,
+        tools_allowlist=frozenset(),
+        allow_all_tools=True,
+        startup_timeout_seconds=20.0,
+    )
+    catalog_tool = McpTool(
+        name="echo",
+        description="Echo the supplied message.",
+        inputSchema={
+            "type": "object",
+            "properties": {"message": {"type": "string"}},
+            "required": ["message"],
+            "additionalProperties": False,
+        },
+    )
+    connection = McpConnection(server_name="probe", session=_Session(), tools=(catalog_tool,))  # type: ignore[arg-type]
+    (tool,) = mcp_tools_for_connection(connection, config, config_sha_provider=lambda: "shape-baseline")
+    return tool
+
+
+# T17 carry(T21 落实):MCP 决策场景的**真 harness** 接线槽。None = 既有路径
+# 逐字不变;设置后 model/resume 入口在**同一事件循环**内 connect → open →
+# submit → aclose(CLI 入口经 _mcp_configured 自动连接,不需要槽)。
+MCP_WIRING: Callable[[Path, Scenario], Awaitable[tuple[tuple[Tool, ...], tuple[Any, ...]]]] | None = None
+
+
+# ---------------------------------------------------------------------------
 # 入口运行器(统一签名;ENTRIES 注册表 = 阶段 4 子代理扩展位)
 # ---------------------------------------------------------------------------
 
@@ -280,11 +408,27 @@ def _effective_mode(scenario: Scenario) -> PermissionMode:
 
 def run_via_model(workspace: Path, call: Call, scenario: Scenario, example_root: Path) -> Observation:
     adapter = ScriptedAdapter([_resp_call(call), _resp_done()])
-    session = open_session(workspace, adapter, policy=scenario.policy, mode=scenario.mode, thread_id="model")
-    try:
-        asyncio.run(session.submit("three-entry property"))
-    finally:
-        session.close()
+    if MCP_WIRING is None:
+        session = open_session(workspace, adapter, policy=scenario.policy, mode=scenario.mode, thread_id="model")
+        try:
+            asyncio.run(session.submit("three-entry property"))
+        finally:
+            session.close()
+    else:
+        wiring = MCP_WIRING
+
+        async def _go() -> None:
+            extra_tools, integrations = await wiring(workspace, scenario)
+            session = open_session(
+                workspace, adapter, policy=scenario.policy, mode=scenario.mode, thread_id="model",
+                extra_tools=extra_tools, integrations=integrations,
+            )
+            try:
+                await session.submit("three-entry property")
+            finally:
+                await session.aclose()
+
+        asyncio.run(_go())
     return observe_first_decision(_read_items(workspace, "model"), CALL_ID, workspace)
 
 
@@ -314,16 +458,36 @@ def run_via_cli(workspace: Path, call: Call, scenario: Scenario, example_root: P
 
 def run_via_resume(workspace: Path, call: Call, scenario: Scenario, example_root: Path) -> Observation:
     adapter = ScriptedAdapter([_resp_call(call), _resp_done()])
-    session = open_session(workspace, adapter, policy=scenario.policy, mode=scenario.mode, thread_id="resume")
-    try:
-        result = asyncio.run(session.submit("three-entry property"))
-        first = observe_first_decision(session.items(), CALL_ID, workspace)
-        if first.decision_class == "asked":
-            asyncio.run(session.resume(result.turn_id, approval={CALL_ID: "allow"}))
-            _assert_reentry_outcome(session.items(), CALL_ID, scenario.policy)
-    finally:
-        session.close()
-    return first
+    if MCP_WIRING is None:
+        session = open_session(workspace, adapter, policy=scenario.policy, mode=scenario.mode, thread_id="resume")
+        try:
+            result = asyncio.run(session.submit("three-entry property"))
+            first = observe_first_decision(session.items(), CALL_ID, workspace)
+            if first.decision_class == "asked":
+                asyncio.run(session.resume(result.turn_id, approval={CALL_ID: "allow"}))
+                _assert_reentry_outcome(session.items(), CALL_ID, scenario.policy)
+        finally:
+            session.close()
+        return first
+    wiring = MCP_WIRING
+
+    async def _go() -> Observation:
+        extra_tools, integrations = await wiring(workspace, scenario)
+        session = open_session(
+            workspace, adapter, policy=scenario.policy, mode=scenario.mode, thread_id="resume",
+            extra_tools=extra_tools, integrations=integrations,
+        )
+        try:
+            result = await session.submit("three-entry property")
+            first = observe_first_decision(session.items(), CALL_ID, workspace)
+            if first.decision_class == "asked":
+                await session.resume(result.turn_id, approval={CALL_ID: "allow"})
+                _assert_reentry_outcome(session.items(), CALL_ID, scenario.policy)
+            return first
+        finally:
+            await session.aclose()
+
+    return asyncio.run(_go())
 
 
 # 阶段 4 子代理入口复用同一 execute,届时在此注册即纳入一致性属性。
@@ -336,6 +500,7 @@ ENTRIES: dict[str, Callable[[Path, Call, Scenario, Path], Observation]] = {
 
 def _reference_decision(workspace: Path, call: Call, scenario: Scenario, sandbox: SandboxAvailability) -> permission.Decision:
     sessions = CommandSessions(workspace)
+    web_client = _offline_http_client(authorize=lambda _url: None, limits=WebLimits())
     tools: dict[str, Tool] = {
         "read": create_read_tool(workspace),
         "write": create_write_tool(workspace),
@@ -345,6 +510,16 @@ def _reference_decision(workspace: Path, call: Call, scenario: Scenario, sandbox
         "update_plan": create_update_plan_tool(),
         "manage_command": create_manage_command_tool(sessions),
         "run_python": create_run_python_tool(workspace),
+        # T21:与组合根默认表同工厂/同配置源(web.json 缺失 ⇒ unconfigured,
+        # 与三入口实际装配一致);render=false 的 resolve_use 与 renderer
+        # 注入与否无关(只 NETWORK),decide 输入逐字相同。
+        "web_fetch": create_web_fetch_tools(web_client, limits=WebLimits())[0],
+        "web_search": create_web_search_tools(
+            web_client, config_provider=load_web_search_config, credential_provider=lambda _cfg: None
+        )[0],
+        "invoke_skill": create_invoke_skill_tool(load_skill_catalog(workspace)),
+        "materialize_skill_asset": create_materialize_skill_asset_tool(workspace),
+        "mcp__probe__echo": _mcp_shape_tool(),
     }
     tool = tools[call.tool]
     args = tool.validate_input(dict(call.arguments))
@@ -394,6 +569,9 @@ def test_three_entries_same_decision(tmp_path_factory: pytest.TempPathFactory) -
         mp.setattr(composition, "probe_backend", lambda: _FAKE_SANDBOX)
         mp.setattr(composition, "compile_sandbox", None)
         mp.setattr(composition, "finalize_sandbox", None)
+        # T21:web_fetch 入表后 executed 类会真实 dispatch 抓取——离线替身
+        # 保持属性测试零网络(authorize 仍是组合根的生产闭包)。
+        mp.setattr(composition, "PublicHttpClient", _offline_http_client)
 
         @example(Call("write", {"path": "out.txt", "content": "x"}), Scenario(PermissionPolicy(), None))  # executed
         @example(Call("write", {"path": ".git/config", "content": "x"}), Scenario(PermissionPolicy(), None))  # denied(floor)
@@ -461,6 +639,25 @@ _NET_DENY = PermissionPolicy(network=NetworkPolicy(decision="deny"))
         ("allow-run-python", Call("run_python", {"code": "print('ok')"}), Scenario(_NET_ALLOW, None), "executed"),
         ("ask-run-python-default-network", Call("run_python", {"code": "print('ok')"}), Scenario(PermissionPolicy(), None), "asked"),
         ("deny-tool-rule-run-python", Call("run_python", {"code": "print('ok')"}), Scenario(PermissionPolicy(tools=(ToolRule(pattern="run_python", decision="deny"),)), None), "denied"),
+        # T21 扩展:3B 四个新 builtin 每类至少一例(同一 decide、同一观测口径)。
+        # web_fetch:URL target 走 network 面——allow ⇒ 离线抓取执行;默认 ask ⇒
+        # 第 2 步暂停;deny ⇒ 第 1 步拒。web_search 未配置(隔离宿主无 web.json):
+        # NETWORK **无 url target** ⇒ 第 6 步完整授权覆盖不成立 ⇒ fallback ask
+        # ——即使 network allow 也 ask(决策类别与业务错误 unconfigured 无关)。
+        ("allow-web-fetch-net-allow", Call("web_fetch", {"url": "https://example.com/"}), Scenario(_NET_ALLOW, None), "executed"),
+        ("ask-web-fetch-default-network", Call("web_fetch", {"url": "https://example.com/"}), Scenario(PermissionPolicy(), None), "asked"),
+        ("deny-web-fetch-net-deny", Call("web_fetch", {"url": "https://example.com/"}), Scenario(_NET_DENY, None), "denied"),
+        ("ask-web-search-unconfigured-net-allow", Call("web_search", {"query": "praxis"}), Scenario(_NET_ALLOW, None), "asked"),
+        ("ask-web-search-default", Call("web_search", {"query": "praxis"}), Scenario(PermissionPolicy(), None), "asked"),
+        ("deny-tool-rule-web-search", Call("web_search", {"query": "praxis"}), Scenario(PermissionPolicy(tools=(ToolRule(pattern="web_search", decision="deny"),)), None), "denied"),
+        ("allow-invoke-skill", Call("invoke_skill", {"name": "demo"}), Scenario(PermissionPolicy(), None), "executed"),
+        ("ask-invoke-skill", Call("invoke_skill", {"name": "demo"}), Scenario(PermissionPolicy(tools=(ToolRule(pattern="invoke_skill", decision="ask"),)), None), "asked"),
+        ("deny-invoke-skill", Call("invoke_skill", {"name": "demo"}), Scenario(PermissionPolicy(tools=(ToolRule(pattern="invoke_skill", decision="deny"),)), None), "denied"),
+        # materialize:单调用 turn 未激活 ⇒ 业务错误 skill_not_active(已 dispatch,
+        # 决策类别 executed);read-only profile 写拒 ⇒ denied;tool ask ⇒ asked。
+        ("allow-materialize-skill-asset", Call("materialize_skill_asset", {"skill_id": "demo", "relative_path": "scripts/run.py"}), Scenario(PermissionPolicy(), None), "executed"),
+        ("deny-materialize-readonly", Call("materialize_skill_asset", {"skill_id": "demo", "relative_path": "scripts/run.py"}), Scenario(PermissionPolicy(profile="read-only"), None), "denied"),
+        ("ask-materialize-tool-rule", Call("materialize_skill_asset", {"skill_id": "demo", "relative_path": "scripts/run.py"}), Scenario(PermissionPolicy(tools=(ToolRule(pattern="materialize_skill_asset", decision="ask"),)), None), "asked"),
     ],
 )
 def test_decision_matrix_all_entries(
@@ -470,6 +667,7 @@ def test_decision_matrix_all_entries(
         mp.setattr(composition, "probe_backend", lambda: _FAKE_SANDBOX)
         mp.setattr(composition, "compile_sandbox", None)
         mp.setattr(composition, "finalize_sandbox", None)
+        mp.setattr(composition, "PublicHttpClient", _offline_http_client)  # T21:零网络
         example_root = tmp_path_factory.mktemp(label)
         observations = _run_all_entries(example_root, call, scenario)
         reference = _reference_decision(example_root / "model", call, scenario, _FAKE_SANDBOX)
@@ -506,6 +704,111 @@ def test_real_sandbox_three_entries(
     reference = _reference_decision(example_root / "model", call, scenario, _AVAILABLE)
     observed = _assert_consistent(observations, call, scenario, reference, example_root / "model")
     assert observed == expected, (label, observations)
+
+
+# ---------------------------------------------------------------------------
+# T21 扩展:MCP 形状样本(source=MCP)与真 harness 三入口 MCP 场景(T17 carry)
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_shape_sample_decides_without_special_treatment() -> None:
+    """fake McpConnection 经 mcp_tools_for_connection 构造的 source=MCP 样本:
+    decide 不得因 source 特殊对待——把 source 换成 BUILTIN 的克隆在全部策略
+    形态下 verdict+reason 逐字相同(分类只消费 tool.source 的展示/审计面,
+    决策面没有 MCP 分支;Q3 三层自带守卫消灭的终态)。
+    """
+    tool = _mcp_shape_tool()
+    assert tool.source is ToolSource.MCP
+    assert tool.definition.name == "mcp__probe__echo"
+    assert tool.static_effects == frozenset()  # stdio {} effects(T17 钉死值)
+    clone = dataclasses.replace(tool, source=ToolSource.BUILTIN)
+    use = tool.resolve_use({"message": "hi"})
+    policies = (
+        PermissionPolicy(),
+        PermissionPolicy(tools=(ToolRule(pattern="mcp__probe__echo", decision="allow"),)),
+        PermissionPolicy(tools=(ToolRule(pattern="mcp__probe__echo", decision="ask"),)),
+        PermissionPolicy(tools=(ToolRule(pattern="mcp__probe__echo", decision="deny"),)),
+        PermissionPolicy(tools=(ToolRule(pattern="mcp__probe__*", decision="deny"),)),
+        PermissionPolicy(network=NetworkPolicy(decision="deny")),
+    )
+    for policy in policies:
+        for mode in ("on-request", "never", "bypass"):
+            ctx = PermissionContext(
+                workspace="/tmp", policy=policy, mode=mode, sandbox=_FAKE_SANDBOX  # type: ignore[arg-type]
+            )
+            mcp_decision = permission.decide(tool, use, ctx)
+            builtin_decision = permission.decide(clone, use, ctx)
+            assert (mcp_decision.verdict, mcp_decision.reason) == (
+                builtin_decision.verdict, builtin_decision.reason
+            ), (policy, mode)
+
+
+_MCP_CALL = Call("mcp__probe__echo", {"message": "hi"})
+_MCP_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "mcp_probe_server.py"
+
+
+@pytest.mark.skipif(not _AVAILABLE.available, reason="bwrap deferred / no sandbox backend")
+@pytest.mark.parametrize(
+    ("label", "scenario", "expected"),
+    [
+        # stdio MCP 工具 effects={} ⇒ 默认策略 policy-grant 直接执行;
+        # tool 规则 ask/deny 与 builtin 同一 decide 口径。allow_all_tools=True
+        # 使连接预检只在 wildcard deny 时跳过(Q4),exact-name 规则留给 decide。
+        ("mcp-executed-default", Scenario(PermissionPolicy(), None), "executed"),
+        ("mcp-ask-tool-rule", Scenario(PermissionPolicy(tools=(ToolRule(pattern="mcp__probe__echo", decision="ask"),)), None), "asked"),
+        ("mcp-deny-tool-rule", Scenario(PermissionPolicy(tools=(ToolRule(pattern="mcp__probe__echo", decision="deny"),)), None), "denied"),
+    ],
+)
+def test_mcp_three_real_harness_entries(
+    label: str, scenario: Scenario, expected: str, tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T17 carry:一个 MCP 决策场景经**真 harness 三入口**(run_via_model /
+    run_via_cli / run_via_resume),而不是三次相同的 execute——model/resume
+    经 MCP_WIRING 在同一 loop 内 connect→open→submit→aclose;CLI 经
+    ``_mcp_configured`` 自动连接(生产 compile_sandbox,真 seatbelt)。
+    真 fixture stdio server(mcp SDK),参考决策用同形状 fake-connection 样本。
+    """
+    token = "t21-entry-" + uuid.uuid4().hex
+    directory = host_config_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    directory.chmod(0o700)
+    config = directory / "mcp_servers.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "servers": [
+                    {
+                        "name": "probe",
+                        "enabled": True,
+                        "transport": "stdio",
+                        "command": sys.executable,
+                        "args": ["-I", str(_MCP_FIXTURE), "--token", token],
+                        "allow_all_tools": True,
+                        "startup_timeout_seconds": 10.0,
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    config.chmod(0o600)
+
+    async def wiring(workspace: Path, scen: Scenario) -> tuple[tuple[Tool, ...], tuple[Any, ...]]:
+        bundle = await composition.connect_mcp_servers(workspace, policy=scen.policy)
+        assert [s.connected for s in bundle.statuses] == [True], bundle.statuses
+        return bundle.tools, (bundle,)
+
+    monkeypatch.setattr(sys.modules[__name__], "MCP_WIRING", wiring)
+    example_root = tmp_path_factory.mktemp(label)
+    observations = _run_all_entries(example_root, _MCP_CALL, scenario)
+    reference = _reference_decision(example_root / "model", _MCP_CALL, scenario, _AVAILABLE)
+    observed = _assert_consistent(observations, _MCP_CALL, scenario, reference, example_root / "model")
+    assert observed == expected, (label, observations)
+    # 三入口各自的 server 进程组都必须已回收(session.aclose / CLI finally)。
+    completed = subprocess.run(
+        ["ps", "-eo", "pid=,args="], capture_output=True, text=True, timeout=20, check=False
+    )
+    assert [row for row in completed.stdout.splitlines() if token in row] == []
 
 
 if __name__ == "__main__":  # pragma: no cover
