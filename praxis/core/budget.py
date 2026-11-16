@@ -133,10 +133,16 @@ class BudgetNode:
 
 @dataclass(frozen=True, slots=True)
 class Admission:
-    """一次 dispatch 的准入结论;reason 只在拒绝时非空。"""
+    """一次 dispatch 的准入结论;reason 只在拒绝时非空。
+
+    ``dimension``(R-T3-6)是拒绝时的耗尽维名(tokens/cost_micros/steps/
+    web_requests/browser_requests;pricing_unavailable 归 cost_micros)——
+    供上层(CLI 文案)点名耗尽维与对应补预算出路;放行时恒 None。
+    """
 
     allowed: bool
     reason: str = ""
+    dimension: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -384,7 +390,7 @@ def admit_dispatch(node: BudgetNode, *, needs_compaction: bool) -> Admission:
     """
     cost_limit = node.limits.cost_micros
     if cost_limit is not None and (node.unit_costs is None or node.unit_costs.is_zero):
-        return Admission(False, "pricing_unavailable")
+        return Admission(False, "pricing_unavailable", "cost_micros")
 
     used = exposure(node)
     token_limit = node.limits.tokens
@@ -395,11 +401,11 @@ def admit_dispatch(node: BudgetNode, *, needs_compaction: bool) -> Admission:
             else max(token_limit - protected_tail(token_limit), 0)
         )
         if used.tokens >= effective_limit:
-            return Admission(False, "budget_exhausted")
+            return Admission(False, "budget_exhausted", "tokens")
     if cost_limit is not None and used.cost_micros >= cost_limit:
-        return Admission(False, "budget_exhausted")
+        return Admission(False, "budget_exhausted", "cost_micros")
     if node.limits.steps is not None and used.steps >= node.limits.steps:
-        return Admission(False, "budget_exhausted")
+        return Admission(False, "budget_exhausted", "steps")
     return Admission(True, "")
 
 
@@ -699,12 +705,12 @@ class BudgetTracker:
         web_limit = node.limits.web_requests
         used_web = used.web_requests + self._inflight_web
         if web_limit is not None and used_web >= web_limit:
-            return Admission(False, "budget_exhausted")
+            return Admission(False, "budget_exhausted", "web_requests")
         if browser:
             browser_limit = node.limits.browser_requests
             used_browser = used.browser_requests + self._inflight_browser
             if browser_limit is not None and used_browser >= browser_limit:
-                return Admission(False, "budget_exhausted")
+                return Admission(False, "budget_exhausted", "browser_requests")
         self._inflight_web += 1
         if browser:
             self._inflight_browser += 1

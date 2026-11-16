@@ -21,8 +21,9 @@
 3.5. 预算闸(阶段4 T3,注入 ``budget`` 时):``refresh()`` 后 ``admit_dispatch``
    ——树维度耗尽 → ``transition(PAUSED, "budget_exhausted")``、cost 限额而
    单价缺失 → ``transition(PAUSED, "pricing_unavailable")``,可 resume+extend
-   续跑;压缩逃生面(已压缩续作/本轮超压缩阈值)可用保护尾。与 max_steps
-   硬护栏双闸并存、语义不同(R-T3-1);
+   续跑。保护尾豁免逐次 dispatch(R-T3-7):一次性续作旗标消费即复位,
+   超阈值预授只给摘要调用——压缩未产出摘要则按普通调用重新准入。与
+   max_steps 硬护栏双闸并存、语义不同(R-T3-1);
 4. 无 tool_calls → ``transition(COMPLETED, "model_finished")``;
 5. 有 tool_calls → 逐个 ``execute``;任一 PAUSED → 管道已完成 RUNNING→PAUSED
    转换,直接返回并附未批摘要;
@@ -48,7 +49,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-from praxis.core.budget import BudgetTracker, fold_turn_facts
+from praxis.core.budget import Admission, BudgetTracker, fold_turn_facts
 from praxis.core.compaction import (
     SUMMARY_MAX_OUTPUT_TOKENS,
     SUMMARY_PROMPT_MAX_CHARS,
@@ -186,6 +187,8 @@ class TurnResult:
 
     ``notices`` 是本次续跑**落地权限更新**时的如实披露(如 NetworkRule 授权
     使 bash 命令网络 fail-closed 的 D9 提示);空元组 = 无披露,既有构造零改动。
+    ``budget_dimension``(R-T3-6,尾部默认零破坏)只在 reason=="budget_exhausted"
+    时填耗尽维名,供 CLI 点名对应补预算出路;其余结局恒 None。
     """
 
     turn_id: str
@@ -195,6 +198,7 @@ class TurnResult:
     pending_approvals: tuple[ApprovalSummary, ...] = ()
     unknown_calls: tuple[str, ...] = ()
     notices: tuple[PermissionNotice, ...] = ()
+    budget_dimension: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +427,28 @@ def _collect_pending_approvals(deps: TurnDeps, turn_id: str) -> tuple[ApprovalSu
     )
 
 
+def _budget_paused(
+    deps: TurnDeps,
+    state: TurnState,
+    admission: Admission,
+    output: str,
+    unknown_calls: Sequence[str],
+) -> TurnResult:
+    """预算拒绝 → PAUSED(T3):reason 即准入真实 reason,pending_approvals 恒空
+    (这不是审批暂停)。budget_dimension 只在 budget_exhausted 时填(R-T3-6)。
+    """
+    transition(deps.store, deps.bus, state.turn_id, TurnStatus.PAUSED, reason=admission.reason)
+    return TurnResult(
+        turn_id=state.turn_id,
+        status=TurnStatus.PAUSED,
+        output=output,
+        reason=admission.reason,
+        pending_approvals=(),
+        unknown_calls=tuple(unknown_calls),
+        budget_dimension=admission.dimension if admission.reason == "budget_exhausted" else None,
+    )
+
+
 def _paused_result(
     deps: TurnDeps, state: TurnState, output: str, unknown_calls: Sequence[str]
 ) -> TurnResult:
@@ -460,7 +486,10 @@ async def run_turn(
     ctx = _exec_ctx(deps, state)
     unknown_calls: list[str] = []
     last_content = ""
-    compacted = False  # 本 turn 是否真的写入过 summary/boundary(K-1)
+    # R-T3-7:保护尾豁免是**逐次 dispatch** 参数(旧 ensure_token_headroom 的
+    # allow_protected 每次现算,从不锁存整 turn)。continuation 旗标一次性:
+    # 压缩成功置位,下一次 admit 消费即复位——豁免只及紧随压缩的那次续作。
+    compaction_continuation = False
     compaction_attempted = False  # R-P4:每 turn 最多尝试一次(含"无可覆盖区间")
     try:
         # R-PF-4:steps 初值 = fold 声明轮数(重放轮无新 model_response 事实,
@@ -505,25 +534,19 @@ async def run_turn(
             # 步序 3.5(阶段4 T3):步边界预算闸——先 refresh 后 admit
             # (BudgetTracker 不变量)。树维度耗尽/单价缺失 → PAUSED(约定预算
             # 可补预算续跑,不是 FAILED 失控);pending_approvals 恒空——这不是
-            # 审批暂停。needs_compaction = 压缩逃生面:本 turn 已压缩(续作)
-            # 或本轮出站请求超压缩阈值(摘要调用本身)——可用完整 token limit
-            # (保护尾);普通调用只用扣保护尾后的余量(T2 admit_dispatch)。
+            # 审批暂停。保护尾豁免逐次 dispatch(R-T3-7):continuation 旗标
+            # 只豁免紧随压缩的那次续作(消费即复位);over_threshold 只预授
+            # 本轮摘要调用,压缩未产出摘要时下面按普通调用重新准入。普通调用
+            # 只用扣保护尾后的余量(T2 admit_dispatch)。
+            needs_compaction = compaction_continuation or over_threshold
+            compaction_continuation = False
             if deps.budget is not None:
                 deps.budget.refresh()
-                admission = deps.budget.admit_dispatch(needs_compaction=compacted or over_threshold)
+                admission = deps.budget.admit_dispatch(needs_compaction=needs_compaction)
                 if not admission.allowed:
-                    transition(
-                        deps.store, deps.bus, state.turn_id, TurnStatus.PAUSED, reason=admission.reason
-                    )
-                    return TurnResult(
-                        turn_id=state.turn_id,
-                        status=TurnStatus.PAUSED,
-                        output=last_content,
-                        reason=admission.reason,
-                        pending_approvals=(),
-                        unknown_calls=tuple(unknown_calls),
-                    )
-            if measured_tokens is not None and compact_limit is not None and measured_tokens > compact_limit:
+                    return _budget_paused(deps, state, admission, last_content, unknown_calls)
+            # compact_limit is not None 是 mypy 类型守卫(over_threshold 已蕴含)。
+            if over_threshold and compact_limit is not None:
                 compaction_attempted = True
                 outcome = await maybe_compact(
                     store=deps.store,
@@ -538,9 +561,16 @@ async def run_turn(
                     request=req,
                     measured_tokens=measured_tokens,
                 )
-                compacted = isinstance(outcome, CompactionOutcome) and outcome.compacted
-                if compacted:
+                if isinstance(outcome, CompactionOutcome) and outcome.compacted:
+                    compaction_continuation = True  # 豁免只及下一次 admit(续作)
                     continue
+                # R-T3-7 同源边界:压缩未产出摘要(失败/无可覆盖区间)——预授
+                # 豁免作废,本轮普通 dispatch 按 needs_compaction=False 重新准入。
+                if deps.budget is not None:
+                    deps.budget.refresh()
+                    admission = deps.budget.admit_dispatch(needs_compaction=False)
+                    if not admission.allowed:
+                        return _budget_paused(deps, state, admission, last_content, unknown_calls)
             # core 只走流式(D1);complete() 也由同一条 stream 装配派生。
             # 重试机制由 composition 以结构签名注入:core 不认识
             # openai/httpx,只认识"给工厂、已有尝试、clock floor,拿回事件"。

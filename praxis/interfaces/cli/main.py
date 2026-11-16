@@ -95,7 +95,7 @@ _MAX_COST_MICROS_OPT = typer.Option(
     help="Budget cap on cost in micros; needs model pricing, else pauses pricing_unavailable.",
 )
 _MAX_STEPS_OPT = typer.Option(
-    None, "--max-steps", help="Budget cap on tool rounds; exhaustion pauses (resumable with budget extend)."
+    None, "--max-steps", help="Budget cap on tool rounds; exhaustion pauses (resume --extend-steps)."
 )
 _EXTEND_TOKENS_OPT = typer.Option(
     None, "--extend-tokens", help="Add tokens to the turn's budget and resume (budget_extension item)."
@@ -103,6 +103,15 @@ _EXTEND_TOKENS_OPT = typer.Option(
 _EXTEND_COST_MICROS_OPT = typer.Option(
     None, "--extend-cost-micros", help="Add cost micros to the turn's budget and resume (budget_extension item)."
 )
+_EXTEND_STEPS_OPT = typer.Option(
+    None, "--extend-steps", help="Add tool rounds to the turn's budget and resume (budget_extension item)."
+)
+# R-T3-6:耗尽维 → 对应补预算旗标(CLI 文案点名出路;steps 死路关闭)。
+_BUDGET_EXTEND_FLAGS: Mapping[str, str] = {
+    "tokens": "--extend-tokens",
+    "cost_micros": "--extend-cost-micros",
+    "steps": "--extend-steps",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +243,9 @@ def _budget_from_flags(max_tokens: int | None, max_cost_micros: int | None, max_
     )
 
 
-def _extend_from_flags(extend_tokens: int | None, extend_cost_micros: int | None) -> dict[str, int]:
+def _extend_from_flags(
+    extend_tokens: int | None, extend_cost_micros: int | None, extend_steps: int | None
+) -> dict[str, int]:
     """resume --extend-* → Limits 维度增量映射;空映射 = 不补预算。"""
     extend: dict[str, int] = {}
     tokens = _nonneg_flag(extend_tokens, "--extend-tokens")
@@ -243,6 +254,9 @@ def _extend_from_flags(extend_tokens: int | None, extend_cost_micros: int | None
     cost = _nonneg_flag(extend_cost_micros, "--extend-cost-micros")
     if cost is not None:
         extend["cost_micros"] = cost
+    steps = _nonneg_flag(extend_steps, "--extend-steps")
+    if steps is not None:
+        extend["steps"] = steps
     return extend
 
 
@@ -356,13 +370,22 @@ def _echo_notices(notices: tuple[PermissionNotice, ...]) -> None:
 
 
 def _echo_budget_hint(result: TurnResult) -> None:
-    """budget_exhausted 暂停的一行文案(T3):点名原因与补预算续跑出路。
+    """budget_exhausted 暂停的一行文案(T3/R-T3-6):按耗尽维点名对应出路旗标。
 
+    ``budget_dimension`` 已知(run/resume 的 live 结果)→ 点名该维与旗标
+    (steps→--extend-steps,不再把 steps 耗尽指向无效的 tokens 出路);
+    未知(status 从 items 重建,维度不落 item)→ 通用文案列全三旗标。
     其余暂停原因(approval_required/outcome_unknown)沿用既有渲染,零变化。
     """
-    if result.reason == "budget_exhausted":
+    if result.reason != "budget_exhausted":
+        return
+    flag = _BUDGET_EXTEND_FLAGS.get(result.budget_dimension or "")
+    if flag is not None:
+        typer.echo(f"  budget exhausted ({result.budget_dimension}): praxis resume {result.turn_id} {flag} N")
+    else:
         typer.echo(
-            f"  budget exhausted: praxis resume {result.turn_id} --extend-tokens N (or --extend-cost-micros N)"
+            f"  budget exhausted: praxis resume {result.turn_id} "
+            "--extend-tokens N / --extend-cost-micros N / --extend-steps N"
         )
 
 
@@ -632,15 +655,17 @@ def resume(
     reconcile: list[str] = _RECONCILE_OPT,
     extend_tokens: int | None = _EXTEND_TOKENS_OPT,
     extend_cost_micros: int | None = _EXTEND_COST_MICROS_OPT,
+    extend_steps: int | None = _EXTEND_STEPS_OPT,
 ) -> None:
     """续跑 paused/interrupted turn:--confirm 人工确认,--allow/--deny 审批,--reconcile 对账。
 
-    --extend-tokens/--extend-cost-micros 补预算(budget_extension item)后走
-    同一续跑路径:budget_exhausted 的 PAUSED 无需审批即可续跑(T3)。
+    --extend-tokens/--extend-cost-micros/--extend-steps 补预算(budget_extension
+    item)后走同一续跑路径:budget_exhausted 的 PAUSED 无需审批即可续跑(T3;
+    耗尽维与出路旗标由文案点名,R-T3-6)。
     """
     approval_map = _parse_approval(allow, deny)
     reconcile_map = _parse_reconcile(reconcile)
-    extend_map = _extend_from_flags(extend_tokens, extend_cost_micros)
+    extend_map = _extend_from_flags(extend_tokens, extend_cost_micros, extend_steps)
     root = _resolve_workspace(workspace)
     if not _mcp_configured(root):
         session = _open_from_options(workspace, model, scripted, thread, policy, mode)

@@ -904,7 +904,7 @@ def test_admit_dispatch_normal_call_cannot_eat_protected_tail() -> None:
 
     at_edge = _node(limits=Limits(tokens=1_000), used=UsageFacts(tokens=900), unit_costs=None)
     assert admit_dispatch(at_edge, needs_compaction=False) == Admission(
-        allowed=False, reason="budget_exhausted"
+        allowed=False, reason="budget_exhausted", dimension="tokens"
     )
 
     in_tail = _node(limits=Limits(tokens=1_000), used=UsageFacts(tokens=950), unit_costs=None)
@@ -921,17 +921,17 @@ def test_admit_dispatch_steps_exhaustion() -> None:
     assert admit_dispatch(node, needs_compaction=False).allowed
     node_exhausted = _node(limits=Limits(steps=3), used=UsageFacts(steps=3))
     assert admit_dispatch(node_exhausted, needs_compaction=False) == Admission(
-        allowed=False, reason="budget_exhausted"
+        allowed=False, reason="budget_exhausted", dimension="steps"
     )
 
 
 def test_admit_dispatch_pricing_unavailable_fails_closed() -> None:
     limits = Limits(cost_micros=1_000)
     assert admit_dispatch(_node(limits=limits, unit_costs=None), needs_compaction=False) == Admission(
-        allowed=False, reason="pricing_unavailable"
+        allowed=False, reason="pricing_unavailable", dimension="cost_micros"
     )
     assert admit_dispatch(_node(limits=limits, unit_costs=CostMicros()), needs_compaction=False) == Admission(
-        allowed=False, reason="pricing_unavailable"
+        allowed=False, reason="pricing_unavailable", dimension="cost_micros"
     )
 
 
@@ -950,7 +950,7 @@ def test_admit_dispatch_cost_dimension_uses_estimated_facts() -> None:
         unit_costs=pricing,
     )
     assert admit_dispatch(at_limit, needs_compaction=False) == Admission(
-        allowed=False, reason="budget_exhausted"
+        allowed=False, reason="budget_exhausted", dimension="cost_micros"
     )
 
 
@@ -1023,7 +1023,7 @@ def test_tracker_web_in_flight_counts_and_note_result_releases(store: Store) -> 
     assert tracker.admit_web_request("web_fetch", browser=False).allowed
     assert tracker.admit_web_request("web_search", browser=False).allowed
     assert tracker.admit_web_request("web_fetch", browser=False) == Admission(
-        allowed=False, reason="budget_exhausted"
+        allowed=False, reason="budget_exhausted", dimension="web_requests"
     )
     tracker.note_result("web_fetch", browser=False)
     assert tracker.admit_web_request("web_fetch", browser=False).allowed
@@ -1100,7 +1100,7 @@ def test_tracker_web_gate_sees_active_child_reserved_share(store: Store) -> None
     for _ in range(5):
         assert tracker.admit_web_request("web_fetch", browser=False).allowed
     assert tracker.admit_web_request("web_fetch", browser=False) == Admission(
-        allowed=False, reason="budget_exhausted"
+        allowed=False, reason="budget_exhausted", dimension="web_requests"
     )
 
 

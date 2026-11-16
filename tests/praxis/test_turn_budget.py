@@ -174,6 +174,7 @@ def test_steps_budget_exhaustion_pauses_not_fails(store: Store, bus: Any, worksp
 
     assert result.status is TurnStatus.PAUSED  # 树预算是约定,不是失控:绝不 FAILED
     assert result.reason == "budget_exhausted"
+    assert result.budget_dimension == "steps"  # R-T3-6:耗尽维透出,CLI 据此点名出路
     assert result.pending_approvals == ()
     turn = get_turn(store, TURN)
     assert turn is not None and turn.status == "paused"
@@ -206,6 +207,7 @@ def test_token_exhaustion_pauses_before_next_dispatch_settle_not_truncated(
     result = asyncio.run(run_turn(deps, TurnState(TURN, THREAD)))
 
     assert result.status is TurnStatus.PAUSED and result.reason == "budget_exhausted"
+    assert result.budget_dimension == "tokens"
     responses = [i for i in store.read_turn_items(TURN) if i.kind == ItemKind.MODEL_RESPONSE]
     assert len(responses) == 2  # 第 3 次请求从未发出
     last_usage = responses[-1].payload["usage"]
@@ -278,6 +280,83 @@ def test_compaction_escape_is_load_bearing(store: Store, bus: Any, workspace: Pa
     assert tracker.refresh().used.tokens == 900
 
 
+def test_normal_dispatch_after_continuation_cannot_eat_protected_tail(
+    store: Store, bus: Any, workspace: Path
+) -> None:
+    """R-T3-7 负例:保护尾豁免逐次 dispatch——压缩成功置位、下一次 admit 消费
+    即复位;续作之后第 2+ 轮普通调用不得入尾。tokens=1000(有效 900):两轮 900
+    → 摘要 10 → 续作工具轮 20 → used=930;再下一轮普通准入 930≥900 → PAUSED
+    (锁存实现会带 needs_compaction=True 放行到 COMPLETED——本测试钉死危险方向)。"""
+    _turn(store)
+    store.append_items(
+        THREAD,
+        TURN,
+        [ItemEntry(kind=ItemKind.USER_MESSAGE, payload={"text": "hist"}) for _ in range(3)],
+    )
+    adapter = ScriptedAdapter(
+        [
+            _resp("", (("c1", "big", {}),), usage=Usage(input_tokens=400, output_tokens=50)),
+            _resp("", (("c2", "big", {}),), usage=Usage(input_tokens=400, output_tokens=50)),
+            _resp("摘要正文", usage=Usage(input_tokens=5, output_tokens=5)),
+            _resp("", (("c3", "big", {}),), usage=Usage(input_tokens=10, output_tokens=10)),
+            _resp("不可达"),
+        ]
+    )
+    tracker = _tracker(store, Limits(tokens=1000))
+    deps = _deps(
+        store,
+        bus,
+        workspace,
+        adapter,
+        {"big": _toy_tool("big", text="x" * 3000)},
+        budget=tracker,
+        compact_limit_tokens=1000,
+        measure_tokens=lambda req: sum(len(m.content) for m in req.messages) // 4,
+    )
+
+    result = asyncio.run(run_turn(deps, TurnState(TURN, THREAD)))
+
+    assert result.status is TurnStatus.PAUSED and result.reason == "budget_exhausted"
+    assert result.budget_dimension == "tokens"
+    kinds = _kinds(store)
+    assert kinds.count(ItemKind.MODEL_RESPONSE) == 3  # r1/r2/续作(摘要落 summary item);第 5 条剧本未消费
+    assert kinds.count(ItemKind.SUMMARY) == 1
+    assert tracker.refresh().used.tokens == 930
+
+
+def test_over_threshold_without_compaction_readmits_as_normal(store: Store, bus: Any, workspace: Path) -> None:
+    """R-T3-7 同源边界:超阈值预授豁免只给摘要调用;压缩未产出摘要(无可覆盖
+    区间)时,同轮普通 dispatch 必须按 needs_compaction=False 重新准入——
+    used=900≥有效 900 → PAUSED,不得借预授放行(旧实现会 COMPLETED)。"""
+    _turn(store)  # 不预置历史:6 条可压缩 item < keep_tail 8 → 无覆盖区间
+    adapter = ScriptedAdapter(
+        [
+            _resp("", (("c1", "big", {}),), usage=Usage(input_tokens=400, output_tokens=50)),
+            _resp("", (("c2", "big", {}),), usage=Usage(input_tokens=400, output_tokens=50)),
+            _resp("不可达"),
+        ]
+    )
+    tracker = _tracker(store, Limits(tokens=1000))
+    deps = _deps(
+        store,
+        bus,
+        workspace,
+        adapter,
+        {"big": _toy_tool("big", text="x" * 3000)},
+        budget=tracker,
+        compact_limit_tokens=1000,
+        measure_tokens=lambda req: sum(len(m.content) for m in req.messages) // 4,
+    )
+
+    result = asyncio.run(run_turn(deps, TurnState(TURN, THREAD)))
+
+    assert result.status is TurnStatus.PAUSED and result.reason == "budget_exhausted"
+    kinds = _kinds(store)
+    assert kinds.count(ItemKind.MODEL_RESPONSE) == 2  # 普通 dispatch 从未发出
+    assert kinds.count(ItemKind.SUMMARY) == 0
+    assert tracker.refresh().used.tokens == 900
+
+
 # ---------------------------------------------------------------------------
 # brief ④:pricing_unavailable fail-closed(cost 限额生效而单价缺失/全零)
 # ---------------------------------------------------------------------------
@@ -296,6 +375,7 @@ def test_pricing_unavailable_pauses_before_dispatch(
     result = asyncio.run(run_turn(deps, TurnState(TURN, THREAD)))
 
     assert result.status is TurnStatus.PAUSED and result.reason == "pricing_unavailable"
+    assert result.budget_dimension is None  # 只有 budget_exhausted 填耗尽维
     assert _kinds(store).count(ItemKind.MODEL_RESPONSE) == 0  # 绝不按 0 计价后放行
     turn = get_turn(store, TURN)
     assert turn is not None and turn.status == "paused"
@@ -321,6 +401,7 @@ def test_cost_exhaustion_pauses_with_budget_exhausted(store: Store, bus: Any, wo
     result = asyncio.run(run_turn(deps, TurnState(TURN, THREAD)))
 
     assert result.status is TurnStatus.PAUSED and result.reason == "budget_exhausted"
+    assert result.budget_dimension == "cost_micros"
     assert tracker.refresh().used.cost_micros == 21
 
 
@@ -699,7 +780,9 @@ def test_cli_run_max_steps_pauses_with_resume_hint(workspace: Path, tmp_path: Pa
     assert paused.exit_code == 2, paused.output
     assert "budget_exhausted" in paused.output
     assert "budget exhausted" in paused.output  # 一行文案增强:点名可续跑出路
-    assert "--extend-tokens" in paused.output
+    # R-T3-6:steps 耗尽必须点名 --extend-steps(旧文案恒印 tokens 是死路误导)。
+    assert "--extend-steps" in paused.output
+    assert "steps" in paused.output
     turn_id = _turn_id_from_output(paused.output)
 
     detail = runner.invoke(
@@ -708,6 +791,7 @@ def test_cli_run_max_steps_pauses_with_resume_hint(workspace: Path, tmp_path: Pa
     assert detail.exit_code == 0, detail.output
     assert "budget_exhausted" in detail.output
     assert "budget exhausted" in detail.output
+    assert "--extend-steps" in detail.output  # status 重建无维度 → 通用文案列全三旗标
 
     reader = open_session(workspace, ScriptedAdapter([]), thread_id="b1")
     try:
@@ -751,6 +835,36 @@ def test_cli_cost_flag_pricing_pause_then_extend_resumes(workspace: Path, tmp_pa
         reader.close()
 
 
+def test_cli_extend_steps_resumes_steps_exhausted_turn(workspace: Path, tmp_path: Path) -> None:
+    """R-T3-6 端到端:--max-steps 1 耗尽 PAUSED → resume --extend-steps 5 续跑
+    成功(CLI steps 死路关闭),extension item 落 steps 增量。"""
+    script = _write_script(tmp_path, "steps2.json", [_list_call("c1"), _list_call("c2"), {"content": "done"}])
+    paused = runner.invoke(
+        app,
+        ["run", "go", "--workspace", str(workspace), "--thread", "b3", "--scripted", str(script), "--max-steps", "1"],
+        env=_CLEAN_ENV,
+    )
+    assert paused.exit_code == 2, paused.output
+    turn_id = _turn_id_from_output(paused.output)
+
+    done = runner.invoke(
+        app,
+        ["resume", turn_id, "--workspace", str(workspace), "--thread", "b3", "--scripted", str(script),
+         "--extend-steps", "5"],
+        env=_CLEAN_ENV,
+    )
+    assert done.exit_code == 0, done.output
+    assert "done" in done.output
+
+    reader = open_session(workspace, ScriptedAdapter([]), thread_id="b3")
+    try:
+        extensions = [i for i in reader.items() if i.kind == ItemKind.BUDGET_EXTENSION]
+        assert len(extensions) == 1
+        assert extensions[0].payload == {"limits_delta": {"steps": 5}}
+    finally:
+        reader.close()
+
+
 @pytest.mark.parametrize(
     ("flags", "flag_name"),
     [
@@ -759,6 +873,7 @@ def test_cli_cost_flag_pricing_pause_then_extend_resumes(workspace: Path, tmp_pa
         (["run", "go", "--max-steps", "-2"], "--max-steps"),
         (["resume", "abc", "--extend-tokens", "-5"], "--extend-tokens"),
         (["resume", "abc", "--extend-cost-micros", "-1"], "--extend-cost-micros"),
+        (["resume", "abc", "--extend-steps", "-1"], "--extend-steps"),
     ],
 )
 def test_cli_negative_budget_flags_exit_3(
