@@ -61,6 +61,7 @@ from pathlib import Path
 from typing import cast
 
 from praxis.core import permission  # 唯一决策入口:经模块属性调用,测试 monkeypatch 此处
+from praxis.core.budget import BudgetTracker
 from praxis.core.events import EventBus
 from praxis.core.skill_state import latest_active_skill_ids
 from praxis.core.statemachine import TurnStatus, transition
@@ -126,6 +127,9 @@ class ExecCtx:
     artifacts: ArtifactStore | None = None
     # None = 不接 hook(单测/裸管道):行为与未接线前逐字不变。
     hooks: HookSetup | None = None
+    # None = 无预算(单测/裸管道):16 处直构点默认值零改动。T3 透传持有面;
+    # web/browser 维 dispatch gate(admit_web_request)由 T15 在此消费。
+    budget: BudgetTracker | None = None
 
 
 # ---------------------------------------------------------------------------

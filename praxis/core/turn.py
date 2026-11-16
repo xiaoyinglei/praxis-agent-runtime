@@ -5,6 +5,8 @@
 每 turn 一个错误边界:循环内任何异常都收敛为本 turn 的 FAILED,永不炸穿会话。
 
 步骤序(与代码一一对应):
+0. 入口:``TurnState.steps`` 置为 ``fold_turn_facts`` 的声明轮数(R-PF-4)——
+   steps 跨 pause/resume 累计,护栏基数不再每次运行从 0 计(阶段4 T3);
 1. ``resume_calls`` 非空 → 先逐个 ``pipeline.execute``(审批重入路径;调用方
    保证回合已 RUNNING——Task 14 的 resume 负责先转换再重入),PAUSED 同步序 5;
 2. 每轮重读 thread items → ``build_context`` 折叠 → ``to_messages`` 投影 →
@@ -14,12 +16,18 @@
    item、最终成功落 model_response item → emit ``ModelOutputDelta`` 与
    ``ModelResponseReceived``(预览 ≤200 字符);core 只走流式,complete 只是
    同一路径的薄门面(设计 D1)。重试机制由 composition 以结构签名注入,
-   core 不认识 openai/httpx(R-T3-1);重试期间不 emit 增量,失败首帧不会
-   变成回滚不掉的重影。
+   core 不认识 openai/httpx;重试期间不 emit 增量,失败首帧不会变成回滚不
+   掉的重影。
+3.5. 预算闸(阶段4 T3,注入 ``budget`` 时):``refresh()`` 后 ``admit_dispatch``
+   ——树维度耗尽 → ``transition(PAUSED, "budget_exhausted")``、cost 限额而
+   单价缺失 → ``transition(PAUSED, "pricing_unavailable")``,可 resume+extend
+   续跑;压缩逃生面(已压缩续作/本轮超压缩阈值)可用保护尾。与 max_steps
+   硬护栏双闸并存、语义不同(R-T3-1);
 4. 无 tool_calls → ``transition(COMPLETED, "model_finished")``;
 5. 有 tool_calls → 逐个 ``execute``;任一 PAUSED → 管道已完成 RUNNING→PAUSED
    转换,直接返回并附未批摘要;
-6. ``steps += 1``;≥ max_steps → ``transition(FAILED, "step_limit_exceeded")``;
+6. ``steps += 1``(初值见步序 0);≥ max_steps →
+   ``transition(FAILED, "step_limit_exceeded")``(失控防御,保持 FAILED);
 7. ``CancelledError`` → ``transition(CANCELLED, "cancelled_by_user")``——except
    路径内只有同步调用,不 await、不上抛:SDK 表面返回结果,任务生命周期归
    会话层;
@@ -40,6 +48,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
+from praxis.core.budget import BudgetTracker, fold_turn_facts
 from praxis.core.compaction import (
     SUMMARY_MAX_OUTPUT_TOKENS,
     SUMMARY_PROMPT_MAX_CHARS,
@@ -135,11 +144,21 @@ class TurnDeps:
     # composition 注入 loader 产出的 catalog。目录只经 append_skill_catalog
     # 这一个纯函数步骤进入本轮消息组装(§5.14/R-T7-1)。
     skills_catalog: SkillCatalog | None = None
+    # None = 无预算(单测路径零扰动);生产 Session._execute 恒注入 BudgetTracker。
+    # 步边界 refresh → admit_dispatch;耗尽 → PAUSED(budget_exhausted /
+    # pricing_unavailable),可 resume+extend 续跑(阶段4 T3)。
+    budget: BudgetTracker | None = None
 
 
 @dataclass
 class TurnState:
-    """显式可变循环状态:steps 由 run_turn 每完成一轮工具步 +1。"""
+    """显式可变循环状态:steps 跨 pause/resume 累计(R-PF-4,阶段4 T3)。
+
+    run_turn 入口把 steps 置为 ``fold_turn_facts`` 的声明轮数(tool_calls 非空
+    的 model_response 条数);每完成一轮"请求+全部工具"再 +1。重放轮没有新的
+    model_response 事实,由进程内自增补计——两者相加与旧"每次运行总自增量"
+    逐值一致,但基数不再每次 run_turn 从 0 计。
+    """
 
     turn_id: str
     thread_id: str
@@ -197,6 +216,7 @@ def _exec_ctx(deps: TurnDeps, state: TurnState) -> ExecCtx:
         finalize_sandbox=deps.finalize_sandbox,
         artifacts=deps.artifacts,
         hooks=deps.hooks,
+        budget=deps.budget,
     )
 
 
@@ -429,9 +449,13 @@ async def run_turn(
 ) -> TurnResult:
     """执行(或重入)一个 turn 直到终结。前置约定:回合状态为 RUNNING(会话层保证)。
 
-    结局五途,全部经状态机唯一入口写入且 reason 真实:
-    model_finished / approval_required / step_limit_exceeded /
-    cancelled_by_user / ``<异常类型>: <消息>``。
+    结局诸途,全部经状态机唯一入口写入且 reason 真实:
+    model_finished / approval_required / budget_exhausted / pricing_unavailable /
+    step_limit_exceeded / cancelled_by_user / ``<异常类型>: <消息>``。
+
+    预算双闸(R-T3-1):``deps.budget`` 的树维度耗尽 → PAUSED(约定预算,
+    可 resume+extend 续跑);``max_steps`` 硬护栏 → FAILED(失控防御)。
+    护栏基数 = fold 声明轮数 + 本次重放轮自增(R-PF-4),跨 pause/resume 累计。
     """
     ctx = _exec_ctx(deps, state)
     unknown_calls: list[str] = []
@@ -439,6 +463,10 @@ async def run_turn(
     compacted = False  # 本 turn 是否真的写入过 summary/boundary(K-1)
     compaction_attempted = False  # R-P4:每 turn 最多尝试一次(含"无可覆盖区间")
     try:
+        # R-PF-4:steps 初值 = fold 声明轮数(重放轮无新 model_response 事实,
+        # 由步序 6 的进程内自增补计)——跨 pause/resume 累计自此成立。
+        turn_items = [item for item in deps.store.read_items(state.thread_id) if item.turn_id == state.turn_id]
+        state.steps = fold_turn_facts(turn_items, unit_costs=None).steps
         # 步序 1:审批重入——先重放已批准的调用,再进模型循环。
         for call in resume_calls:
             result = await execute(_model_call(call), ctx)
@@ -467,32 +495,54 @@ async def run_turn(
             # 的 livelock)。K-1:物化判定与压缩共用 turn 已算出的同一次测量
             # (req 含 system + tools),不再让 maybe_compact 用另一份无 tools
             # 的请求重测;只有真的写了 summary/boundary 才重建上下文。
-            if (
-                not compaction_attempted
-                and deps.compact_limit_tokens
-                and deps.measure_tokens is not None
-            ):
+            compact_limit = deps.compact_limit_tokens
+            measured_tokens: int | None = None
+            if not compaction_attempted and compact_limit and deps.measure_tokens is not None:
                 measured_tokens = deps.measure_tokens(req)
-                if measured_tokens > deps.compact_limit_tokens:
-                    compaction_attempted = True
-                    outcome = await maybe_compact(
-                        store=deps.store,
-                        adapter=deps.adapter,
-                        thread_id=state.thread_id,
-                        turn_id=state.turn_id,
-                        items=items,
-                        limit_tokens=deps.compact_limit_tokens,
-                        summary_max_output_tokens=deps.summary_max_output_tokens,
-                        summary_prompt_max_chars=deps.summary_prompt_max_chars,
-                        measure_tokens=deps.measure_tokens,
-                        request=req,
-                        measured_tokens=measured_tokens,
+            over_threshold = (
+                measured_tokens is not None and compact_limit is not None and measured_tokens > compact_limit
+            )
+            # 步序 3.5(阶段4 T3):步边界预算闸——先 refresh 后 admit
+            # (BudgetTracker 不变量)。树维度耗尽/单价缺失 → PAUSED(约定预算
+            # 可补预算续跑,不是 FAILED 失控);pending_approvals 恒空——这不是
+            # 审批暂停。needs_compaction = 压缩逃生面:本 turn 已压缩(续作)
+            # 或本轮出站请求超压缩阈值(摘要调用本身)——可用完整 token limit
+            # (保护尾);普通调用只用扣保护尾后的余量(T2 admit_dispatch)。
+            if deps.budget is not None:
+                deps.budget.refresh()
+                admission = deps.budget.admit_dispatch(needs_compaction=compacted or over_threshold)
+                if not admission.allowed:
+                    transition(
+                        deps.store, deps.bus, state.turn_id, TurnStatus.PAUSED, reason=admission.reason
                     )
-                    compacted = isinstance(outcome, CompactionOutcome) and outcome.compacted
-                    if compacted:
-                        continue
+                    return TurnResult(
+                        turn_id=state.turn_id,
+                        status=TurnStatus.PAUSED,
+                        output=last_content,
+                        reason=admission.reason,
+                        pending_approvals=(),
+                        unknown_calls=tuple(unknown_calls),
+                    )
+            if measured_tokens is not None and compact_limit is not None and measured_tokens > compact_limit:
+                compaction_attempted = True
+                outcome = await maybe_compact(
+                    store=deps.store,
+                    adapter=deps.adapter,
+                    thread_id=state.thread_id,
+                    turn_id=state.turn_id,
+                    items=items,
+                    limit_tokens=compact_limit,
+                    summary_max_output_tokens=deps.summary_max_output_tokens,
+                    summary_prompt_max_chars=deps.summary_prompt_max_chars,
+                    measure_tokens=deps.measure_tokens,
+                    request=req,
+                    measured_tokens=measured_tokens,
+                )
+                compacted = isinstance(outcome, CompactionOutcome) and outcome.compacted
+                if compacted:
+                    continue
             # core 只走流式(D1);complete() 也由同一条 stream 装配派生。
-            # 重试机制由 composition 以结构签名注入(R-T3-1):core 不认识
+            # 重试机制由 composition 以结构签名注入:core 不认识
             # openai/httpx,只认识"给工厂、已有尝试、clock floor,拿回事件"。
             # 每次适配器调用各记一个派发时刻,成功记录用它作为 dispatched_at。
             dispatch_times: list[float] = []

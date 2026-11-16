@@ -68,6 +68,7 @@ from praxis.core.events import EventBus
 from praxis.core.permission import network_verdict
 from praxis.core.recovery import sweep, sweep_orphan_command_jobs
 from praxis.core.session import AsyncCloser, Session
+from praxis.protocol.budget import UNLIMITED, Limits
 from praxis.protocol.hooks import HookOutcome, HookSetup, HookSpec
 from praxis.protocol.json import JsonValue
 from praxis.protocol.models import (
@@ -468,6 +469,7 @@ def build_session(
     thread_id: str | None = None,
     tools: Sequence[Tool] | None = None,
     max_steps: int = 50,
+    budget: Limits = UNLIMITED,
     hooks: HookSetup | None = None,
     skills_catalog: SkillCatalog | None = None,
     extra_tools: Sequence[Tool] = (),
@@ -504,6 +506,13 @@ def build_session(
     authorize 闭包读 live ``session.permissions``;``tools`` 整体替换时**不**
     构造 web client、不装渲染器(capability coupling:没有 web 工具就没有 web
     能力,替换路径保持廉价)。web client 自身作为 integration 收尾。
+
+    阶段4 T3(R-T3-4):``budget`` 是 root limits(缺省 UNLIMITED = 不 enforce,
+    历史路径零扰动),经 Session 写进 turn binding;``unit_costs`` 从注册库
+    解析出的 ModelSpec.cost **取一次**注入——显式 adapter(测试/--scripted)
+    没有可解析的 spec → None,cost 限额生效时由 admit_dispatch fail-closed
+    (pricing_unavailable)兜底。core 不 import adapters/config,与
+    measure_tokens 注入同纪律。
     """
     if thread_id is not None:
         _validate_thread_id(thread_id)
@@ -518,6 +527,9 @@ def build_session(
     compact_limit_tokens = (
         default_compact_limit(resolved_spec) if resolved_spec is not None else None
     )
+    # R-T3-4:单价只在这里取一次(spec.cost 全零 = 未配置计价,admit 判据
+    # 对 cost 限额 fail-closed);显式 adapter 无 spec → None。
+    unit_costs = resolved_spec.cost if resolved_spec is not None else None
     summary_max_output_tokens = (
         default_summary_max_output_tokens(resolved_spec)
         if resolved_spec is not None
@@ -633,6 +645,8 @@ def build_session(
             hooks=hook_setup,
             skills_catalog=resolved_skills,
             integrations=effective_integrations,
+            budget=budget,
+            unit_costs=unit_costs,
         )
         # 延迟绑定完成:此后 web authorize 闭包读到的就是 live 权限上下文
         # (Session.update_permission 替换 _permissions,property 每次现取)。

@@ -31,6 +31,9 @@ save_mcp_bearer。宿主构造 typed ``extra_tools``/hooks/skills 面所需的
 Task 20 扩展:web 宿主配置面 ``WebLimits``/``load_web_limits`` 与 provider
 覆盖 env 名 ``WEB_SEARCH_PROVIDER_ENV`` 经 sdk 出口(宿主配置限度、CLI
 归因展示都不直依 adapters)。
+阶段4 T3 扩展:预算限额面 ``Limits``/``UNLIMITED`` re-export——CLI 的
+``run --max-*`` 构造 root limits、宿主装配 ``open_session(budget=...)``
+都只经 sdk,不直依 protocol 内部模块。
 
 ``ConversationBusy``/``ResumeNotConfirmed`` 定义在 core.session 并由这里
 re-export:core 不得 import interfaces(import-linter praxis_core_purity),
@@ -99,6 +102,7 @@ from praxis.core.planning import latest_plan
 from praxis.core.session import ConversationBusy, ResumeNotConfirmed, Session
 from praxis.core.statemachine import TurnStatus
 from praxis.core.turn import ApprovalSummary, TurnResult
+from praxis.protocol.budget import UNLIMITED, Limits
 from praxis.protocol.items import Item, ItemKind
 from praxis.protocol.models import (
     CostMicros,
@@ -135,6 +139,7 @@ __all__ = [
     "HttpServerConfig",
     "Item",
     "ItemKind",
+    "Limits",
     "McpBundle",
     "McpServerConfig",
     "McpServerStatus",
@@ -173,6 +178,7 @@ __all__ = [
     "Turn",
     "TurnResult",
     "TurnStatus",
+    "UNLIMITED",
     "Usage",
     "VerifyReport",
     "WEB_SEARCH_PROVIDER_ENV",

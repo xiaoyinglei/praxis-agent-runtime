@@ -31,7 +31,9 @@ from praxis.interfaces.cli.render import render_item
 from praxis.interfaces.cli.slash import REGISTRY, ExitChat
 from praxis.interfaces.cli.web_cli import app as web_app
 from praxis.interfaces.sdk import (
+    UNLIMITED,
     ConversationBusy,
+    Limits,
     McpBundle,
     ModelResponse,
     ModelToolCall,
@@ -81,6 +83,25 @@ _MODE_OPT = typer.Option(
     "--mode",
     click_type=click.Choice(["on-request", "never", "bypass"]),
     help="Approval mode override; orthogonal to policy rules, never persisted.",
+)
+# 阶段4 T3:预算树 root limits(约定预算,耗尽 → PAUSED 可补预算续跑;
+# 与 max_steps 硬护栏语义不同——护栏是失控防御,FAILED 不可续)。
+_MAX_TOKENS_OPT = typer.Option(
+    None, "--max-tokens", help="Budget cap on total tokens; exhaustion pauses (resume --extend-tokens)."
+)
+_MAX_COST_MICROS_OPT = typer.Option(
+    None,
+    "--max-cost-micros",
+    help="Budget cap on cost in micros; needs model pricing, else pauses pricing_unavailable.",
+)
+_MAX_STEPS_OPT = typer.Option(
+    None, "--max-steps", help="Budget cap on tool rounds; exhaustion pauses (resumable with budget extend)."
+)
+_EXTEND_TOKENS_OPT = typer.Option(
+    None, "--extend-tokens", help="Add tokens to the turn's budget and resume (budget_extension item)."
+)
+_EXTEND_COST_MICROS_OPT = typer.Option(
+    None, "--extend-cost-micros", help="Add cost micros to the turn's budget and resume (budget_extension item)."
 )
 
 
@@ -197,6 +218,34 @@ def _resolve_thread(thread: str | None) -> str:
     return thread if thread is not None else _DEFAULT_THREAD
 
 
+def _nonneg_flag(value: int | None, flag: str) -> int | None:
+    """预算旗标边界拒绝:负值不是限额(预算只增不减),BadParameter → 退出码 3。"""
+    if value is not None and value < 0:
+        raise typer.BadParameter(f"{flag} must be >= 0, got {value}")
+    return value
+
+
+def _budget_from_flags(max_tokens: int | None, max_cost_micros: int | None, max_steps: int | None) -> Limits:
+    """run --max-* → root limits;全缺省 = UNLIMITED(历史路径零扰动)。"""
+    return Limits(
+        tokens=_nonneg_flag(max_tokens, "--max-tokens"),
+        cost_micros=_nonneg_flag(max_cost_micros, "--max-cost-micros"),
+        steps=_nonneg_flag(max_steps, "--max-steps"),
+    )
+
+
+def _extend_from_flags(extend_tokens: int | None, extend_cost_micros: int | None) -> dict[str, int]:
+    """resume --extend-* → Limits 维度增量映射;空映射 = 不补预算。"""
+    extend: dict[str, int] = {}
+    tokens = _nonneg_flag(extend_tokens, "--extend-tokens")
+    if tokens is not None:
+        extend["tokens"] = tokens
+    cost = _nonneg_flag(extend_cost_micros, "--extend-cost-micros")
+    if cost is not None:
+        extend["cost_micros"] = cost
+    return extend
+
+
 def _load_policy_file(path: Path) -> PermissionPolicy:
     """--policy JSON → PermissionPolicy;坏文件/坏 JSON → BadParameter(退出码 3,边界拒绝)。"""
     try:
@@ -221,6 +270,7 @@ def _open_session_guarded(
     thread_id: str,
     extra_tools: Sequence[Any] = (),
     integrations: Sequence[Any] = (),
+    budget: Limits = UNLIMITED,
 ) -> Session:
     """R12:open_session 的 ValueError(损坏的既有状态,如 .praxis/permissions.json
     无法解析)是运行时失败 → 干净错误消息 + EXIT_FAILED(1),绝不裸 traceback(C4)。
@@ -236,6 +286,7 @@ def _open_session_guarded(
             thread_id=thread_id,
             extra_tools=extra_tools,
             integrations=integrations,
+            budget=budget,
         )
     except KeyError as exc:
         message = exc.args[0] if exc.args else str(exc)
@@ -253,6 +304,7 @@ def _open_from_options(
     thread: str | None,
     policy: Path | None = None,
     mode: str | None = None,
+    budget: Limits = UNLIMITED,
 ) -> Session:
     # Task 8:policy/mode 经 sdk 透传给 composition(来源序在 composition 执行;
     # mode 与 policy 正交,C5——这里不折叠、不改写)。
@@ -266,6 +318,7 @@ def _open_from_options(
             policy=resolved_policy,
             mode=resolved_mode,
             thread_id=_resolve_thread(thread),
+            budget=budget,
         )
     # R-T6-2:CLI 不再直接构造 provider adapter;模型解析与唯一分派都在
     # composition(_adapter_and_spec_from_registry → _adapter_for)。
@@ -276,6 +329,7 @@ def _open_from_options(
         policy=resolved_policy,
         mode=resolved_mode,
         thread_id=_resolve_thread(thread),
+        budget=budget,
     )
 
 
@@ -299,6 +353,17 @@ def _echo_notices(notices: tuple[PermissionNotice, ...]) -> None:
     """权限更新披露的单行渲染(D9 等);空元组零输出,退出码不变。"""
     for notice in notices:
         typer.echo(f"notice: {notice.text}")
+
+
+def _echo_budget_hint(result: TurnResult) -> None:
+    """budget_exhausted 暂停的一行文案(T3):点名原因与补预算续跑出路。
+
+    其余暂停原因(approval_required/outcome_unknown)沿用既有渲染,零变化。
+    """
+    if result.reason == "budget_exhausted":
+        typer.echo(
+            f"  budget exhausted: praxis resume {result.turn_id} --extend-tokens N (or --extend-cost-micros N)"
+        )
 
 
 def _report_turn(result: TurnResult) -> int:
@@ -333,6 +398,7 @@ def _report_turn(result: TurnResult) -> int:
         if result.unknown_calls:
             typer.echo(f"  outcome unknown calls: {', '.join(result.unknown_calls)}")
             typer.echo("  resume with --reconcile CALL_ID=ok|failed (side effects are never auto-replayed)")
+        _echo_budget_hint(result)
         return EXIT_PAUSED
     typer.echo(f"unexpected turn status: {status.value}", err=True)
     return EXIT_FAILED
@@ -410,6 +476,7 @@ def _open_mcp_session(
     policy: PermissionPolicy,
     mode: str | None,
     thread: str | None,
+    budget: Limits = UNLIMITED,
 ) -> Session:
     return _open_session_guarded(
         workspace,
@@ -420,6 +487,7 @@ def _open_mcp_session(
         thread_id=_resolve_thread(thread),
         extra_tools=bundle.tools,
         integrations=(bundle,),
+        budget=budget,
     )
 
 
@@ -437,12 +505,21 @@ def run(
     thread: str | None = _THREAD_OPT,
     policy: Path | None = _POLICY_OPT,
     mode: str | None = _MODE_OPT,
+    max_tokens: int | None = _MAX_TOKENS_OPT,
+    max_cost_micros: int | None = _MAX_COST_MICROS_OPT,
+    max_steps: int | None = _MAX_STEPS_OPT,
 ) -> None:
-    """一次性 turn:提交 prompt,打印结果,按 turn 终态决定退出码。"""
+    """一次性 turn:提交 prompt,打印结果,按 turn 终态决定退出码。
+
+    --max-tokens/--max-cost-micros/--max-steps 是预算树 root limits(约定预算):
+    耗尽 → PAUSED budget_exhausted,可 resume 补预算续跑;与内部 max_steps
+    硬护栏(失控防御,FAILED)语义不同(R-T3-1)。
+    """
+    budget = _budget_from_flags(max_tokens, max_cost_micros, max_steps)
     root = _resolve_workspace(workspace)
     if not _mcp_configured(root):
         # 无 MCP:既有同步装配路径逐字保留(T19 零行为变化)。
-        session = _open_from_options(workspace, model, scripted, thread, policy, mode)
+        session = _open_from_options(workspace, model, scripted, thread, policy, mode, budget)
         try:
             result = asyncio.run(session.submit(prompt))
         except ConversationBusy as exc:
@@ -462,6 +539,7 @@ def run(
                 thread=thread,
                 policy=policy,
                 mode=mode,
+                budget=budget,
             )
         )
     )
@@ -476,6 +554,7 @@ async def _run_with_mcp(
     thread: str | None,
     policy: Path | None,
     mode: str | None,
+    budget: Limits = UNLIMITED,
 ) -> int:
     """Q9:connect → open_session → submit → ``finally`` aclose 都在同一 loop。
 
@@ -497,6 +576,7 @@ async def _run_with_mcp(
             policy=snapshot,
             mode=mode,
             thread=thread,
+            budget=budget,
         )
         try:
             result = await session.submit(prompt)
@@ -550,10 +630,17 @@ def resume(
     allow: list[str] = _ALLOW_OPT,
     deny: list[str] = _DENY_OPT,
     reconcile: list[str] = _RECONCILE_OPT,
+    extend_tokens: int | None = _EXTEND_TOKENS_OPT,
+    extend_cost_micros: int | None = _EXTEND_COST_MICROS_OPT,
 ) -> None:
-    """续跑 paused/interrupted turn:--confirm 人工确认,--allow/--deny 审批,--reconcile 对账。"""
+    """续跑 paused/interrupted turn:--confirm 人工确认,--allow/--deny 审批,--reconcile 对账。
+
+    --extend-tokens/--extend-cost-micros 补预算(budget_extension item)后走
+    同一续跑路径:budget_exhausted 的 PAUSED 无需审批即可续跑(T3)。
+    """
     approval_map = _parse_approval(allow, deny)
     reconcile_map = _parse_reconcile(reconcile)
+    extend_map = _extend_from_flags(extend_tokens, extend_cost_micros)
     root = _resolve_workspace(workspace)
     if not _mcp_configured(root):
         session = _open_from_options(workspace, model, scripted, thread, policy, mode)
@@ -564,6 +651,7 @@ def resume(
                     confirm=confirm,
                     approval=approval_map or None,
                     reconcile=reconcile_map or None,
+                    extend=extend_map or None,
                 )
             )
         except (ResumeNotConfirmed, ValueError) as exc:
@@ -584,6 +672,7 @@ def resume(
                 confirm=confirm,
                 approval=approval_map or None,
                 reconcile=reconcile_map or None,
+                extend=extend_map or None,
                 model=model,
                 scripted=scripted,
                 thread=thread,
@@ -601,6 +690,7 @@ async def _resume_with_mcp(
     confirm: bool,
     approval: Mapping[str, Literal["allow", "deny"]] | None,
     reconcile: Mapping[str, Literal["ok", "failed"]] | None,
+    extend: Mapping[str, int] | None = None,
     model: str | None,
     scripted: Path | None,
     thread: str | None,
@@ -625,7 +715,7 @@ async def _resume_with_mcp(
         )
         try:
             result = await session.resume(
-                turn_id, confirm=confirm, approval=approval, reconcile=reconcile
+                turn_id, confirm=confirm, approval=approval, reconcile=reconcile, extend=extend
             )
         except (ResumeNotConfirmed, ValueError) as exc:
             typer.echo(f"error: {exc}", err=True)
@@ -1010,6 +1100,8 @@ def status(
             typer.echo(f"  pending approval: call {approval.call_id} tool={approval.tool_name}")
         if result.unknown_calls:
             typer.echo(f"  outcome unknown calls: {', '.join(result.unknown_calls)}")
+        if turn.status == TurnStatus.PAUSED:
+            _echo_budget_hint(result)
     finally:
         session.close()
 

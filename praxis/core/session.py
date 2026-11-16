@@ -16,18 +16,25 @@ Session 是 turn 循环之上的会话门面:它不执行任何东西,只负责"
    ——续跑的代价不对称,绝不自动重放未知副作用。
 
 resume 的处理序(与代码一一对应):守卫 → 映射校验(目标存在、verdict/outcome
-合法——在**任何** transition 之前,失败即零写入,绝不把 turn 留在无执行者的
-RUNNING 等 sweep 误标 interrupted)→ transition(RUNNING,真实 reason) →
-reconcile 写结果(先) → approval 写决策(摘要从 approval_request item 取,绑定
-digest;policy_revision stamp 当前策略——R5(b) 批准时刻绑定)→ classify_pending
+合法、extend 维度名/非负 int——在**任何** transition 之前,失败即零写入,绝不
+把 turn 留在无执行者的 RUNNING 等 sweep 误标 interrupted)→ transition(RUNNING,
+真实 reason) → reconcile 写结果(先) → approval 写决策(摘要从 approval_request
+item 取,绑定 digest;policy_revision stamp 当前策略——R5(b) 批准时刻绑定)→
+budget_extension 写增量(T3)→ classify_pending
 分类(**先 started 后 decision**:未 started 且有
 matching decision 的调用进重放队列承接审批重入;已 started 的决策一律失效于
 安全矩阵——非幂等 outcome_unknown,见 _classify_and_prepare)→ 若有 outcome_unknown 则
 transition(PAUSED) 直接返回 → 否则带 resume_calls 重入 run_turn。
 
-已知边界(Phase 1,如实):
-- steps 不跨 pause/resume 累计(每次 run_turn 从 0 计)——预算归 §5.5 的
-  Phase 4 budget 树,此处不建预算;
+预算接线(阶段4 T3,设计 §5.5):submit 把 root limits 写进 turn binding
+(``budget`` 键,UNLIMITED 时省略——历史 turn 形状零扰动);``_execute`` 从
+binding 读回 limits 构造 ``BudgetTracker`` 注入 run_turn。steps 跨 pause/resume
+累计自此成立(R-PF-4:fold 声明轮数 + 重放轮自增);树预算耗尽 → PAUSED
+``budget_exhausted``,``resume(extend=...)`` 写 ``budget_extension`` item 续跑
+(校验先于 transition,同 approval 纪律);``max_steps`` 硬护栏保持 FAILED
+``step_limit_exceeded``(失控防御,与树预算双闸并存,R-T3-1)。
+
+已知边界(如实):
 - 分类写入在锁外完成(与 brief 钉死的序一致):并发 resume 同一 turn 时,第二条
   ``transition(→RUNNING)`` 会因 RUNNING→RUNNING 非法而 IllegalTransition 失败,
   这是天然的单执行者守卫;
@@ -49,6 +56,7 @@ from pathlib import Path
 from typing import Literal, Protocol
 from uuid import uuid4
 
+from praxis.core.budget import BudgetTracker
 from praxis.core.compaction import SUMMARY_MAX_OUTPUT_TOKENS, SUMMARY_PROMPT_MAX_CHARS
 from praxis.core.events import EventBus, Subscription
 from praxis.core.locks import ThreadBusy, thread_execution_lock
@@ -64,10 +72,11 @@ from praxis.core.turn import (
     pending_approval_summaries,
     run_turn,
 )
+from praxis.protocol.budget import EXTENSION_KEYS, UNLIMITED, Limits, limits_from_payload, limits_payload
 from praxis.protocol.hooks import HookSetup
 from praxis.protocol.items import Item, ItemKind
 from praxis.protocol.json import JsonValue
-from praxis.protocol.models import ModelAdapter, ModelSettings, ModelToolCall, WireRequest
+from praxis.protocol.models import CostMicros, ModelAdapter, ModelSettings, ModelToolCall, WireRequest
 from praxis.protocol.permission import (
     PermissionContext,
     PermissionNotice,
@@ -285,6 +294,25 @@ def _validate_approval(
     return requests
 
 
+def _validate_extend(turn_id: str, extend: Mapping[str, int]) -> None:
+    """budget extend 校验(R-T3-3:在 transition 之前调用,失败零写入)。
+
+    维度名必须是 Limits 的合法字段(``Limits(**extend)`` 对未知键抛 TypeError,
+    不另写第二份维度名单);值只接受非负 int——负值拒绝(预算只增不减,与
+    ``_fold_extensions`` 的读端忽略负增量同向),bool 不是计数拒绝,0 合法
+    (无操作增量,续跑后仍耗尽则如实再 PAUSED)。
+    """
+    try:
+        Limits(**extend)
+    except TypeError as exc:
+        raise ValueError(f"unknown budget dimension in extend for turn {turn_id!r}: {exc}") from exc
+    for name, value in extend.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"budget extend {name!r} for turn {turn_id!r} must be a non-negative integer, got {value!r}"
+            )
+
+
 # ---------------------------------------------------------------------------
 # 策略声明落盘(原子写:同目录 tmp + os.replace,与 filesystem 内置工具同语义;
 # 不跨层借 tools.builtins 的私有助手——ACI 各层自有实现,R6-4)
@@ -331,6 +359,8 @@ class Session:
         hooks: HookSetup | None = None,
         skills_catalog: SkillCatalog | None = None,
         integrations: Sequence[AsyncCloser] = (),
+        budget: Limits = UNLIMITED,
+        unit_costs: CostMicros | None = None,
     ) -> None:
         self._store = store
         self._bus = bus
@@ -363,6 +393,12 @@ class Session:
         self._hooks = hooks
         # None = 不注入 skill 目录(既有测试/单测路径);composition 注入 loader 产出。
         self._skills_catalog = skills_catalog
+        # 阶段4 T3:root limits 进 turn binding;unit_costs 由 composition 从
+        # ModelSpec.cost 取一次注入(R-T3-4;None = 无单价,cost 限额生效时
+        # admit_dispatch fail-closed pricing_unavailable)。
+        self._budget = budget
+        self._unit_costs = unit_costs
+        self._budget_binding_warned = False
 
     # -- 身份与生命周期 -------------------------------------------------------
 
@@ -516,11 +552,17 @@ class Session:
         self._store.append_items(
             self._thread_id, turn_id, [ItemEntry(kind=ItemKind.USER_MESSAGE, payload={"text": text})]
         )
+        binding: dict[str, JsonValue] = {"model": self._model_id()}
+        # UNLIMITED(缺省)不写 budget 键:历史 turn 的 binding 形状零扰动;
+        # 读端(_turn_budget_limits)对缺键一律 UNLIMITED(R-T3-2)。
+        budget_payload = limits_payload(self._budget)
+        if budget_payload:
+            binding["budget"] = budget_payload
         create_turn(
             self._store,
             turn_id=turn_id,
             thread_id=self._thread_id,
-            binding={"model": self._model_id()},
+            binding=binding,
         )
         return await self._execute(turn_id, ())
 
@@ -534,6 +576,7 @@ class Session:
         approval: Mapping[str, Literal["allow", "deny"]] | None = None,
         reconcile: Mapping[str, Literal["ok", "failed"]] | None = None,
         permission_updates: Sequence[PermissionUpdate] = (),
+        extend: Mapping[str, int] | None = None,
     ) -> TurnResult:
         """续跑 interrupted/paused turn——审批决策以 item 为事实显式落库,
         授权建议经 ``permission_updates`` update 通道落地(两者不混写)。
@@ -543,6 +586,12 @@ class Session:
         ``update_permission`` 提交(always 同批落盘),产生的 D9 披露收集进
         TurnResult.notices 供 CLI 打印。审批本身仍是 once 决策——绝不因批准
         一次调用而自动放宽权限。
+
+        ``extend``(阶段4 T3)是预算增量(Limits 维度名 → 非负 int):写一条
+        ``budget_extension`` item 折叠进本 turn limits,然后走同一续跑路径。
+        budget_exhausted 的 PAUSED 可只给 extend(无需 approval/reconcile);
+        校验(维度名/非负 int)与 approval/reconcile 同纪律——全部在 transition
+        之前,失败零写入零 transition(R-T3-3)。
         """
         turn = get_turn(self._store, turn_id)
         if turn is None:
@@ -559,8 +608,10 @@ class Session:
                     f"turn {turn_id!r} is interrupted; resume requires confirm=True (design §5.2)"
                 )
         elif status is TurnStatus.PAUSED:
-            if not approval and not reconcile:  # 空映射不是决策:不得静默丢弃待决审批/对账
-                raise ValueError("paused turn needs approval or reconcile")
+            # 空映射不是决策:不得静默丢弃待决审批/对账;extend(补预算)是
+            # budget_exhausted 暂停的第三种合法续跑输入(T3)。
+            if not approval and not reconcile and not extend:
+                raise ValueError("paused turn needs approval or reconcile (or extend to add budget)")
         elif status is TurnStatus.RUNNING:
             raise ValueError(f"turn {turn_id!r} is still running; not resumable")
         else:
@@ -575,6 +626,9 @@ class Session:
                 _validate_reconcile(turn_id, probe_items, reconcile)
             if approval:
                 _validate_approval(turn_id, probe_items, approval)
+        # extend 同纪律:负值/bool/未知维度在 transition 之前拒绝(R-T3-3)。
+        if extend:
+            _validate_extend(turn_id, extend)
         # 建议落地先纯代数预验(R11:非法 grant 在 transition 之前抛,零写入)。
         self._validate_permission_updates(permission_updates)
 
@@ -583,7 +637,7 @@ class Session:
             self._bus,
             turn_id,
             TurnStatus.RUNNING,
-            reason=self._resume_reason(status, approval, reconcile),
+            reason=self._resume_reason(status, approval, reconcile, extend),
         )
         # 授权先于 approval_decision 落笔:decision 必须 stamp 更新后的 revision,
         # 否则重入按 revision 绑定判旧批准作废,刚批准的动作会被 re-ask。
@@ -594,6 +648,8 @@ class Session:
             self._write_reconcile(turn_id, reconcile)
         if approval:
             self._write_approval_decisions(turn_id, approval)
+        if extend:
+            self._write_budget_extension(turn_id, extend)
 
         resume_calls, unknown_ids = self._classify_and_prepare(turn_id)
         if unknown_ids:
@@ -617,12 +673,26 @@ class Session:
         status: TurnStatus,
         approval: Mapping[str, Literal["allow", "deny"]] | None,
         reconcile: Mapping[str, Literal["ok", "failed"]] | None,
+        extend: Mapping[str, int] | None = None,
     ) -> str:
         if status is TurnStatus.INTERRUPTED:
             return "resume_confirmed"
         if reconcile:
             return "reconciled"
-        return "approval_decided"
+        if approval:
+            return "approval_decided"
+        return "budget_extended"
+
+    def _write_budget_extension(self, turn_id: str, extend: Mapping[str, int]) -> None:
+        """一条 budget_extension 事实:limits_delta 是 Limits 形状的增量(T1 键常量)。
+
+        resume 已前置校验(R-T3-3);折叠(_fold_extensions)只增不减,
+        多次扩展逐维累加。
+        """
+        payload: dict[str, JsonValue] = {EXTENSION_KEYS[0]: dict(extend)}
+        self._store.append_items(
+            self._thread_id, turn_id, [ItemEntry(kind=ItemKind.BUDGET_EXTENSION, payload=payload)]
+        )
 
     def _write_reconcile(self, turn_id: str, reconcile: Mapping[str, Literal["ok", "failed"]]) -> None:
         items = self._store.read_turn_items(turn_id)
@@ -743,8 +813,39 @@ class Session:
 
     # -- 内部执行入口 ----------------------------------------------------------
 
+    def _turn_budget_limits(self, turn_id: str) -> Limits:
+        """turn binding → root limits(R-T3-2 读端容错)。
+
+        键缺失/None → UNLIMITED(历史 turn 零扰动);畸形值 → UNLIMITED 并
+        emit 一次性诊断——写方是我们自己(submit/composition),读端 fail-open
+        符合 §5.1 纪律:一条坏 binding 绝不炸既有 turn。
+        """
+        turn = get_turn(self._store, turn_id)
+        raw = turn.binding.get("budget") if turn is not None else None
+        if raw is None:
+            return UNLIMITED
+        if isinstance(raw, Mapping):
+            try:
+                return limits_from_payload(raw)
+            except (TypeError, ValueError):
+                pass
+        if not self._budget_binding_warned:
+            self._budget_binding_warned = True
+            logger.warning(
+                "turn %s has malformed budget binding %r; treating as UNLIMITED (fail-open)",
+                turn_id,
+                raw,
+            )
+        return UNLIMITED
+
     async def _execute(self, turn_id: str, resume_calls: Sequence[ModelToolCall]) -> TurnResult:
-        """持 thread 执行锁跑 run_turn;锁忙 → ConversationBusy(不排队,§5.8)。"""
+        """持 thread 执行锁跑 run_turn;锁忙 → ConversationBusy(不排队,§5.8)。
+
+        BudgetTracker 恒注入(UNLIMITED 时 admit 恒放行,行为零扰动):
+        root limits 取 turn binding,unit_costs 取 composition 注入(R-T3-4);
+        child_reader 缺省 = store.read_items(build_tree 的生产默认,T5 子分配
+        经同一 reader 读子线程事实)。
+        """
         deps = TurnDeps(
             store=self._store,
             bus=self._bus,
@@ -764,6 +865,13 @@ class Session:
             summary_prompt_max_chars=self._summary_prompt_max_chars,
             hooks=self._hooks,
             skills_catalog=self._skills_catalog,
+            budget=BudgetTracker(
+                store=self._store,
+                thread_id=self._thread_id,
+                turn_id=turn_id,
+                root_limits=self._turn_budget_limits(turn_id),
+                unit_costs=self._unit_costs,
+            ),
         )
         try:
             with thread_execution_lock(self._workspace, self._thread_id):
