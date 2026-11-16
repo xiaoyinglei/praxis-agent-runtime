@@ -353,6 +353,30 @@ def _web_search_credential(cfg: SearchProviderConfig) -> str | None:
     return resolve_web_search_credential(cfg.api_key_env, SEARCH_ENDPOINTS[cfg.provider])
 
 
+# R-T8-1:子工具重构识别的 builtin 名集(与 _default_tools 稳定序同源,
+# test_default_table3b 钉序)。集合外的名字(MCP extra/测试玩具)保留父实例
+# ——它们不是根绑定的 builtin 工厂产物,无重绑语义。
+_BUILTIN_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "read",
+        "write",
+        "bash",
+        "manage_command",
+        "list_files",
+        "search_text",
+        "inspect_data_file",
+        "apply_patch",
+        "update_plan",
+        "run_python",
+        "read_artifact",
+        "web_fetch",
+        "web_search",
+        "invoke_skill",
+        "materialize_skill_asset",
+    }
+)
+
+
 def _default_tools(
     root: Path,
     sessions: CommandSessions,
@@ -504,6 +528,7 @@ def build_session(
     enable_subagents: bool = False,
     subagent_limits: Mapping[str, int] | None = None,
     persist_always: bool = True,
+    parent_tools: Mapping[str, Tool] | None = None,
 ) -> Session:
     """装配一个 Session:唯一组合根。CLI/TUI/host 一律经 sdk.open_session 走到这里。
 
@@ -568,6 +593,15 @@ def build_session(
       SUBAGENT_LIMITS_DEFAULT;未知键/负值边界拒绝,manager 同纪律);
     - ``persist_always=False``:always 授权只改内存不落盘(read_only 子
       共享父工作区,写父 permissions.json 即泄漏——㉖ 收口)。
+
+    阶段4 T8(R-T8-1,尾部默认零扰动):
+    - ``parent_tools``:子装配专用——给定父工具表时,builtin 按**本会话
+      工作区根**经既有工厂重构(子的 CommandSessions/ArtifactStore/skills/
+      web authorizer 全绑子自身),非 builtin(MCP/玩具)保留父实例,agent
+      五件排除(depth 门);``tools=`` 显式整体替换仍最优先。write 子因此
+      可经生产 write/bash/patch 写自身 worktree(落点已迁出地板私有集,
+      见 protocol.floor.host_worktrees_dir);read_only 子同根重构,写否决
+      仍由 read-only ceiling 承重。
     """
     if thread_id is not None:
         _validate_thread_id(thread_id)
@@ -640,6 +674,24 @@ def build_session(
         web_client: PublicHttpClient | None = None
         if tools is not None:
             tool_seq = tools
+        elif parent_tools is not None:
+            # R-T8-1(i):子工具表 = 按**子工作区根**重构的 builtin(经既有
+            # _default_tools 工厂:子的 sessions/artifacts/skills/web authorizer
+            # 全部绑子自身)+ 父非 builtin 实例(MCP extra/测试玩具),减 agent
+            # 五件(depth 结构门)。父工具实例根绑父仓,直接复用会让 write 子
+            # 永远写不了自身 worktree(阻断(a));read_only 子同根重构,收窄
+            # 仍由 ceiling 承重。wanted 为空 ⇒ 不构造默认表/web client
+            # (capability coupling:替换路径保持廉价)。
+            wanted = [name for name in parent_tools if name not in AGENT_TOOL_NAMES]
+            rebuilt: dict[str, Tool] = {}
+            if any(name in _BUILTIN_TOOL_NAMES for name in wanted):
+                default_seq, web_client = _default_tools(
+                    root, sessions, artifact_store, resolved_skills, session_holder
+                )
+                rebuilt = {tool.definition.name: tool for tool in default_seq}
+            tool_seq = tuple(
+                rebuilt[name] if name in rebuilt else parent_tools[name] for name in wanted
+            )
         else:
             tool_seq, web_client = _default_tools(
                 root, sessions, artifact_store, resolved_skills, session_holder
@@ -800,6 +852,11 @@ def build_child_session(
 ) -> Session:
     """子 Session 工厂(阶段4 T5;内部仍调 build_session——构造唯一点不破)。
 
+    R-T8-1(i):子工具表经 ``parent_tools`` 通道按子工作区根重构 builtin
+    (read_only 子根=父工作区,write 子根=worktree),非 builtin 保留父实例;
+    depth 结构门(减 agent 五件)在 build_session 子装配分支与 manager 双侧
+    保持。
+
     装配纪律:
     - **同库**(§5.13):Store 经 ``parent.store.db_path`` 指向父库文件——
       write 子的独立工作区目录不等于独立库;子 items 写自己的 thread;
@@ -868,7 +925,9 @@ def build_child_session(
         workspace,
         parent.adapter,
         thread_id=thread_id,
-        tools=tuple(tool_subset),
+        # R-T8-1(i):不再复用父工具实例(根绑父仓)——builtin 按子工作区根
+        # 重构,非 builtin 保留;tool_subset 仍供上方 read_only ceiling 判据。
+        parent_tools={tool.definition.name: tool for tool in tool_subset},
         policy=parent.permissions.policy,
         mode=parent.permissions.mode,
         budget=limits,

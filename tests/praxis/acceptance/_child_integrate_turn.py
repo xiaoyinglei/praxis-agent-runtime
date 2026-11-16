@@ -6,17 +6,15 @@
 
 scripts.json 形状:{"parent": [spec...], "child": [spec...]}(spec 与
 _child_run_turn.py 的 responses.json 条目同构)。父剧本 spawn 一个 write 子
-(任务含标记 ``[kill-child]``),子剧本经 ``child_edit`` 测试缝改 a.txt 后收尾;
+(任务含标记 ``[kill-child]``),子剧本经生产 write 工具改 a.txt 后收尾;
 父 wait 子终态后调 integrate apply。
 
 故障注入缝:``GitWorktreeProvisioner.apply`` 类级替换为"先睡 _HOLD_SECONDS
 再进原函数"——kill 恰好落在 integrate 的 tool_call item 已落库、真实 apply
 尚未写父仓的窗口(started+非幂等 → outcome_unknown → reconcile,T4 矩阵)。
 
-``child_edit`` 是**测试缝**(T6 spawn_probe/child_hang 同先例):write 子经
-生产工具写自身 worktree 的通路当前被地板/工具根绑定结构性阻断(见
-task-8-report 顾虑①),缝工具经 exec_ctx.permissions.workspace 写**本会话
-自己的工作区**,只代表子的工作产物字节,不是生产写路径。
+R-T8-1:子经**生产 write 工具**改自身 worktree(子工具按子工作区根重构 +
+worktree 迁出地板私有集),无测试缝工具。
 
 子进程绝不自求多福地清理:SIGKILL 不留任何用户态收尾正是被验收的性质。
 若它侥幸跑完 resume(缝失效=测试装置失败),打印结局并以退出码 1 报给父测试。
@@ -40,7 +38,6 @@ from praxis.adapters.models.scripted import ScriptedAdapter  # noqa: E402
 from praxis.adapters.workspaces.git import GitWorktreeProvisioner  # noqa: E402
 from praxis.interfaces.sdk import open_session  # noqa: E402
 from praxis.protocol.items import ItemKind  # noqa: E402
-from praxis.protocol.json import JsonValue  # noqa: E402
 from praxis.protocol.models import (  # noqa: E402
     ModelEvent,
     ModelMessage,
@@ -52,18 +49,6 @@ from praxis.protocol.models import (  # noqa: E402
     WireRequest,
     assemble_model_events,
     collect_events,
-)
-from praxis.protocol.sandbox import ToolExecContext  # noqa: E402
-from praxis.protocol.tools import (  # noqa: E402
-    CancellationMode,
-    InterruptBehavior,
-    ResolvedUse,
-    ResultStatus,
-    Tool,
-    ToolContentBlock,
-    ToolDefinition,
-    ToolResult,
-    json_schema_input,
 )
 
 _HOLD_SECONDS = 45.0  # 必须远大于父进程轮询间隔:保证 kill 落在窗口正中
@@ -130,51 +115,6 @@ class _Router:
         return assemble_model_events(await collect_events(self.stream(req)))
 
 
-def _edit_seam_tool() -> Tool:
-    schema = {
-        "type": "object",
-        "properties": {
-            "path": {"type": "string", "minLength": 1},
-            "content": {"type": "string"},
-        },
-        "required": ["path", "content"],
-        "additionalProperties": False,
-    }
-
-    def run(arguments: Mapping[str, JsonValue], exec_ctx: ToolExecContext) -> ToolResult:
-        workspace = Path(exec_ctx.permissions.workspace)
-        raw = arguments.get("path")
-        target = workspace / str(raw)
-        if not target.resolve().is_relative_to(workspace.resolve()):
-            raise ValueError(f"child_edit seam path escapes workspace: {raw!r}")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(str(arguments.get("content", "")), encoding="utf-8")
-        return ToolResult(
-            tool_call_id="pending",
-            tool_name="child_edit",
-            content=(ToolContentBlock(type="text", data={"text": f"edited {raw}"}),),
-            status=ResultStatus.OK,
-        )
-
-    return Tool(
-        definition=ToolDefinition(
-            name="child_edit",
-            description="TEST SEAM: write work-product bytes into this session's own workspace.",
-            input_schema=schema,
-        ),
-        validate_input=json_schema_input(schema),
-        run=run,
-        static_effects=frozenset(),
-        resolve_use=lambda arguments: ResolvedUse(frozenset(), ()),
-        idempotent=True,
-        concurrency_safe=True,
-        cancellation_mode=CancellationMode.COOPERATIVE,
-        interrupt_behavior=InterruptBehavior.CANCEL,
-        timeout_seconds=30,
-        max_model_output_bytes=4_000,
-    )
-
-
 def _install_apply_seam() -> None:
     real_apply = GitWorktreeProvisioner.apply
 
@@ -201,8 +141,7 @@ async def _amain(workspace: Path, scripts: Mapping[str, Any], thread_id: str) ->
         thread_id,
     )
     session = open_session(
-        workspace, router, thread_id=thread_id, enable_subagents=True,
-        extra_tools=(_edit_seam_tool(),),
+        workspace, router, thread_id=thread_id, enable_subagents=True
     )
     holder.append(session)
     try:

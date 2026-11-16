@@ -2,8 +2,8 @@
 
 覆盖面(逐条对应 brief 与控制器裁决):
 - prepare:真 git repo 的 ``git worktree add --detach HEAD`` 快照,父脏文件与
-  untracked 都不入快照;落点 = ``host_config_dir()/worktrees/<sha256>/<child>``
-  (库外、宿主目录);
+  untracked 都不入快照;落点 = ``host_worktrees_dir()/<sha256>/<child>``
+  (R-T8-1 重裁:宿主私有、非地板、父工作区外;根 0o700);
 - diff/apply round-trip:tracked 修改 + untracked 新文件(含二进制)可重建;
 - preimage 逐文件 sha256 复检:不一致 → conflicts 且**整组不写**(双方字节都在);
 - ``git apply --check`` 失败 → ``patch_failed`` 整组拒(untracked 也不写);
@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import stat
 import subprocess
 from pathlib import Path
 
@@ -29,7 +30,7 @@ import pytest
 from praxis.adapters.workspaces.git import GitWorktreeProvisioner, _encode_bundle
 from praxis.composition import build_session
 from praxis.interfaces.sdk import ScriptedAdapter
-from praxis.protocol.floor import host_config_dir
+from praxis.protocol.floor import host_config_dir, host_worktrees_dir
 from praxis.protocol.workspaces import ChildWorkspaceRequiresGit
 from praxis.tools.builtins.child_env import child_env
 
@@ -69,7 +70,7 @@ def provisioner() -> GitWorktreeProvisioner:
 
 def _expected_workspace(repo: Path, child_id: str) -> Path:
     digest = hashlib.sha256(os.fsencode(str(repo.resolve()))).hexdigest()[:16]
-    return host_config_dir() / "worktrees" / digest / child_id
+    return host_worktrees_dir() / digest / child_id
 
 
 # ---------------------------------------------------------------------------
@@ -88,8 +89,12 @@ def test_prepare_detached_snapshot_hides_parent_dirty_bytes(
 
     assert ws == _expected_workspace(repo, "child-1")
     assert ws.is_dir()
-    assert ws.is_relative_to(host_config_dir())
+    # R-T8-1:迁出 host_config_dir(地板私有集 S-3 不变,子可写自身工作区)。
+    assert ws.is_relative_to(host_worktrees_dir())
+    assert not ws.is_relative_to(host_config_dir())
     assert not ws.is_relative_to(repo)
+    # 宿主私有:快照根 0o700(command_jobs_dir 同惯例)。
+    assert stat.S_IMODE(ws.parent.parent.stat().st_mode) == 0o700
     # 快照 = HEAD 字节,不含父脏修改/untracked。
     assert (ws / "a.txt").read_text(encoding="utf-8") == "base\n"
     assert not (ws / "dirty-only.txt").exists()

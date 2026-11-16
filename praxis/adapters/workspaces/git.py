@@ -3,8 +3,10 @@
 ``GitWorktreeProvisioner`` 是 protocol.workspaces.ChildWorkspaceProvisioner 的
 唯一生产实现(composition 绑定)。控制器裁决:
 
-- 落点 ``host_config_dir()/worktrees/<sha256(resolve(parent))[:16]>/<child>``
-  ——库外、宿主配置目录、安全地板内(代理不可写);
+- 落点 ``host_worktrees_dir()/<sha256(resolve(parent))[:16]>/<child>``
+  (R-T8-1 重裁 T7 落点)——库外、父工作区外、宿主私有(根 0o700)、
+  **非地板私有集**:子 Session 可经生产工具写自身工作区;父工具/沙箱
+  不可达(host_private_paths 逐字不变,S-3);
 - ``git -C parent worktree add --detach <path> HEAD``——detach 快照,父工作区
   未提交字节不入快照;integrate 走 diff/patch,不引入 branch merge;
 - diff bundle = ``git diff HEAD`` + ``git status --porcelain -z`` 的 untracked
@@ -37,7 +39,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from praxis.protocol.floor import host_config_dir
+from praxis.protocol.floor import host_worktrees_dir
 from praxis.protocol.sandbox import EnvBuilder
 from praxis.protocol.workspaces import (
     DIFF_PREVIEW_LIMIT_BYTES,
@@ -532,7 +534,12 @@ class GitWorktreeProvisioner:
                 f"{parent} (repository root is {repository_root})"
             )
         digest = _sha256(os.fsencode(str(parent)))[:16]
-        base = Path(os.path.abspath(host_config_dir())) / "worktrees" / digest
+        root = Path(os.path.abspath(host_worktrees_dir()))
+        # 宿主私有根 0o700(command_jobs_dir 同惯例);chmod 幂等收口,
+        # 防外部预创建的宽松模式目录。
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(root, 0o700)
+        base = root / digest
         base.mkdir(parents=True, exist_ok=True)
         workspace = base / child_id
         if workspace.exists():

@@ -151,6 +151,21 @@ def command_jobs_dir() -> Path:
     return Path(tempfile.gettempdir()) / f"praxis-command-jobs-{os.getuid()}"
 
 
+def host_worktrees_dir() -> Path:
+    """write 子 worktree 快照根目录(T8 R-T8-1 重裁 T7 落点)。
+
+    宿主私有、**不在地板私有集合**(``host_private_paths()`` 逐字不变,
+    S-3 裁决):子 Session 的工作区即本目录子树——地板若以它为祖先,子经
+    任何生产工具写自身工作区都会被否(write 子可用性承重)。父工作区在
+    本目录外,父工具根围栏与沙箱写区都不可达(confinement 探针钉)。
+
+    与 ``command_jobs_dir`` 同惯例:tempdir + uid 后缀(测试经 per-test
+    TMPDIR 隔离天然覆盖,不污染真实宿主);调用方以 0o700 建根。integrate
+    期间稳定:tempdir per-user 稳定,快照生命周期 ⊆ 会话族生命周期。
+    """
+    return Path(tempfile.gettempdir()) / f"praxis-worktrees-{os.getuid()}"
+
+
 def host_private_paths() -> tuple[str, ...]:
     """返回宿主私有目录元组(两个公开定义函数的组合)。
 

@@ -12,10 +12,11 @@
    outcome_unknown → reconcile(ok) 收尾(T4 既有矩阵完整链);随后全新 turn
    再 integrate apply 成功——崩溃现场可解释、工作区仍可交付。
 
-子工作产物字节经 ``child_edit`` 测试缝写入(T6 spawn_probe/child_hang 同先例):
-write 子经生产工具写自身 worktree 的通路当前被地板/工具根绑定结构性阻断
-(见 task-8-report 顾虑①,待控制器裁决)。子是同库真 Session、真终态 turn、
-真 git worktree diff——integrate 交付语义全程真实管道。
+R-T8-1:子经**生产工具**改自身 worktree(write/bash;子工具按子工作区根
+重构 + worktree 迁出地板私有集 host_worktrees_dir)。``child_barrier`` 是
+纯编排测试缝(只等 barrier、零写入,T6 child_hang 同先例),与 asyncio.Barrier
+一起钉双子编辑**同时在飞**;编辑字节全部来自真 write/bash 管道。
+子是同库真 Session、真终态 turn、真 git worktree diff——integrate 全程真实管道。
 """
 
 from __future__ import annotations
@@ -37,7 +38,6 @@ import pytest
 from praxis.core.statemachine import TurnStatus
 from praxis.interfaces.sdk import ScriptedAdapter, open_session
 from praxis.protocol.items import Item, ItemKind
-from praxis.protocol.json import JsonValue
 from praxis.protocol.models import (
     ModelEvent,
     ModelMessage,
@@ -50,7 +50,7 @@ from praxis.protocol.models import (
     assemble_model_events,
     collect_events,
 )
-from praxis.protocol.sandbox import ToolExecContext
+from praxis.protocol.policy import NetworkPolicy, PermissionPolicy
 from praxis.protocol.tools import (
     CancellationMode,
     InterruptBehavior,
@@ -60,7 +60,6 @@ from praxis.protocol.tools import (
     ToolContentBlock,
     ToolDefinition,
     ToolResult,
-    json_schema_input,
 )
 from praxis.store.log import Store
 from praxis.store.turns import get_turn
@@ -146,44 +145,30 @@ class _Router:
         return assemble_model_events(await collect_events(self.stream(req)))
 
 
-def _edit_tool(barrier: asyncio.Barrier | None, arrivals: list[str]) -> Tool:
-    """child_edit 测试缝:写本会话工作区;barrier 非 None 时钉双子同时在飞。"""
+def _barrier_tool(barrier: asyncio.Barrier, arrivals: list[str]) -> Tool:
+    """child_barrier 纯编排测试缝:只等 barrier 并记录到达,零写入。
 
-    schema = {
-        "type": "object",
-        "properties": {
-            "path": {"type": "string", "minLength": 1},
-            "content": {"type": "string"},
-        },
-        "required": ["path", "content"],
-        "additionalProperties": False,
-    }
+    与 asyncio.Barrier(2) 一起钉双子在生产编辑前同时在飞(并行承重);
+    编辑本身由子的真 write/bash 工具完成(R-T8-1)。
+    """
 
-    async def run(arguments: Mapping[str, JsonValue], exec_ctx: ToolExecContext) -> ToolResult:
-        workspace = Path(exec_ctx.permissions.workspace)
-        if barrier is not None:
-            await asyncio.wait_for(barrier.wait(), timeout=15)
-        arrivals.append(str(workspace))
-        raw = str(arguments["path"])
-        target = workspace / raw
-        if not target.resolve().is_relative_to(workspace.resolve()):
-            raise ValueError(f"child_edit seam path escapes workspace: {raw!r}")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(str(arguments["content"]), encoding="utf-8")
+    async def run(arguments: Mapping[str, Any], exec_ctx: Any) -> ToolResult:
+        await asyncio.wait_for(barrier.wait(), timeout=15)
+        arrivals.append(exec_ctx.permissions.workspace)
         return ToolResult(
             tool_call_id="pending",
-            tool_name="child_edit",
-            content=(ToolContentBlock(type="text", data={"text": f"edited {raw}"}),),
+            tool_name="child_barrier",
+            content=(ToolContentBlock(type="text", data={"text": "barrier passed"}),),
             status=ResultStatus.OK,
         )
 
     return Tool(
         definition=ToolDefinition(
-            name="child_edit",
-            description="TEST SEAM: write work-product bytes into this session's own workspace.",
-            input_schema=schema,
+            name="child_barrier",
+            description="TEST SEAM: wait for the sibling child (orchestration only, no writes).",
+            input_schema={"type": "object"},
         ),
-        validate_input=json_schema_input(schema),
+        validate_input=lambda arguments: arguments,
         run=run,
         static_effects=frozenset(),
         resolve_use=lambda arguments: ResolvedUse(frozenset(), ()),
@@ -214,11 +199,13 @@ def _integrate(call_id: str, n: int, action: str = "apply") -> ModelResponse:
     )
 
 
-def _open(repo: Path, frames: Sequence[ModelResponse], marked: Mapping[str, Sequence[ModelResponse]], edit: Tool) -> Any:
+def _open(repo: Path, frames: Sequence[ModelResponse], marked: Mapping[str, Sequence[ModelResponse]], barrier_tool: Tool) -> Any:
     holder: list[Any] = []
     session = open_session(
         repo, _Router(frames, holder, marked),
-        thread_id="parent", enable_subagents=True, extra_tools=(edit,),
+        thread_id="parent", enable_subagents=True, extra_tools=(barrier_tool,),
+        # 子的 bash 继承父网络策略(kill9 先例:默认 ask 会暂停命令网络)。
+        policy=PermissionPolicy(network=NetworkPolicy(decision="allow")),
     )
     holder.append(session)
     return session
@@ -259,11 +246,13 @@ def test_two_write_children_parallel_adjacent_files_both_integrate(repo: Path) -
         arrivals: list[str] = []
         marked = {
             "[child-a]": [
-                _resp("", (("e1", "child_edit", {"path": "a.txt", "content": "child-a\n"}),)),
+                _resp("", (("b1", "child_barrier", {}),)),
+                _resp("", (("e1", "write", {"path": "a.txt", "content": "child-a\n"}),)),
                 _resp("done a"),
             ],
             "[child-b]": [
-                _resp("", (("e2", "child_edit", {"path": "b.txt", "content": "child-b\n"}),)),
+                _resp("", (("b2", "child_barrier", {}),)),
+                _resp("", (("e2", "bash", {"command": "printf 'child-b\\n' > b.txt"}),)),
                 _resp("done b"),
             ],
         }
@@ -276,13 +265,13 @@ def test_two_write_children_parallel_adjacent_files_both_integrate(repo: Path) -
             _integrate("ib", 2),
             _resp("parent done"),
         ]
-        session = _open(repo, frames, marked, _edit_tool(barrier, arrivals))
+        session = _open(repo, frames, marked, _barrier_tool(barrier, arrivals))
         try:
             result = await session.submit("go")
             result = await _approve(session, result)
             result = await _approve(session, result)
             assert result.status is TurnStatus.COMPLETED
-            # 并行承重:两个子的 child_edit 曾同时在飞(barrier 双侧到达)。
+            # 并行承重:两个子的 barrier 曾同时在飞(双侧到达),编辑是真工具。
             assert len(arrivals) == 2
             allocations = _allocations(session)
             assert len(allocations) == 2
@@ -314,11 +303,13 @@ def test_two_write_children_same_line_second_conflicts_bytes_preserved(repo: Pat
         arrivals: list[str] = []
         marked = {
             "[child-a]": [
-                _resp("", (("e1", "child_edit", {"path": "a.txt", "content": "child-a\n"}),)),
+                _resp("", (("b1", "child_barrier", {}),)),
+                _resp("", (("e1", "write", {"path": "a.txt", "content": "child-a\n"}),)),
                 _resp("done a"),
             ],
             "[child-b]": [
-                _resp("", (("e2", "child_edit", {"path": "a.txt", "content": "child-b\n"}),)),
+                _resp("", (("b2", "child_barrier", {}),)),
+                _resp("", (("e2", "bash", {"command": "printf 'child-b\\n' > a.txt"}),)),
                 _resp("done b"),
             ],
         }
@@ -331,7 +322,7 @@ def test_two_write_children_same_line_second_conflicts_bytes_preserved(repo: Pat
             _integrate("ib", 2),
             _resp("parent done"),
         ]
-        session = _open(repo, frames, marked, _edit_tool(barrier, arrivals))
+        session = _open(repo, frames, marked, _barrier_tool(barrier, arrivals))
         try:
             result = await session.submit("go")
             result = await _approve(session, result)
@@ -394,7 +385,7 @@ def test_kill9_mid_integrate_apply_reconcile_chain(repo: Path, tmp_path: Path) -
             _spec(_resp("parent done")),
         ],
         "child": [
-            _spec(_resp("", (("e1", "child_edit", {"path": "a.txt", "content": "child-killed\n"}),))),
+            _spec(_resp("", (("e1", "write", {"path": "a.txt", "content": "child-killed\n"}),))),
             _spec(_resp("child done")),
         ],
     }

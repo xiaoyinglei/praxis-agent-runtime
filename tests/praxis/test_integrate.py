@@ -14,9 +14,10 @@
 - R-T7-3 经 integrate 承重:父仓祖先 symlink 指仓外 → apply conflicts,绝不写出
   parent_root(provisioner 层承重见 test_child_workspace.py)。
 
-子工作区字节由测试直接写入(T7 先例):write 子经生产工具写自身 worktree 的
-通路当前被地板/工具根绑定结构性阻断(见 task-8-report 顾虑①,待控制器裁决),
-本文件钉的是 integrate 交付语义,子是同库真 Session、真终态 turn。
+R-T8-1 后 write 子经**生产工具**(write/bash/apply_patch)改自身 worktree:
+子工具按子工作区根重构 + worktree 迁出地板私有集(host_worktrees_dir)。
+旗舰端到端与生产工具测试用真子编辑;其余 integrate 机制测试(冲突/子集/
+祖先 symlink 等)仍由测试直接写 worktree 字节(T7 先例,聚焦交付语义)。
 
 仓库无 pytest-asyncio:与 test_agent_tools.py 同风格,asyncio.run 包装。
 """
@@ -26,14 +27,19 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import shlex
 import subprocess
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
+from praxis.adapters.sandbox.base import probe_backend
+from praxis.adapters.workspaces.git import GitWorktreeProvisioner
+from praxis.composition import build_child_session
 from praxis.core.statemachine import TurnStatus
 from praxis.interfaces.sdk import ScriptedAdapter, open_session
 from praxis.protocol.agents import ChildActiveError
@@ -51,7 +57,8 @@ from praxis.protocol.models import (
     assemble_model_events,
     collect_events,
 )
-from praxis.protocol.policy import PermissionPolicy
+from praxis.protocol.budget import UNLIMITED
+from praxis.protocol.policy import NetworkPolicy, PermissionPolicy
 from praxis.protocol.sandbox import ToolExecContext
 from praxis.protocol.tools import (
     CancellationMode,
@@ -66,6 +73,7 @@ from praxis.protocol.tools import (
 )
 from praxis.protocol.workspaces import ApplyResult, WorkspaceInspection
 from praxis.store.artifacts import ArtifactStore
+from praxis.tools.builtins.child_env import child_env
 from praxis.tools.builtins.agent_tools import create_agent_tools
 
 _ZERO_USAGE = Usage(input_tokens=0, output_tokens=0)
@@ -334,14 +342,35 @@ def test_integrate_tool_surface_shapes_and_error_codes() -> None:
 
 def test_inspect_apply_end_to_end_with_explicit_approval(repo: Path) -> None:
     async def scenario() -> None:
-        session = _open(repo, [*_spawn_wait_frames(), _resp("turn one done")])
+        # R-T8-1:子经**生产 write 工具**改自身 worktree(子工具按子根重构)。
+        marked = {
+            "[edit-child]": [
+                _resp("", (("ew1", "write", {"path": "a.txt", "content": "child-a\n"}),)),
+                _resp("", (("ew2", "write", {"path": "new.txt", "content": "new\n"}),)),
+                _resp("child done"),
+            ]
+        }
+        frames = [
+            _resp(
+                "",
+                (("s1", "spawn_subagent", {"task": "[edit-child] edit files", "workspace_mode": "write"}),)),
+            _resp("", (("w1", "wait_subagent", {"child_thread_id": "PLACEHOLDER", "timeout": 10}),)),
+            _resp("turn one done"),
+        ]
+        session = _open(repo, frames, marked=marked)
         try:
             r1 = await session.submit("go")
             assert r1.status is TurnStatus.COMPLETED
-            child_ws = Path(str(_allocations(session)[0]["workspace"]))
-            # 子已终态;子工作区字节由测试写入(T7 先例,见模块 docstring)。
-            (child_ws / "a.txt").write_text("child-a\n", encoding="utf-8")
-            (child_ws / "new.txt").write_text("new\n", encoding="utf-8")
+            allocation = _allocations(session)[0]
+            child_ws = Path(str(allocation["workspace"]))
+            child_results = [
+                item.payload
+                for item in session.store.read_turn_items(str(allocation["child_root_turn_id"]))
+                if item.kind == ItemKind.TOOL_RESULT
+            ]
+            assert [p["status"] for p in child_results] == ["ok", "ok"]
+            assert (child_ws / "a.txt").read_text(encoding="utf-8") == "child-a\n"
+            assert (child_ws / "new.txt").read_text(encoding="utf-8") == "new\n"
             _rescript(session, [_integrate_frame("inspect"), _integrate_frame("apply"), _resp("parent done")])
             r2 = await session.submit("integrate")
             # 第一个 integrate(inspect)即 DESTRUCTIVE 显式审批(S5)。
@@ -594,6 +623,109 @@ def test_integrate_never_mode_denied(repo: Path) -> None:
             payload = _integrate_payloads(session, r1.turn_id)[0]
             assert payload["status"] == "denied"
             assert payload["error_code"] == "permission_denied"
+        finally:
+            await session.aclose()
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# ②b R-T8-1:write 子经生产 write/bash/apply_patch 改自身 worktree + 父 confinement
+# ---------------------------------------------------------------------------
+
+
+def test_write_child_production_tools_edit_own_worktree(repo: Path) -> None:
+    """子工具按子工作区根重构(R-T8-1(i))+ worktree 迁出地板(iii):
+    write/bash/apply_patch(Add File,非 DESTRUCTIVE)三条生产路径全通。"""
+
+    async def scenario() -> None:
+        patch_text = "*** Begin Patch\n*** Add File: patched.txt\n+patched\n*** End Patch\n"
+        # 父不 submit;剧本只被子 Session 消费(适配器继承父,公开构造)。
+        adapter = ScriptedAdapter(
+            [
+                _resp("", (("cw1", "write", {"path": "a.txt", "content": "child-a\n"}),)),
+                _resp("", (("cb1", "bash", {"command": "printf 'child-b\\n' > b.txt"}),)),
+                _resp("", (("cp1", "apply_patch", {"patch": patch_text}),)),
+                _resp("child done"),
+            ]
+        )
+        parent = open_session(
+            repo, adapter, thread_id="parent",
+            policy=PermissionPolicy(network=NetworkPolicy(decision="allow")),
+        )
+        provisioner = GitWorktreeProvisioner(child_env)
+        ws = provisioner.prepare(repo, uuid4().hex, "write")
+        child = build_child_session(
+            parent=parent, workspace=ws, thread_id=uuid4().hex, limits=UNLIMITED,
+            tool_subset=tuple(parent.tools.values()), workspace_mode="write",
+        )
+        try:
+            result = await child.submit("edit my workspace")
+            assert result.status is TurnStatus.COMPLETED
+            payloads = [
+                item.payload
+                for item in child.store.read_turn_items(result.turn_id)
+                if item.kind == ItemKind.TOOL_RESULT
+            ]
+            assert [p["status"] for p in payloads] == ["ok", "ok", "ok"]
+            assert (ws / "a.txt").read_text(encoding="utf-8") == "child-a\n"
+            assert (ws / "b.txt").read_text(encoding="utf-8") == "child-b\n"
+            assert (ws / "patched.txt").read_text(encoding="utf-8") == "patched\n"
+            # 交付:inspect preimages + diff + apply 全真实管道语义。
+            inspection = provisioner.inspect(ws)
+            applied = provisioner.apply(repo, provisioner.diff(ws), preimages=inspection.preimages)
+            assert applied.conflicts == []
+            assert applied.applied == ["a.txt", "b.txt", "patched.txt"]
+            assert (repo / "a.txt").read_text(encoding="utf-8") == "child-a\n"
+            assert (repo / "patched.txt").read_text(encoding="utf-8") == "patched\n"
+        finally:
+            await child.aclose()
+            await parent.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(not probe_backend().available, reason="no sandbox backend")
+def test_parent_production_tools_cannot_reach_child_worktree(repo: Path) -> None:
+    """R-T8-1 安全承重:迁出地板**不开父旁路**——父 bash 读/写子 worktree
+    绝对路径被沙箱拒,父 write/read 工具被根围栏拒(invalid_input)。"""
+
+    async def scenario() -> None:
+        # 父 bash 需网络 allow(默认 ask 会暂停命令网络;kill9 先例)。
+        session = _open(
+            repo,
+            [*_spawn_wait_frames(), _resp("turn one done")],
+            policy=PermissionPolicy(network=NetworkPolicy(decision="allow")),
+        )
+        try:
+            r1 = await session.submit("go")
+            assert r1.status is TurnStatus.COMPLETED
+            child_ws = Path(str(_allocations(session)[0]["workspace"]))
+            target = shlex.quote(str(child_ws / "a.txt"))
+            _rescript(
+                session,
+                [
+                    _resp("", (("pb1", "bash", {"command": f"cat {target}"}),)),
+                    _resp("", (("pb2", "bash", {"command": f"printf hacked > {target}"}),)),
+                    _resp("", (("pw1", "write", {"path": str(child_ws / "a.txt"), "content": "hacked\n"}),)),
+                    _resp("", (("pr1", "read", {"path": str(child_ws / "a.txt")}),)),
+                    _resp("parent done"),
+                ],
+            )
+            r2 = await session.submit("probe")
+            assert r2.status is TurnStatus.COMPLETED
+            payloads = {
+                item.payload.get("call_id"): item.payload
+                for item in session.store.read_turn_items(r2.turn_id)
+                if item.kind == ItemKind.TOOL_RESULT
+            }
+            # 沙箱拒:命令真实执行但非零退出(读/写都不可达)。
+            assert int(payloads["pb1"]["metadata"]["exit_code"]) != 0
+            assert int(payloads["pb2"]["metadata"]["exit_code"]) != 0
+            # 工具根围栏:绝对路径越出父工作区 → invalid_input。
+            assert payloads["pw1"]["error_code"] == "invalid_input"
+            assert payloads["pr1"]["error_code"] == "invalid_input"
+            assert (child_ws / "a.txt").read_text(encoding="utf-8") == "base-a\n"
         finally:
             await session.aclose()
 
