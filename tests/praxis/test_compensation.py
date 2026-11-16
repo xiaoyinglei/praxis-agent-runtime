@@ -22,6 +22,7 @@ from praxis.core.compensation import (
     OUTCOME_UNKNOWN_TEXTS,
     UnresolvedCall,
     close_unresolved,
+    settlement_outcome,
     unclosed_windows,
 )
 from praxis.protocol.items import Item, ItemKind
@@ -302,3 +303,40 @@ def test_unresolved_call_is_frozen() -> None:
     )
     with pytest.raises(FrozenInstanceError):
         uc.started = True  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# settlement_outcome:唯一清算矩阵(T16 ㉔——NOT_EXECUTED 字面构造收敛本模块)
+# ---------------------------------------------------------------------------
+
+
+def test_settlement_outcome_matrix_both_contexts() -> None:
+    """started → outcome_unknown / 未 started → not_executed;两种终态语境文案
+    与 close_unresolved 逐字同源(session resume 矩阵与 pipeline cancel 检查点
+    都消费这一份,不得另写第二份映射)。"""
+    assert settlement_outcome(False, text_for="interrupted") == (
+        ResultStatus.NOT_EXECUTED, _LEGACY_NOT_EXECUTED
+    )
+    assert settlement_outcome(True, text_for="interrupted") == (
+        ResultStatus.OUTCOME_UNKNOWN, _LEGACY_OUTCOME_UNKNOWN
+    )
+    assert settlement_outcome(False, text_for="cancelled") == (
+        ResultStatus.NOT_EXECUTED, NOT_EXECUTED_TEXTS["cancelled"]
+    )
+    assert settlement_outcome(True, text_for="cancelled") == (
+        ResultStatus.OUTCOME_UNKNOWN, OUTCOME_UNKNOWN_TEXTS["cancelled"]
+    )
+
+
+def test_close_unresolved_consumes_the_same_matrix() -> None:
+    items = [
+        _response(1, [_call("c1", "write_file"), _call("c2", "read_file")]),
+        _tool_call(2, "c1", "write_file"),
+    ]
+    entries, unknown = close_unresolved(items, _TOOLS, text_for="cancelled")
+    by_id = {e.payload["call_id"]: e.payload for e in entries}
+    for call_id, started in (("c1", True), ("c2", False)):
+        status, text = settlement_outcome(started, text_for="cancelled")
+        assert by_id[call_id]["status"] == status.value
+        assert by_id[call_id]["content"][0]["data"]["text"] == text  # type: ignore[index]
+    assert unknown == ["c1"]

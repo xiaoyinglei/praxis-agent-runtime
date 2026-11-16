@@ -1,9 +1,14 @@
-"""Task 9:三入口决策一致性属性测试(设计 §7.2/§8 验收;硬规则 3)。
+"""Task 9/T16:四入口决策一致性属性测试(设计 §7.2/§8 验收;硬规则 3)。
 
-设计 §7.2 要求"同一策略在 CLI/模型/子代理三入口决策一致(属性测试)"。子代理入口
-阶段 4 才落地,当前可达面 = **模型 / CLI / resume** 三入口——它们一律经唯一管道
+设计 §7.2 要求"同一策略在 CLI/模型/子代理三入口决策一致(属性测试)"。阶段 4
+T16 兑现第四入口:**模型 / CLI / resume / child** 四入口——它们一律经唯一管道
 ``praxis.core.pipeline.execute`` 执行工具,唯一决策入口 ``permission.decide``。
-``ENTRIES`` 注册表是扩展位:阶段 4 子代理入口复用同一 execute,注册即纳入本属性。
+child 入口 = ScriptedAdapter 父发 spawn_subagent(workspace_mode="write")→
+子 Session(继承父 adapter/policy/mode,无 read-only ceiling)在自己的 thread
+里执行**同一目标 call**;父经 wait_subagent 等子收敛后才结束(剧本占位 id 由
+_ChildIdRewritingAdapter 重写为运行期 uuid)。子工作区是父仓 HEAD 的 detach
+worktree 快照(T7 provisioner),种子文件逐字 commit 入 HEAD——决策输入与三入口
+同形,reason 里的 workspace 根按子工作区规范化为 "<ws>"。无第二执行路径。
 
 观测口径(brief 钉死):比较**首次 execute 的决策类别 + reason**——
 - executed = tool_call item(管道已 dispatch;工具自身业务错误如
@@ -20,16 +25,19 @@ resume(approval={call: allow}) 重入,断言重入后执行成功且 args_digest
 绑定生效;executed/denied 则直接观测 submit 快照,无需 resume。跨入口比较用的是
 **submit 的首次决策**(重入是第二次决策,单独断言)。
 
-真实面:模型/resume 经 sdk.open_session(唯一组合根),CLI 经 typer CliRunner 进程内
-真实分派 ``run`` 命令(--scripted + --policy 临时文件)。ScriptedAdapter 只是确定性
-模型替身,循环/管道/工具/store 全是真的。
+真实面:模型/resume/child 经 sdk.open_session(唯一组合根),CLI 经 typer CliRunner
+进程内真实分派 ``run`` 命令(--scripted + --policy 临时文件)。ScriptedAdapter 只是
+确定性模型替身,循环/管道/工具/store 全是真的。child 腿的父会话 enable_subagents=True
+(编排四件 session 域 allow,不影响目标 call 的决策输入);子腿工作区额外做
+git init+commit(write 子快照前提;.git/config 由 git 自管,不入种子集——.git
+目标的地板决策按路径形态,与存在性无关)。
 
 沙箱面分层(brief):
 - 广度属性(全平台):fake availability(monkeypatch composition.probe_backend →
   available,compile/finalize → None 单测路径)——decide 层一致性,避免真实沙箱主导
   时长;bash 以无沙箱直跑 trivial 命令。强制面不在此证明。
 - 真实子集(darwin seatbelt,skipif 无后端):不 monkeypatch,经真实组合根 + 真实
-  sandbox-exec,证明真实强制下三入口仍一致。
+  sandbox-exec,证明真实强制下四入口仍一致。
 - 每例独立 workspace/store(tmp_path_factory);reason 比较把各入口 workspace 根
   规范化为 "<ws>"——这是逐入口隔离的产物,非决策差异;规则/地板/裁决内容逐字比较。
 """
@@ -37,14 +45,15 @@ resume(approval={call: allow}) 重入,断言重入后执行成功且 args_digest
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import json
 import subprocess
 import sys
 import uuid
 from collections import Counter
-from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +71,7 @@ from praxis.adapters.mcp.descriptors import mcp_tools_for_connection
 from praxis.adapters.mcp.lifecycle import McpConnection
 from praxis.adapters.models.scripted import ScriptedAdapter
 from praxis.adapters.sandbox.base import probe_backend
+from praxis.adapters.workspaces.git import GitWorktreeProvisioner
 from praxis.adapters.web.client import PublicHttpClient
 from praxis.adapters.web.limits import WebLimits
 from praxis.adapters.web.search import create_web_search_tools, load_web_search_config
@@ -71,11 +81,23 @@ from praxis.interfaces.cli import app
 from praxis.interfaces.sdk import open_session
 from praxis.protocol.floor import host_config_dir
 from praxis.protocol.items import Item, ItemKind
-from praxis.protocol.models import ModelResponse, ModelToolCall, Usage
+from praxis.protocol.models import (
+    ModelEvent,
+    ModelMessage,
+    ModelResponse,
+    ModelSettings,
+    ModelToolCall,
+    ModelToolCallDelta,
+    Usage,
+    WireRequest,
+    assemble_model_events,
+    collect_events,
+)
 from praxis.protocol.permission import PermissionContext, PermissionMode, SandboxAvailability
 from praxis.protocol.policy import NetworkPolicy, PathRule, PermissionPolicy, ToolRule
-from praxis.protocol.tools import Tool, ToolSource
+from praxis.protocol.tools import Tool, ToolDefinition, ToolSource
 from praxis.store.log import Store
+from praxis.tools.builtins.child_env import child_env
 from praxis.tools.builtins.command import create_bash_tool
 from praxis.tools.builtins.command_sessions import CommandSessions, create_manage_command_tool
 from praxis.tools.builtins.filesystem import create_read_tool, create_write_tool
@@ -249,7 +271,7 @@ def observe_first_decision(items: list[Item], call_id: str, workspace: Path) -> 
         if calls:
             # executed = decide 放行且管道已 dispatch(存在 tool_call item)。
             # 工具自身的业务错误(manage_command 的未知 session、run_python 的
-            # 非零退出)不改变**决策类别**——目标正是三入口同一 decide。
+            # 非零退出)不改变**决策类别**——目标正是四入口同一 decide。
             return Observation("executed", "executed")
         raise AssertionError(f"unexpected first result shape: {result!r}")
     if requests and not decisions:
@@ -370,7 +392,7 @@ MCP_WIRING: Callable[[Path, Scenario], Awaitable[tuple[tuple[Tool, ...], tuple[A
 
 
 # ---------------------------------------------------------------------------
-# 入口运行器(统一签名;ENTRIES 注册表 = 阶段 4 子代理扩展位)
+# 入口运行器(统一签名;ENTRIES 注册表 = 四入口,T16 child 腿已注册)
 # ---------------------------------------------------------------------------
 
 
@@ -379,6 +401,31 @@ def _seed_workspace(workspace: Path) -> None:
         target = workspace / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
+
+
+def _seed_git_workspace(workspace: Path) -> None:
+    """child 腿工作区 = 真 git repo(write 子 worktree 快照的前提,Q5)。
+
+    .git/config 由 git 自管,不入种子集(.git 目标的地板决策按路径形态,
+    与存在性无关);其余种子逐字 commit 入 HEAD——worktree 检出与三入口
+    种子面同形(read/patch/skill 的执行前提一致)。
+    """
+    for rel, content in _SEED_FILES.items():
+        if rel == ".git/config":
+            continue
+        target = workspace / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    for args in (
+        ("init", "-q"),
+        ("config", "user.email", "praxis-test@example.com"),
+        ("config", "user.name", "Praxis Test"),
+        ("add", "."),
+        ("-c", "commit.gpgsign=false", "commit", "-qm", "seed"),
+    ):
+        subprocess.run(
+            ["git", "-C", str(workspace), *args], check=True, capture_output=True, timeout=30
+        )
 
 
 def _read_items(workspace: Path, thread_id: str) -> list[Item]:
@@ -490,11 +537,176 @@ def run_via_resume(workspace: Path, call: Call, scenario: Scenario, example_root
     return asyncio.run(_go())
 
 
-# 阶段 4 子代理入口复用同一 execute,届时在此注册即纳入一致性属性。
+# ---------------------------------------------------------------------------
+# T16 第四入口:ScriptedAdapter 父发 spawn → 子线程执行同一 call(同一 execute)
+# ---------------------------------------------------------------------------
+
+_CHILD_PARENT_THREAD = "child-parent"
+_SPAWN_CALL_ID = "s1"
+_WAIT_CALL_ID = "w1"
+_CHILD_ID_PLACEHOLDER = "PLACEHOLDER"
+
+
+def _resp_spawn() -> ModelResponse:
+    return ModelResponse(
+        content="",
+        tool_calls=(
+            ModelToolCall(
+                call_id=_SPAWN_CALL_ID,
+                name="spawn_subagent",
+                arguments={"task": "four-entry property child task", "workspace_mode": "write"},
+            ),
+        ),
+        usage=Usage(input_tokens=1, output_tokens=1),
+        finish_reason="tool_calls",
+    )
+
+
+def _resp_wait() -> ModelResponse:
+    return ModelResponse(
+        content="",
+        tool_calls=(
+            ModelToolCall(
+                call_id=_WAIT_CALL_ID,
+                name="wait_subagent",
+                arguments={"child_thread_id": _CHILD_ID_PLACEHOLDER, "timeout": 30},
+            ),
+        ),
+        usage=Usage(input_tokens=1, output_tokens=1),
+        finish_reason="tool_calls",
+    )
+
+
+class _ChildIdRewritingAdapter:
+    """ScriptedAdapter 代理:把 wait 剧本里的占位 child id 重写为父 thread 最近
+    一条 child_allocation 的真实 child_thread_id(剧本静态,spawn 的 id 是运行期
+    uuid;其余帧原样透传)。test_agent_tools 同先例;store 经 provider 延迟绑定。
+    """
+
+    def __init__(
+        self, inner: ScriptedAdapter, store_provider: Callable[[], Store], parent_thread: str
+    ) -> None:
+        self._inner = inner
+        self._store_provider = store_provider
+        self._parent_thread = parent_thread
+
+    def _latest_child_id(self) -> str:
+        child_id = ""
+        for item in self._store_provider().read_items(self._parent_thread):
+            if item.kind == ItemKind.CHILD_ALLOCATION:
+                raw = item.payload.get("child_thread_id")
+                if isinstance(raw, str):
+                    child_id = raw
+        return child_id
+
+    def build_request(
+        self,
+        messages: Sequence[ModelMessage],
+        tools: Sequence[ToolDefinition],
+        settings: ModelSettings,
+    ) -> WireRequest:
+        return self._inner.build_request(messages, tools, settings)
+
+    async def stream(self, req: WireRequest) -> AsyncIterator[ModelEvent]:
+        async for event in self._inner.stream(req):
+            if isinstance(event, ModelToolCallDelta) and event.name_fragment == "wait_subagent":
+                args = json.loads(event.arguments_fragment)
+                args["child_thread_id"] = self._latest_child_id()
+                event = replace(event, arguments_fragment=json.dumps(args))
+            yield event
+
+    async def complete(self, req: WireRequest) -> ModelResponse:
+        return assemble_model_events(await collect_events(self.stream(req)))
+
+
+def _child_observation(workspace: Path) -> tuple[Observation, Path]:
+    """从父 thread 的 child_allocation 定位子 thread/工作区,观测子的首次决策。"""
+    items = _read_items(workspace, _CHILD_PARENT_THREAD)
+    allocations = [i.payload for i in items if i.kind == ItemKind.CHILD_ALLOCATION]
+    assert len(allocations) == 1, f"expected exactly one child_allocation: {allocations!r}"
+    allocation = allocations[0]
+    child_thread = str(allocation["child_thread_id"])
+    child_workspace = Path(str(allocation["workspace"]))
+    child_items = _read_items(workspace, child_thread)
+    observation = observe_first_decision(child_items, CALL_ID, child_workspace)
+    if observation.decision_class == "asked":
+        # child×审批窗口维:子的 ask 与父入口同形,携带窗口绑定三键
+        # (window_seq/args_digest/policy_revision;管道唯一写点,无第二形状)。
+        requests = _payloads(child_items, ItemKind.APPROVAL_REQUEST, CALL_ID)
+        assert requests, "asked child must carry an approval_request"
+        for key in ("window_seq", "args_digest", "policy_revision"):
+            assert key in requests[0], f"child approval_request missing {key}"
+    return observation, child_workspace
+
+
+def _discard_child_workspace(workspace: Path) -> None:
+    """回收 worktree 快照(生产 discard 路径)。落点在 per-test TMPDIR 下,
+    pytest tmp 保留兜底——清理失败绝不掩盖主断言。"""
+    with contextlib.suppress(Exception):
+        items = _read_items(workspace, _CHILD_PARENT_THREAD)
+        provisioner = GitWorktreeProvisioner(child_env)
+        for item in items:
+            if item.kind == ItemKind.CHILD_ALLOCATION:
+                raw = item.payload.get("workspace")
+                if isinstance(raw, str):
+                    provisioner.discard(Path(raw))
+
+
+def run_via_child(workspace: Path, call: Call, scenario: Scenario, example_root: Path) -> Observation:
+    """第四入口:父发 spawn(write 子)→ 子 Session 执行同一 call,同一 execute。
+
+    剧本消费序(test_agent_tools spawn→wait 同先例):父 spawn → 子 model#1
+    (目标 call)→ 父 wait(占位 id 重写;阻塞至子收敛,过期不取消子)→
+    子 model#2(done;asked 子无第二次模型调用)→ 父 done。wait 保证父终态前
+    子的首次决策已落库,close 不会截断子腿。子继承父 adapter/policy/mode,
+    write 子无 read-only ceiling——决策输入与三入口同形。
+    """
+    inner = ScriptedAdapter([_resp_spawn(), _resp_call(call), _resp_wait(), _resp_done(), _resp_done()])
+    store_holder: list[Store] = []
+    adapter = _ChildIdRewritingAdapter(inner, lambda: store_holder[0], _CHILD_PARENT_THREAD)
+    try:
+        if MCP_WIRING is None:
+            session = open_session(
+                workspace, adapter, policy=scenario.policy, mode=scenario.mode,
+                thread_id=_CHILD_PARENT_THREAD, enable_subagents=True,
+            )
+            store_holder.append(session.store)
+            try:
+                asyncio.run(session.submit("four-entry property"))
+                observation, _child_ws = _child_observation(workspace)
+            finally:
+                session.close()
+        else:
+            wiring = MCP_WIRING
+
+            async def _go() -> Observation:
+                extra_tools, integrations = await wiring(workspace, scenario)
+                session = open_session(
+                    workspace, adapter, policy=scenario.policy, mode=scenario.mode,
+                    thread_id=_CHILD_PARENT_THREAD, enable_subagents=True,
+                    extra_tools=extra_tools, integrations=integrations,
+                )
+                store_holder.append(session.store)
+                try:
+                    await session.submit("four-entry property")
+                    observation, _child_ws = _child_observation(workspace)
+                    return observation
+                finally:
+                    await session.aclose()
+
+            observation = asyncio.run(_go())
+        return observation
+    finally:
+        _discard_child_workspace(workspace)
+
+
+# T16:第四入口注册即纳入一致性属性——child Session 复用同一 pipeline.execute,
+# 无第二执行路径(:493 占位兑现删除)。
 ENTRIES: dict[str, Callable[[Path, Call, Scenario, Path], Observation]] = {
     "model": run_via_model,
     "cli": run_via_cli,
     "resume": run_via_resume,
+    "child": run_via_child,
 }
 
 
@@ -535,7 +747,10 @@ def _run_all_entries(example_root: Path, call: Call, scenario: Scenario) -> dict
     for name, runner_fn in ENTRIES.items():
         workspace = example_root / name
         workspace.mkdir()
-        _seed_workspace(workspace)
+        if name == "child":
+            _seed_git_workspace(workspace)  # write 子快照前提(T7 provisioner)
+        else:
+            _seed_workspace(workspace)
         observations[name] = runner_fn(workspace, call, scenario, example_root)
     return observations
 
@@ -548,7 +763,7 @@ def _assert_consistent(
     assert len(classes) == 1, f"decision class diverged: {observations} (call={call}, scenario={scenario})"
     assert len(reasons) == 1, f"reason diverged: {observations} (call={call}, scenario={scenario})"
     observed = next(iter(classes))
-    # 唯一 decide 强化:三入口不仅彼此一致,且与唯一决策入口一致(防三入口同偏)。
+    # 唯一 decide 强化:四入口不仅彼此一致,且与唯一决策入口一致(防四入口同偏)。
     expected = "executed" if reference.is_allow else "denied" if reference.is_deny else "asked"
     assert observed == expected, f"entries={observed} but decide={reference.verdict} ({reference.reason})"
     if reference.is_deny:
@@ -565,6 +780,7 @@ def _assert_consistent(
 
 def test_three_entries_same_decision(tmp_path_factory: pytest.TempPathFactory) -> None:
     distribution: Counter[str] = Counter()
+    per_entry: dict[str, Counter[str]] = {name: Counter() for name in ENTRIES}
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(composition, "probe_backend", lambda: _FAKE_SANDBOX)
         mp.setattr(composition, "compile_sandbox", None)
@@ -584,12 +800,18 @@ def test_three_entries_same_decision(tmp_path_factory: pytest.TempPathFactory) -
             reference = _reference_decision(example_root / "model", call, scenario, _FAKE_SANDBOX)
             observed = _assert_consistent(observations, call, scenario, reference, example_root / "model")
             distribution[observed] += 1
+            for name, observation in observations.items():
+                per_entry[name][observation.decision_class] += 1
 
         prop()
 
     # 非空泛:三个 @example 保证三类必现;打印分布供执行日志存证。
     print(f"decision-class distribution: {dict(distribution)}")
     assert set(distribution) == {"executed", "denied", "asked"}, distribution
+    # T16 四集合非空泛:每一入口(含 child 腿)三类都必现——防某腿静默偏科。
+    print(f"per-entry distribution: { {name: dict(counter) for name, counter in per_entry.items()} }")
+    for name, counter in per_entry.items():
+        assert set(counter) == {"executed", "denied", "asked"}, (name, counter)
 
 
 # ---------------------------------------------------------------------------

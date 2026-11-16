@@ -901,3 +901,39 @@ def test_sdk_reexports_limits() -> None:
     for name in ("Limits", "UNLIMITED"):
         assert name in sdk_pkg.__all__, f"sdk.__all__ missing {name}"
         assert hasattr(sdk_pkg, name), f"sdk missing attribute {name}"
+
+
+def test_sdk_reexports_phase4_budget_and_agents_surface() -> None:
+    """T16 收口:预算树读面/份额公式/子代理形状全经 sdk 出口;sorted 纪律,
+    无 `_` 私有泄漏(memory 助手面 T13 已出口,此处一并钉)。"""
+    for name in (
+        "BudgetTracker",
+        "BudgetNode",
+        "UsageFacts",
+        "Admission",
+        "build_tree",
+        "fold_turn_facts",
+        "remaining",
+        "exposure",
+        "limits_merge_grant",
+        "limits_payload",
+        "limits_from_payload",
+        "MAX_CHILD_FRACTION",
+        "SUBAGENT_LIMITS_DEFAULT",
+        "ChildActiveError",
+        "ChildStateLabel",
+        "AGENT_TOOL_NAMES",
+        "SubagentManager",
+        "ChildHandle",
+        "ChildStatus",
+        "ChildSummary",
+        "remember_memory",
+        "read_memory_status",
+        "edit_memory",
+        "delete_memory",
+        "explain_memory",
+    ):
+        assert name in sdk_pkg.__all__, f"sdk.__all__ missing {name}"
+        assert hasattr(sdk_pkg, name), f"sdk missing attribute {name}"
+    assert sdk_pkg.__all__ == sorted(sdk_pkg.__all__)
+    assert not any(name.startswith("_") for name in sdk_pkg.__all__)

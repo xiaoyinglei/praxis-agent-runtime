@@ -150,3 +150,55 @@ def limits_from_payload(payload: Mapping[str, JsonValue]) -> Limits:
         web_requests=_limit_dimension(payload, "web_requests"),
         browser_requests=_limit_dimension(payload, "browser_requests"),
     )
+
+
+# ---------------------------------------------------------------------------
+# payload 拼装助手(T16 ㉓:child_allocation/cancel_request 唯一拼装点)
+#
+# 键常量在本模块(T1 落点),拼装助手与键同模块内聚——写端命名约定与
+# 序列化形状一处持有;core.agents/core.session 只调用,不再裸拼 dict。
+# CI 规则 26(计划㉓)钉住特征键集 dict 字面量不得在别处出现。
+# ---------------------------------------------------------------------------
+
+
+def allocation_payload(
+    *,
+    allocation_id: str,
+    parent_turn_id: str,
+    child_thread_id: str,
+    child_root_turn_id: str,
+    workspace_mode: str,
+    workspace: str,
+    grant: Limits,
+    requested: Limits | None,
+    source: str,
+) -> dict[str, JsonValue]:
+    """child_allocation item payload 的唯一拼装点(键序 = ALLOCATION_PAYLOAD_KEYS)。
+
+    ``grant``/``requested`` 经 limits_payload 序列化(requested=None → {},
+    与读端 _parse_allocation 的 fail-open 口径配对);source 边界拒绝未知值
+    (写端命名约定,读端仍不校验)。
+    """
+    if source not in ALLOCATION_SOURCES:
+        raise ValueError(f"unknown allocation source: {source!r} (expected model/memory)")
+    return {
+        "allocation_id": allocation_id,
+        "parent_turn_id": parent_turn_id,
+        "child_thread_id": child_thread_id,
+        "child_root_turn_id": child_root_turn_id,
+        "workspace_mode": workspace_mode,
+        "workspace": workspace,
+        "grant": limits_payload(grant),
+        "requested": limits_payload(requested) if requested is not None else {},
+        "source": source,
+    }
+
+
+def cancel_request_payload(*, source: str, parent_turn_id: str | None) -> dict[str, JsonValue]:
+    """cancel_request item payload 的唯一拼装点(键序 = CANCEL_KEYS)。
+
+    source=user 为本机取消(parent_turn_id=None),parent 为父代理级联。
+    """
+    if source not in CANCEL_SOURCES:
+        raise ValueError(f"unknown cancel source: {source!r} (expected user/parent)")
+    return {"source": source, "parent_turn_id": parent_turn_id}

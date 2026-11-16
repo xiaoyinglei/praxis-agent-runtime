@@ -2,6 +2,8 @@
 
 阶段4 T6 口径同步:默认表 15+0(enable_subagents 缺省关,旧 parity 零扰动);
 ``enable_subagents=True`` 后 15+5=20(agent 五件套追加在表尾)。
+阶段4 T13/T16 开关矩阵:``enable_memory=True`` 后 15+1=16(read_memory);
+两开关正交叠加 15+5+1=21。文档面:docs/praxis-tool-table.md(T16 收口)。
 
 钉住四件事:
 1. 默认表恰好 15 个 builtin(集合),MCP 动态工具不进入(只经 extra_tools);
@@ -108,6 +110,30 @@ def test_enable_subagents_adds_exactly_five_to_default_table(workspace: Path) ->
         assert adapter.last_request is not None
         wire_names = {tool.name for tool in adapter.last_request.tools}
         assert _AGENT_FIVE <= wire_names
+    finally:
+        session.close()
+
+
+def test_enable_memory_adds_read_memory_to_default_table(workspace: Path) -> None:
+    """T13/T16 口径:enable_memory=True 后 15+1=16(read_memory 表尾追加)。"""
+    session = open_session(workspace, ScriptedAdapter([]), enable_memory=True)
+    try:
+        names = set(session._tools)  # noqa: SLF001 — 装配契约:集合可断言
+        assert names == _EXPECTED_BUILTINS | {"read_memory"}
+        assert len(names) == 16
+    finally:
+        session.close()
+
+
+def test_both_switches_compose_to_twenty_one(workspace: Path) -> None:
+    """T16 开关矩阵收口:两开关正交可叠加,15+5+1=21,无重名冲突。"""
+    session = open_session(
+        workspace, ScriptedAdapter([]), enable_subagents=True, enable_memory=True
+    )
+    try:
+        names = set(session._tools)  # noqa: SLF001 — 装配契约:集合可断言
+        assert names == _EXPECTED_BUILTINS | _AGENT_FIVE | {"read_memory"}
+        assert len(names) == 21
     finally:
         session.close()
 

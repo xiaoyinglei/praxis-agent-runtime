@@ -42,6 +42,13 @@ SubagentManager(core 编排面)与 create_agent_tools(五件套工厂,provider
 ``close_unresolved`` re-export——宿主读取未决调用判据只经 sdk;cancel 面
 本身是 ``Session.request_cancel``(Session 已导出),CLI ``praxis cancel``
 跨进程只 append cancel_request item。
+阶段4 T16 收口:预算树读面(``BudgetTracker``/``BudgetNode``/``UsageFacts``/
+``Admission``/``build_tree``/``fold_turn_facts``/``remaining``/``exposure``)与
+份额公式面(``limits_merge_grant``/``limits_payload``/``limits_from_payload``/
+``MAX_CHILD_FRACTION``/``SUBAGENT_LIMITS_DEFAULT``)、子代理形状补全
+(``ChildActiveError``/``ChildStateLabel``/``AGENT_TOOL_NAMES``)经 sdk 出口——
+宿主装配/展示预算与子代理状态不直依 core/protocol 内部模块。memory 助手面
+T13 已全量出口(remember/edit/delete/explain/read_memory_status + 视图型)。
 
 ``ConversationBusy``/``ResumeNotConfirmed`` 定义在 core.session 并由这里
 re-export:core 不得 import interfaces(import-linter praxis_core_purity),
@@ -104,6 +111,16 @@ from praxis.composition import (
     validate_model_spec,
 )
 from praxis.core.agents import SubagentManager
+from praxis.core.budget import (
+    Admission,
+    BudgetNode,
+    BudgetTracker,
+    UsageFacts,
+    build_tree,
+    exposure,
+    fold_turn_facts,
+    remaining,
+)
 from praxis.core.compensation import UnresolvedCall, close_unresolved, unclosed_windows
 from praxis.core.events import Subscription
 from praxis.core.locks import ThreadBusy
@@ -126,14 +143,25 @@ from praxis.core.session import ConversationBusy, ResumeNotConfirmed, Session
 from praxis.core.statemachine import TurnStatus
 from praxis.core.turn import TurnResult
 from praxis.protocol.agents import (
+    AGENT_TOOL_NAMES,
+    ChildActiveError,
     ChildGrantError,
     ChildHandle,
     ChildLimitError,
+    ChildStateLabel,
     ChildStatus,
     ChildSummary,
     SubagentSurface,
 )
-from praxis.protocol.budget import UNLIMITED, Limits
+from praxis.protocol.budget import (
+    MAX_CHILD_FRACTION,
+    SUBAGENT_LIMITS_DEFAULT,
+    UNLIMITED,
+    Limits,
+    limits_from_payload,
+    limits_merge_grant,
+    limits_payload,
+)
 from praxis.protocol.items import Item, ItemKind
 from praxis.protocol.models import (
     CostMicros,
@@ -161,12 +189,18 @@ from praxis.tools.builtins.skills import load_skill_catalog
 open_session = build_session
 
 __all__ = [
+    "AGENT_TOOL_NAMES",
     "API_KEY_ENV_NAME",
+    "Admission",
     "ApprovalSummary",
     "ArtifactStore",
+    "BudgetNode",
+    "BudgetTracker",
+    "ChildActiveError",
     "ChildGrantError",
     "ChildHandle",
     "ChildLimitError",
+    "ChildStateLabel",
     "ChildStatus",
     "ChildSummary",
     "ConfigVersionConflict",
@@ -177,6 +211,7 @@ __all__ = [
     "Item",
     "ItemKind",
     "Limits",
+    "MAX_CHILD_FRACTION",
     "McpBundle",
     "McpServerConfig",
     "McpServerStatus",
@@ -207,6 +242,7 @@ __all__ = [
     "ResumeNotConfirmed",
     "SEARCH_ENDPOINTS",
     "SEARCH_PROVIDERS",
+    "SUBAGENT_LIMITS_DEFAULT",
     "ScriptedAdapter",
     "SearchProvider",
     "SearchProviderConfig",
@@ -226,11 +262,13 @@ __all__ = [
     "UNLIMITED",
     "UnresolvedCall",
     "Usage",
+    "UsageFacts",
     "VerifyReport",
     "WEB_SEARCH_PROVIDER_ENV",
     "WebLimits",
     "apply_update",
     "assemble_model_events",
+    "build_tree",
     "close_unresolved",
     "connect_mcp_servers",
     "create_agent_tools",
@@ -240,7 +278,12 @@ __all__ = [
     "delete_web_search_credential",
     "edit_memory",
     "explain_memory",
+    "exposure",
+    "fold_turn_facts",
     "latest_plan",
+    "limits_from_payload",
+    "limits_merge_grant",
+    "limits_payload",
     "load_host_hooks",
     "load_mcp_configs",
     "load_skill_catalog",
@@ -252,6 +295,7 @@ __all__ = [
     "open_session",
     "probe_model",
     "read_memory_status",
+    "remaining",
     "remember_memory",
     "resolve_declared_policy",
     "resolve_mcp_config_path",

@@ -78,9 +78,8 @@ from typing import cast
 from praxis.core import permission  # 唯一决策入口:经模块属性调用,测试 monkeypatch 此处
 from praxis.core.budget import WEB_REQUEST_BUDGET_EXCEEDED, WEB_TOOL_NAMES, BudgetTracker
 from praxis.core.compensation import (
-    NOT_EXECUTED_TEXTS,
-    OUTCOME_UNKNOWN_TEXTS,
     UnresolvedCall,
+    settlement_outcome,
     unclosed_windows,
 )
 from praxis.core.events import EventBus
@@ -660,10 +659,9 @@ def _cancel_refusal(ctx: ExecCtx, items: list[Item], call: ToolCall) -> ToolResu
             target = unresolved  # 升序扫:最后匹配 = 最新声明窗口
     if target is None or target.declaration_seq >= cancel_seq:
         return None
-    if target.started:
-        status, text = ResultStatus.OUTCOME_UNKNOWN, OUTCOME_UNKNOWN_TEXTS["cancelled"]
-    else:
-        status, text = ResultStatus.NOT_EXECUTED, NOT_EXECUTED_TEXTS["cancelled"]
+    # T16 ㉔:与 close_unresolved 同一清算矩阵(compensation 单点),检查点
+    # 只消费产物——不写 item、不另写第二份 status/文案映射。
+    status, text = settlement_outcome(target.started, text_for="cancelled")
     return ToolResult(
         tool_call_id=call.tool_call_id,
         tool_name=call.tool_name,

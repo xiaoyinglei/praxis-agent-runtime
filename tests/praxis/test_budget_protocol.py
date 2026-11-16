@@ -21,6 +21,8 @@ from praxis.protocol.budget import (
     SUBAGENT_LIMITS_DEFAULT,
     UNLIMITED,
     Limits,
+    allocation_payload,
+    cancel_request_payload,
     limits_from_payload,
     limits_merge_grant,
     limits_payload,
@@ -223,3 +225,72 @@ def test_limits_from_payload_missing_keys_are_none() -> None:
 def test_limits_from_payload_rejects_non_integer(bad: object) -> None:
     with pytest.raises(TypeError):
         limits_from_payload({"tokens": bad})  # type: ignore[dict-item]
+
+
+# ---------------------------------------------------------------------------
+# payload 拼装助手(T16 ㉓:child_allocation/cancel_request 唯一拼装点)
+# ---------------------------------------------------------------------------
+
+
+def test_allocation_payload_helper_key_order_and_shapes() -> None:
+    payload = allocation_payload(
+        allocation_id="a1",
+        parent_turn_id="p1",
+        child_thread_id="c1",
+        child_root_turn_id="r1",
+        workspace_mode="read_only",
+        workspace="/ws",
+        grant=Limits(tokens=100, web_requests=16),
+        requested=Limits(tokens=500),
+        source="model",
+    )
+    assert tuple(payload) == ALLOCATION_PAYLOAD_KEYS
+    assert payload["grant"] == {"tokens": 100, "web_requests": 16}
+    assert payload["requested"] == {"tokens": 500}
+    assert payload["source"] == "model"
+    assert limits_from_payload(payload["grant"]) == Limits(tokens=100, web_requests=16)  # type: ignore[arg-type]
+
+
+def test_allocation_payload_none_requested_is_empty_dict() -> None:
+    payload = allocation_payload(
+        allocation_id="a1",
+        parent_turn_id="p1",
+        child_thread_id="c1",
+        child_root_turn_id="r1",
+        workspace_mode="write",
+        workspace="/ws",
+        grant=UNLIMITED,
+        requested=None,
+        source="memory",
+    )
+    assert payload["requested"] == {}
+    assert payload["grant"] == {}
+    assert payload["workspace_mode"] == "write"
+
+
+def test_allocation_payload_rejects_unknown_source() -> None:
+    with pytest.raises(ValueError, match="source"):
+        allocation_payload(
+            allocation_id="a1",
+            parent_turn_id="p1",
+            child_thread_id="c1",
+            child_root_turn_id="r1",
+            workspace_mode="read_only",
+            workspace="/ws",
+            grant=UNLIMITED,
+            requested=None,
+            source="bogus",
+        )
+
+
+def test_cancel_request_payload_helper_key_order_and_sources() -> None:
+    user = cancel_request_payload(source="user", parent_turn_id=None)
+    assert tuple(user) == CANCEL_KEYS
+    assert user == {"source": "user", "parent_turn_id": None}
+    parent = cancel_request_payload(source="parent", parent_turn_id="p1")
+    assert parent == {"source": "parent", "parent_turn_id": "p1"}
+
+
+def test_cancel_request_payload_rejects_unknown_source() -> None:
+    with pytest.raises(ValueError, match="source"):
+        cancel_request_payload(source="bogus", parent_turn_id=None)

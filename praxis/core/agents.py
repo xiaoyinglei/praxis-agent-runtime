@@ -75,6 +75,8 @@ from praxis.protocol.budget import (
     ALLOCATION_SOURCES,
     SUBAGENT_LIMITS_DEFAULT,
     Limits,
+    allocation_payload,
+    cancel_request_payload,
     limits_merge_grant,
     limits_payload,
 )
@@ -263,7 +265,7 @@ def cascade_for(store: Store, parent_thread_id: str, parent_turn_id: str) -> int
             [
                 ItemEntry(
                     kind=ItemKind.CANCEL_REQUEST,
-                    payload={"source": "parent", "parent_turn_id": parent_turn_id},
+                    payload=cancel_request_payload(source="parent", parent_turn_id=parent_turn_id),
                 )
             ],
         )
@@ -473,17 +475,18 @@ class SubagentManager:
             tool_subset=tool_subset,
             workspace_mode=workspace_mode,
         )
-        payload: dict[str, JsonValue] = {
-            "allocation_id": allocation_id,
-            "parent_turn_id": parent_turn_id,
-            "child_thread_id": child_thread_id,
-            "child_root_turn_id": child_root_turn_id,
-            "workspace_mode": workspace_mode,
-            "workspace": str(child_workspace),
-            "grant": limits_payload(grant),
-            "requested": limits_payload(requested) if requested is not None else {},
-            "source": source,
-        }
+        # T16 ㉓:payload 拼装唯一助手(protocol/budget.py 键常量同模块)。
+        payload = allocation_payload(
+            allocation_id=allocation_id,
+            parent_turn_id=parent_turn_id,
+            child_thread_id=child_thread_id,
+            child_root_turn_id=child_root_turn_id,
+            workspace_mode=workspace_mode,
+            workspace=str(child_workspace),
+            grant=grant,
+            requested=requested,
+            source=source,
+        )
         binding: dict[str, JsonValue] = {
             "budget": limits_payload(grant),
             "parent_turn_id": parent_turn_id,
@@ -626,7 +629,7 @@ class SubagentManager:
             [
                 ItemEntry(
                     kind=ItemKind.CANCEL_REQUEST,
-                    payload={"source": "user", "parent_turn_id": ref.parent_turn_id},
+                    payload=cancel_request_payload(source="user", parent_turn_id=ref.parent_turn_id),
                 )
             ],
         )

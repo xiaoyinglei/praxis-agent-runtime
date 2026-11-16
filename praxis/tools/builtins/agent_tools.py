@@ -114,7 +114,7 @@ _SPAWN_SCHEMA: dict[str, Any] = {
             "enum": ["read_only", "write"],
             "description": (
                 "read_only (default) shares the parent workspace with writes vetoed; "
-                "write isolates the child in a git worktree snapshot (requires a git workspace)."
+                "write isolates the child in a detached worktree snapshot (requires a git workspace)."
             ),
         },
     },

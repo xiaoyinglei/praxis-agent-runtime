@@ -835,3 +835,257 @@ def test_metadata_write_in_comment_or_docstring_not_flagged(tmp_path):
 
 def test_real_praxis_tree_clean_under_3b_rules():
     assert capi.scan_praxis_tree(capi._PRAXIS_DIR) == []
+
+
+# ===========================================================================
+# 阶段4 新增硬规则(Task 16):CI 单一来源收口(计划编号㉒–㉕ → 实际 25–28)
+#
+# ㉒(实际 25)预算折叠/份额公式字面唯一:limits_merge_grant 定义点唯一
+#    protocol/budget.py(T1 实际落点),fold_turn_facts/build_tree 唯一
+#    core/budget.py;MAX_CHILD_FRACTION 定义与乘点只在 protocol/budget.py;
+# ㉓(实际 26)child_allocation/cancel_request payload 拼装唯一走
+#    protocol/budget.py 助手(裸 dict 字面 key 串多处拼装禁止);
+# ㉔(实际 27)ResultStatus.NOT_EXECUTED 字面构造只在 core/compensation.py
+#    (close_unresolved 唯一清算口;session/turn/pipeline 经 settlement_outcome);
+# ㉕(实际 28)git worktree/git apply 字面只在 adapters/workspaces/。
+# 计划编号㉑ = 实际规则 24(T10 已建,上方既有负形样本覆盖,不重复建)。
+# ===========================================================================
+
+
+# --- 规则 25(㉒):预算公式单一定义点与乘点 ---
+
+@pytest.mark.parametrize(
+    ("func", "site"),
+    (
+        ("limits_merge_grant", "praxis/protocol/budget.py"),
+        ("fold_turn_facts", "praxis/core/budget.py"),
+        ("build_tree", "praxis/core/budget.py"),
+    ),
+)
+def test_budget_formula_def_outside_its_site_rejected(tmp_path, func, site):
+    f = _write(tmp_path, "praxis/core/evil.py", f"def {func}(*args, **kwargs):\n    return None\n")
+    assert any(f"def {func}()" in v and site in v for v in scan_praxis_file(f))
+
+
+@pytest.mark.parametrize(
+    ("func", "site"),
+    (
+        ("limits_merge_grant", "praxis/protocol/budget.py"),
+        ("fold_turn_facts", "praxis/core/budget.py"),
+        ("build_tree", "praxis/core/budget.py"),
+    ),
+)
+def test_budget_formula_def_allowed_at_its_site(tmp_path, func, site):
+    f = _write(tmp_path, site, f"def {func}(*args, **kwargs):\n    return None\n")
+    assert scan_praxis_file(f) == []
+
+
+def test_max_child_fraction_definition_outside_protocol_budget_rejected(tmp_path):
+    f = _write(tmp_path, "praxis/core/evil.py", "MAX_CHILD_FRACTION = 0.9\n")
+    assert any("MAX_CHILD_FRACTION" in v and "protocol/budget.py" in v for v in scan_praxis_file(f))
+
+
+def test_annotated_max_child_fraction_outside_protocol_budget_rejected(tmp_path):
+    f = _write(tmp_path, "praxis/core/evil.py", "MAX_CHILD_FRACTION: float = 0.9\n")
+    assert any("MAX_CHILD_FRACTION" in v for v in scan_praxis_file(f))
+
+
+def test_max_child_fraction_multiplication_outside_protocol_budget_rejected(tmp_path):
+    # 第二份额公式:即使不重新定义常量,乘点也不得出现在别处
+    f = _write(
+        tmp_path,
+        "praxis/core/evil.py",
+        "import math\n\n\ndef share(remaining):\n    return math.floor(remaining * MAX_CHILD_FRACTION)\n",
+    )
+    assert any("MAX_CHILD_FRACTION" in v and "乘点" in v for v in scan_praxis_file(f))
+
+
+def test_fraction_multiplication_outside_protocol_budget_rejected(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/core/evil.py",
+        "def merge(remaining, fraction):\n    return remaining * fraction\n",
+    )
+    assert any("乘点" in v for v in scan_praxis_file(f))
+
+
+def test_budget_formula_sites_allowed_in_protocol_budget(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/protocol/budget.py",
+        "import math\n\nMAX_CHILD_FRACTION: float = 0.5\n\n\n"
+        "def limits_merge_grant(requested, remaining, fraction=MAX_CHILD_FRACTION):\n"
+        "    return math.floor(remaining * fraction)\n",
+    )
+    assert scan_praxis_file(f) == []
+
+
+def test_retry_jitter_fraction_is_not_the_child_share_formula(tmp_path):
+    # random_fraction 是重试抖动(protocol/retry.py),不是子份额乘点——精确名匹配不误报
+    f = _write(
+        tmp_path,
+        "praxis/protocol/retry.py",
+        "def jitter(ceiling, random_fraction):\n    return int(ceiling * random_fraction)\n",
+    )
+    assert scan_praxis_file(f) == []
+
+
+# --- 规则 26(㉓):child_allocation/cancel_request payload 唯一拼装 ---
+
+def test_raw_allocation_payload_outside_protocol_budget_rejected(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/core/evil.py",
+        'payload = {\n'
+        '    "allocation_id": aid,\n'
+        '    "parent_turn_id": ptid,\n'
+        '    "child_thread_id": ctid,\n'
+        '    "child_root_turn_id": crid,\n'
+        '    "workspace_mode": "read_only",\n'
+        '    "workspace": "/ws",\n'
+        '    "grant": {},\n'
+        '    "requested": {},\n'
+        '    "source": "model",\n'
+        '}\n',
+    )
+    assert any("child_allocation" in v and "protocol/budget.py" in v for v in scan_praxis_file(f))
+
+
+def test_raw_cancel_payload_outside_protocol_budget_rejected(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/core/session.py",
+        'payload = {"source": "user", "parent_turn_id": None}\n',
+    )
+    assert any("cancel_request" in v and "protocol/budget.py" in v for v in scan_praxis_file(f))
+
+
+def test_payload_assembly_allowed_in_protocol_budget(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/protocol/budget.py",
+        'def allocation_payload(**kw):\n'
+        '    return {"allocation_id": kw["allocation_id"], "child_thread_id": kw["child_thread_id"],\n'
+        '            "child_root_turn_id": kw["child_root_turn_id"], "source": kw["source"]}\n\n\n'
+        'def cancel_request_payload(*, source, parent_turn_id):\n'
+        '    return {"source": source, "parent_turn_id": parent_turn_id}\n',
+    )
+    assert scan_praxis_file(f) == []
+
+
+def test_spawn_result_metadata_without_source_is_not_allocation_assembly(tmp_path):
+    # spawn 工具结果 metadata 是展示面(无 source 键),不是 item payload 拼装
+    f = _write(
+        tmp_path,
+        "praxis/tools/builtins/agent_tools.py",
+        'metadata = {"child_thread_id": cid, "child_root_turn_id": rid,\n'
+        '            "allocation_id": aid, "workspace": "/ws", "grant": {}}\n',
+    )
+    assert scan_praxis_file(f) == []
+
+
+def test_turn_binding_with_parent_turn_id_but_no_source_is_not_cancel_assembly(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/core/agents.py",
+        'binding = {"budget": {}, "parent_turn_id": ptid, "root_turn_id": rid, "depth": 1}\n',
+    )
+    assert scan_praxis_file(f) == []
+
+
+# --- 规则 27(㉔):NOT_EXECUTED 字面构造只在 core/compensation.py ---
+
+@pytest.mark.parametrize("relpath", ("praxis/core/session.py", "praxis/core/turn.py", "praxis/core/pipeline.py"))
+def test_not_executed_literal_outside_compensation_rejected(tmp_path, relpath):
+    f = _write(tmp_path, relpath, "status = ResultStatus.NOT_EXECUTED\n")
+    assert any("NOT_EXECUTED" in v and "core/compensation.py" in v for v in scan_praxis_file(f))
+
+
+def test_not_executed_literal_allowed_in_compensation(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/core/compensation.py",
+        "status = ResultStatus.NOT_EXECUTED\n",
+    )
+    assert scan_praxis_file(f) == []
+
+
+def test_not_executed_enum_definition_is_not_a_settlement_construction(tmp_path):
+    # 枚举成员定义(Assign)不是清算构造;读侧字符串比较也不触发
+    f = _write(
+        tmp_path,
+        "praxis/protocol/tools.py",
+        'class ResultStatus:\n    NOT_EXECUTED = "not_executed"\n',
+    )
+    assert scan_praxis_file(f) == []
+
+
+def test_not_executed_mention_in_docstring_not_flagged(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/core/session.py",
+        '"""resume 矩阵:not_started → ResultStatus.NOT_EXECUTED(经 compensation)。"""\nX = 1\n',
+    )
+    assert scan_praxis_file(f) == []
+
+
+# --- 规则 28(㉕):git worktree/git apply 字面只在 adapters/workspaces/ ---
+
+@pytest.mark.parametrize("literal", ("git worktree add", "git apply --check"))
+def test_git_command_phrase_outside_workspaces_rejected(tmp_path, literal):
+    f = _write(tmp_path, "praxis/core/evil.py", f'CMD = "{literal}"\n')
+    assert any("adapters/workspaces" in v and literal in v for v in scan_praxis_file(f))
+
+
+def test_git_worktree_argv_subcommand_outside_workspaces_rejected(tmp_path):
+    # argv 形态(子命令词独立字面量)同样是第二 provisioner 的构造痕迹
+    f = _write(
+        tmp_path,
+        "praxis/tools/builtins/evil.py",
+        'argv = ["git", "-C", str(root), "worktree", "add", "--detach", str(ws), "HEAD"]\n',
+    )
+    assert any("worktree" in v and "adapters/workspaces" in v for v in scan_praxis_file(f))
+
+
+def test_git_literals_allowed_in_workspaces_package(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/adapters/workspaces/git.py",
+        'CMD = "git worktree add failed"\n'
+        'argv = ["git", "worktree", "add", "--detach"]\n'
+        'patch = ["apply", "--check", "--binary"]\n'
+        'ERR = "git apply --check rejected the bundle"\n',
+    )
+    assert scan_praxis_file(f) == []
+
+
+def test_git_phrase_in_docstring_not_flagged(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/composition.py",
+        '"""write 子隔离由 git worktree 快照承载;apply 走 git apply。"""\nX = 1\n',
+    )
+    assert scan_praxis_file(f) == []
+
+
+def test_integrate_apply_action_word_is_not_git_apply(tmp_path):
+    # integrate 的 action 枚举词 "apply" 不是 git 子命令构造(短语/精确 worktree 才触发)
+    f = _write(
+        tmp_path,
+        "praxis/tools/builtins/agent_tools.py",
+        'ACTIONS = ["inspect", "apply", "discard"]\n',
+    )
+    assert scan_praxis_file(f) == []
+
+
+# --- 第 15 契约评估:adapters/workspaces 不得 import core(既有契约覆盖钉) ---
+
+def test_workspaces_core_forbidden_covered_by_existing_contract():
+    """brief 第 15 契约评估:praxis_tools_adapters_boundary 的 source 含
+    praxis.adapters(整包,含 workspaces 子包)、forbidden 含 praxis.core——
+    无需新增契约;本测试机械钉住覆盖关系,防未来改契约静默放开。"""
+    text = (capi._PROJECT_ROOT / ".importlinter").read_text(encoding="utf-8")
+    section = text.split("[importlinter:contract:praxis_tools_adapters_boundary]", 1)[1]
+    section = section.split("[importlinter:contract:", 1)[0]
+    assert "praxis.adapters" in section.split("forbidden_modules", 1)[0]
+    assert "praxis.core" in section.split("forbidden_modules", 1)[1]

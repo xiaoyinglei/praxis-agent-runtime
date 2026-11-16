@@ -59,6 +59,28 @@ Also scans praxis/ for architecture hard-rule violations (阶段1 CI 硬规则):
      store/memory.py——memory 状态写入唯一缝(设计 §5.14 字面授权);
      docstring/注释提及不算写入面。
 
+阶段4 追加(Task 16;计划编号㉒–㉕ → 实际续编 25–28,㉑=24 不重复建):
+ 25. 预算折叠/份额公式单一来源:def limits_merge_grant 只允许
+     protocol/budget.py(T1 实际落点;brief 计划的 core/budget.py 是折叠侧
+     落点,两侧各唯一),def fold_turn_facts/build_tree 只允许 core/budget.py;
+     MAX_CHILD_FRACTION 定义点与乘点(BinOp Mult 操作数精确名
+     MAX_CHILD_FRACTION/fraction)只允许 protocol/budget.py——retry 抖动的
+     random_fraction 不在精确名集,不误报;
+ 26. child_allocation/cancel_request payload 拼装只允许 protocol/budget.py
+     助手(allocation_payload/cancel_request_payload):dict 字面特征键集
+     (allocation = allocation_id+child_thread_id+child_root_turn_id+source;
+     cancel = source+parent_turn_id)不得在别处拼装。spawn 工具结果 metadata
+     (无 source 键)与 turn binding(无 source 键)不是 item payload 拼装;
+ 27. ResultStatus.NOT_EXECUTED 字面构造只允许 core/compensation.py
+     (close_unresolved 唯一清算口;session/turn/pipeline 消费面经
+     settlement_outcome 矩阵)。枚举成员定义(Assign)不是清算构造;
+ 28. ``git worktree``/``git apply`` 命令短语字面量与 ``worktree`` argv 子命令
+     精确词只允许 adapters/workspaces/(T7 provisioner 唯一实现点);
+     integrate 的 action 枚举词 "apply" 不是 git 子命令构造,不触发。
+ 盲区(文档化,非静默):与规则 8/19/24 同口径——拆分拼接/变量间接/别名
+ (``RS = ResultStatus`` 后 ``RS.NOT_EXECUTED``)静态字面量扫描看不到,
+  交给整分支审查台账。
+
 ``--praxis-only``:只扫 praxis 硬规则、跳过 rag 存量扫描(CI 门 R5:阶段1 只强制 praxis 规则)。
 
 Exit code 0: no anti-patterns found.
@@ -255,6 +277,37 @@ _HOST_CONFIG_ENV_LITERALS = (
     "PRAXIS_WEB_LIMITS",
     "PRAXIS_WEB_SEARCH_PROVIDER",
 )
+
+# 阶段4(Task 16)单一来源白名单:同样严格等于"相对 praxis 根的路径"。
+_PRAXIS_PROTOCOL_BUDGET_FILE = ("protocol", "budget.py")
+_PRAXIS_CORE_BUDGET_FILE = ("core", "budget.py")
+_PRAXIS_COMPENSATION_FILE = ("core", "compensation.py")
+_PRAXIS_WORKSPACES_PKG = ("adapters", "workspaces")
+
+# 规则 25(计划㉒):预算公式唯一定义点。limits_merge_grant 的实际落点是
+# protocol/budget.py(T1 份额公式与键常量同模块);fold_turn_facts/build_tree
+# 在 core/budget.py(T2 折叠侧)——brief 计划文案把三者都写在 core/budget.py,
+# 以实际落点为准,两侧各唯一(单一来源原则不变)。
+_BUDGET_FORMULA_SITES: dict[str, tuple[str, ...]] = {
+    "limits_merge_grant": _PRAXIS_PROTOCOL_BUDGET_FILE,
+    "fold_turn_facts": _PRAXIS_CORE_BUDGET_FILE,
+    "build_tree": _PRAXIS_CORE_BUDGET_FILE,
+}
+# 份额乘点操作数精确名(protocol/retry.py 的 random_fraction 抖动不在集内)。
+_CHILD_FRACTION_OPERANDS = frozenset({"MAX_CHILD_FRACTION", "fraction"})
+
+# 规则 26(计划㉓):payload 拼装特征键集(dict 字面量 key 串)。
+# allocation 要求 source 在场:spawn 工具结果 metadata(展示面,无 source)
+# 不是 item payload 拼装;cancel 要求 source+parent_turn_id 共现:turn binding
+# (有 parent_turn_id 无 source)不是取消事实拼装。
+_ALLOCATION_ASSEMBLY_KEYS = frozenset(
+    {"allocation_id", "child_thread_id", "child_root_turn_id", "source"}
+)
+_CANCEL_ASSEMBLY_KEYS = frozenset({"source", "parent_turn_id"})
+
+# 规则 28(计划㉕):git 工作区命令短语 + argv 子命令精确词。
+_GIT_COMMAND_PHRASES = ("git worktree", "git apply")
+_GIT_WORKTREE_SUBCOMMAND = "worktree"
 
 
 def _rel_to_praxis_parts(path: Path, praxis_root: Path | None) -> tuple[str, ...]:
@@ -798,6 +851,85 @@ def scan_praxis_file(path: Path, praxis_root: Path | None = None) -> list[str]:
                 "adapters — host_config_dir() 只允许 adapters/{hooks,config}/、web、mcp config "
                 "与 protocol/floor.py"
             )
+
+    # 规则 25-28(阶段4/Task 16;计划㉒–㉕):预算公式/payload 拼装/清算字面/
+    # git 工作区命令单一来源。纯增:不改上方旧规则。
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            # 规则 25:预算折叠/份额公式唯一定义点
+            site = _BUDGET_FORMULA_SITES.get(node.name)
+            if site is not None and rel_parts != site:
+                violations.append(
+                    f"line {node.lineno}: def {node.name}() outside its single definition site — "
+                    f"预算公式只允许 praxis/{'/'.join(site)}(规则 25/计划㉒)"
+                )
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            if node.value is None:  # 裸注解无定义,不算第二来源
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if (
+                any(isinstance(t, ast.Name) and t.id == "MAX_CHILD_FRACTION" for t in targets)
+                and rel_parts != _PRAXIS_PROTOCOL_BUDGET_FILE
+            ):
+                violations.append(
+                    f"line {node.lineno}: MAX_CHILD_FRACTION definition outside protocol/budget.py — "
+                    "子份额上限单一来源(规则 25/计划㉒)"
+                )
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+            # 规则 25:份额乘点只在份额公式唯一表达内(操作数精确名)
+            if rel_parts != _PRAXIS_PROTOCOL_BUDGET_FILE and any(
+                isinstance(operand, ast.Name) and operand.id in _CHILD_FRACTION_OPERANDS
+                for operand in (node.left, node.right)
+            ):
+                violations.append(
+                    f"line {node.lineno}: child share multiplication outside protocol/budget.py — "
+                    "MAX_CHILD_FRACTION/fraction 乘点只允许份额公式唯一表达(规则 25/计划㉒)"
+                )
+        elif isinstance(node, ast.Dict):
+            # 规则 26:child_allocation/cancel_request payload 唯一拼装助手
+            keys = {
+                key.value
+                for key in node.keys
+                if isinstance(key, ast.Constant) and isinstance(key.value, str)
+            }
+            if rel_parts != _PRAXIS_PROTOCOL_BUDGET_FILE:
+                if _ALLOCATION_ASSEMBLY_KEYS <= keys:
+                    violations.append(
+                        f"line {node.lineno}: child_allocation payload assembled outside "
+                        "protocol/budget.py — 只允许 allocation_payload() 助手(规则 26/计划㉓)"
+                    )
+                if _CANCEL_ASSEMBLY_KEYS <= keys:
+                    violations.append(
+                        f"line {node.lineno}: cancel_request payload assembled outside "
+                        "protocol/budget.py — 只允许 cancel_request_payload() 助手(规则 26/计划㉓)"
+                    )
+        elif isinstance(node, ast.Attribute):
+            # 规则 27:NOT_EXECUTED 字面构造只在唯一清算口模块
+            if (
+                _dotted_chain(node) == ["ResultStatus", "NOT_EXECUTED"]
+                and rel_parts != _PRAXIS_COMPENSATION_FILE
+            ):
+                violations.append(
+                    f"line {node.lineno}: ResultStatus.NOT_EXECUTED constructed outside "
+                    "core/compensation.py — close_unresolved 唯一清算口,消费面经 "
+                    "settlement_outcome(规则 27/计划㉔)"
+                )
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            # 规则 28:git worktree/git apply 字面只在 adapters/workspaces/
+            if id(node) in docstrings or rel_parts[:2] == _PRAXIS_WORKSPACES_PKG:
+                continue
+            for phrase in _GIT_COMMAND_PHRASES:
+                if phrase in node.value:
+                    violations.append(
+                        f"line {node.lineno}: git workspace command literal outside "
+                        f"adapters/workspaces — 代码字符串 {node.value[:80]!r} 含 {phrase!r},"
+                        "git worktree/git apply 只允许 provisioner(规则 28/计划㉕)"
+                    )
+            if node.value == _GIT_WORKTREE_SUBCOMMAND:
+                violations.append(
+                    f"line {node.lineno}: git worktree argv subcommand outside adapters/workspaces — "
+                    "'worktree' 子命令词只允许 provisioner argv(规则 28/计划㉕)"
+                )
 
     return list(dict.fromkeys(violations))
 

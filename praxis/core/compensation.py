@@ -166,6 +166,21 @@ def text_result_entry(
     return ItemEntry(kind=ItemKind.TOOL_RESULT, payload=payload)
 
 
+def settlement_outcome(
+    started: bool, *, text_for: Literal["cancelled", "interrupted"]
+) -> tuple[ResultStatus, str]:
+    """唯一清算矩阵(T16 ㉔):started → outcome_unknown;未 started → not_executed。
+
+    close_unresolved(终态清算)、resume 决策矩阵(session._classify_and_prepare)
+    与 cancel 检查点(pipeline._cancel_refusal)共用这一份 status/文案映射——
+    ``ResultStatus.NOT_EXECUTED`` 字面构造只在本模块(CI 规则 27/计划㉔)。
+    消费面只取矩阵产物,不得另写第二份映射或裸构造 not_executed。
+    """
+    if started:
+        return ResultStatus.OUTCOME_UNKNOWN, OUTCOME_UNKNOWN_TEXTS[text_for]
+    return ResultStatus.NOT_EXECUTED, NOT_EXECUTED_TEXTS[text_for]
+
+
 def close_unresolved(
     items: Sequence[Item],
     tools: Mapping[str, Tool],
@@ -182,17 +197,8 @@ def close_unresolved(
     unknown_ids: list[str] = []
     for unresolved in unclosed_windows(items, tools):
         call = unresolved.call
+        status, text = settlement_outcome(unresolved.started, text_for=text_for)
+        entries.append(text_result_entry(call.call_id, call.name, status, text, {}))
         if unresolved.started:
-            entries.append(
-                text_result_entry(
-                    call.call_id, call.name, ResultStatus.OUTCOME_UNKNOWN, OUTCOME_UNKNOWN_TEXTS[text_for], {}
-                )
-            )
             unknown_ids.append(call.call_id)
-        else:
-            entries.append(
-                text_result_entry(
-                    call.call_id, call.name, ResultStatus.NOT_EXECUTED, NOT_EXECUTED_TEXTS[text_for], {}
-                )
-            )
     return entries, unknown_ids

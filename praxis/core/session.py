@@ -66,8 +66,7 @@ from praxis.core.agents import ChildSessionFactory, cascade_for, children_summar
 from praxis.core.budget import BudgetTracker
 from praxis.core.compaction import SUMMARY_MAX_OUTPUT_TOKENS, SUMMARY_PROMPT_MAX_CHARS
 from praxis.core.compensation import (
-    NOT_EXECUTED_TEXTS,
-    OUTCOME_UNKNOWN_TEXTS,
+    settlement_outcome,
     text_result_entry,
     unclosed_windows,
 )
@@ -84,7 +83,14 @@ from praxis.core.turn import (
     pending_approval_summaries,
     run_turn,
 )
-from praxis.protocol.budget import EXTENSION_KEYS, UNLIMITED, Limits, limits_from_payload, limits_payload
+from praxis.protocol.budget import (
+    EXTENSION_KEYS,
+    UNLIMITED,
+    Limits,
+    cancel_request_payload,
+    limits_from_payload,
+    limits_payload,
+)
 from praxis.protocol.hooks import HookSetup
 from praxis.protocol.items import Item, ItemKind
 from praxis.protocol.json import JsonValue
@@ -875,19 +881,15 @@ class Session:
                 if call.call_id in decided:
                     resume_calls.append(call)  # 审批重入:未 dispatch,无未知副作用
                 else:
-                    entries.append(
-                        text_result_entry(
-                            call.call_id, call.name, ResultStatus.NOT_EXECUTED, NOT_EXECUTED_TEXTS["interrupted"], {}
-                        )
-                    )
+                    # T16 ㉔:清算矩阵经 compensation 单点(NOT_EXECUTED 字面
+                    # 构造只在 core/compensation.py),本处只消费产物。
+                    status, text = settlement_outcome(False, text_for="interrupted")
+                    entries.append(text_result_entry(call.call_id, call.name, status, text, {}))
             elif pending.idempotent:
                 resume_calls.append(call)
             else:
-                entries.append(
-                    text_result_entry(
-                        call.call_id, call.name, ResultStatus.OUTCOME_UNKNOWN, OUTCOME_UNKNOWN_TEXTS["interrupted"], {}
-                    )
-                )
+                status, text = settlement_outcome(True, text_for="interrupted")
+                entries.append(text_result_entry(call.call_id, call.name, status, text, {}))
                 unknown_ids.append(call.call_id)
         if entries:
             self._store.append_items(self._thread_id, turn_id, entries)
@@ -931,7 +933,12 @@ class Session:
         self._store.append_items(
             self._thread_id,
             turn_id,
-            [ItemEntry(kind=ItemKind.CANCEL_REQUEST, payload={"source": "user", "parent_turn_id": None})],
+            [
+                ItemEntry(
+                    kind=ItemKind.CANCEL_REQUEST,
+                    payload=cancel_request_payload(source="user", parent_turn_id=None),
+                )
+            ],
         )
         # 只对 RUNNING 注入取消:run_turn 已返回 PAUSED/终态但 _execute 尚未
         # 清除登记的微窗口里,task.cancel() 会把 CancelledError 抛给 submit
