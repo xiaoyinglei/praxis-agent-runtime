@@ -126,6 +126,16 @@ class Store:
         self._writer.start()
         ready.result()  # 打开连接/初始化 schema 的失败在此同步抛出
 
+    @property
+    def db_path(self) -> Path:
+        """本 Store 的库文件路径(只读)。
+
+        阶段4 T5:子 Session 必须与父**同库**(§5.13 同库独立 thread)——
+        子工作区是独立目录时,composition 仍把 Store 指向父库文件,经本属性
+        取路径,不读私有字段。
+        """
+        return self._db_path
+
     # -- 写者线程 --------------------------------------------------------------
 
     def _open(self) -> sqlite3.Connection:

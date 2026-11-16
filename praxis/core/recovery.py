@@ -46,6 +46,7 @@ R-T15-7),core 不 import tools。
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import signal
@@ -57,6 +58,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+from praxis.core.agents import cascade_for
 from praxis.core.context import pair_tool_results
 from praxis.core.locks import ThreadBusy, thread_execution_lock
 from praxis.core.statemachine import IllegalTransition, TurnStatus, transition
@@ -72,6 +74,8 @@ if TYPE_CHECKING:
     from praxis.protocol.tools import Tool
     from praxis.store.log import Store
 
+logger = logging.getLogger(__name__)
+
 
 def sweep(store: Store, bus: EventBus, workspace: Path) -> list[str]:
     """清扫:running 且执行锁空闲(原主已死)的 turn → interrupted。
@@ -79,6 +83,10 @@ def sweep(store: Store, bus: EventBus, workspace: Path) -> list[str]:
     返回被标记的 turn_id 列表(按 list_turns 的 created_at 顺序)。
     单条 turn 的任何失败绝不中断整次清扫:sweep 是 recovery 入口,
     漏扫其余 dead turn 的代价远大于跳过一条。
+
+    阶段4 T5(§5.13 显式级联):每个被标 interrupted 的父 turn 随后调
+    ``cascade_for``——与 Session 终态路径共用同一级联实现;孙代由子自己
+    这一跳的 sweep/终态级联逐跳收敛。级联失败只记日志,不阻断清扫。
     """
     marked: list[str] = []
     for turn in list_turns(store, status=TurnStatus.RUNNING.value):
@@ -98,6 +106,10 @@ def sweep(store: Store, bus: EventBus, workspace: Path) -> list[str]:
             # ——不再是 dead,跳过并继续清扫其余。执行锁保证这不是"执行中":
             # 活执行者改写状态全程持锁,能取到锁就说明它已经交还了该 thread。
             continue
+        try:
+            cascade_for(store, turn.thread_id, turn.turn_id)
+        except Exception:  # noqa: BLE001 — 单条级联失败绝不中断整次清扫
+            logger.warning("cascade for interrupted turn %s failed", turn.turn_id, exc_info=True)
         marked.append(turn.turn_id)
     return marked
 

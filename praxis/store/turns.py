@@ -51,6 +51,26 @@ def _fetch_turn(conn: sqlite3.Connection, turn_id: str) -> Turn | None:
     return _row_to_turn(row) if row is not None else None
 
 
+def create_turn_tx(
+    conn: sqlite3.Connection,
+    *,
+    turn_id: str,
+    thread_id: str,
+    binding: Mapping[str, JsonValue],
+) -> None:
+    """在**调用方已开启的事务内** INSERT 一条 status="running" 的 turn。
+
+    与 ``append_items_tx`` 同纪律(阶段4 T5,R-T5-3):spawn 的"child_allocation
+    item + 子根 turn"经同一 BEGIN IMMEDIATE 提交,kill 于事务任一侧都不产生
+    半写孤儿。写入口仍 INSERT only——初始状态不经由改写路径产生。
+    """
+    now = time.time()
+    conn.execute(
+        "INSERT INTO turns VALUES (?, ?, ?, ?, ?, ?)",
+        (turn_id, thread_id, "running", now, now, json.dumps(thaw_json(binding), sort_keys=True)),
+    )
+
+
 def create_turn(
     store: Store,
     *,
@@ -61,11 +81,7 @@ def create_turn(
     """INSERT 一条 status="running" 的 turn(初始状态不经由改写路径产生)。"""
 
     def _insert(conn: sqlite3.Connection) -> Turn:
-        now = time.time()
-        conn.execute(
-            "INSERT INTO turns VALUES (?, ?, ?, ?, ?, ?)",
-            (turn_id, thread_id, "running", now, now, json.dumps(thaw_json(binding), sort_keys=True)),
-        )
+        create_turn_tx(conn, turn_id=turn_id, thread_id=thread_id, binding=binding)
         turn = _fetch_turn(conn, turn_id)
         assert turn is not None
         return turn

@@ -72,6 +72,7 @@ from praxis.protocol.budget import UNLIMITED, Limits
 from praxis.protocol.hooks import HookOutcome, HookSetup, HookSpec
 from praxis.protocol.json import JsonValue
 from praxis.protocol.models import (
+    CostMicros,
     ModelAdapter,
     ModelMessage,
     ModelSettings,
@@ -79,10 +80,11 @@ from praxis.protocol.models import (
     WireRequest,
 )
 from praxis.protocol.permission import PermissionContext, PermissionMode
-from praxis.protocol.policy import PermissionPolicy, PolicyVerdict, url_host
+from praxis.protocol.policy import PermissionPolicy, PolicyVerdict, ToolRule, url_host
 from praxis.protocol.retry import RetryPolicy
 from praxis.protocol.skills import SkillCatalog
-from praxis.protocol.tools import Tool, ToolSource
+from praxis.protocol.tools import Tool, ToolEffect, ToolSource
+from praxis.protocol.workspaces import WorkspaceMode
 from praxis.store.artifacts import ArtifactStore
 from praxis.store.log import Store
 from praxis.tools.builtins.artifacts_tool import create_read_artifact_tool
@@ -474,6 +476,10 @@ def build_session(
     skills_catalog: SkillCatalog | None = None,
     extra_tools: Sequence[Tool] = (),
     integrations: Sequence[AsyncCloser] = (),
+    db_path: Path | None = None,
+    unit_costs: CostMicros | None = None,
+    ceilings: Sequence[PermissionPolicy] = (),
+    run_sweep: bool = True,
 ) -> Session:
     """装配一个 Session:唯一组合根。CLI/TUI/host 一律经 sdk.open_session 走到这里。
 
@@ -513,6 +519,18 @@ def build_session(
     没有可解析的 spec → None,cost 限额生效时由 admit_dispatch fail-closed
     (pricing_unavailable)兜底。core 不 import adapters/config,与
     measure_tokens 注入同纪律。
+
+    阶段4 T5(子代理装配,全部尾部默认零扰动):
+    - ``db_path``:Store 库文件位置覆盖(缺省 workspace/.praxis/praxis.sqlite)。
+      子 Session 与父**同库**(§5.13)——write 子工作区是独立目录时仍指向父库;
+    - ``unit_costs``:显式单价覆盖(子继承父单价;缺省从 ModelSpec.cost 解析);
+    - ``ceilings``:权限上限策略(只否决永不授权;read_only 子的 WRITE/
+      DESTRUCTIVE 拒绝经此注入,与父 live policy 取交集);
+    - 恒注入 ``child_session_factory`` 闭包(经 session_holder 延迟绑定,
+      与 web authorizer 同先例)——SubagentManager 经它构造子 Session,
+      内部仍调 build_child_session → build_session(Session 构造唯一点不破);
+    - ``run_sweep=False``:跳过打开即清扫(子 Session 构造用——同库已由父
+      打开时 sweep 覆盖;见 build_child_session 的锁文件族说明)。
     """
     if thread_id is not None:
         _validate_thread_id(thread_id)
@@ -529,7 +547,9 @@ def build_session(
     )
     # R-T3-4:单价只在这里取一次(spec.cost 全零 = 未配置计价,admit 判据
     # 对 cost 限额 fail-closed);显式 adapter 无 spec → None。
-    unit_costs = resolved_spec.cost if resolved_spec is not None else None
+    # T5:显式 unit_costs 参数优先(子 Session 继承父单价,不重解析注册库)。
+    spec_unit_costs = resolved_spec.cost if resolved_spec is not None else None
+    effective_unit_costs = unit_costs if unit_costs is not None else spec_unit_costs
     summary_max_output_tokens = (
         default_summary_max_output_tokens(resolved_spec)
         if resolved_spec is not None
@@ -553,10 +573,13 @@ def build_session(
     )
     praxis_dir = root / ".praxis"
     praxis_dir.mkdir(parents=True, exist_ok=True)
-    store = Store(praxis_dir / "praxis.sqlite")
+    # T5 同库纪律:db_path 缺省 = 本工作区会话库;子 Session 经父 Store.db_path
+    # 注入同一库文件(独立目录 ≠ 独立库)。
+    store = Store(db_path if db_path is not None else praxis_dir / "praxis.sqlite")
     try:
         bus = EventBus()
-        sweep(store, bus, root)
+        if run_sweep:
+            sweep(store, bus, root)
         # Task 15:后台命令会话注册表(一次实例化,注入 bash 与 manage_command)。
         sessions = CommandSessions(root)
         # 崩溃遗留的命令进程组清扫:结果只记日志,不影响会话可用性(函数自身不抛,
@@ -613,6 +636,8 @@ def build_session(
             # 真实探测:darwin seatbelt;其他平台不可用 → decide 第 7 步对
             # EXECUTE_PROCESS fail-closed deny(bwrap 延后,D2/D7)。
             sandbox=probe_backend(),
+            # T5:ceiling 只否决永不授权(read_only 子的收窄经此与父策略取交集)。
+            ceilings=tuple(ceilings),
         )
         resolved_thread = thread_id if thread_id is not None else store.create_thread()
         store.ensure_thread(resolved_thread)
@@ -621,6 +646,26 @@ def build_session(
         effective_integrations: tuple[AsyncCloser, ...] = tuple(integrations) + (
             (web_client,) if web_client is not None else ()
         )
+
+        def _child_session_factory(
+            *,
+            workspace: Path,
+            thread_id: str,
+            limits: Limits,
+            tool_subset: Sequence[Tool],
+            workspace_mode: WorkspaceMode,
+        ) -> Session:
+            # T5:parent 经 session_holder 延迟绑定(与 web authorizer 同先例);
+            # 内部仍调 build_child_session → build_session,构造唯一点不破。
+            return build_child_session(
+                parent=session_holder[0],
+                workspace=workspace,
+                thread_id=thread_id,
+                limits=limits,
+                tool_subset=tool_subset,
+                workspace_mode=workspace_mode,
+            )
+
         session = Session(
             store,
             bus,
@@ -646,7 +691,8 @@ def build_session(
             skills_catalog=resolved_skills,
             integrations=effective_integrations,
             budget=budget,
-            unit_costs=unit_costs,
+            unit_costs=effective_unit_costs,
+            child_session_factory=_child_session_factory,
         )
         # 延迟绑定完成:此后 web authorize 闭包读到的就是 live 权限上下文
         # (Session.update_permission 替换 _permissions,property 每次现取)。
@@ -655,3 +701,67 @@ def build_session(
     except BaseException:
         store.close()
         raise
+
+
+# read_only 子拒绝的副作用维(brief §5.13:intersection + 拒 WRITE/DESTRUCTIVE)。
+_READ_ONLY_DENIED_EFFECTS: frozenset[ToolEffect] = frozenset(
+    {ToolEffect.WRITE_WORKSPACE, ToolEffect.DESTRUCTIVE}
+)
+
+
+def build_child_session(
+    *,
+    parent: Session,
+    workspace: Path,
+    thread_id: str,
+    limits: Limits,
+    tool_subset: Sequence[Tool],
+    workspace_mode: WorkspaceMode = "read_only",
+) -> Session:
+    """子 Session 工厂(阶段4 T5;内部仍调 build_session——构造唯一点不破)。
+
+    装配纪律:
+    - **同库**(§5.13):Store 经 ``parent.store.db_path`` 指向父库文件——
+      write 子的独立工作区目录不等于独立库;子 items 写自己的 thread;
+    - 适配器/单价继承父(生产适配器无状态可共享;子的 cost 限额与父同单价);
+    - 权限 = 父 live policy ∩ read_only 收窄:``workspace_mode="read_only"``
+      时,对 tool_subset 中声明 WRITE_WORKSPACE/DESTRUCTIVE 的工具逐名注入
+      ToolRule deny ceiling(ceiling 只否决永不授权,且先于 bypass 生效);
+      父 ceilings 一并继承。write 子不加收窄(其隔离由 T7 worktree 供给);
+    - ``workspace_mode`` 是 brief 签名之外的尾部默认参数(read_only 缺省):
+      收窄判据需要它,既有签名调用零破坏。
+
+    ``run_sweep=False``:子构造不是"打开库"事件——同库已由父打开时 sweep
+    覆盖,且子根 turn 此刻尚未写入。更关键:write 子的锁文件族在子工作区,
+    若以子工作区对全库 running turn 试锁,父/兄弟的锁(在父工作区)会被
+    误判空闲而错标 interrupted。独立目录子的全库 sweep 工作区解析(按
+    allocation 的 workspace 试锁)属 T7/T9 接线,本任务不开第二套 sweep。
+
+    已知边界(如实,交 T6/T7):read_only 子与父共享 permissions.json——
+    子的 always 授权落盘会写同一文件(子自身被 ceiling 否决不变,但父下次
+    打开会读到子的 always 规则);EXECUTE_PROCESS 工具(bash)不在 brief
+    钉死的 WRITE/DESTRUCTIVE 拒绝集内,bypass 父下的 read_only 子仍可经
+    shell 写文件。两者的收口属后续任务,不在本任务重开已拍板语义。
+    """
+    ceilings = list(parent.permissions.ceilings)
+    if workspace_mode == "read_only":
+        denied = tuple(
+            ToolRule(pattern=tool.definition.name, decision="deny")
+            for tool in tool_subset
+            if tool.static_effects & _READ_ONLY_DENIED_EFFECTS
+        )
+        if denied:
+            ceilings.append(PermissionPolicy(tools=denied))
+    return build_session(
+        workspace,
+        parent.adapter,
+        thread_id=thread_id,
+        tools=tuple(tool_subset),
+        policy=parent.permissions.policy,
+        mode=parent.permissions.mode,
+        budget=limits,
+        unit_costs=parent.unit_costs,
+        ceilings=tuple(ceilings),
+        db_path=parent.store.db_path,
+        run_sweep=False,
+    )

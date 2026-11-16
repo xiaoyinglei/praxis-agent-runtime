@@ -54,7 +54,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from praxis.core.budget import Admission, BudgetTracker, fold_turn_facts
 from praxis.core.compaction import (
@@ -104,6 +104,10 @@ from praxis.protocol.skills import SkillCatalog
 from praxis.protocol.tools import ResultStatus, Tool, ToolCall, ToolResult
 from praxis.store.artifacts import ArtifactStore
 from praxis.store.log import ItemEntry, Store
+
+if TYPE_CHECKING:
+    # 仅注解依赖:runtime 不 import agents(agents 依赖本模块,避免循环)。
+    from praxis.core.agents import ChildSummary
 
 _CONTENT_PREVIEW_CHARS = 200
 _UNKNOWN_TOOL_ERROR_CODE = "unknown_tool"
@@ -197,6 +201,9 @@ class TurnResult:
     使 bash 命令网络 fail-closed 的 D9 提示);空元组 = 无披露,既有构造零改动。
     ``budget_dimension``(R-T3-6,尾部默认零破坏)只在 reason=="budget_exhausted"
     时填耗尽维名,供 CLI 点名对应补预算出路;其余结局恒 None。
+    ``children_summary``(阶段4 T5,尾部默认零破坏)是 Session._execute 完成后
+    并入的本 turn 子代理状态注记(children 注册表 = child_allocation items
+    折叠);无子代理恒空元组。
     """
 
     turn_id: str
@@ -207,6 +214,7 @@ class TurnResult:
     unknown_calls: tuple[str, ...] = ()
     notices: tuple[PermissionNotice, ...] = ()
     budget_dimension: str | None = None
+    children_summary: tuple[ChildSummary, ...] = ()
 
 
 # ---------------------------------------------------------------------------

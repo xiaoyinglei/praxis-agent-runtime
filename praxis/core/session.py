@@ -57,9 +57,11 @@ import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal, Protocol
 from uuid import uuid4
 
+from praxis.core.agents import ChildSessionFactory, cascade_for, children_summary
 from praxis.core.budget import BudgetTracker
 from praxis.core.compaction import SUMMARY_MAX_OUTPUT_TOKENS, SUMMARY_PROMPT_MAX_CHARS
 from praxis.core.compensation import (
@@ -345,6 +347,7 @@ class Session:
         integrations: Sequence[AsyncCloser] = (),
         budget: Limits = UNLIMITED,
         unit_costs: CostMicros | None = None,
+        child_session_factory: ChildSessionFactory | None = None,
     ) -> None:
         self._store = store
         self._bus = bus
@@ -383,6 +386,9 @@ class Session:
         self._budget = budget
         self._unit_costs = unit_costs
         self._budget_binding_warned = False
+        # 阶段4 T5:子 Session 工厂(composition 注入,内部仍调 build_session——
+        # Session 构造唯一点不破)。None = 未装配(单测直构路径),spawn 明确拒绝。
+        self._child_session_factory = child_session_factory
         # T4 cancel 快速路径:_execute 持锁期间登记本进程执行 task 与归属 turn;
         # request_cancel 命中即注入取消("signalled"),否则仅落 item("queued")。
         self._active_task: asyncio.Task[Any] | None = None
@@ -393,6 +399,43 @@ class Session:
     @property
     def thread_id(self) -> str:
         return self._thread_id
+
+    # -- 只读装配面(阶段4 T5:子代理原语经公开属性触达,不跨模块取私有)------
+
+    @property
+    def workspace(self) -> Path:
+        """本会话的工作区根(read_only 子共享它;write 子经 provisioner 另建)。"""
+        return self._workspace
+
+    @property
+    def adapter(self) -> ModelAdapter:
+        """模型适配器(子 Session 复用同一实例——生产适配器无状态可共享)。"""
+        return self._adapter
+
+    @property
+    def tools(self) -> Mapping[str, Tool]:
+        """工具表只读视图(子工具表 = 父表减 agent 五件,manager 据此派生)。"""
+        return MappingProxyType(self._tools)
+
+    @property
+    def store(self) -> Store:
+        """本会话的 Store(子代理同库:composition 经 db_path 绑定同一库文件)。"""
+        return self._store
+
+    @property
+    def unit_costs(self) -> CostMicros | None:
+        """composition 注入的单价(子继承同一单价;None = 未配置计价)。"""
+        return self._unit_costs
+
+    @property
+    def active_turn_id(self) -> str | None:
+        """本进程正在执行的 turn(_execute 持锁期间登记;spawn 的父 turn 判据)。"""
+        return self._active_turn_id
+
+    @property
+    def child_session_factory(self) -> ChildSessionFactory | None:
+        """composition 注入的子 Session 工厂(None = 未装配)。"""
+        return self._child_session_factory
 
     @property
     def permissions(self) -> PermissionContext:
@@ -529,29 +572,46 @@ class Session:
 
     # -- submit ---------------------------------------------------------------
 
-    async def submit(self, text: str) -> TurnResult:
+    async def submit(self, text: str, *, turn_id: str | None = None) -> TurnResult:
         """新 turn:append user_message → create_turn(INSERT running) → 持锁执行。
 
         turn_id 先生成:user_message 以本 turn 归因落库(先 item 后 turns 行,
         顺序由 brief 钉死;锁被占时留下的 running 孤儿 turn 由下次 sweep 收编,
         这正是"崩溃即 interrupted"同一条收敛路径)。
+
+        ``turn_id`` 给定 = 收养预创建 turn(阶段4 T5:spawn 已在同一事务内
+        INSERT 子根 turn,binding 含 budget grant/parent_turn_id/root_turn_id),
+        跳过 create_turn,只补 user_message 后持锁执行——子根 turn 与
+        child_allocation 的身份互指不被第二条 turn 行破坏。
         """
-        turn_id = uuid4().hex
+        adopted = turn_id is not None
+        if turn_id is None:
+            turn_id = uuid4().hex
+        else:
+            turn = get_turn(self._store, turn_id)
+            if turn is None:
+                raise ValueError(f"unknown turn_id: {turn_id!r}")
+            if turn.thread_id != self._thread_id:
+                raise ValueError(
+                    f"turn {turn_id!r} belongs to thread {turn.thread_id!r}, not this session's "
+                    f"thread {self._thread_id!r} (different thread)"
+                )
         self._store.append_items(
             self._thread_id, turn_id, [ItemEntry(kind=ItemKind.USER_MESSAGE, payload={"text": text})]
         )
-        binding: dict[str, JsonValue] = {"model": self._model_id()}
-        # UNLIMITED(缺省)不写 budget 键:历史 turn 的 binding 形状零扰动;
-        # 读端(_turn_budget_limits)对缺键一律 UNLIMITED(R-T3-2)。
-        budget_payload = limits_payload(self._budget)
-        if budget_payload:
-            binding["budget"] = budget_payload
-        create_turn(
-            self._store,
-            turn_id=turn_id,
-            thread_id=self._thread_id,
-            binding=binding,
-        )
+        if not adopted:
+            binding: dict[str, JsonValue] = {"model": self._model_id()}
+            # UNLIMITED(缺省)不写 budget 键:历史 turn 的 binding 形状零扰动;
+            # 读端(turn_budget_limits)对缺键一律 UNLIMITED(R-T3-2)。
+            budget_payload = limits_payload(self._budget)
+            if budget_payload:
+                binding["budget"] = budget_payload
+            create_turn(
+                self._store,
+                turn_id=turn_id,
+                thread_id=self._thread_id,
+                binding=binding,
+            )
         return await self._execute(turn_id, ())
 
     # -- resume ---------------------------------------------------------------
@@ -850,12 +910,12 @@ class Session:
 
     # -- 内部执行入口 ----------------------------------------------------------
 
-    def _turn_budget_limits(self, turn_id: str) -> Limits:
-        """turn binding → root limits(R-T3-2 读端容错)。
+    def turn_budget_limits(self, turn_id: str) -> Limits:
+        """turn binding → root limits(R-T3-2 读端容错;公开供 T5 manager 取父限额)。
 
         键缺失/None → UNLIMITED(历史 turn 零扰动);畸形值 → UNLIMITED 并
-        emit 一次性诊断——写方是我们自己(submit/composition),读端 fail-open
-        符合 §5.1 纪律:一条坏 binding 绝不炸既有 turn。
+        emit 一次性诊断——写方是我们自己(submit/composition/spawn),读端
+        fail-open 符合 §5.1 纪律:一条坏 binding 绝不炸既有 turn。
         """
         turn = get_turn(self._store, turn_id)
         raw = turn.binding.get("budget") if turn is not None else None
@@ -906,10 +966,11 @@ class Session:
                 store=self._store,
                 thread_id=self._thread_id,
                 turn_id=turn_id,
-                root_limits=self._turn_budget_limits(turn_id),
+                root_limits=self.turn_budget_limits(turn_id),
                 unit_costs=self._unit_costs,
             ),
         )
+        result: TurnResult
         try:
             with thread_execution_lock(self._workspace, self._thread_id):
                 # T4:登记本进程执行 task——request_cancel 的快速路径判据;
@@ -917,7 +978,9 @@ class Session:
                 self._active_turn_id = turn_id
                 self._active_task = asyncio.current_task()
                 try:
-                    return await run_turn(deps, TurnState(turn_id, self._thread_id), resume_calls=resume_calls)
+                    result = await run_turn(
+                        deps, TurnState(turn_id, self._thread_id), resume_calls=resume_calls
+                    )
                 finally:
                     self._active_task = None
                     self._active_turn_id = None
@@ -929,6 +992,17 @@ class Session:
             # R6-4:once 授权是调用域——本执行批结束即清除,绝不下渗后续批。
             if self._permissions.once_rules:
                 self._permissions = replace(self._permissions, once_rules=())
+        # 阶段4 T5 终态挂钩(§5.13 显式级联):CANCELLED/FAILED 时逐个取消
+        # 直接子 turn——cascade_for 是唯一实现(INTERRUPTED 路径归 sweep)。
+        # 级联只是向子 thread append cancel_request(不取锁、不写子状态),
+        # 收敛归子执行者步边界;锁外执行,与"append 不取执行锁"纪律一致。
+        if result.status in (TurnStatus.CANCELLED, TurnStatus.FAILED):
+            cascade_for(self._store, self._thread_id, turn_id)
+        # children 状态注记并入 TurnResult(尾部默认字段,无子恒空零扰动)。
+        summary = children_summary(self._store, self._thread_id, turn_id)
+        if summary:
+            result = replace(result, children_summary=summary)
+        return result
 
     def _model_id(self) -> str:
         """turn binding 的 model 标识:经公开 build_request 探针取 WireRequest.model
