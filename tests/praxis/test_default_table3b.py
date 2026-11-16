@@ -75,6 +75,17 @@ def test_default_table_has_exactly_fifteen_builtins(workspace: Path) -> None:
         session.close()
 
 
+def test_child_rebuild_builtin_name_set_matches_default_table(workspace: Path) -> None:
+    """R-T8-1 drift 钉:子工具重构 builtin 名集必须与实际默认表逐字一致——
+    未来新增 builtin 漏改该集合 ⇒ 子静默保留父根绑实例(R-T8-1 复现)。"""
+    session = open_session(workspace, ScriptedAdapter([]))
+    try:
+        names = set(session._tools)  # noqa: SLF001 — 装配契约:集合可断言
+        assert composition._BUILTIN_TOOL_NAMES == names  # noqa: SLF001 — drift 钉
+    finally:
+        session.close()
+
+
 _AGENT_FIVE = {
     "spawn_subagent",
     "wait_subagent",

@@ -139,6 +139,29 @@ def _ancestor_symlink_escape(parent: Path, rel: PurePosixPath) -> bool:
     return False
 
 
+def _symlink_digest(path: Path) -> str | None:
+    """tracked symlink 的父侧 preimage 摘要(R-T8-2)。
+
+    HEAD mode 120000 的 blob 内容 = 链接目标字节,``_head_preimages`` 据此
+    返回 sha256(目标);父侧复检必须同口径(readlink sha),否则子改/删
+    tracked symlink 在父未漂移时永久假冲突。缺失 = None(父删了 → 漂移
+    conflict);已存在但非 symlink = ""(父类型漂移 → conflict)。
+    untracked 写目标仍走 ``_file_digest``(非普通文件一律拒写,语义不变)。
+    """
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return ""
+    if not stat.S_ISLNK(mode):
+        return ""
+    try:
+        return _sha256(os.fsencode(os.readlink(path)))
+    except OSError:
+        return ""
+
+
 def _worktree_digest(path: Path) -> str | None:
     """子工作区侧 postimage 摘要:普通文件 sha256;symlink = 链接目标字节
     sha256(与 bundle 的 120000 口径一致);缺失 = None;其余 = ""。"""
@@ -182,6 +205,10 @@ def _file_digest(path: Path) -> str | None:
     不可作为普通文件写的目标返回空串——空串与任何 sha256/None 都不相等,
     因此 apply 会把它计入 conflicts(整体零写),不会先 apply tracked patch
     再在 untracked 写入时炸出半写。
+
+    口径分工(R-T8-2):本函数服务 regular 路径与 untracked 写目标;
+    HEAD 为 symlink(120000)的 tracked 路径父侧复检走 ``_symlink_digest``
+    (readlink sha,与 _head_preimages 的 blob 内容口径配对)。
     """
     try:
         mode = path.lstat().st_mode
@@ -676,6 +703,33 @@ class GitWorktreeProvisioner:
             preimages[path] = _sha256(data)
         return preimages
 
+    def _head_symlink_paths(self, parent: Path, paths: Sequence[str]) -> frozenset[str]:
+        """HEAD mode 120000 的 touched 路径集(R-T8-2 父侧口径判据)。
+
+        以父仓 HEAD 为模式事实源:preimages 期望值来自子快照基线,父 HEAD
+        未漂移时两者同源;父 HEAD 漂移致模式/内容变化时 preimage 复检本就
+        conflict(fail-closed),``git apply --check`` 仍是类型错配的最终兜底。
+        """
+        if not paths:
+            return frozenset()
+        listing = self._git(parent, parent, ("ls-tree", "-r", "-z", "HEAD"))
+        if listing.returncode != 0:
+            raise RuntimeError(f"git ls-tree failed: {_bounded(listing.stderr)}")
+        wanted = set(paths)
+        symlinks: set[str] = set()
+        for record in listing.stdout.split(b"\0"):
+            if not record:
+                continue
+            meta, _, raw_path = record.partition(b"\t")
+            fields = meta.split(b" ")
+            if len(fields) != 3:
+                raise RuntimeError(f"malformed git ls-tree record: {record!r}")
+            if fields[0] == b"120000":
+                path = os.fsdecode(raw_path)
+                if path in wanted:
+                    symlinks.add(path)
+        return frozenset(symlinks)
+
     def inspect(self, ws: Path, *, paths: Sequence[str] | None = None) -> WorkspaceInspection:
         """T8 读面:变更路径集 + HEAD/子两侧 sha256 表 + 有界 diff 预览。"""
         workspace = Path(ws)
@@ -729,11 +783,16 @@ class GitWorktreeProvisioner:
             )
         touched = sorted(set(bundle_paths))
 
+        # R-T8-2:HEAD 为 symlink 的路径,父侧按 readlink sha 复检(与
+        # _head_preimages 的 120000 blob 口径配对);其余路径仍 _file_digest
+        # (untracked 写目标的非普通文件拒语义不变)。
+        head_symlinks = self._head_symlink_paths(parent, touched)
         conflicts: list[str] = []
         for raw_path in touched:
             expected = preimages[raw_path] if raw_path in preimages else None
             rel = PurePosixPath(raw_path)
-            actual = _file_digest(parent / Path(*rel.parts))
+            target = parent / Path(*rel.parts)
+            actual = _symlink_digest(target) if raw_path in head_symlinks else _file_digest(target)
             # R-T7-3:祖先链 symlink confinement 先于任何写入(悬空/越界
             # 祖先都计 conflict,整组零写——ENOENT→None 假匹配不再可达)。
             if actual != expected or _ancestor_symlink_escape(parent, rel):

@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import shlex
 import subprocess
 from collections.abc import AsyncIterator, Mapping, Sequence
@@ -814,6 +815,38 @@ def test_child_praxis_permissions_never_leak_through_integrate(repo: Path) -> No
             assert (repo / "a.txt").read_text(encoding="utf-8") == "child-a\n"
             # 父策略文件字节不动(子的 always 绝不渗父)。
             assert parent_policy.read_bytes() == before
+        finally:
+            await session.aclose()
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# ④b R-T8-2 经 integrate 承重:tracked symlink 变更可交付(父未漂移)
+# ---------------------------------------------------------------------------
+
+
+def test_tracked_symlink_change_integrates_when_parent_untouched(repo: Path) -> None:
+    (repo / "link.txt").symlink_to("a.txt")
+    _git(repo, "add", "link.txt")
+    _git(repo, "commit", "-qm", "tracked symlink")
+
+    async def scenario() -> None:
+        session = _open(repo, [*_spawn_wait_frames(), _resp("turn one done")])
+        try:
+            r1 = await session.submit("go")
+            assert r1.status is TurnStatus.COMPLETED
+            child_ws = Path(str(_allocations(session)[0]["workspace"]))
+            (child_ws / "link.txt").unlink()
+            (child_ws / "link.txt").symlink_to("b.txt")
+            _rescript(session, [_integrate_frame("apply"), _resp("parent done")])
+            r2 = await session.submit("integrate")
+            r3 = await _approve(session, r2)
+            assert r3.status is TurnStatus.COMPLETED
+            payload = _integrate_payloads(session, r2.turn_id)[0]
+            assert payload["status"] == "ok"
+            assert payload["metadata"]["applied"] == ("link.txt",)
+            assert os.readlink(repo / "link.txt") == "b.txt"
         finally:
             await session.aclose()
 

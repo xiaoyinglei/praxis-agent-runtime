@@ -302,6 +302,91 @@ def test_apply_rejects_differing_name_patch_deletion_vector(
 
 
 # ---------------------------------------------------------------------------
+# R-T8-2:tracked symlink preimage 口径(HEAD 120000 blob = 链接目标字节)
+# ---------------------------------------------------------------------------
+
+
+def _commit_tracked_symlink(repo: Path) -> None:
+    (repo / "link.txt").symlink_to("a.txt")
+    _git(repo, "add", "link.txt")
+    _git(repo, "commit", "-qm", "tracked symlink")
+
+
+def test_apply_tracked_symlink_retarget_delivers_when_parent_untouched(
+    repo: Path, provisioner: GitWorktreeProvisioner
+) -> None:
+    """子改 tracked symlink 目标、父未漂移 → applied(修前 ""!=sha 永久假冲突)。"""
+    _commit_tracked_symlink(repo)
+    ws = provisioner.prepare(repo, "child-1", "write")
+    (ws / "link.txt").unlink()
+    (ws / "link.txt").symlink_to("bin.dat")
+    inspection = provisioner.inspect(ws)
+    assert inspection.preimages["link.txt"] == _sha(b"a.txt")
+
+    result = provisioner.apply(repo, provisioner.diff(ws), preimages=inspection.preimages)
+
+    assert result.conflicts == []
+    assert "link.txt" in result.applied
+    assert os.readlink(repo / "link.txt") == "bin.dat"
+
+
+def test_apply_tracked_symlink_deletion_delivers_when_parent_untouched(
+    repo: Path, provisioner: GitWorktreeProvisioner
+) -> None:
+    """子删 tracked symlink、父未漂移 → applied(删除向量同口径)。"""
+    _commit_tracked_symlink(repo)
+    ws = provisioner.prepare(repo, "child-1", "write")
+    (ws / "link.txt").unlink()
+    inspection = provisioner.inspect(ws)
+
+    result = provisioner.apply(repo, provisioner.diff(ws), preimages=inspection.preimages)
+
+    assert result.conflicts == []
+    assert "link.txt" in result.applied
+    assert not os.path.lexists(repo / "link.txt")
+
+
+def test_apply_tracked_symlink_parent_drift_still_conflicts(
+    repo: Path, provisioner: GitWorktreeProvisioner
+) -> None:
+    """父漂移(retarget)仍 conflict:双方字节保留,整组零写。"""
+    _commit_tracked_symlink(repo)
+    ws = provisioner.prepare(repo, "child-1", "write")
+    (ws / "link.txt").unlink()
+    (ws / "link.txt").symlink_to("bin.dat")
+    inspection = provisioner.inspect(ws)
+    (repo / "link.txt").unlink()
+    (repo / "link.txt").symlink_to("bin.dat")  # 父也改了(不同目标漂移同理)
+    (repo / "link.txt").unlink()
+    (repo / "link.txt").symlink_to("a.txt")
+    (repo / "link.txt").unlink()
+    (repo / "link.txt").symlink_to("drifted-target")
+
+    result = provisioner.apply(repo, provisioner.diff(ws), preimages=inspection.preimages)
+
+    assert result.applied == []
+    assert result.conflicts == ["link.txt"]
+    assert os.readlink(repo / "link.txt") == "drifted-target"
+    assert os.readlink(ws / "link.txt") == "bin.dat"
+
+
+def test_apply_untracked_target_symlink_still_rejected(
+    repo: Path, provisioner: GitWorktreeProvisioner
+) -> None:
+    """既有承重保留:untracked 写目标本身是 symlink(非普通文件)→ conflict。"""
+    ws = provisioner.prepare(repo, "child-1", "write")
+    (ws / "new.txt").write_text("new\n", encoding="utf-8")
+    bundle = provisioner.diff(ws)
+    (repo / "new.txt").symlink_to("a.txt")  # 父侧同名 symlink(非 HEAD 条目)
+
+    result = provisioner.apply(repo, bundle, preimages={"new.txt": None})
+
+    assert result.applied == []
+    assert result.conflicts == ["new.txt"]
+    assert os.readlink(repo / "new.txt") == "a.txt"
+
+
+# ---------------------------------------------------------------------------
 # R-T7-3:untracked 写入段的祖先 symlink confinement(T8 接通 integrate 前收口)
 # ---------------------------------------------------------------------------
 
