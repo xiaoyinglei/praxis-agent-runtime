@@ -26,6 +26,7 @@ import typer
 from typer.core import TyperGroup
 
 from praxis.interfaces.cli.mcp_cli import app as mcp_app
+from praxis.interfaces.cli.memory_cli import app as memory_app
 from praxis.interfaces.cli.models_cli import app as models_app
 from praxis.interfaces.cli.render import render_item
 from praxis.interfaces.cli.slash import REGISTRY, ExitChat
@@ -106,6 +107,12 @@ _EXTEND_COST_MICROS_OPT = typer.Option(
 _EXTEND_STEPS_OPT = typer.Option(
     None, "--extend-steps", help="Add tool rounds to the turn's budget and resume (budget_extension item)."
 )
+# 阶段4 T13:memory 开关与 composition 参数一致(默认 False = 历史路径零扰动)。
+_ENABLE_MEMORY_OPT = typer.Option(
+    False,
+    "--enable-memory",
+    help="Enable workspace memory (background extraction driver + read_memory tool).",
+)
 # R-T3-6:耗尽维 → 对应补预算旗标(CLI 文案点名出路;steps 死路关闭)。
 _BUDGET_EXTEND_FLAGS: Mapping[str, str] = {
     "tokens": "--extend-tokens",
@@ -156,6 +163,7 @@ app = typer.Typer(
 app.add_typer(models_app, name="models")
 app.add_typer(web_app, name="web")
 app.add_typer(mcp_app, name="mcp")
+app.add_typer(memory_app, name="memory")
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +293,7 @@ def _open_session_guarded(
     extra_tools: Sequence[Any] = (),
     integrations: Sequence[Any] = (),
     budget: Limits = UNLIMITED,
+    enable_memory: bool = False,
 ) -> Session:
     """R12:open_session 的 ValueError(损坏的既有状态,如 .praxis/permissions.json
     无法解析)是运行时失败 → 干净错误消息 + EXIT_FAILED(1),绝不裸 traceback(C4)。
@@ -301,6 +310,7 @@ def _open_session_guarded(
             extra_tools=extra_tools,
             integrations=integrations,
             budget=budget,
+            enable_memory=enable_memory,
         )
     except KeyError as exc:
         message = exc.args[0] if exc.args else str(exc)
@@ -319,6 +329,7 @@ def _open_from_options(
     policy: Path | None = None,
     mode: str | None = None,
     budget: Limits = UNLIMITED,
+    enable_memory: bool = False,
 ) -> Session:
     # Task 8:policy/mode 经 sdk 透传给 composition(来源序在 composition 执行;
     # mode 与 policy 正交,C5——这里不折叠、不改写)。
@@ -333,6 +344,7 @@ def _open_from_options(
             mode=resolved_mode,
             thread_id=_resolve_thread(thread),
             budget=budget,
+            enable_memory=enable_memory,
         )
     # R-T6-2:CLI 不再直接构造 provider adapter;模型解析与唯一分派都在
     # composition(_adapter_and_spec_from_registry → _adapter_for)。
@@ -344,6 +356,7 @@ def _open_from_options(
         mode=resolved_mode,
         thread_id=_resolve_thread(thread),
         budget=budget,
+        enable_memory=enable_memory,
     )
 
 
@@ -500,6 +513,7 @@ def _open_mcp_session(
     mode: str | None,
     thread: str | None,
     budget: Limits = UNLIMITED,
+    enable_memory: bool = False,
 ) -> Session:
     return _open_session_guarded(
         workspace,
@@ -511,6 +525,7 @@ def _open_mcp_session(
         extra_tools=bundle.tools,
         integrations=(bundle,),
         budget=budget,
+        enable_memory=enable_memory,
     )
 
 
@@ -531,6 +546,7 @@ def run(
     max_tokens: int | None = _MAX_TOKENS_OPT,
     max_cost_micros: int | None = _MAX_COST_MICROS_OPT,
     max_steps: int | None = _MAX_STEPS_OPT,
+    enable_memory: bool = _ENABLE_MEMORY_OPT,
 ) -> None:
     """一次性 turn:提交 prompt,打印结果,按 turn 终态决定退出码。
 
@@ -542,7 +558,9 @@ def run(
     root = _resolve_workspace(workspace)
     if not _mcp_configured(root):
         # 无 MCP:既有同步装配路径逐字保留(T19 零行为变化)。
-        session = _open_from_options(workspace, model, scripted, thread, policy, mode, budget)
+        session = _open_from_options(
+            workspace, model, scripted, thread, policy, mode, budget, enable_memory
+        )
         try:
             result = asyncio.run(session.submit(prompt))
         except ConversationBusy as exc:
@@ -563,6 +581,7 @@ def run(
                 policy=policy,
                 mode=mode,
                 budget=budget,
+                enable_memory=enable_memory,
             )
         )
     )
@@ -578,6 +597,7 @@ async def _run_with_mcp(
     policy: Path | None,
     mode: str | None,
     budget: Limits = UNLIMITED,
+    enable_memory: bool = False,
 ) -> int:
     """Q9:connect → open_session → submit → ``finally`` aclose 都在同一 loop。
 
@@ -600,6 +620,7 @@ async def _run_with_mcp(
             mode=mode,
             thread=thread,
             budget=budget,
+            enable_memory=enable_memory,
         )
         try:
             result = await session.submit(prompt)
@@ -1025,6 +1046,7 @@ async def _chat_with_mcp(
     thread: str | None,
     policy: Path | None,
     mode: str | None,
+    enable_memory: bool = False,
 ) -> int:
     """Q9:整个 REPL 活在一个 ``asyncio.run`` 里(MCP owner task 不跨 loop)。"""
     snapshot = _policy_snapshot(root, policy)
@@ -1040,6 +1062,7 @@ async def _chat_with_mcp(
             policy=snapshot,
             mode=mode,
             thread=thread,
+            enable_memory=enable_memory,
         )
         typer.echo(f"praxis chat — thread {session.thread_id} — /help for commands, /exit to leave")
         await _chat_loop_async(session)
@@ -1059,11 +1082,14 @@ def chat(
     thread: str | None = _THREAD_OPT,
     policy: Path | None = _POLICY_OPT,
     mode: str | None = _MODE_OPT,
+    enable_memory: bool = _ENABLE_MEMORY_OPT,
 ) -> None:
     """交互式 REPL:每 turn 错误边界(C1);/help /status /exit 查表分派。"""
     root = _resolve_workspace(workspace)
     if not _mcp_configured(root):
-        session = _open_from_options(workspace, model, scripted, thread, policy, mode)
+        session = _open_from_options(
+            workspace, model, scripted, thread, policy, mode, enable_memory=enable_memory
+        )
         typer.echo(f"praxis chat — thread {session.thread_id} — /help for commands, /exit to leave")
         try:
             _chat_loop(session)
@@ -1079,6 +1105,7 @@ def chat(
                 thread=thread,
                 policy=policy,
                 mode=mode,
+                enable_memory=enable_memory,
             )
         )
     )

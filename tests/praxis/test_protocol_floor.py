@@ -83,6 +83,17 @@ def test_floor_any_component(tmp_path: Path) -> None:
     ) != ""
 
 
+@pytest.mark.parametrize("write", [False, True])
+def test_floor_memory_surface_paths(tmp_path: Path, write: bool) -> None:
+    """T13 地板钉:memory 内容面(.agent_memory 目录 + workspace 库文件)双拒。
+
+    .agent_memory 是防御面(memory 内容实际在 DB);workspace/.praxis/praxis.sqlite
+    由 .praxis deny 覆盖——读写都不放行(bash/write/patch 共用同一判定源)。
+    """
+    for rel in (".agent_memory/memory.md", ".praxis/praxis.sqlite"):
+        assert floor_reason(tmp_path / rel, write=write, private_paths=()) != ""
+
+
 def test_host_private_denied(tmp_path: Path) -> None:
     priv = str(tmp_path / "private")
     assert floor_reason(

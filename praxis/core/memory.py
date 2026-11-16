@@ -62,6 +62,7 @@ from praxis.protocol.json import JsonValue, canonical_json, thaw_json
 from praxis.store.log import Store
 from praxis.store.memory import (
     MEMORY_ENTRY_HISTORY_KEEP,
+    VERSION_SNAPSHOT_SEGMENT,
     cas_put_metadata,
     delete_metadata,
     get_metadata,
@@ -1198,6 +1199,431 @@ class MemoryDriver:
             self._task = None
 
 
+# ---------------------------------------------------------------------------
+# 人类面显式编辑(T13):status/remember/edit/delete/explain
+# ---------------------------------------------------------------------------
+#
+# 与旧 ``memory_management.py`` 的**有意差异**(计划简化表):
+# - 无 synthetic 维护 turn provenance:显式条目 origin="explicit"、
+#   source_item_ids 取被编辑条目的既有来源(新建为空),evidence 只陈述
+#   "有什么来源佐证",绝不宣布世界真值(record_revision 同口径);
+# - CAS + record_revision + prune_versions 全部在一个 BEGIN IMMEDIATE 内
+#   (``_mutate_state``),expected_version 失配即整事务回滚;
+# - 无 redact_sensitive_text(阶段4 无该模块;prompt 层纪律保留)。
+
+STATE_VERSION_PREFIX: Final = f"{STATE_KEY}:{VERSION_SNAPSHOT_SEGMENT}:"
+_EXPLAIN_EVIDENCE_POLICY: Final = (
+    "User statements and past tool results are provenance, not proof of current facts."
+)
+
+
+class MemoryStateConflict(RuntimeError):  # noqa: N818 — 任务契约固定异常名(T13 CLI 消费)
+    """显式编辑的 expected_version 与当前 committed state 不一致(CAS 拒绝)。"""
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryEntryView:
+    """一条 memory entry 的人类面投影(CLI 展示/JSON;不含内部 sources 映射)。"""
+
+    key: str
+    title: str
+    text: str
+    kind: str
+    entry_id: str | None
+    origin: str | None
+    updated_at: str | None
+    source_item_ids: tuple[str, ...]
+    supersedes: str | None = None
+    evidence: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryJobView:
+    """作业行的人类面投影;``in_flight`` = run_update 的只读在途判定。"""
+
+    status: str | None
+    in_flight: bool
+    turn_ids: tuple[str, ...]
+    retry_after: float | None
+    error_type: str | None
+    error_message: str | None
+    source_thread: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryStatusView:
+    """``praxis memory status`` 的只读视图。"""
+
+    version: int
+    total_entries: int
+    use_memories: bool
+    generate_memories: bool
+    entries: tuple[MemoryEntryView, ...]
+    job: MemoryJobView
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryMutation:
+    """remember/edit/delete 的结局(version = 提交后的 state 版本)。"""
+
+    version: int
+    entry: MemoryEntryView | None = None
+    deleted_key: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryExplanation:
+    """``praxis memory explain`` 的版本快照分页视图。"""
+
+    version: int
+    entry: MemoryEntryView | None
+    forgotten: bool
+    history: tuple[Mapping[str, JsonValue], ...]
+    total_changes: int
+    next_offset: int | None
+    evidence_policy: str = _EXPLAIN_EVIDENCE_POLICY
+
+
+def _opt_str(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _str_list(value: object) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
+def _int_field(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _entries_list(state: Mapping[str, JsonValue]) -> list[Mapping[str, JsonValue]]:
+    raw = state.get("entries")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [entry for entry in raw if isinstance(entry, Mapping)]
+
+
+def _entry_view(entry: Mapping[str, JsonValue]) -> MemoryEntryView:
+    return MemoryEntryView(
+        key=_opt_str(entry.get("key")) or "",
+        title=_opt_str(entry.get("title")) or "",
+        text=_opt_str(entry.get("text")) or "",
+        kind=_opt_str(entry.get("kind")) or "fact",
+        entry_id=_opt_str(entry.get("entry_id")),
+        origin=_opt_str(entry.get("origin")),
+        updated_at=_opt_str(entry.get("updated_at")),
+        source_item_ids=tuple(_str_list(entry.get("source_item_ids"))),
+        supersedes=_opt_str(entry.get("supersedes")),
+        evidence=tuple(_str_list(entry.get("evidence"))),
+    )
+
+
+def _flag(state: Mapping[str, JsonValue], key: str) -> bool:
+    return state.get(key, True) is not False
+
+
+def _validate_explicit(key: str, title: str, text: str, kind: str) -> None:
+    """显式条目边界(与 validate_output 同值;空串不是内容)。"""
+    if not isinstance(key, str) or not 1 <= len(key) <= 120 or not key.strip():
+        raise ValueError("memory key must be a nonempty string of 1..120 chars")
+    if not isinstance(title, str) or not 1 <= len(title) <= 120 or not title.strip():
+        raise ValueError("memory title must be a nonempty string of 1..120 chars")
+    if not isinstance(text, str) or not 1 <= len(text) <= MAX_ENTRY_CHARS or not text.strip():
+        raise ValueError(f"memory text must be a nonempty string of 1..{MAX_ENTRY_CHARS} chars")
+    if kind not in MEMORY_KINDS:
+        raise ValueError(f"memory kind must be one of {sorted(MEMORY_KINDS)}")
+
+
+def _explicit_entry(
+    key: str,
+    title: str,
+    text: str,
+    kind: str,
+    *,
+    previous: Mapping[str, JsonValue] | None = None,
+) -> dict[str, JsonValue]:
+    """显式条目的 record_revision 输入:保留旧来源/来源映射,替换正文三字段。"""
+    entry: dict[str, JsonValue] = {"key": key, "title": title, "text": text, "kind": kind}
+    if previous is None:
+        entry["source_item_ids"] = cast("JsonValue", ())
+        return entry
+    entry["source_item_ids"] = previous.get("source_item_ids", ())
+    sources = previous.get("sources")
+    if isinstance(sources, Mapping):
+        entry["sources"] = dict(sources)
+    return entry
+
+
+def _entry_kind_map(store: Store, entry: Mapping[str, JsonValue] | None) -> dict[str, str]:
+    """显式条目的 evidence 映射:ref → item.kind(事务外预取,只服务展示佐证)。
+
+    来源映射只含 ref→thread_id;逐来源线程读 items 建 kind。读不到 ref 时
+    evidence 只少一项,绝不阻断编辑(evidence 是陈述佐证,不是世界真值)。
+    """
+    if entry is None:
+        return {}
+    sources = entry.get("sources")
+    thread_ids = (
+        {value for value in sources.values() if isinstance(value, str)}
+        if isinstance(sources, Mapping)
+        else set()
+    )
+    if not thread_ids:
+        return {}
+    kinds: dict[str, str] = {}
+    for thread_id in thread_ids:
+        for item in store.read_items(thread_id):
+            kinds.setdefault(item.item_id, item.kind)
+    return kinds
+
+
+def _mutate_state(
+    store: Store,
+    mutate: Callable[[dict[str, JsonValue]], None],
+    *,
+    expected_version: int | None,
+) -> int:
+    """CAS 状态编辑:读校验 state → mutate → 包络写 + prune_versions(同事务)。
+
+    expected_version 校验与 put_state_enveloped 的版本推进在同一个
+    BEGIN IMMEDIATE 临界区,并发编辑恰一赢(stale 写入零落库)。
+    """
+
+    def _tx(conn: sqlite3.Connection) -> int:
+        current = read_state_verified(conn, STATE_KEY)
+        state: dict[str, JsonValue] = dict(current) if current is not None else initial_state()
+        version = _int_field(state.get("version"))
+        if expected_version is not None and expected_version != version:
+            raise MemoryStateConflict(
+                f"memory changed: expected version {expected_version}, current {version}"
+            )
+        mutate(state)
+        new_version = put_state_enveloped(conn, STATE_KEY, state)
+        prune_versions(conn, STATE_KEY)
+        return new_version
+
+    return store.transact(_tx)
+
+
+def read_memory_status(store: Store, tools: Mapping[str, Tool]) -> MemoryStatusView:
+    """当前 state + 作业行的只读视图(run_update 只读在途判定)。
+
+    ``in_flight`` 复用 ``job_unresolved``(B4:未终态 turn 或未闭合事实窗口);
+    作业行状态为 running/needs_reconciliation 时它区分"真在途"与"残留行,
+    无未决工作"——CLI 据此如实展示,绝不让用户把 running 误读成活。
+    作业行畸形 fail-open 为空视图(状态展示不因一行坏数据失败)。
+    """
+    state = read_memory_state(store)
+    entries = _entries_list(state) if state is not None else []
+    raw_version = 0 if state is None else state.get("version", 0)
+    try:
+        _raw, job = _read_job(store)
+    except RuntimeError:
+        job = {}
+    status = _opt_str(job.get("status"))
+    turn_ids = tuple(_str_list(job.get("turn_ids")))
+    in_flight = status in ("running", "needs_reconciliation") and job_unresolved(
+        store, turn_ids, tools
+    )
+    retry_after = job.get("retry_after")
+    return MemoryStatusView(
+        version=_int_field(raw_version),
+        total_entries=len(entries),
+        use_memories=_flag(state or {}, "use_memories"),
+        generate_memories=_flag(state or {}, "generate_memories"),
+        entries=tuple(_entry_view(entry) for entry in entries),
+        job=MemoryJobView(
+            status=status,
+            in_flight=in_flight,
+            turn_ids=turn_ids,
+            retry_after=(
+                float(retry_after)
+                if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool)
+                else None
+            ),
+            error_type=_opt_str(job.get("error_type")),
+            error_message=_opt_str(job.get("error_message")),
+            source_thread=_opt_str(job.get("source_thread")),
+        ),
+    )
+
+
+def remember_memory(
+    store: Store,
+    *,
+    key: str,
+    text: str,
+    title: str | None = None,
+    kind: str = "fact",
+    expected_version: int | None = None,
+) -> MemoryMutation:
+    """新建一条显式 entry(重复 key 拒绝;origin="explicit")。"""
+    resolved_title = key if title is None else title
+    _validate_explicit(key, resolved_title, text, kind)
+    captured: list[MemoryEntryView] = []
+
+    def mutate(state: dict[str, JsonValue]) -> None:
+        entries = _entries_list(state)
+        if any(entry.get("key") == key for entry in entries):
+            raise ValueError(f"memory key {key!r} already exists; use edit")
+        stamped = record_revision(
+            state,
+            _explicit_entry(key, resolved_title, text, kind),
+            action="remember",
+            origin="explicit",
+            previous=None,
+            kind_map={},
+        )
+        state["entries"] = cast("JsonValue", [*entries, stamped])
+        deleted = [k for k in _str_list(state.get("deleted_keys")) if k != key]
+        state["deleted_keys"] = cast("JsonValue", deleted)
+        captured.append(_entry_view(stamped))
+
+    version = _mutate_state(store, mutate, expected_version=expected_version)
+    return MemoryMutation(version=version, entry=captured[-1])
+
+
+def edit_memory(
+    store: Store,
+    *,
+    key: str,
+    text: str,
+    title: str | None = None,
+    kind: str | None = None,
+    expected_version: int | None = None,
+) -> MemoryMutation:
+    """改写既有 entry:保留省略的 title/kind 与来源,record_revision 记修订。"""
+    pre_state = read_memory_state(store)
+    pre_old = next(
+        (entry for entry in _entries_list(pre_state or {}) if entry.get("key") == key), None
+    )
+    kind_map = _entry_kind_map(store, pre_old)
+    captured: list[MemoryEntryView] = []
+
+    def mutate(state: dict[str, JsonValue]) -> None:
+        entries = _entries_list(state)
+        old = next((entry for entry in entries if entry.get("key") == key), None)
+        if old is None:
+            raise KeyError(f"unknown memory key: {key!r}")
+        resolved_title = (
+            _opt_str(old.get("title")) or key if title is None else title
+        )
+        resolved_kind = kind if kind is not None else (_opt_str(old.get("kind")) or "fact")
+        _validate_explicit(key, resolved_title, text, resolved_kind)
+        stamped = record_revision(
+            state,
+            _explicit_entry(key, resolved_title, text, resolved_kind, previous=old),
+            action="edit",
+            origin="explicit",
+            previous=old,
+            kind_map=kind_map,
+        )
+        state["entries"] = cast(
+            "JsonValue", [entry for entry in entries if entry.get("key") != key] + [stamped]
+        )
+        deleted = [k for k in _str_list(state.get("deleted_keys")) if k != key]
+        state["deleted_keys"] = cast("JsonValue", deleted)
+        captured.append(_entry_view(stamped))
+
+    version = _mutate_state(store, mutate, expected_version=expected_version)
+    return MemoryMutation(version=version, entry=captured[-1])
+
+
+def delete_memory(
+    store: Store, *, key: str, expected_version: int | None = None
+) -> MemoryMutation:
+    """删除 entry:deleted_keys/deleted_sources 防复生 + entry_history 记 delete。"""
+    pre_state = read_memory_state(store)
+    pre_old = next(
+        (entry for entry in _entries_list(pre_state or {}) if entry.get("key") == key), None
+    )
+    kind_map = _entry_kind_map(store, pre_old)
+
+    def mutate(state: dict[str, JsonValue]) -> None:
+        entries = _entries_list(state)
+        old = next((entry for entry in entries if entry.get("key") == key), None)
+        if old is None:
+            raise KeyError(f"unknown memory key: {key!r}")
+        record_revision(
+            state,
+            {
+                "key": key,
+                "source_item_ids": old.get("source_item_ids", ()),
+                "kind": _opt_str(old.get("kind")) or "fact",
+            },
+            action="delete",
+            origin="explicit",
+            previous=old,
+            kind_map=kind_map,
+        )
+        state["entries"] = cast(
+            "JsonValue", [entry for entry in entries if entry.get("key") != key]
+        )
+        deleted_keys = sorted({*_str_list(state.get("deleted_keys")), key})
+        state["deleted_keys"] = cast("JsonValue", deleted_keys)
+        forgotten = {
+            *_str_list(state.get("deleted_sources")),
+            *_str_list(old.get("source_item_ids")),
+        }
+        state["deleted_sources"] = cast("JsonValue", sorted(forgotten))
+
+    version = _mutate_state(store, mutate, expected_version=expected_version)
+    return MemoryMutation(version=version, deleted_key=key)
+
+
+def explain_memory(
+    store: Store,
+    *,
+    key: str,
+    version: int | None = None,
+    offset: int = 0,
+    limit: int = 8,
+) -> MemoryExplanation:
+    """读取一个版本快照的 entry + 分页修订历史(默认当前 state)。
+
+    旧 ``explain_memory`` 语义:entry 已删除时 ``forgotten=True``(history 仍
+    可查);版本快照经 ``read_state_verified`` 读 ``memory:state:version:<n>``
+    (隔离/完整性校验与当前 state 同口径)。
+    """
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+        raise ValueError("history offset must be nonnegative")
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 8:
+        raise ValueError("history limit must be between 1 and 8")
+    if version is None:
+        state = read_memory_state(store)
+    else:
+        snapshot_key = f"{STATE_VERSION_PREFIX}{version}"
+        state = store.transact(lambda conn: read_state_verified(conn, snapshot_key))
+        if state is None:
+            raise KeyError(f"memory version {version} is not available")
+    if state is None:
+        raise KeyError(f"unknown memory key: {key!r}")
+    entries = _entries_list(state)
+    entry = next((item for item in entries if item.get("key") == key), None)
+    history_root = state.get("entry_history")
+    raw_history: object = history_root.get(key, []) if isinstance(history_root, Mapping) else []
+    history = (
+        [dict(item) for item in raw_history if isinstance(item, Mapping)]
+        if isinstance(raw_history, (list, tuple))
+        else []
+    )
+    ordered = list(reversed(history))
+    deleted_keys = set(_str_list(state.get("deleted_keys")))
+    if entry is None and not ordered and key not in deleted_keys:
+        raise KeyError(f"unknown memory key: {key!r}")
+    page = ordered[offset : offset + limit]
+    return MemoryExplanation(
+        version=_int_field(state.get("version")),
+        entry=None if entry is None else _entry_view(entry),
+        forgotten=entry is None,
+        history=tuple(page),
+        total_changes=len(ordered),
+        next_offset=offset + limit if offset + limit < len(ordered) else None,
+    )
+
+
 __all__ = [
     "CONSOLIDATE_INSTRUCTION",
     "EXTRACT_INSTRUCTION",
@@ -1213,19 +1639,31 @@ __all__ = [
     "MEMORY_TOKEN_BUDGET",
     "MEMORY_UPDATE_DEADLINE_SECONDS",
     "STATE_KEY",
+    "STATE_VERSION_PREFIX",
     "JobOutcome",
     "Lease",
     "MemoryDriver",
+    "MemoryEntryView",
+    "MemoryExplanation",
+    "MemoryJobView",
+    "MemoryMutation",
     "MemorySnapshot",
     "MemorySnapshotEntry",
+    "MemoryStateConflict",
+    "MemoryStatusView",
     "claim_lease",
+    "delete_memory",
+    "edit_memory",
+    "explain_memory",
     "initial_state",
     "job_unresolved",
     "memory_snapshot",
     "read_memory_snapshot",
     "read_memory_state",
+    "read_memory_status",
     "record_revision",
     "release_lease",
+    "remember_memory",
     "run_update",
     "validate_output",
 ]

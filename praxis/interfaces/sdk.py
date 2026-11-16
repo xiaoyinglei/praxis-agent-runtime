@@ -107,6 +107,19 @@ from praxis.core.agents import SubagentManager
 from praxis.core.compensation import UnresolvedCall, close_unresolved, unclosed_windows
 from praxis.core.events import Subscription
 from praxis.core.locks import ThreadBusy
+from praxis.core.memory import (
+    MemoryEntryView,
+    MemoryExplanation,
+    MemoryJobView,
+    MemoryMutation,
+    MemoryStateConflict,
+    MemoryStatusView,
+    delete_memory,
+    edit_memory,
+    explain_memory,
+    read_memory_status,
+    remember_memory,
+)
 from praxis.core.permission import apply_update
 from praxis.core.planning import latest_plan
 from praxis.core.session import ConversationBusy, ResumeNotConfirmed, Session
@@ -167,6 +180,12 @@ __all__ = [
     "McpBundle",
     "McpServerConfig",
     "McpServerStatus",
+    "MemoryEntryView",
+    "MemoryExplanation",
+    "MemoryJobView",
+    "MemoryMutation",
+    "MemoryStateConflict",
+    "MemoryStatusView",
     "ModelConfigStore",
     "ModelEntry",
     "ModelEvent",
@@ -217,7 +236,10 @@ __all__ = [
     "create_agent_tools",
     "credential_source",
     "decide_mcp_config_trust",
+    "delete_memory",
     "delete_web_search_credential",
+    "edit_memory",
+    "explain_memory",
     "latest_plan",
     "load_host_hooks",
     "load_mcp_configs",
@@ -229,6 +251,8 @@ __all__ = [
     "normalize_mcp_name",
     "open_session",
     "probe_model",
+    "read_memory_status",
+    "remember_memory",
     "resolve_declared_policy",
     "resolve_mcp_config_path",
     "resolve_model_credential",
