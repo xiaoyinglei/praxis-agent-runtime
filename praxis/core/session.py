@@ -72,6 +72,7 @@ from praxis.core.compensation import (
 )
 from praxis.core.events import EventBus, Subscription
 from praxis.core.locks import ThreadBusy, thread_execution_lock
+from praxis.core.memory import MemoryDriver
 from praxis.core.permission import apply_update, command_network_verdict, extend_policy
 from praxis.core.pipeline import SandboxCompiler, SandboxFinalizer
 from praxis.core.statemachine import TRANSITIONS, TurnStatus, transition
@@ -357,6 +358,7 @@ class Session:
         unit_costs: CostMicros | None = None,
         child_session_factory: ChildSessionFactory | None = None,
         persist_always: bool = True,
+        memory: MemoryDriver | None = None,
     ) -> None:
         self._store = store
         self._bus = bus
@@ -406,6 +408,10 @@ class Session:
         # request_cancel 命中即注入取消("signalled"),否则仅落 item("queued")。
         self._active_task: asyncio.Task[Any] | None = None
         self._active_turn_id: str | None = None
+        # 阶段4 T11(Q6):memory 后台消费面(composition enable_memory 注入;
+        # None = 关闭,历史路径零扰动)。turn 执行绝不 await memory——终态只
+        # 同步入队 + create_task;aclose 取消 driver 不 join(lease 交下次接管)。
+        self._memory = memory
 
     # -- 身份与生命周期 -------------------------------------------------------
 
@@ -477,6 +483,11 @@ class Session:
             self._store.close()
 
     async def _close_runtime(self) -> None:
+        # T11(Q6):先取消 memory driver——**不 join 死等**(run_update 的
+        # 同步收尾自行终态化作业;lease 交下次接管)。子 driver 经 integrations
+        # 里的 manager 收尾链收敛,不留孤儿。
+        if self._memory is not None:
+            self._memory.cancel()
         sessions = self._command_sessions
         if sessions is not None:
             try:
@@ -497,6 +508,8 @@ class Session:
         ``asyncio.run``;若被异步宿主调用,交给当前循环(store 仍立即关闭——
         集成本身不依赖 store,T19 测试钉住这一顺序)。
         """
+        if self._memory is not None:
+            self._memory.cancel()
         if self._command_sessions is None and not self._integrations:
             self._store.close()
             return
@@ -606,6 +619,10 @@ class Session:
         跳过 create_turn,只补 user_message 后持锁执行——子根 turn 与
         child_allocation 的身份互指不被第二条 turn 行破坏。
         """
+        # T11(Q6):Session 打开后的首次 async 交互消费崩溃遗留/前进程入队的
+        # 作业(create_task 不 await——turn 执行绝不 await memory)。
+        if self._memory is not None:
+            self._memory.kick()
         adopted = turn_id is not None
         if turn_id is None:
             turn_id = uuid4().hex
@@ -1024,6 +1041,15 @@ class Session:
         summary = children_summary(self._store, self._thread_id, turn_id)
         if summary:
             result = replace(result, children_summary=summary)
+        # T11(Q6)终态入队:同步 KV 作业行 + create_task 消费(绝不 await
+        # memory——核心循环纪律)。子 Session 无 driver(composition 只对根
+        # 会话 enable_memory),维护子 turn 终态不会递归入队。
+        if self._memory is not None and result.status in (
+            TurnStatus.COMPLETED,
+            TurnStatus.FAILED,
+            TurnStatus.CANCELLED,
+        ):
+            self._memory.note_turn_finished(turn_id)
         return result
 
     def _model_id(self) -> str:

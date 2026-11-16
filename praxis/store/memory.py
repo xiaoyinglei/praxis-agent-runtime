@@ -55,9 +55,20 @@ def get_metadata(store: Store, key: str) -> str | None:
     """读一个 store_metadata 原始值;键不存在返回 None。
 
     走 ``Store.transact``(既有读方法先例,如 ``get_turn``)——store 层只暴露
-    这一条事务入口,避免另开读连接/私有字段访问。
+    这一条事务入口,避免另开读连接/私有字段访问。**事务外**形态:不可在
+    已有 ``Store.transact`` 回调内调用(会嵌套 BEGIN)。
     """
     return store.transact(lambda conn: _select_raw(conn, key))
+
+
+def get_metadata_tx(conn: sqlite3.Connection, key: str) -> str | None:
+    """在**调用方已开启的事务内**读一个原始值(T11 lease/job CAS 消费)。
+
+    与 ``read_state_verified`` 同纪律:BEGIN IMMEDIATE 由 ``Store.transact``
+    提供,"读+比较+写入"因此在同一临界区原子完成。非包络键(lease/job 行)
+    的原始读面——包络 state 仍走 ``read_state_verified``(完整性校验)。
+    """
+    return _select_raw(conn, key)
 
 
 def cas_put_metadata(
@@ -220,6 +231,7 @@ __all__ = [
     "cas_put_metadata",
     "delete_metadata",
     "get_metadata",
+    "get_metadata_tx",
     "prune_job_history",
     "prune_versions",
     "put_state_enveloped",

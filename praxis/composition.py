@@ -67,6 +67,7 @@ from praxis.core.compaction import (
     default_summary_prompt_max_chars,
 )
 from praxis.core.events import EventBus
+from praxis.core.memory import MemoryDriver
 from praxis.core.permission import network_verdict
 from praxis.core.recovery import sweep, sweep_orphan_command_jobs
 from praxis.core.session import AsyncCloser, Session
@@ -529,6 +530,7 @@ def build_session(
     subagent_limits: Mapping[str, int] | None = None,
     persist_always: bool = True,
     parent_tools: Mapping[str, Tool] | None = None,
+    enable_memory: bool = False,
 ) -> Session:
     """装配一个 Session:唯一组合根。CLI/TUI/host 一律经 sdk.open_session 走到这里。
 
@@ -593,6 +595,16 @@ def build_session(
       SUBAGENT_LIMITS_DEFAULT;未知键/负值边界拒绝,manager 同纪律);
     - ``persist_always=False``:always 授权只改内存不落盘(read_only 子
       共享父工作区,写父 permissions.json 即泄漏——㉖ 收口)。
+
+    阶段4 T11(memory 装配,尾部默认零扰动):
+    - ``enable_memory``(缺省 False):True 时注入 ``MemoryDriver``(Q6 进程内
+      async 消费:turn 终态入队 + submit/终态后 create_task;aclose 取消不
+      join)。state 的 use_memories/generate_memories 两旗标默认 True
+      (initial_state;CLI configure 归 T13)。maintenance turn 经唯一 spawn
+      原语(source="memory"),因此 manager 在 enable_memory 时同样构造
+      (不挂 agent 工具面——工具面仅 enable_subagents);manager 收尾链与
+      enable_subagents 同挂 integrations 最前。子 Session 不继承本开关
+      (维护子 turn 终态不递归入队)。
 
     阶段4 T8(R-T8-1,尾部默认零扰动):
     - ``parent_tools``:子装配专用——给定父工具表时,builtin 按**本会话
@@ -757,9 +769,14 @@ def build_session(
         # T6 ③:manager 收尾排在 integrations 最前——先收敛子 driver,再关
         # 子可能闭包引用的共享能力(web client/MCP bundle),最后 store。
         effective_integrations: tuple[AsyncCloser, ...] = (
-            ((_SubagentManagerCloser(manager_holder),) if enable_subagents else ())
+            ((_SubagentManagerCloser(manager_holder),) if (enable_subagents or enable_memory) else ())
             + tuple(integrations)
             + ((web_client,) if web_client is not None else ())
+        )
+        # T11(Q6):memory driver 先于 Session 构造(不依赖 Session 引用;
+        # manager 经 holder 延迟绑定,与 web authorizer 同先例)。
+        memory_driver = (
+            MemoryDriver(store=store, manager_provider=lambda: manager_holder[0]) if enable_memory else None
         )
 
         def _child_session_factory(
@@ -809,10 +826,13 @@ def build_session(
             unit_costs=effective_unit_costs,
             child_session_factory=_child_session_factory,
             persist_always=persist_always,
+            memory=memory_driver,
         )
         # T6:manager 此刻才有 parent 引用;holder 填充后工具面与收尾链同时
         # 生效(工具只在 submit 内被调用,与 web authorizer 同延迟绑定纪律)。
-        if enable_subagents:
+        # T11:enable_memory 同样需要 manager——maintenance turn 走唯一 spawn
+        # 原语(source="memory");agent 工具面仍仅 enable_subagents 挂载。
+        if enable_subagents or enable_memory:
             # T7:write 子隔离由 git worktree 快照承载;child_env 唯一实现在此
             # 注入(adapters 不 import tools,R-T15-7)。
             provisioner = GitWorktreeProvisioner(child_env)

@@ -72,6 +72,7 @@ from praxis.protocol.agents import (
     ChildSummary,
 )
 from praxis.protocol.budget import (
+    ALLOCATION_SOURCES,
     SUBAGENT_LIMITS_DEFAULT,
     Limits,
     limits_merge_grant,
@@ -363,14 +364,45 @@ class SubagentManager:
         requested: Limits | None = None,
         workspace_mode: WorkspaceMode = "read_only",
         depth: int = 0,
+        source: str = "model",
+        parent_turn_id: str | None = None,
+        maintenance_purpose: str | None = None,
     ) -> ChildHandle:
-        """分配份额并启动一个子代理(序见模块 docstring;guard 先于任何写入)。"""
-        parent_turn_id = self.parent.active_turn_id
-        if parent_turn_id is None:
-            raise RuntimeError("spawn requires an executing parent turn (called outside turn execution)")
-        parent_turn = get_turn(self._store, parent_turn_id)
-        if parent_turn is None or not TRANSITIONS[TurnStatus(parent_turn.status)]:
-            raise ChildLimitError(f"parent turn {parent_turn_id!r} is terminal; cannot spawn children")
+        """分配份额并启动一个子代理(序见模块 docstring;guard 先于任何写入)。
+
+        T11:``source="memory"`` = memory maintenance 子分配(唯一 spawn 原语,
+        不开第二条路径)。差异仅三点:锚 turn 经 ``parent_turn_id`` 显式给定
+        且**允许终态**(Q6:维护在源 turn 完成后学习);子工具表为空(旧
+        bounded tool-free maintenance turn parity);binding 记
+        ``memory_maintenance``/``maintenance_purpose``(stage 答案崩溃复用
+        与选源跳过消费)。份额仍走 ``limits_merge_grant`` **无例外规则**
+        (R-PF-5):父无限 → grant=requested parity;父有界 → 份额截断,
+        不足 ChildGrantError 由调用方 retry_after 重试。
+        """
+        if source not in ALLOCATION_SOURCES:
+            raise ValueError(f"unknown allocation source: {source!r} (expected model/memory)")
+        if source == "memory":
+            if parent_turn_id is None:
+                raise ValueError("source='memory' requires parent_turn_id (the terminal anchor turn)")
+            if not maintenance_purpose:
+                raise ValueError("source='memory' requires a non-empty maintenance_purpose")
+            if workspace_mode != "read_only":
+                raise ValueError("memory maintenance children must be read_only")
+            anchor = get_turn(self._store, parent_turn_id)
+            if anchor is None or anchor.thread_id != self.parent.thread_id:
+                raise ValueError(
+                    f"anchor turn {parent_turn_id!r} not found in parent thread {self.parent.thread_id!r}"
+                )
+            # 终态锚合法:maintenance 学的就是已完成的 turn(非终态 guard 只约束 model 子)。
+        else:
+            if parent_turn_id is not None:
+                raise ValueError("parent_turn_id override is only valid for source='memory'")
+            parent_turn_id = self.parent.active_turn_id
+            if parent_turn_id is None:
+                raise RuntimeError("spawn requires an executing parent turn (called outside turn execution)")
+            parent_turn = get_turn(self._store, parent_turn_id)
+            if parent_turn is None or not TRANSITIONS[TurnStatus(parent_turn.status)]:
+                raise ChildLimitError(f"parent turn {parent_turn_id!r} is terminal; cannot spawn children")
         if isinstance(depth, bool) or not isinstance(depth, int) or depth < 0:
             raise ValueError("depth must be a non-negative integer")
         if depth + 1 > self._limits["max_depth"]:
@@ -426,8 +458,11 @@ class SubagentManager:
         if factory is None:
             raise RuntimeError("child session factory not wired (composition.build_session)")
         # 结构深度门:子工具表 = 父表减 agent 五件(T6 挂工具后生效)。
-        tool_subset = tuple(
-            tool for name, tool in self.parent.tools.items() if name not in AGENT_TOOL_NAMES
+        # T11:maintenance 子工具表为空(旧 tool-free bounded turn parity)。
+        tool_subset = (
+            ()
+            if source == "memory"
+            else tuple(tool for name, tool in self.parent.tools.items() if name not in AGENT_TOOL_NAMES)
         )
         # 子 Session 先于事务构造:其 build_session sweep 看不到尚未存在的
         # 子根 turn(不会把自己的 running 根 turn 误标 interrupted)。
@@ -447,7 +482,7 @@ class SubagentManager:
             "workspace": str(child_workspace),
             "grant": limits_payload(grant),
             "requested": limits_payload(requested) if requested is not None else {},
-            "source": "model",
+            "source": source,
         }
         binding: dict[str, JsonValue] = {
             "budget": limits_payload(grant),
@@ -455,6 +490,9 @@ class SubagentManager:
             "root_turn_id": child_root_turn_id,
             "depth": depth + 1,
         }
+        if source == "memory":
+            binding["memory_maintenance"] = True
+            binding["maintenance_purpose"] = maintenance_purpose
 
         def _tx(conn: sqlite3.Connection) -> None:
             append_items_tx(
