@@ -10,17 +10,19 @@ Session 是 turn 循环之上的会话门面:它不执行任何东西,只负责"
    ``confirm=True``,否则 ``ResumeNotConfirmed``;PAUSED turn 必须给**非空**的
    approval(审批)或 reconcile(结果对账)映射——空映射不是决策,同样拒绝;
    RUNNING 与终态 turn 不可 resume。
-3. **classify_pending 决策矩阵**(§5.9,recovery 提供分类,本模块提供动作):
-   未 started 的待决调用写 not_executed 结果(它确实没跑);started+幂等自动
-   重跑(经唯一管道);started+非幂等写 outcome_unknown 并停在 PAUSED 等人对账
-   ——续跑的代价不对称,绝不自动重放未知副作用。
+3. **未决调用决策矩阵**(§5.9;T4 起判据层 = compensation.unclosed_windows,
+   覆盖所有未闭合声明窗口——B29;本模块提供动作):未 started 的待决调用写
+   not_executed 结果(它确实没跑);started+幂等自动重跑(经唯一管道);
+   started+非幂等写 outcome_unknown 并停在 PAUSED 等人对账——续跑的代价
+   不对称,绝不自动重放未知副作用。entry 形状/文案经 compensation 单点
+   (与 cancel/complete 终态清算共用同一协议,B14 对称性)。
 
 resume 的处理序(与代码一一对应):守卫 → 映射校验(目标存在、verdict/outcome
 合法、extend 维度名/非负 int——在**任何** transition 之前,失败即零写入,绝不
 把 turn 留在无执行者的 RUNNING 等 sweep 误标 interrupted)→ transition(RUNNING,
 真实 reason) → reconcile 写结果(先) → approval 写决策(摘要从 approval_request
 item 取,绑定 digest;policy_revision stamp 当前策略——R5(b) 批准时刻绑定)→
-budget_extension 写增量(T3)→ classify_pending
+budget_extension 写增量(T3)→ unclosed_windows
 分类(**先 started 后 decision**:未 started 且有
 matching decision 的调用进重放队列承接审批重入;已 started 的决策一律失效于
 安全矩阵——非幂等 outcome_unknown,见 _classify_and_prepare)→ 若有 outcome_unknown 则
@@ -58,11 +60,16 @@ from uuid import uuid4
 
 from praxis.core.budget import BudgetTracker
 from praxis.core.compaction import SUMMARY_MAX_OUTPUT_TOKENS, SUMMARY_PROMPT_MAX_CHARS
+from praxis.core.compensation import (
+    NOT_EXECUTED_TEXTS,
+    OUTCOME_UNKNOWN_TEXTS,
+    text_result_entry,
+    unclosed_windows,
+)
 from praxis.core.events import EventBus, Subscription
 from praxis.core.locks import ThreadBusy, thread_execution_lock
 from praxis.core.permission import apply_update, command_network_verdict, extend_policy
 from praxis.core.pipeline import SandboxCompiler, SandboxFinalizer
-from praxis.core.recovery import classify_pending
 from praxis.core.statemachine import TurnStatus, transition
 from praxis.core.turn import (
     ApprovalSummary,
@@ -97,9 +104,6 @@ DEFAULT_SYSTEM_PROMPT_TEMPLATE = (
     "You are Praxis, a workspace coding agent. Workspace: {workspace}. "
     "Use tools to inspect and modify files. Answer concisely."
 )
-
-_NOT_EXECUTED_TEXT = "[not executed: turn interrupted before dispatch]"
-_OUTCOME_UNKNOWN_TEXT = "[outcome unknown: process died during execution]"
 
 _APPROVAL_VERDICTS = frozenset({"allow", "deny"})
 _RECONCILE_OUTCOMES = frozenset({"ok", "failed"})
@@ -239,28 +243,6 @@ def _unresolved_unknown_calls(items: Sequence[Item]) -> tuple[str, ...]:
         if current is None or key >= current[:2]:
             latest[call_id] = (key[0], key[1], status)
     return tuple(cid for cid, (_seq, _pos, status) in latest.items() if status == "outcome_unknown")
-
-
-def _text_result_entry(
-    call_id: str,
-    tool_name: str,
-    status: ResultStatus,
-    text: str,
-    metadata: Mapping[str, JsonValue],
-) -> ItemEntry:
-    """会话层合成的 tool_result item:与管道落库字段形状一致(pipeline 约定,勿漂移)。"""
-    payload: dict[str, JsonValue] = {
-        "call_id": call_id,
-        "tool_name": tool_name,
-        "status": status.value,
-        "content": ({"type": "text", "data": {"text": text}},),
-        "is_error": status is ResultStatus.ERROR,
-        "error_code": "user_reconciled_failed" if status is ResultStatus.ERROR else None,
-        "error_message": text if status is ResultStatus.ERROR else None,
-        "truncated": False,
-        "metadata": dict(metadata),
-    }
-    return ItemEntry(kind=ItemKind.TOOL_RESULT, payload=payload)
 
 
 # ---------------------------------------------------------------------------
@@ -701,7 +683,7 @@ class Session:
         for call_id, outcome in reconcile.items():
             status = ResultStatus.OK if outcome == "ok" else ResultStatus.ERROR
             text = f"reconciled by user: {outcome}"
-            entries.append(_text_result_entry(call_id, names[call_id], status, text, {"reconciled": True}))
+            entries.append(text_result_entry(call_id, names[call_id], status, text, {"reconciled": True}))
         self._store.append_items(self._thread_id, turn_id, entries)
 
     def _write_approval_decisions(
@@ -726,38 +708,41 @@ class Session:
         self._store.append_items(self._thread_id, turn_id, entries)
 
     def _classify_and_prepare(self, turn_id: str) -> tuple[list[ModelToolCall], list[str]]:
-        """classify_pending 决策矩阵 → (重放队列, outcome_unknown 清单)。
+        """未决调用决策矩阵 → (重放队列, outcome_unknown 清单)。
 
-        优先级(R12 评审修复):**先 started,后 decision**。未 started 且持
-        matching approval_decision 的调用进重放队列——正常"ask→批准→重入"里
-        调用从未 dispatch(request 先于 tool_call),审批重入由管道内 digest 绑定
-        落地(Task 12/13 交接语义)。而 approve→dispatch→crash 的调用一旦
-        started,决策就绝不能再开自动重放的安全通道:非幂等一律 outcome_unknown
-        (未知副作用只能人工对账),幂等照常自动重试。其余按中断矩阵:
-        not_started→not_executed / started+幂等→重放 / started+非幂等→unknown。
+        判据层 = compensation.unclosed_windows(T4 提取:所有未闭合声明窗口,
+        含跨窗口孤儿——B29;entry 形状与 interrupted 文案经 compensation 单点,
+        矩阵逐字不变)。优先级(R12 评审修复):**先 started,后 decision**。
+        未 started 且持 matching approval_decision 的调用进重放队列——正常
+        "ask→批准→重入"里调用从未 dispatch(request 先于 tool_call),审批重入
+        由管道内 digest 绑定落地(Task 12/13 交接语义)。而 approve→dispatch→crash
+        的调用一旦 started,决策就绝不能再开自动重放的安全通道:非幂等一律
+        outcome_unknown(未知副作用只能人工对账),幂等照常自动重试。其余按
+        中断矩阵:not_started→not_executed / started+幂等→重放 /
+        started+非幂等→unknown。
         """
         items = self._store.read_turn_items(turn_id)
         decided = set(_latest_payloads(items, ItemKind.APPROVAL_DECISION))
         resume_calls: list[ModelToolCall] = []
         unknown_ids: list[str] = []
         entries: list[ItemEntry] = []
-        for pending in classify_pending(items, self._tools):
+        for pending in unclosed_windows(items, self._tools):
             call = pending.call
             if not pending.started:
                 if call.call_id in decided:
                     resume_calls.append(call)  # 审批重入:未 dispatch,无未知副作用
                 else:
                     entries.append(
-                        _text_result_entry(
-                            call.call_id, call.name, ResultStatus.NOT_EXECUTED, _NOT_EXECUTED_TEXT, {}
+                        text_result_entry(
+                            call.call_id, call.name, ResultStatus.NOT_EXECUTED, NOT_EXECUTED_TEXTS["interrupted"], {}
                         )
                     )
             elif pending.idempotent:
                 resume_calls.append(call)
             else:
                 entries.append(
-                    _text_result_entry(
-                        call.call_id, call.name, ResultStatus.OUTCOME_UNKNOWN, _OUTCOME_UNKNOWN_TEXT, {}
+                    text_result_entry(
+                        call.call_id, call.name, ResultStatus.OUTCOME_UNKNOWN, OUTCOME_UNKNOWN_TEXTS["interrupted"], {}
                     )
                 )
                 unknown_ids.append(call.call_id)
