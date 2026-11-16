@@ -260,6 +260,42 @@ def test_apply_rejects_excluded_paths_in_tracked_payload(
     assert not (repo / ".praxis").exists()
 
 
+def test_apply_rejects_differing_name_patch_deletion_vector(
+    repo: Path, provisioner: GitWorktreeProvisioner
+) -> None:
+    """R-T7-1 残余:``---`` 旧路径 ≠ ``+++`` 新路径的段会删旧路径。
+
+    复审者向量:numstat 只报 a.txt、summary 为空,但 git apply 会删除
+    ``.praxis/permissions.json``。apply 必须在任何写入前整组拒。
+    """
+    (repo / ".praxis").mkdir()
+    victim = repo / ".praxis" / "permissions.json"
+    victim.write_text('{"always":[]}\n', encoding="utf-8")
+    forged_diff = (
+        b"diff --git a/.praxis/permissions.json b/a.txt\n"
+        b"--- a/.praxis/permissions.json\n"
+        b"+++ b/a.txt\n"
+        b"@@ -1 +1 @@\n"
+        b'-{"always":[]}\n'
+        b"+new\n"
+    )
+    # 向量有效性反证:git apply 本身接受该 patch(我们的守卫是唯一拦截)。
+    check = subprocess.run(
+        ["git", "-C", str(repo), "apply", "--check", "-"],
+        input=forged_diff,
+        capture_output=True,
+    )
+    assert check.returncode == 0, check.stderr
+    forged = _encode_bundle(forged_diff, ["a.txt"], [])
+
+    with pytest.raises(ValueError, match="differing"):
+        provisioner.apply(repo, forged, preimages={"a.txt": _sha(b"base\n")})
+
+    # 旧路径字节不动,新路径也未写。
+    assert victim.read_text(encoding="utf-8") == '{"always":[]}\n'
+    assert (repo / "a.txt").read_text(encoding="utf-8") == "base\n"
+
+
 # ---------------------------------------------------------------------------
 # patch_failed:git apply 失败整组拒
 # ---------------------------------------------------------------------------

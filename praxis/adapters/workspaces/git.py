@@ -118,6 +118,162 @@ def _file_digest(path: Path) -> str | None:
         return ""
 
 
+_DIFF_ESCAPES = {
+    ord("\\"): 0x5C,
+    ord('"'): 0x22,
+    ord("t"): 0x09,
+    ord("n"): 0x0A,
+    ord("r"): 0x0D,
+    ord("f"): 0x0C,
+    ord("v"): 0x0B,
+    ord("b"): 0x08,
+    ord("a"): 0x07,
+}
+
+
+def _unquote_diff_path(token: bytes) -> bytes:
+    """git C 引号路径解码(``"a/\\303\\251.txt"`` → 原始字节)。"""
+    if not (len(token) >= 2 and token.startswith(b'"') and token.endswith(b'"')):
+        return token
+    body = token[1:-1]
+    out = bytearray()
+    index = 0
+    while index < len(body):
+        byte = body[index]
+        index += 1
+        if byte != 0x5C:
+            out.append(byte)
+            continue
+        if index >= len(body):
+            raise ValueError("malformed quoted path in workspace bundle")
+        escaped = body[index]
+        index += 1
+        if escaped in _DIFF_ESCAPES:
+            out.append(_DIFF_ESCAPES[escaped])
+            continue
+        if 0x30 <= escaped <= 0x37:
+            digits = bytes((escaped,)) + body[index : index + 2]
+            if len(digits) != 3 or any(digit < 0x30 or digit > 0x37 for digit in digits):
+                raise ValueError("malformed octal escape in workspace bundle path")
+            out.append(int(digits, 8))
+            index += 2
+            continue
+        raise ValueError("unsupported escape in workspace bundle path")
+    return bytes(out)
+
+
+def _decode_repo_path(token: bytes) -> str | None:
+    """``---``/``+++`` 或 ``diff --git`` 的单个路径 token → 仓内相对路径。"""
+    if token == b"/dev/null":
+        return None
+    decoded = _unquote_diff_path(token)
+    for prefix in (b"a/", b"b/"):
+        if decoded.startswith(prefix):
+            return os.fsdecode(decoded[len(prefix) :])
+    raise ValueError(f"workspace bundle diff path lacks a/ or b/ prefix: {os.fsdecode(decoded)!r}")
+
+
+def _header_token(raw: bytes) -> bytes:
+    """``---``/``+++`` 行路径:带空格时 git 在行尾补 tab 作分隔。"""
+    return raw[:-1] if raw.endswith(b"\t") else raw
+
+
+def _split_git_diff_header(remainder: bytes) -> tuple[bytes, bytes]:
+    """``diff --git a/old b/new`` 的双路径拆分(引号名 + 空格名启发式)。
+
+    二进制 patch 没有 ``---``/``+++`` 行,名字只在这个头里;引号名按 C 转义
+    扫描,未引号含空格时用「同一路径两前缀」启发式拆分(git 自身同形态)。
+    """
+    tokens: list[bytes] = []
+    index = 0
+    length = len(remainder)
+    while index < length:
+        if remainder[index] == 0x22:
+            end = index + 1
+            while end < length:
+                if remainder[end] == 0x5C:
+                    end += 2
+                    continue
+                if remainder[end] == 0x22:
+                    break
+                end += 1
+            if end >= length:
+                raise ValueError("unterminated quoted path in workspace bundle header")
+            tokens.append(remainder[index : end + 1])
+            index = end + 1
+            if index < length and remainder[index] == 0x20:
+                index += 1
+        else:
+            end = remainder.find(b" ", index)
+            if end == -1:
+                end = length
+            tokens.append(remainder[index:end])
+            index = end + 1
+    if len(tokens) == 2:
+        return tokens[0], tokens[1]
+    marker = b" b/"
+    start = 0
+    while True:
+        split = remainder.find(marker, start)
+        if split == -1:
+            break
+        first = remainder[:split]
+        second = remainder[split + 1 :]
+        if first.startswith(b"a/") and second.startswith(b"b/") and first[2:] == second[2:]:
+            return first, second
+        start = split + 1
+    raise ValueError("ambiguous diff --git header in workspace bundle")
+
+
+def _diff_declared_paths(tracked_diff: bytes) -> tuple[str, ...]:
+    """解析 patch 声明的**两端口径**路径(旧路径删除向量承重)。
+
+    numstat 只报 ``+++`` 新路径;``---``/``+++`` 名字不同的段会被 git apply
+    同时删除旧路径。这里对 old≠new 的段直接整组拒绝(本模块 diff 固定
+    ``--no-renames``,只产 old==new / /dev/null 形态);旧路径也进入排除校验。
+    """
+    paths: list[str] = []
+    in_header = False
+    git_header: bytes | None = None
+    old_token: bytes | None = None
+    for line in tracked_diff.split(b"\n"):
+        if line.startswith(b"diff --git "):
+            in_header = True
+            git_header = line[len(b"diff --git ") :]
+            old_token = None
+            continue
+        if not in_header:
+            continue
+        if line.startswith(b"GIT binary patch"):
+            if git_header is None:
+                raise ValueError("workspace bundle binary section lacks diff --git header")
+            old_token, new_token = _split_git_diff_header(git_header)
+            old_path = _decode_repo_path(old_token)
+            new_path = _decode_repo_path(new_token)
+            if old_path is not None and new_path is not None and old_path != new_path:
+                raise ValueError("workspace bundle must not contain differing patch paths")
+            paths.extend(path for path in (old_path, new_path) if path is not None)
+            in_header = False
+            continue
+        if line.startswith(b"@@"):
+            in_header = False
+            old_token = None
+            continue
+        if line.startswith(b"--- "):
+            old_token = _header_token(line[4:])
+            continue
+        if line.startswith(b"+++ "):
+            new_token = _header_token(line[4:])
+            if old_token is not None:
+                old_path = _decode_repo_path(old_token)
+                new_path = _decode_repo_path(new_token)
+                if old_path is not None and new_path is not None and old_path != new_path:
+                    raise ValueError("workspace bundle must not contain differing patch paths")
+                paths.extend(path for path in (old_path, new_path) if path is not None)
+            old_token = None
+    return tuple(paths)
+
+
 def _untracked_paths(status: bytes) -> tuple[str, ...]:
     """解析 ``git status --porcelain -z`` 的 ``??`` 记录(跳过 rename 的旧路径字段)。"""
     fields = status.split(b"\0")
@@ -341,6 +497,9 @@ class GitWorktreeProvisioner:
             "--no-ext-diff",
             "--binary",
             "--no-renames",
+            "--no-color",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
             "HEAD",
             "--",
             ".",
@@ -356,6 +515,7 @@ class GitWorktreeProvisioner:
                 "diff",
                 "--no-ext-diff",
                 "--no-renames",
+                "--no-color",
                 "--name-only",
                 "-z",
                 "HEAD",
@@ -388,14 +548,17 @@ class GitWorktreeProvisioner:
             if _is_excluded(raw_path):
                 raise ValueError(f"workspace bundle must not contain excluded path: {raw_path!r}")
         # 安全面承重:header 自报之外,逐条校验 tracked diff 载荷路径并对账。
+        # declared = ---/+++ 与二进制 diff --git 的两端口径(旧路径删除向量);
+        # payload = numstat 的新路径清单,保留作交叉核对。
+        declared_paths = _diff_declared_paths(tracked_diff)
         payload_paths = self._tracked_payload_paths(parent, tracked_diff)
-        for raw_path in payload_paths:
+        for raw_path in (*declared_paths, *payload_paths):
             _repo_relative(raw_path)
             if _is_excluded(raw_path):
                 raise ValueError(
                     f"workspace bundle patch must not touch excluded path: {raw_path!r}"
                 )
-        undeclared = sorted(set(payload_paths) - set(tracked_paths))
+        undeclared = sorted((set(declared_paths) | set(payload_paths)) - set(tracked_paths))
         if undeclared:
             raise ValueError(
                 "workspace bundle tracked diff paths do not match bundle header: "
