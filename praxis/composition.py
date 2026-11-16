@@ -725,9 +725,18 @@ def build_child_session(
       write 子的独立工作区目录不等于独立库;子 items 写自己的 thread;
     - 适配器/单价继承父(生产适配器无状态可共享;子的 cost 限额与父同单价);
     - 权限 = 父 live policy ∩ read_only 收窄:``workspace_mode="read_only"``
-      时,对 tool_subset 中声明 WRITE_WORKSPACE/DESTRUCTIVE 的工具逐名注入
-      ToolRule deny ceiling(ceiling 只否决永不授权,且先于 bypass 生效);
-      父 ceilings 一并继承。write 子不加收窄(其隔离由 T7 worktree 供给);
+      时追加一个 ``profile="read-only"`` ceiling(恒追加,与工具表组成无关),
+      承载两层否决:
+      (a) **沙箱写路径否决(承重层,R-T5-6)**:compile_sandbox 的 allow_write
+      逐 ceiling AND ``path_access(write=True)``;read-only profile 在规则
+      匹配之前即拒写 → bash(EXECUTE_PROCESS,无 path target,工具规则/地板
+      全不触)的沙箱工作区写路径关闭。注意不可用 ``PathRule(root,"read")``
+      表达——resolve 的 profile 基线同路径生成 write 规则,_ACCESS_ORDER
+      同特异性取 write,read 规则被吸收;profile 形态才是有效否决;
+      (b) 工具规则 deny(纵深防御):对 tool_subset 中声明 WRITE_WORKSPACE/
+      DESTRUCTIVE 的工具逐名 ToolRule deny(dispatch 前拒,先于 bypass)。
+      读不受影响:read-only profile 基线授权工作区读。父 ceilings 一并继承。
+      write 子不加收窄(其隔离由 T7 worktree 供给);
     - ``workspace_mode`` 是 brief 签名之外的尾部默认参数(read_only 缺省):
       收窄判据需要它,既有签名调用零破坏。
 
@@ -737,11 +746,9 @@ def build_child_session(
     误判空闲而错标 interrupted。独立目录子的全库 sweep 工作区解析(按
     allocation 的 workspace 试锁)属 T7/T9 接线,本任务不开第二套 sweep。
 
-    已知边界(如实,交 T6/T7):read_only 子与父共享 permissions.json——
-    子的 always 授权落盘会写同一文件(子自身被 ceiling 否决不变,但父下次
-    打开会读到子的 always 规则);EXECUTE_PROCESS 工具(bash)不在 brief
-    钉死的 WRITE/DESTRUCTIVE 拒绝集内,bypass 父下的 read_only 子仍可经
-    shell 写文件。两者的收口属后续任务,不在本任务重开已拍板语义。
+    已知边界(如实,交 T6):read_only 子与父共享 permissions.json——子的
+    always 授权落盘会写同一文件(子自身被 ceiling 否决不变,但父下次打开会
+    读到子的 always 规则)。收口属后续任务,不在本任务重开已拍板语义。
     """
     ceilings = list(parent.permissions.ceilings)
     if workspace_mode == "read_only":
@@ -750,8 +757,9 @@ def build_child_session(
             for tool in tool_subset
             if tool.static_effects & _READ_ONLY_DENIED_EFFECTS
         )
-        if denied:
-            ceilings.append(PermissionPolicy(tools=denied))
+        # R-T5-6:read-only profile 是沙箱写否决的承重层(见 docstring (a));
+        # 恒追加——即使工具表没有静态 WRITE 工具,bash 的写路径也必须关闭。
+        ceilings.append(PermissionPolicy(profile="read-only", tools=denied))
     return build_session(
         workspace,
         parent.adapter,

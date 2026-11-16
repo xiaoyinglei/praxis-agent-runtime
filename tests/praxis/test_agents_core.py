@@ -19,12 +19,18 @@ R-T5-4:wait 过期不取消 driver(asyncio.wait 旧先例 subagents.py:199-201)�
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
+from praxis.adapters.sandbox.base import probe_backend
+from praxis.adapters.sandbox.compile import compile_sandbox, finalize_sandbox
+from praxis.composition import build_child_session
 from praxis.core import agents as agents_module
 from praxis.core.agents import (
     AGENT_TOOL_NAMES,
@@ -41,10 +47,11 @@ from praxis.core.recovery import sweep
 from praxis.core.session import ResumeNotConfirmed
 from praxis.core.statemachine import TurnStatus
 from praxis.interfaces.sdk import ScriptedAdapter, open_session
-from praxis.protocol.budget import Limits, limits_payload
+from praxis.protocol.budget import UNLIMITED, Limits, limits_payload
 from praxis.protocol.items import ItemKind
 from praxis.protocol.json import JsonValue
 from praxis.protocol.models import ModelResponse, ModelToolCall, Usage
+from praxis.protocol.policy import PermissionPolicy, path_access, resolve_policy
 from praxis.protocol.sandbox import ToolExecContext
 from praxis.protocol.tools import (
     CancellationMode,
@@ -63,6 +70,7 @@ from praxis.store.log import ItemEntry, Store
 from praxis.store.turns import create_turn, get_turn, list_turns
 
 _ZERO_USAGE = Usage(input_tokens=0, output_tokens=0)
+_SANDBOX = probe_backend()
 
 
 # ---------------------------------------------------------------------------
@@ -1163,6 +1171,99 @@ def test_read_only_child_denies_write_tool(workspace: Path) -> None:
             assert status.state == "done"
         finally:
             await manager.aclose()
+            await parent.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_read_only_child_ceiling_vetoes_write_path_but_not_read(workspace: Path) -> None:
+    """R-T5-6 承重层(全平台可跑):read_only ceiling 对写路径的 path_access
+    否决——compile_sandbox 的 allow_write 逐 ceiling AND 此项;读不受影响。
+
+    空工具表也恒追加 ceiling:bash 无静态 WRITE 声明,收窄不能依赖工具表组成。
+    """
+
+    async def scenario() -> None:
+        parent = open_session(workspace, ScriptedAdapter([]), tools=[], thread_id="parent")
+        child = build_child_session(
+            parent=parent,
+            workspace=workspace,
+            thread_id=uuid4().hex,
+            limits=UNLIMITED,
+            tool_subset=(),
+        )
+        try:
+            readonly = [c for c in child.permissions.ceilings if c.profile == "read-only"]
+            assert len(readonly) == 1
+            resolved = resolve_policy(readonly[0], workspace)
+            # 写否决:工作区根本体与子路径都拒(allow_write 的 AND 项 = False)。
+            assert path_access(resolved, workspace, write=True) is False
+            assert path_access(resolved, workspace / "f.txt", write=True) is False
+            # 读保留:收窄只否决写,不伤读。
+            assert path_access(resolved, workspace, write=False) is True
+            assert path_access(resolved, workspace / "f.txt", write=False) is True
+            # 父策略本身不受影响(ceiling 只约束子)。
+            assert path_access(resolve_policy(parent.permissions.policy, workspace), workspace, write=True) is True
+        finally:
+            await child.aclose()
+            await parent.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(not _SANDBOX.available, reason="no sandbox backend (bwrap deferred)")
+def test_read_only_child_bash_write_denied_by_sandbox(workspace: Path) -> None:
+    """R-T5-6 实证:read_only 子的 bash `echo x > f.txt` 被沙箱拒,读仍允许。
+
+    编译层断言(离线):profile 对工作区子路径渲染 deny file-write*、无
+    allow file-write*;强制层(真沙箱后端):写命令非零退出且文件不存在,
+    cat 既有文件成功。child.permissions 经公开工厂构造——与生产 driver
+    注入管道的 compile_sandbox 是同一上下文同一编译入口。
+    """
+    (workspace / "readable.txt").write_text("orig", encoding="utf-8")
+
+    async def scenario() -> None:
+        parent = open_session(workspace, ScriptedAdapter([]), tools=[], thread_id="parent")
+        child = build_child_session(
+            parent=parent,
+            workspace=workspace,
+            thread_id=uuid4().hex,
+            limits=UNLIMITED,
+            tool_subset=(),
+        )
+        try:
+            use = ResolvedUse(
+                effects=frozenset({ToolEffect.EXECUTE_PROCESS}),
+                targets=(ToolTarget(kind="path", value=str(workspace)),),
+            )
+            spec = compile_sandbox(child.permissions, use, workspace)
+            try:
+                text = spec.profile_text or ""
+                realpath = os.path.realpath(workspace)
+                assert f'(allow file-write* (require-all (subpath "{realpath}")' not in text
+                assert f'(deny file-write* (require-all (subpath "{realpath}")' in text
+                write = subprocess.run(
+                    [*spec.argv_prefix, "/bin/bash", "-lc", "echo hacked > f.txt"],
+                    cwd=workspace,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                assert write.returncode != 0
+                assert not (workspace / "f.txt").exists()
+                read = subprocess.run(
+                    [*spec.argv_prefix, "/bin/bash", "-lc", "cat readable.txt"],
+                    cwd=workspace,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                assert read.returncode == 0, read.stderr
+                assert "orig" in read.stdout
+            finally:
+                finalize_sandbox(spec, workspace)
+        finally:
+            await child.aclose()
             await parent.aclose()
 
     asyncio.run(scenario())
