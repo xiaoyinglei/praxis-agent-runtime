@@ -65,12 +65,14 @@ from praxis.core.compaction import (
 )
 from praxis.core.compensation import close_unresolved
 from praxis.core.context import (
+    append_memory_navigation,
     append_skill_catalog,
     build_context,
     elide_old_tool_outputs,
     to_messages,
 )
 from praxis.core.events import EventBus
+from praxis.core.memory import MemorySnapshot
 from praxis.core.pipeline import ExecCtx, SandboxCompiler, SandboxFinalizer, execute
 from praxis.core.statemachine import TurnStatus, transition
 from praxis.protocol.agents import ChildSummary
@@ -154,6 +156,10 @@ class TurnDeps:
     # composition 注入 loader 产出的 catalog。目录只经 append_skill_catalog
     # 这一个纯函数步骤进入本轮消息组装(§5.14/R-T7-1)。
     skills_catalog: SkillCatalog | None = None
+    # None = 无 memory 导航(enable_memory=False / use_memories=False / 空 state);
+    # 非空时只经 append_memory_navigation 这一个纯函数步骤进入消息组装,
+    # 且在 append_skill_catalog 之后(T12;R-T7-1 同纪律)。
+    memory_navigation: MemorySnapshot | None = None
     # None = 无预算(单测路径零扰动);生产 Session._execute 恒注入 BudgetTracker。
     # 步边界 refresh → admit_dispatch;耗尽 → PAUSED(budget_exhausted /
     # pricing_unavailable),可 resume+extend 续跑(阶段4 T3)。
@@ -560,6 +566,9 @@ async def run_turn(
             # (measure_request 测的就是真实出站体,不存在阈值盲区)。
             if deps.skills_catalog is not None:
                 messages = list(append_skill_catalog(messages, deps.skills_catalog))
+            # T12:memory 导航同纪律——append_skill_catalog 之后的唯一注入点。
+            if deps.memory_navigation is not None:
+                messages = list(append_memory_navigation(messages, deps.memory_navigation))
             definitions = [tool.definition for tool in deps.tools.values()]
             # 步序 3:构建请求 → 补全 → 落 model_response item → emit 预览事件。
             req = deps.adapter.build_request(messages, definitions, ModelSettings())

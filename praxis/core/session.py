@@ -72,7 +72,7 @@ from praxis.core.compensation import (
 )
 from praxis.core.events import EventBus, Subscription
 from praxis.core.locks import ThreadBusy, thread_execution_lock
-from praxis.core.memory import MemoryDriver
+from praxis.core.memory import MemoryDriver, MemorySnapshot, read_memory_snapshot
 from praxis.core.permission import apply_update, command_network_verdict, extend_policy
 from praxis.core.pipeline import SandboxCompiler, SandboxFinalizer
 from praxis.core.statemachine import TRANSITIONS, TurnStatus, transition
@@ -982,6 +982,14 @@ class Session:
         child_reader 缺省 = store.read_items(build_tree 的生产默认,T5 子分配
         经同一 reader 读子线程事实)。
         """
+        memory_navigation: MemorySnapshot | None = None
+        if self._memory is not None:
+            # T12:导航每 turn 现读当前 state(版本变化自然反映);读失败
+            # fail-open——memory 坏包络绝不阻断普通 turn。
+            try:
+                memory_navigation = read_memory_snapshot(self._store)
+            except Exception:  # noqa: BLE001 — memory 是增强面,turn 可用性优先
+                logger.warning("memory navigation snapshot unavailable", exc_info=True)
         deps = TurnDeps(
             store=self._store,
             bus=self._bus,
@@ -1001,6 +1009,7 @@ class Session:
             summary_prompt_max_chars=self._summary_prompt_max_chars,
             hooks=self._hooks,
             skills_catalog=self._skills_catalog,
+            memory_navigation=memory_navigation,
             budget=BudgetTracker(
                 store=self._store,
                 thread_id=self._thread_id,

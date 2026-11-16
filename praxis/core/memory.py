@@ -170,6 +170,28 @@ CONSOLIDATE_INSTRUCTION: Final = (
 
 
 @dataclass(frozen=True, slots=True)
+class MemorySnapshotEntry:
+    """导航条目:**只** key/title(正文不进上下文,token 卫生)。"""
+
+    key: str
+    title: str
+
+
+@dataclass(frozen=True, slots=True)
+class MemorySnapshot:
+    """一份 state 的导航投影(T12 注入单点消费;旧 memory.py:71-91 形状)。
+
+    ``content_revision`` 覆盖条目 key/title/text/kind 的规范 JSON(与旧
+    navigation_only 同口径);导航消息只渲染 key/title 与它的短哈希。
+    """
+
+    version: int
+    content_revision: str
+    total_entries: int
+    entries: tuple[MemorySnapshotEntry, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class Lease:
     """一次成功 claim 的租约身份(owner + lease_id 双因子,过期可接管)。"""
 
@@ -213,6 +235,93 @@ def initial_state() -> dict[str, JsonValue]:
         "generate_memories": True,
         "entry_history": {},
     }
+
+
+# ---------------------------------------------------------------------------
+# T12 读面:state → 导航快照 / read_memory 的当前 state 读取缝
+# ---------------------------------------------------------------------------
+
+_NAVIGATION_CONTENT_FIELDS: Final = ("key", "title", "text", "kind")
+
+
+def _normalized_entries(
+    state: Mapping[str, JsonValue],
+) -> list[tuple[str, str, str, str]]:
+    """state["entries"] → (key,title,text,kind) 正规形;畸形条目 fail-open 跳过。
+
+    状态由 T11 写入(可信),但读路径仍按 fail-open 纪律处理外部/旧数据:
+    缺 key/title 的非空字符串、或非 mapping 的条目一律跳过,绝不让一次导航
+    注入因一条坏 entry 失败。
+    """
+    raw = state.get("entries")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    normalized: list[tuple[str, str, str, str]] = []
+    for entry in raw:
+        if not isinstance(entry, Mapping):
+            continue
+        key, title = entry.get("key"), entry.get("title")
+        if not isinstance(key, str) or not key or not isinstance(title, str) or not title:
+            continue
+        text = entry.get("text")
+        kind = entry.get("kind")
+        normalized.append(
+            (
+                key,
+                title,
+                text if isinstance(text, str) else "",
+                kind if isinstance(kind, str) else "fact",
+            )
+        )
+    return normalized
+
+
+def memory_snapshot(state: Mapping[str, JsonValue] | None) -> MemorySnapshot | None:
+    """当前 state 的导航投影;无 state / ``use_memories=False`` → None。
+
+    content_revision 与旧 ``memory_snapshot(..., navigation_only=True)`` 同口径:
+    sha256(规范 JSON of key/title/text/kind 列表)。导航条目取**最后**
+    ``MAX_MEMORY_ENTRIES`` 条(state 正常已 ≤32;防御性地再截断一次)。
+    """
+    if state is None:
+        return None
+    if state.get("use_memories", True) is False:
+        return None
+    normalized = _normalized_entries(state)
+    content = [
+        dict(zip(_NAVIGATION_CONTENT_FIELDS, entry, strict=True))
+        for entry in normalized
+    ]
+    revision = hashlib.sha256(
+        json.dumps(content, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    version_raw = state.get("version")
+    version = version_raw if isinstance(version_raw, int) and not isinstance(version_raw, bool) else 0
+    return MemorySnapshot(
+        version=version,
+        content_revision=revision,
+        total_entries=len(normalized),
+        entries=tuple(
+            MemorySnapshotEntry(key=key, title=title)
+            for key, title, _text, _kind in normalized[-MAX_MEMORY_ENTRIES:]
+        ),
+    )
+
+
+def read_memory_state(store: Store) -> Mapping[str, JsonValue] | None:
+    """读当前 committed state(完整性校验经 T10 ``read_state_verified``)。
+
+    这是 T12 read_memory 工具与导航快照共用的**唯一** state 读取缝:
+    composition 把它绑定成工具的无参 provider(tools 不 import core/store);
+    包络损坏时 ``MemoryEnvelopeCorrupt`` 由调用方(工具/Session)按各自
+    fail-open 边界收敛。
+    """
+    return store.transact(lambda conn: read_state_verified(conn, STATE_KEY))
+
+
+def read_memory_snapshot(store: Store) -> MemorySnapshot | None:
+    """当前 state 的导航快照(每 turn 现读;state 版本变化自然反映)。"""
+    return memory_snapshot(read_memory_state(store))
 
 
 # ---------------------------------------------------------------------------
@@ -1107,9 +1216,14 @@ __all__ = [
     "JobOutcome",
     "Lease",
     "MemoryDriver",
+    "MemorySnapshot",
+    "MemorySnapshotEntry",
     "claim_lease",
     "initial_state",
     "job_unresolved",
+    "memory_snapshot",
+    "read_memory_snapshot",
+    "read_memory_state",
     "record_revision",
     "release_lease",
     "run_update",

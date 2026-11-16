@@ -67,7 +67,7 @@ from praxis.core.compaction import (
     default_summary_prompt_max_chars,
 )
 from praxis.core.events import EventBus
-from praxis.core.memory import MemoryDriver
+from praxis.core.memory import MemoryDriver, read_memory_state
 from praxis.core.permission import network_verdict
 from praxis.core.recovery import sweep, sweep_orphan_command_jobs
 from praxis.core.session import AsyncCloser, Session
@@ -105,6 +105,7 @@ from praxis.tools.builtins.filesystem import (
     create_read_tool,
     create_write_tool,
 )
+from praxis.tools.builtins.memory_tools import create_read_memory_tool
 from praxis.tools.builtins.patch import create_apply_patch_tool
 from praxis.tools.builtins.planning import create_update_plan_tool
 from praxis.tools.builtins.process import signal_group
@@ -745,6 +746,21 @@ def build_session(
                 ToolRule(pattern=agent_name, decision="allow")
                 for agent_name in sorted(AGENT_ORCHESTRATION_NAMES)
             )
+        # T12(R-PF-7):read_memory 是普通只读工具。state 读取缝在此绑定
+        # (tools 不 import core/store)——每次调用现读当前 committed state。
+        # session 域 allow 与 read/list_files 同姿态(内存域,绝不进 always 落盘);
+        # 工具 effects={} 且无 targets,policy-grant 本也会放行,这里的显式
+        # allow 只是让授权意图可审计、与编排 allow 同一机制。
+        memory_session_rules: tuple[ToolRule, ...] = ()
+        if enable_memory:
+            if "read_memory" in tool_map:
+                raise ValueError(
+                    "tool name 'read_memory' collides with the enable_memory memory tool"
+                )
+            tool_map["read_memory"] = create_read_memory_tool(
+                lambda: read_memory_state(store)
+            )
+            memory_session_rules = (ToolRule(pattern="read_memory", decision="allow"),)
         # 外部化与回读能力耦合:工具表被整体替换且没有 read_artifact 时,
         # 不注入 artifacts——否则模型只会拿到打不开的指针,比旧字节截断更差。
         effective_artifacts = artifact_store if "read_artifact" in tool_map else None
@@ -759,8 +775,8 @@ def build_session(
             sandbox=probe_backend(),
             # T5:ceiling 只否决永不授权(read_only 子的收窄经此与父策略取交集)。
             ceilings=tuple(ceilings),
-            # T6:四件编排的 session 域 allow(仅 enable_subagents;内存域)。
-            session_rules=agent_session_rules,
+            # T6/T12:编排与 memory 只读工具的 session 域 allow(仅内存域)。
+            session_rules=(*agent_session_rules, *memory_session_rules),
         )
         resolved_thread = thread_id if thread_id is not None else store.create_thread()
         store.ensure_thread(resolved_thread)
