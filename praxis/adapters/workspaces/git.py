@@ -12,6 +12,11 @@
   apply 路径集都排除(子 always 策略文件绝不渗回父);
 - apply 逐文件 preimage sha256 复检:任一不一致 → conflicts 且整组不写;
   ``git apply --check`` 后 ``git apply``,失败整组拒(``patch_failed`` parity);
+- R-T7-3(T8 收口):untracked 写入前对目标路径**祖先链**做 symlink
+  confinement——悬空 symlink 祖先计 conflict;解析后越出 parent_root 的
+  symlink 祖先计 conflict(否则 ENOENT→None 假匹配会半写/写出父仓);
+- T8 inspect:路径集 + HEAD/子两侧 sha256 表 + ≤200_000 字节 diff 预览
+  (截断旗标 parity 旧 diff_limit);diff/inspect 支持 paths 子集;
 - 非 git 工作区 prepare 抛 ``ChildWorkspaceRequiresGit``(Q5)。
 
 子进程纪律(B33):固定 argv 数组、不经 shell;env 基底由 composition 注入
@@ -34,7 +39,12 @@ from pathlib import Path, PurePosixPath
 
 from praxis.protocol.floor import host_config_dir
 from praxis.protocol.sandbox import EnvBuilder
-from praxis.protocol.workspaces import ApplyResult, ChildWorkspaceRequiresGit
+from praxis.protocol.workspaces import (
+    DIFF_PREVIEW_LIMIT_BYTES,
+    ApplyResult,
+    ChildWorkspaceRequiresGit,
+    WorkspaceInspection,
+)
 
 # diff bundle 自有格式:magic + 4-byte header 长度 + JSON header + tracked diff
 # + 每个 untracked 文件原始字节(长度/摘要见 header)。格式常量只此一处。
@@ -88,6 +98,73 @@ def _repo_relative(raw: str) -> PurePosixPath:
 
 def _is_excluded(raw: str) -> bool:
     return any(part.casefold() in _EXCLUDED_COMPONENTS for part in PurePosixPath(raw).parts)
+
+
+def _validated_subset(paths: Sequence[str]) -> tuple[str, ...]:
+    """integrate paths 子集校验:相对、无越界成分、不含排除路径。"""
+    subset: list[str] = []
+    for raw in paths:
+        rel = _repo_relative(raw)
+        if _is_excluded(raw):
+            raise ValueError(f"workspace subset must not contain excluded path: {raw!r}")
+        subset.append(rel.as_posix())
+    return tuple(subset)
+
+
+def _in_subset(raw: str, subset: Sequence[str]) -> bool:
+    return any(raw == entry or raw.startswith(entry + "/") for entry in subset)
+
+
+def _ancestor_symlink_escape(parent: Path, rel: PurePosixPath) -> bool:
+    """R-T7-3:目标路径祖先链的 symlink confinement(承重)。
+
+    任一祖先是 symlink 时:悬空/环链(resolve 失败)→ True;解析后越出
+    parent_root → True。解析后仍在父仓内的 symlink 祖先放行(controller
+    裁决口径)。不查目标本身——``_file_digest`` 的 lstat 已把非普通文件
+    目标计为冲突。
+    """
+    current = parent
+    for part in rel.parts[:-1]:
+        current = current / part
+        if not current.is_symlink():
+            continue
+        try:
+            resolved = current.resolve(strict=True)
+        except OSError:
+            return True  # 悬空 symlink/环链:ENOENT 假匹配的病灶
+        if not resolved.is_relative_to(parent):
+            return True
+    return False
+
+
+def _worktree_digest(path: Path) -> str | None:
+    """子工作区侧 postimage 摘要:普通文件 sha256;symlink = 链接目标字节
+    sha256(与 bundle 的 120000 口径一致);缺失 = None;其余 = ""。"""
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return ""
+    if stat.S_ISLNK(mode):
+        try:
+            return _sha256(os.fsencode(os.readlink(path)))
+        except OSError:
+            return ""
+    if not stat.S_ISREG(mode):
+        return ""
+    try:
+        return _sha256(path.read_bytes())
+    except OSError:
+        return ""
+
+
+def _diff_preview(tracked_diff: bytes) -> tuple[str, bool]:
+    """≤200_000 字节预览(UTF-8 边界安全;旧 diff_limit 分页口径 parity)。"""
+    end = min(len(tracked_diff), DIFF_PREVIEW_LIMIT_BYTES)
+    while end < len(tracked_diff) and tracked_diff[end] & 0xC0 == 0x80:
+        end += 1
+    return tracked_diff[:end].decode("utf-8", errors="backslashreplace"), end < len(tracked_diff)
 
 
 def _validated_child_id(child_thread_id: str) -> str:
@@ -469,9 +546,14 @@ class GitWorktreeProvisioner:
 
     # -- diff ----------------------------------------------------------------
 
-    def diff(self, ws: Path) -> bytes:
-        """子工作区相对 HEAD 的 bundle(tracked diff + untracked;排除 .praxis/.git)。"""
+    def diff(self, ws: Path, *, paths: Sequence[str] | None = None) -> bytes:
+        """子工作区相对 HEAD 的 bundle(tracked diff + untracked;排除 .praxis/.git)。
+
+        ``paths`` 给定 = 子集 bundle:tracked diff 走 literal pathspec,
+        untracked 按精确文件/目录前缀过滤(T8 integrate paths 参数)。
+        """
         workspace = Path(ws)
+        subset = _validated_subset(paths) if paths is not None else None
         status = self._git(
             workspace, workspace, ("status", "--porcelain", "-z", "--untracked-files=all")
         )
@@ -480,6 +562,8 @@ class GitWorktreeProvisioner:
         untracked: list[_UntrackedFile] = []
         for raw_path in _untracked_paths(status.stdout):
             if _is_excluded(raw_path):
+                continue
+            if subset is not None and not _in_subset(raw_path, subset):
                 continue
             _repo_relative(raw_path)
             target = workspace / Path(*PurePosixPath(raw_path).parts)
@@ -492,6 +576,7 @@ class GitWorktreeProvisioner:
             untracked.append(_UntrackedFile(raw_path, mode, _sha256(data), data))
         untracked.sort(key=lambda file: file.path)
 
+        pathspecs = (".",) if subset is None else tuple(f":(literal){entry}" for entry in subset)
         diff_args = (
             "diff",
             "--no-ext-diff",
@@ -502,7 +587,7 @@ class GitWorktreeProvisioner:
             "--dst-prefix=b/",
             "HEAD",
             "--",
-            ".",
+            *pathspecs,
             *_EXCLUDED_PATHSPECS,
         )
         tracked_diff = self._git(workspace, workspace, diff_args)
@@ -520,7 +605,7 @@ class GitWorktreeProvisioner:
                 "-z",
                 "HEAD",
                 "--",
-                ".",
+                *pathspecs,
                 *_EXCLUDED_PATHSPECS,
             ),
         )
@@ -532,6 +617,77 @@ class GitWorktreeProvisioner:
             if raw and not _is_excluded(path := os.fsdecode(raw))
         )
         return _encode_bundle(tracked_diff.stdout, tracked_paths, untracked)
+
+    # -- inspect -------------------------------------------------------------
+
+    def _head_preimages(self, workspace: Path, paths: Sequence[str]) -> dict[str, str | None]:
+        """HEAD(快照基线)侧逐路径 sha256;基线不存在 = None。
+
+        ls-tree -r -z 取 blob oid(路径经 -z 原始字节,无引号歧义),
+        cat-file --batch 按 oid 取内容(oid 是 hex,stdin 无路径注入面)。
+        """
+        preimages: dict[str, str | None] = {path: None for path in paths}
+        if not paths:
+            return preimages
+        listing = self._git(workspace, workspace, ("ls-tree", "-r", "-z", "HEAD"))
+        if listing.returncode != 0:
+            raise RuntimeError(f"git ls-tree failed: {_bounded(listing.stderr)}")
+        wanted = set(paths)
+        oids: dict[str, str] = {}
+        for record in listing.stdout.split(b"\0"):
+            if not record:
+                continue
+            meta, _, raw_path = record.partition(b"\t")
+            fields = meta.split(b" ")
+            if len(fields) != 3:
+                raise RuntimeError(f"malformed git ls-tree record: {record!r}")
+            path = os.fsdecode(raw_path)
+            if path in wanted:
+                oids[path] = fields[2].decode("ascii")
+        if not oids:
+            return preimages
+        ordered = sorted(oids.items())
+        stdin = "".join(f"{oid}\n" for _, oid in ordered).encode("ascii")
+        batch = self._git(workspace, workspace, ("cat-file", "--batch"), stdin=stdin)
+        if batch.returncode != 0:
+            raise RuntimeError(f"git cat-file --batch failed: {_bounded(batch.stderr)}")
+        out = batch.stdout
+        offset = 0
+        for path, oid in ordered:
+            newline = out.find(b"\n", offset)
+            if newline == -1:
+                raise RuntimeError("truncated git cat-file batch output")
+            header = out[offset:newline].decode("ascii").split()
+            offset = newline + 1
+            if len(header) != 3 or header[0] != oid or header[1] != "blob":
+                raise RuntimeError(f"unexpected git cat-file header for {path!r}: {header!r}")
+            size = int(header[2])
+            data = out[offset : offset + size]
+            if len(data) != size:
+                raise RuntimeError(f"truncated git cat-file blob payload for {path!r}")
+            offset += size + 1  # blob 后的分隔 LF
+            preimages[path] = _sha256(data)
+        return preimages
+
+    def inspect(self, ws: Path, *, paths: Sequence[str] | None = None) -> WorkspaceInspection:
+        """T8 读面:变更路径集 + HEAD/子两侧 sha256 表 + 有界 diff 预览。"""
+        workspace = Path(ws)
+        tracked_diff, tracked_paths, untracked = _decode_bundle(self.diff(workspace, paths=paths))
+        touched = sorted(set(tracked_paths) | {file.path for file in untracked})
+        preimages = self._head_preimages(workspace, touched)
+        postimages = {
+            path: _worktree_digest(workspace / Path(*PurePosixPath(path).parts))
+            for path in touched
+        }
+        preview, truncated = _diff_preview(tracked_diff)
+        return WorkspaceInspection(
+            paths=tuple(touched),
+            preimages=preimages,
+            postimages=postimages,
+            diff_preview=preview,
+            diff_truncated=truncated,
+            diff_bytes=len(tracked_diff),
+        )
 
     # -- apply ---------------------------------------------------------------
 
@@ -569,8 +725,11 @@ class GitWorktreeProvisioner:
         conflicts: list[str] = []
         for raw_path in touched:
             expected = preimages[raw_path] if raw_path in preimages else None
-            actual = _file_digest(parent / Path(*PurePosixPath(raw_path).parts))
-            if actual != expected:
+            rel = PurePosixPath(raw_path)
+            actual = _file_digest(parent / Path(*rel.parts))
+            # R-T7-3:祖先链 symlink confinement 先于任何写入(悬空/越界
+            # 祖先都计 conflict,整组零写——ENOENT→None 假匹配不再可达)。
+            if actual != expected or _ancestor_symlink_escape(parent, rel):
                 conflicts.append(raw_path)
         if conflicts:
             # 双方字节都在:parent 不动,子快照/bundle 也未被消费。

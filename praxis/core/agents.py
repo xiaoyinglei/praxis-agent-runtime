@@ -63,6 +63,7 @@ from praxis.core.statemachine import TRANSITIONS, TurnStatus
 from praxis.core.turn import pending_approval_summaries
 from praxis.protocol.agents import (
     AGENT_TOOL_NAMES,
+    ChildActiveError,
     ChildGrantError,
     ChildHandle,
     ChildLimitError,
@@ -79,7 +80,12 @@ from praxis.protocol.budget import (
 from praxis.protocol.items import Item, ItemKind
 from praxis.protocol.json import JsonValue
 from praxis.protocol.tools import Tool
-from praxis.protocol.workspaces import ChildWorkspaceProvisioner, WorkspaceMode
+from praxis.protocol.workspaces import (
+    ApplyResult,
+    ChildWorkspaceProvisioner,
+    WorkspaceInspection,
+    WorkspaceMode,
+)
 from praxis.store.log import ItemEntry, Store, append_items_tx
 from praxis.store.turns import create_turn_tx, get_turn, list_turns
 
@@ -603,6 +609,66 @@ class SubagentManager:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+    # -- integrate 交付面(T8)-------------------------------------------------
+
+    def _integration_target(
+        self, child_thread_id: str
+    ) -> tuple[_AllocationRef, ChildWorkspaceProvisioner]:
+        """integrate 三动作共用前置:write 子 + provisioner 接线 + 子终态。
+
+        子须终态(completed/failed/cancelled;旧 child_workspaces parity):
+        running/paused/interrupted 都拒——子工作区还在被消费时绝不 diff/apply/
+        discard。读不到子 turn 保守拒绝(fail-open 同 _child_is_active 方向)。
+        read_only 子/provisioner 未接线抛 ValueError(工具面如实上抛,管道
+        唯一归一 tool_error,不发明第二套错误码)。
+        """
+        ref = self._ref_for(child_thread_id)
+        if ref.workspace_mode != "write":
+            raise ValueError(
+                f"child {child_thread_id!r} is read_only; only write-mode children "
+                "have an isolated workspace to integrate"
+            )
+        provisioner = self._provisioner
+        if provisioner is None:
+            raise ValueError(
+                "write-mode child workspace provisioner is not wired; cannot integrate"
+            )
+        turn = get_turn(self._store, ref.child_root_turn_id)
+        if turn is None or TRANSITIONS[TurnStatus(turn.status)]:
+            raise ChildActiveError(
+                f"child {child_thread_id!r} is still active; integrate requires a "
+                "terminal child (completed/failed/cancelled)"
+            )
+        return ref, provisioner
+
+    def integrate_inspect(
+        self, child_thread_id: str, *, paths: Sequence[str] | None = None
+    ) -> WorkspaceInspection:
+        """子工作区变更的有界读面(路径集/双方 sha 表/≤200_000 预览)。"""
+        ref, provisioner = self._integration_target(child_thread_id)
+        return provisioner.inspect(Path(ref.workspace), paths=paths)
+
+    def integrate_apply(
+        self, child_thread_id: str, *, paths: Sequence[str] | None = None
+    ) -> ApplyResult:
+        """preimage 复检 + 整组 apply;conflicts 非空 = 双方字节保留零写。
+
+        preimages 取 HEAD 基线(inspect 同源)——父仓快照后的漂移必然
+        conflict,绝不静默覆盖。apply 是普通工具调用:事实 = tool_call/
+        tool_result,kill 在 apply 内 → outcome_unknown → reconcile 走 T4
+        既有矩阵(不写 durable intent,brief 钉死)。
+        """
+        ref, provisioner = self._integration_target(child_thread_id)
+        workspace = Path(ref.workspace)
+        inspection = provisioner.inspect(workspace, paths=paths)
+        bundle = provisioner.diff(workspace, paths=paths)
+        return provisioner.apply(self.parent.workspace, bundle, preimages=inspection.preimages)
+
+    def integrate_discard(self, child_thread_id: str) -> None:
+        """移除子工作区快照;provisioner.discard 路径已消失 = 幂等成功。"""
+        ref, provisioner = self._integration_target(child_thread_id)
+        provisioner.discard(Path(ref.workspace))
 
     # -- 内部重建 --------------------------------------------------------------
 

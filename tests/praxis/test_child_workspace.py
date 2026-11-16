@@ -297,6 +297,76 @@ def test_apply_rejects_differing_name_patch_deletion_vector(
 
 
 # ---------------------------------------------------------------------------
+# R-T7-3:untracked 写入段的祖先 symlink confinement(T8 接通 integrate 前收口)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_conflicts_when_ancestor_symlink_escapes_parent(
+    repo: Path, provisioner: GitWorktreeProvisioner, tmp_path: Path
+) -> None:
+    """父仓祖先 symlink 指仓外:preimage ENOENT→None 会假匹配,必须计 conflict。
+
+    不修则 untracked 写入经 symlink 祖先写出 parent_root(跨两次 integrate
+    可达任意宿主路径)。承重:outside 目录零写入,子快照字节保留。
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    ws = provisioner.prepare(repo, "child-1", "write")
+    (ws / "link").mkdir()
+    (ws / "link" / "pwned.txt").write_text("pwned\n", encoding="utf-8")
+    bundle = provisioner.diff(ws)
+    # 快照之后父仓出现指仓外的 symlink 祖先(与子 untracked 路径同名)。
+    (repo / "link").symlink_to(outside, target_is_directory=True)
+
+    result = provisioner.apply(repo, bundle, preimages={"link/pwned.txt": None})
+
+    assert result.applied == []
+    assert result.conflicts == ["link/pwned.txt"]
+    assert not (outside / "pwned.txt").exists()  # 绝不写出 parent_root
+    assert (ws / "link" / "pwned.txt").read_text(encoding="utf-8") == "pwned\n"
+
+
+def test_apply_conflicts_when_ancestor_symlink_dangling(
+    repo: Path, provisioner: GitWorktreeProvisioner
+) -> None:
+    """悬空 symlink 祖先:lstat ENOENT→None 假匹配 + mkdir 炸出半写,必须前置 conflict。"""
+    ws = provisioner.prepare(repo, "child-1", "write")
+    (ws / "a.txt").write_text("child\n", encoding="utf-8")
+    (ws / "dang").mkdir()
+    (ws / "dang" / "f.txt").write_text("x\n", encoding="utf-8")
+    bundle = provisioner.diff(ws)
+    (repo / "dang").symlink_to(repo / "no-such-dir")  # 悬空
+
+    result = provisioner.apply(
+        repo, bundle, preimages={"a.txt": _sha(b"base\n"), "dang/f.txt": None}
+    )
+
+    assert result.applied == []
+    assert result.conflicts == ["dang/f.txt"]
+    # 整组零写:tracked 同伴文件也不得先落(半写病灶)。
+    assert (repo / "a.txt").read_text(encoding="utf-8") == "base\n"
+    assert not (repo / "no-such-dir").exists()
+
+
+def test_apply_allows_ancestor_symlink_resolving_inside_parent(
+    repo: Path, provisioner: GitWorktreeProvisioner
+) -> None:
+    """祖先 symlink 解析后仍在 parent_root 内:放行(controller 裁决口径)。"""
+    ws = provisioner.prepare(repo, "child-1", "write")
+    (ws / "inner").mkdir()
+    (ws / "inner" / "f.txt").write_text("x\n", encoding="utf-8")
+    bundle = provisioner.diff(ws)
+    (repo / "realdir").mkdir()
+    (repo / "inner").symlink_to(repo / "realdir", target_is_directory=True)
+
+    result = provisioner.apply(repo, bundle, preimages={"inner/f.txt": None})
+
+    assert result.conflicts == []
+    assert result.applied == ["inner/f.txt"]
+    assert (repo / "realdir" / "f.txt").read_text(encoding="utf-8") == "x\n"
+
+
+# ---------------------------------------------------------------------------
 # patch_failed:git apply 失败整组拒
 # ---------------------------------------------------------------------------
 

@@ -13,14 +13,14 @@ import core。core.agents 原样 re-export,既有调用方零改动。
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Literal, Protocol
 
 from praxis.protocol.budget import Limits
 from praxis.protocol.permission import ApprovalSummary
-from praxis.protocol.workspaces import WorkspaceMode
+from praxis.protocol.workspaces import ApplyResult, WorkspaceInspection, WorkspaceMode
 
 # 子代理状态标签(wait/children_summary 共用):completed/failed 都表达
 # "不再消耗",但 failed 保留独立标签供上层区分结局(与 ChildState 的 done
@@ -47,6 +47,18 @@ class ChildGrantError(RuntimeError):  # noqa: N818 — 计划钉死的名字
 
 class ChildLimitError(RuntimeError):  # noqa: N818 — 与 ChildGrantError 同族
     """并发/总数/深度/父终态 guard 拒绝(T6 映射 child_limit_reached 错误码)。"""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+class ChildActiveError(RuntimeError):  # noqa: N818 — 与 ChildGrantError 同族
+    """子根 turn 非终态时拒绝 integrate(T8 映射 child_still_active 错误码)。
+
+    读不到子 turn 同样保守拒绝(与 _child_is_active 的 fail-open 同向:
+    结局不可知时绝不消费子工作区)。
+    """
 
     def __init__(self, reason: str) -> None:
         self.reason = reason
@@ -115,6 +127,18 @@ class SubagentSurface(Protocol):
     async def send(self, child_thread_id: str, message: str) -> None: ...
 
     def request_cancel(self, child_thread_id: str) -> str: ...
+
+    # T8 integrate 交付面:子须终态(否则 ChildActiveError);read_only 子/
+    # provisioner 未接线抛 ValueError(工具面如实上抛,管道归一 tool_error)。
+    def integrate_inspect(
+        self, child_thread_id: str, *, paths: Sequence[str] | None = None
+    ) -> WorkspaceInspection: ...
+
+    def integrate_apply(
+        self, child_thread_id: str, *, paths: Sequence[str] | None = None
+    ) -> ApplyResult: ...
+
+    def integrate_discard(self, child_thread_id: str) -> None: ...
 
 
 # 延迟绑定 provider:composition 的 manager_holder 闭包(工具表先于 manager 装配)。

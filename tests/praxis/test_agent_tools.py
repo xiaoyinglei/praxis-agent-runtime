@@ -5,7 +5,8 @@
 - 开关默认关=零扰动;enable_subagents=True → 15+5=20(口径同步见
   test_default_table3b);子工具表不含五件(结构深度门);
 - spawn→wait 端到端(scripted 父子,真实管道);错误码面
-  (grant_exhausted/child_limit_reached/child_not_found/integrate_not_wired);
+  (grant_exhausted/child_limit_reached/child_not_found/child_still_active;
+  integrate 实装语义见 test_integrate.py);
 - session 域 ToolRule allow(never 模式仍放行四件编排;显式 deny 仍胜;
   allow 不落盘);integrate DESTRUCTIVE 显式审批不可豁免(S5);
 - `ps` 无关:spawn→wait 全程零新进程(subprocess.Popen 探针);
@@ -42,6 +43,7 @@ from praxis.core.statemachine import TurnStatus
 from praxis.interfaces.sdk import ScriptedAdapter, open_session
 from praxis.protocol.agents import (
     AGENT_TOOL_NAMES,
+    ChildActiveError,
     ChildGrantError,
     ChildHandle,
     ChildLimitError,
@@ -87,7 +89,7 @@ from praxis.protocol.tools import (
     ToolTarget,
     ToolValidationError,
 )
-from praxis.protocol.workspaces import WorkspaceMode
+from praxis.protocol.workspaces import ApplyResult, WorkspaceInspection, WorkspaceMode
 from praxis.store.log import Store
 from praxis.store.turns import get_turn
 from praxis.tools.builtins.agent_tools import create_agent_tools
@@ -200,6 +202,29 @@ class _StubSurface:
         if self.exc is not None:
             raise self.exc
         return "signalled"
+
+    def integrate_inspect(
+        self, child_thread_id: str, *, paths: Sequence[str] | None = None
+    ) -> WorkspaceInspection:
+        self.calls.append(("integrate_inspect", {"child_thread_id": child_thread_id, "paths": paths}))
+        if self.exc is not None:
+            raise self.exc
+        return WorkspaceInspection(
+            paths=(), preimages={}, postimages={}, diff_preview="", diff_truncated=False, diff_bytes=0
+        )
+
+    def integrate_apply(
+        self, child_thread_id: str, *, paths: Sequence[str] | None = None
+    ) -> ApplyResult:
+        self.calls.append(("integrate_apply", {"child_thread_id": child_thread_id, "paths": paths}))
+        if self.exc is not None:
+            raise self.exc
+        return ApplyResult(applied=[], conflicts=[])
+
+    def integrate_discard(self, child_thread_id: str) -> None:
+        self.calls.append(("integrate_discard", {"child_thread_id": child_thread_id}))
+        if self.exc is not None:
+            raise self.exc
 
 
 def _tools_by_name(surface: SubagentSurface | None = None) -> dict[str, Tool]:
@@ -541,12 +566,22 @@ def test_error_code_mapping_on_stub_surface() -> None:
         ):
             result = await tools[name].run(args, ctx)
             assert result.error_code == "child_not_found", name
+        stub.exc = ValueError("unknown child thread 'ghost' (no allocation in parent thread)")
+        result = await tools["integrate_child_workspace"].run(
+            {"child_thread_id": "ghost", "action": "inspect"}, ctx
+        )
+        assert result.error_code == "child_not_found"
+        stub.exc = ChildActiveError("child 'c' is still active; integrate requires a terminal child")
+        result = await tools["integrate_child_workspace"].run(
+            {"child_thread_id": "c", "action": "apply"}, ctx
+        )
+        assert result.error_code == "child_still_active"
+        assert result.status is ResultStatus.ERROR
         stub.exc = None
         result = await tools["integrate_child_workspace"].run(
-            {"child_thread_id": "c", "action": "inspect"}, ctx
+            {"child_thread_id": "c", "action": "discard"}, ctx
         )
-        assert result.error_code == "integrate_not_wired"
-        assert result.status is ResultStatus.ERROR
+        assert result.status is ResultStatus.OK
         # 终态子的 cancel ValueError 不是 child_not_found:如实上抛交管道归一。
         stub.exc = ValueError("child turn 'r' is completed; terminal turns cannot be cancelled")
         with pytest.raises(ValueError, match="terminal"):

@@ -11,8 +11,9 @@ effects 裁决(不新增效果枚举值,YAGNI):
   session 域 allow 只活在内存,绝不进 always 落盘。
 - ``integrate_child_workspace`` 声明 ``DESTRUCTIVE + WRITE_WORKSPACE``
   (S5:破坏性副作用永不自动 allow,显式审批不可豁免);T8 实装
-  inspect/apply/discard,本任务交付 schema + ``integrate_not_wired`` 诚实
-  错误码(R-PF-2 先例)。
+  inspect/apply/discard:inspect → {paths, diff_preview(≤200_000 截断旗标),
+  sha 表}(大结果经管道 artifacts 写时外部化);apply → 子须终态 + preimage
+  复检,conflicts 非空 → 双方字节保留 + ``integrate_conflict``;discard 幂等。
 
 注入纪律(仿 EnvBuilder 先例):tools 不 import core——行为经
 ``protocol.agents.SubagentSurface`` 结构签名触达,composition 以 provider
@@ -22,18 +23,21 @@ authorizer 的 session_holder 同先例)。
 args 上限(旧 integrations/subagent.py:52-59 parity):task/context_summary
 ≤20_000;wait timeout ≤60(manager 钳位同值)。错误码面:``grant_exhausted``
 (ChildGrantError)/``child_limit_reached``(ChildLimitError)/
-``child_not_found``(未知 child 的 ValueError)/``integrate_not_wired``;
-其余异常(如终态子再 cancel、write 模式 provisioner 未接线)如实上抛,
-由管道唯一归一为 ``tool_error``(消息自解释,不发明第二套码)。
+``child_not_found``(未知 child 的 ValueError)/``child_still_active``
+(ChildActiveError,integrate 三动作共用)/``integrate_conflict``(apply
+preimage 不一致,双方字节保留);其余异常(如终态子再 cancel、read_only 子
+integrate、provisioner 未接线)如实上抛,由管道唯一归一为 ``tool_error``
+(消息自解释,不发明第二套码)。
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
 from praxis.protocol.agents import (
+    ChildActiveError,
     ChildGrantError,
     ChildLimitError,
     SurfaceProvider,
@@ -54,7 +58,7 @@ from praxis.protocol.tools import (
     ToolTarget,
     json_schema_input,
 )
-from praxis.protocol.workspaces import WorkspaceMode
+from praxis.protocol.workspaces import DIFF_PREVIEW_LIMIT_BYTES, WorkspaceMode
 from praxis.tools.builtins.filesystem import PENDING_TOOL_CALL_ID
 
 # 旧 subagent.py:52-59 parity:task/context_summary 的有界字符上限。
@@ -248,6 +252,15 @@ def _unknown_child(exc: ValueError) -> bool:
     return str(exc).startswith("unknown child thread")
 
 
+def _sha_display(digest: str | None) -> str:
+    """sha 表展示口径:None = 基线/当前不存在;"" = 已存在但非普通文件。"""
+    if digest is None:
+        return "absent"
+    if digest == "":
+        return "non-regular"
+    return digest
+
+
 def create_agent_tools(surface_provider: SurfaceProvider) -> tuple[Tool, ...]:
     """装配五件套(provider 延迟绑定 SubagentManager;composition 唯一调用点)。
 
@@ -360,13 +373,108 @@ def create_agent_tools(surface_provider: SurfaceProvider) -> tuple[Tool, ...]:
         )
 
     async def integrate_run(arguments: Mapping[str, JsonValue], exec_ctx: ToolExecContext) -> ToolResult:
-        # T8 实装 inspect/apply/discard(provisioner 交付管道);本任务诚实拒绝,
-        # 零副作用(R-PF-2 先例)。schema 校验仍先行(管道 invalid_input 纪律)。
-        return _error(
-            _INTEGRATE_NAME,
-            "integrate_not_wired",
-            "integrate_child_workspace is not wired yet (T8 delivery pipeline); no action was performed",
+        """T8 交付管道:inspect/apply/discard 经 SubagentSurface 触达 provisioner。
+
+        审批/落库/外部化全在唯一管道(execute)——本函数只做动作分派与
+        结果形状;DESTRUCTIVE 显式审批由 decide 强制(S5),此处绝不豁免。
+        """
+        surface = surface_provider()
+        child_id = _child_id(arguments)
+        raw_action = arguments.get("action")
+        action = raw_action if isinstance(raw_action, str) else ""
+        raw_paths = arguments.get("paths")
+        # 管道 args 经 freeze_json:序列是 tuple(非 list),两态都认。
+        paths: Sequence[str] | None = (
+            tuple(entry for entry in raw_paths if isinstance(entry, str))
+            if isinstance(raw_paths, (list, tuple))
+            else None
         )
+        try:
+            if action == "inspect":
+                inspection = surface.integrate_inspect(child_id, paths=paths)
+                lines = [
+                    f"workspace inspection for subagent {child_id}: "
+                    f"{len(inspection.paths)} changed path(s), "
+                    f"tracked diff {inspection.diff_bytes} byte(s)",
+                    "paths (preimage -> postimage sha256):",
+                ]
+                for path in inspection.paths:
+                    pre = inspection.preimages.get(path)
+                    post = inspection.postimages.get(path)
+                    lines.append(
+                        f"  {path}  {_sha_display(pre)} -> {_sha_display(post)}"
+                    )
+                flag = (
+                    f"truncated at {DIFF_PREVIEW_LIMIT_BYTES} bytes"
+                    if inspection.diff_truncated
+                    else "complete"
+                )
+                lines.append(f"diff preview ({flag}):")
+                lines.append(inspection.diff_preview)
+                return _text_result(
+                    _INTEGRATE_NAME,
+                    "\n".join(lines),
+                    {
+                        "child_thread_id": child_id,
+                        "action": "inspect",
+                        "paths": inspection.paths,
+                        "preimages": dict(inspection.preimages),
+                        "postimages": dict(inspection.postimages),
+                        "diff_preview": inspection.diff_preview,
+                        "diff_truncated": inspection.diff_truncated,
+                        "diff_bytes": inspection.diff_bytes,
+                    },
+                )
+            if action == "apply":
+                result = surface.integrate_apply(child_id, paths=paths)
+                if result.conflicts:
+                    # 双方字节保留:父仓整组零写,子快照未被消费。conflicts
+                    # 全量进 metadata(模型可见文本有界,只列前几条)。
+                    listed = ", ".join(result.conflicts[:8])
+                    message = (
+                        f"preimage conflict on {len(result.conflicts)} path(s); "
+                        f"nothing was written, parent and child bytes are both preserved: {listed}"
+                    )
+                    bounded = message[:512]
+                    return ToolResult(
+                        tool_call_id=PENDING_TOOL_CALL_ID,
+                        tool_name=_INTEGRATE_NAME,
+                        content=(ToolContentBlock(type="text", data={"text": f"integrate_conflict: {bounded}"}),),
+                        status=ResultStatus.ERROR,
+                        is_error=True,
+                        error_code="integrate_conflict",
+                        error_message=bounded,
+                        metadata={
+                            "child_thread_id": child_id,
+                            "action": "apply",
+                            "applied": (),
+                            "conflicts": tuple(result.conflicts),
+                        },
+                    )
+                return _text_result(
+                    _INTEGRATE_NAME,
+                    f"applied {len(result.applied)} path(s) from subagent {child_id} "
+                    "into the parent workspace:\n" + "\n".join(f"  {path}" for path in result.applied),
+                    {
+                        "child_thread_id": child_id,
+                        "action": "apply",
+                        "applied": tuple(result.applied),
+                        "conflicts": (),
+                    },
+                )
+            surface.integrate_discard(child_id)
+            return _text_result(
+                _INTEGRATE_NAME,
+                f"discarded workspace snapshot of subagent {child_id} "
+                "(idempotent: repeating discard is a no-op)",
+                {"child_thread_id": child_id, "action": "discard"},
+            )
+        except ChildActiveError as exc:
+            return _error(_INTEGRATE_NAME, "child_still_active", str(exc))
+        except ValueError as exc:
+            if _unknown_child(exc):
+                return _error(_INTEGRATE_NAME, "child_not_found", str(exc))
+            raise  # read_only 子/坏路径等:如实上抛,管道唯一归一 tool_error
 
     def orchestration_use(arguments: Mapping[str, JsonValue]) -> ResolvedUse:
         return ResolvedUse(frozenset(), (ToolTarget(kind="subagent", value=_child_id(arguments)),))
@@ -469,9 +577,11 @@ def create_agent_tools(surface_provider: SurfaceProvider) -> tuple[Tool, ...]:
             name=_INTEGRATE_NAME,
             description=(
                 "Inspect, apply, or discard a write-mode subagent's workspace changes. "
-                "Destructive: explicit approval is always required (never auto-allowed). "
-                "Delivery pipeline lands in T8; until then this tool honestly reports "
-                "integrate_not_wired and performs no action."
+                "The child must be terminal (completed/failed/cancelled). inspect returns "
+                "the changed paths, per-path preimage/postimage sha256, and a bounded diff "
+                "preview; apply re-checks every preimage and writes nothing on conflict "
+                "(both sides' bytes are preserved, error integrate_conflict); discard is "
+                "idempotent. Destructive: explicit approval is always required per call."
             ),
             input_schema=_INTEGRATE_SCHEMA,
         ),
