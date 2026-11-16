@@ -1117,7 +1117,10 @@ def test_cli_budget_near_limit_pauses_then_extend_tokens_resumes(tmp_path: Path)
     try:
         turn = get_turn(store, turn_id)
         assert turn is not None and turn.status == "completed"
-        assert turn.binding["budget"] == {"tokens": 22}
+        # T15(Q8):None 维折入 web 默认(32/64)。
+        assert turn.binding["budget"] == {
+            "tokens": 22, "web_requests": 32, "browser_requests": 64,
+        }
         items = store.read_items("budget-cli")
         extensions = _of_kind(items, ItemKind.BUDGET_EXTENSION)
         assert len(extensions) == 1

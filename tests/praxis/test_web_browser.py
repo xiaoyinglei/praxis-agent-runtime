@@ -718,8 +718,13 @@ def test_web_limits_browser_defaults_and_fields() -> None:
     assert limits.browser_requests == 64
     assert limits.browser_network_bytes == 8_000_000
     names = tuple(f.name for f in fields(WebLimits))
-    assert names == ("max_bytes", "timeout_seconds", "max_redirects", "browser_requests", "browser_network_bytes")
-    assert not hasattr(limits, "turn_requests")  # Q7:turn 账本仍不在 3B
+    assert names == (
+        "max_bytes", "timeout_seconds", "max_redirects", "turn_requests",
+        "browser_requests", "browser_network_bytes",
+    )
+    # T15(Q8)兑现:turn_requests 回归(旧 web_limits.py:9 默认 32)——它是
+    # composition 折进 root Limits 的默认来源;账本本身在 core.budget。
+    assert limits.turn_requests == 32
 
 
 @pytest.mark.parametrize(
@@ -951,6 +956,7 @@ def test_render_true_uses_renderer_without_initial_and_windows_text() -> None:
     assert result.text == "2: line two"
     metadata = result.metadata
     assert metadata["rendered"] is True
+    assert metadata["browser_render"] is True  # T15:T2 fold browser 维判据
     assert metadata["requests_used"] == 4
     assert metadata["bytes_used"] == 1234
     assert metadata["dom_bytes"] == 5678

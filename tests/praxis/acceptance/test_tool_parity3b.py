@@ -1324,16 +1324,19 @@ def test_web_defaults_and_no_turn_budget_ledger() -> None:
     limits = WebLimits()
     assert (limits.max_bytes, limits.timeout_seconds, limits.max_redirects) == (2_000_000, 20.0, 5)
     assert (limits.browser_requests, limits.browser_network_bytes) == (64, 8_000_000)
-    # 有意差异(Q7):旧 turn_requests=32(1..256,web_limits.py:9)+
-    # reserve_resource_unit 原子预扣 + web_request_budget_exceeded
-    # (harness/session.py:1263-1281)归阶段 4 预算树。praxis 3B **无 turn/会话
-    # 账本**:字段缺席、错误码缺席、配置拒绝该键。
+    # T15(Q8)兑现:旧 turn_requests=32(1..256,web_limits.py:9)回归字段集,
+    # 作为 composition 折进 root Limits 的默认来源。有意差异(T17 对照表钉):
+    # 旧 reserve_resource_unit SQLite 原子预扣 → core.budget 事实折叠+进程内
+    # gate(跨进程原子归阶段 5);web_request_budget_exceeded 错误码住在
+    # core.pipeline 的 dispatch gate,**不在** web client/工具层(3B 逐请求
+    # 硬上限面不含 turn 账本机制)。
     field_names = {field.name for field in dataclasses.fields(WebLimits)}
-    assert field_names == {"max_bytes", "timeout_seconds", "max_redirects", "browser_requests", "browser_network_bytes"}
-    assert "turn_requests" not in field_names
+    assert field_names == {
+        "max_bytes", "timeout_seconds", "max_redirects", "turn_requests",
+        "browser_requests", "browser_network_bytes",
+    }
+    assert WebLimits(turn_requests=32).turn_requests == 32
     assert "web_request_budget_exceeded" not in CLIENT_ERROR_CODES
-    with pytest.raises(TypeError):
-        WebLimits(turn_requests=32)  # type: ignore[call-arg]
     import praxis.adapters.web.tools as web_tools_module
 
     assert "web_request_budget_exceeded" not in _code_string_constants(web_tools_module)
@@ -1360,7 +1363,10 @@ def test_web_limits_file_is_path_not_inline_json(tmp_path: Path, monkeypatch: py
     with pytest.raises(ValueError):  # 内联 JSON 不是合法路径
         load_web_limits()
     monkeypatch.setenv("PRAXIS_WEB_LIMITS", str(limits_file))
+    # T15:turn_requests 是合法扁平键(旧 WebLimits 形状 parity);未知键仍拒。
     limits_file.write_text(json.dumps({"max_bytes": 8192, "turn_requests": 8}), encoding="utf-8")
+    assert load_web_limits() == WebLimits(max_bytes=8192, turn_requests=8)
+    limits_file.write_text(json.dumps({"max_bytes": 8192, "nope": 8}), encoding="utf-8")
     with pytest.raises(ValueError, match="unknown keys"):
         load_web_limits()
     # 文件 >4096 字节拒绝(旧 read(4097) 判 >4096)。

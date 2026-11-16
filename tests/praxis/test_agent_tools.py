@@ -455,7 +455,10 @@ def test_spawn_wait_end_to_end_via_pipeline(workspace: Path) -> None:
             assert len(spawn_results) == 1
             assert spawn_results[0]["status"] == "ok"
             child_id = spawn_results[0]["metadata"]["child_thread_id"]
-            assert spawn_results[0]["metadata"]["grant"] == {"tokens": 500}
+            # T15(Q8):默认表含 web 工具 → 父 web 32/browser 64 逐维切半(16/32)。
+            assert spawn_results[0]["metadata"]["grant"] == {
+                "tokens": 500, "web_requests": 16, "browser_requests": 32,
+            }
             wait_results = _result_items(parent.store, result.turn_id, "wait_subagent")
             assert len(wait_results) == 1
             assert wait_results[0]["status"] == "ok"

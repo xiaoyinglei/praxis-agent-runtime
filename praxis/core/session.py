@@ -529,7 +529,9 @@ class Session:
 
     # -- 权限更新(Task 8:once/session/always;设计 §5.3/§5.12;裁决 R6)-----
 
-    def update_permission(self, update: PermissionUpdate) -> PermissionNotice | None:
+    def update_permission(
+        self, update: PermissionUpdate, *, persist: bool = True
+    ) -> PermissionNotice | None:
         """权限更新的会话级唯一入口:经 apply_update 纯代数落地,always 同批落盘。
 
         once/session 只改内存(once 由 _execute 在下一批结束时清除;session
@@ -539,6 +541,11 @@ class Session:
         声明,composition 下次打开时按"显式参数 > 文件 > 默认"加载。
         ㉖(T6):``persist_always=False``(read_only 子)时 always 只改内存,
         绝不写共享的父文件;返回 ``always_memory_only`` 披露(D9 触发时 D9 优先)。
+
+        T15:``persist=False`` 跳过本条落盘(内存 apply 与披露序逐字不变)——
+        ``_apply_permission_updates`` 据此把整批 always 折叠成批尾**单次**
+        ``_persist_policy``(落盘失败整批回滚,无内存/文件分叉)。单条公开调用
+        缺省 ``persist=True``,内部序(apply → 落盘 → 披露)保持。
 
         D9 披露(阶段 2 留档② + R-T11-2):NetworkRule 以 session/always 落地后,
         若 live 的 ``command_network_verdict`` 为 deny(任何来源存在域过滤即
@@ -552,9 +559,9 @@ class Session:
         self._permissions = apply_update(self._permissions, update)
         memory_only: PermissionNotice | None = None
         if update.destination == "always":
-            if self._persist_always:
+            if self._persist_always and persist:
                 self._persist_policy()
-            else:
+            elif not self._persist_always:
                 # ㉖:read_only 子不写父 permissions.json——内存生效+如实披露。
                 memory_only = PermissionNotice(
                     kind=_ALWAYS_MEMORY_ONLY_KIND, text=_ALWAYS_MEMORY_ONLY_TEXT
@@ -599,12 +606,36 @@ class Session:
     def _apply_permission_updates(
         self, updates: Sequence[PermissionUpdate]
     ) -> tuple[PermissionNotice, ...]:
-        """逐条提交(always 落盘)并收集 D9 披露;空输入 = 空元组。"""
+        """T15 批量化:全量预验 → 逐条内存 apply → always 折叠**批尾单次落盘**。
+
+        - 预验经既有 ``_validate_permission_updates``(纯代数,与 resume 的
+          transition 前预验同一实现;此处幂等复核,直调路径也全覆盖)——批中
+          任何一条非法 ⇒ 整批零内存变更零落盘;
+        - 逐条 ``update_permission(persist=False)``:内存 apply 与 D9/㉖ 披露
+          逐条收集,落盘全部推迟;
+        - 批内有 always 且 ``persist_always=True`` ⇒ 单次 ``_persist_policy``
+          (base ⊕ 全部 always_rules 折叠,与逐条落盘终态等价,写次数 1);
+        - **失败回滚零分叉**:落盘 IO 失败(OSError)→ 内存 ctx 还原到调用前
+          (身份级),异常原样上抛——绝不留下"内存已放宽、文件没记住"。
+          调用序上 transition(RUNNING) 先于本方法(resume 钉死的序),IO 失败
+          留下的 RUNNING 孤儿由下次 open_session 的 sweep 收编 interrupted
+          (与崩溃同一条收敛路径)。空输入 = 空元组,零预验零落盘。
+        """
+        if not updates:
+            return ()
+        self._validate_permission_updates(updates)
+        before = self._permissions
         notices: list[PermissionNotice] = []
         for update in updates:
-            notice = self.update_permission(update)
+            notice = self.update_permission(update, persist=False)
             if notice is not None:
                 notices.append(notice)
+        if self._persist_always and any(update.destination == "always" for update in updates):
+            try:
+                self._persist_policy()
+            except OSError:
+                self._permissions = before
+                raise
         return tuple(notices)
 
     # -- submit ---------------------------------------------------------------
@@ -671,8 +702,8 @@ class Session:
         授权建议经 ``permission_updates`` update 通道落地(两者不混写)。
 
         ``permission_updates`` 是审批流里人类**显式选择**的建议落地(例如 URL
-        ask 的域级 NetworkRule):先纯代数预验(零写入),再逐条经
-        ``update_permission`` 提交(always 同批落盘),产生的 D9 披露收集进
+        ask 的域级 NetworkRule):先纯代数预验(零写入),再逐条内存 apply、
+        always 批尾单次落盘(T15;落盘失败整批回滚),产生的 D9 披露收集进
         TurnResult.notices 供 CLI 打印。审批本身仍是 once 决策——绝不因批准
         一次调用而自动放宽权限。
 

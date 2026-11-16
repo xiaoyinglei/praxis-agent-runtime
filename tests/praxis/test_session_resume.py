@@ -140,7 +140,11 @@ def test_submit_completes_and_result_reconstructs(workspace: Path, open_ws: Call
 
     turn = session.status(result.turn_id)
     assert turn.status == "completed" and turn.thread_id == session.thread_id
-    assert turn.binding == {"model": "scripted"}  # adapter spec id 进 binding
+    # T15(Q8):默认 root limits 折入 web 维默认(32/64);adapter spec id 进 binding。
+    assert turn.binding == {
+        "model": "scripted",
+        "budget": {"web_requests": 32, "browser_requests": 64},
+    }
 
     rebuilt = session.result(result.turn_id)
     assert rebuilt.status is result.status

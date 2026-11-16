@@ -564,19 +564,24 @@ def test_submit_binding_carries_budget_payload(workspace: Path, open_ws: Callabl
     result = asyncio.run(session.submit("go"))
 
     assert result.status is TurnStatus.COMPLETED
+    # T15(Q8):显式维优先,None 维折入 web 默认(32/64)。
     assert session.status(result.turn_id).binding == {
         "model": "scripted",
-        "budget": {"tokens": 100, "steps": 3},
+        "budget": {"tokens": 100, "steps": 3, "web_requests": 32, "browser_requests": 64},
     }
 
 
-def test_submit_default_binding_unchanged(workspace: Path, open_ws: Callable[..., Any]) -> None:
-    """UNLIMITED(缺省)不写 budget 键——历史 turn 形状零扰动。"""
+def test_submit_default_binding_carries_web_defaults(workspace: Path, open_ws: Callable[..., Any]) -> None:
+    """T15(Q8)兑现:缺省 budget 不再是全 UNLIMITED——web/browser 维折入
+    WebLimits 默认(32/64,旧 check_web_budget 默认行为 parity),其余维仍 None。"""
     session = open_ws(ScriptedAdapter([_sresp("hi")]))
 
     result = asyncio.run(session.submit("go"))
 
-    assert session.status(result.turn_id).binding == {"model": "scripted"}
+    assert session.status(result.turn_id).binding == {
+        "model": "scripted",
+        "budget": {"web_requests": 32, "browser_requests": 64},
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -795,7 +800,9 @@ def test_cli_run_max_steps_pauses_with_resume_hint(workspace: Path, tmp_path: Pa
 
     reader = open_session(workspace, ScriptedAdapter([]), thread_id="b1")
     try:
-        assert reader.status(turn_id).binding["budget"] == {"steps": 1}
+        assert reader.status(turn_id).binding["budget"] == {
+            "steps": 1, "web_requests": 32, "browser_requests": 64,
+        }
     finally:
         reader.close()
 
@@ -827,7 +834,9 @@ def test_cli_cost_flag_pricing_pause_then_extend_resumes(workspace: Path, tmp_pa
 
     reader = open_session(workspace, ScriptedAdapter([]), thread_id="b2")
     try:
-        assert reader.status(turn_id).binding["budget"] == {"tokens": 500, "cost_micros": 1000}
+        assert reader.status(turn_id).binding["budget"] == {
+            "tokens": 500, "cost_micros": 1000, "web_requests": 32, "browser_requests": 64,
+        }
         extensions = [i for i in reader.items() if i.kind == ItemKind.BUDGET_EXTENSION]
         assert len(extensions) == 1
         assert extensions[0].payload == {"limits_delta": {"tokens": 250}}

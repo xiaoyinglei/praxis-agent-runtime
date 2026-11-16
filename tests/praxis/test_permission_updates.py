@@ -505,3 +505,154 @@ def test_sdk_reexports_update_surface() -> None:
     for name in ("PermissionUpdate", "PathRule", "ToolRule", "NetworkRule", "PermissionMode", "apply_update"):
         assert name in sdk_pkg.__all__, f"sdk.__all__ missing {name}"
         assert hasattr(sdk_pkg, name), f"sdk missing attribute {name}"
+
+
+# ---------------------------------------------------------------------------
+# T15:always 落盘批量化——一批 always 只写一次文件;预验全覆盖;IO 失败回滚
+# ---------------------------------------------------------------------------
+
+
+def _counting_writes(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """计数探针:monkeypatch 原子写助手(控制器裁决的钉法),透传真实写。"""
+    from praxis.core import session as session_module
+
+    writes: list[Path] = []
+    real = session_module._atomic_write_text
+
+    def probe(path: Path, content: str) -> None:
+        writes.append(path)
+        real(path, content)
+
+    monkeypatch.setattr(session_module, "_atomic_write_text", probe)
+    return writes
+
+
+def test_always_batch_persists_once_and_roundtrips(ws: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # brief ①:一批 3 条 always NetworkRule → 文件写次数=1,终态与逐条应用等价。
+    writes = _counting_writes(monkeypatch)
+    script = [script_call("c1", "probe"), script_stop("done")]
+    session = open_session(ws, ScriptedAdapter(script), tools=(probe_tool(),))
+    try:
+        paused = asyncio.run(session.submit("go"))
+        assert paused.status is TurnStatus.PAUSED
+        updates = [
+            PermissionUpdate(rule=NetworkRule(domain=f"d{i}.com", decision="allow"), destination="always")
+            for i in range(3)
+        ]
+        result = asyncio.run(
+            session.resume(paused.turn_id, approval={"c1": "allow"}, permission_updates=updates)
+        )
+        assert result.status is TurnStatus.COMPLETED
+        assert len(writes) == 1  # 批尾单次 _persist_policy(旧实现逐条写 3 次)
+        # D9 披露逐条收集(每条 NetworkRule always 都使命令网络 fail-closed)。
+        assert len(result.notices) == 3
+        assert all(n.kind == "command_network_blocked" for n in result.notices)
+        # 终态与逐条 apply_update 折叠等价(纯代数参照)。
+        reference = base_ctx(ws)
+        for update in updates:
+            reference = apply_update(reference, update)
+        assert session.permissions.policy.network.rules == reference.policy.network.rules
+        assert session.permissions.always_rules == reference.always_rules
+    finally:
+        session.close()
+    data = json.loads(permissions_file(ws).read_text(encoding="utf-8"))
+    assert data["network"]["rules"] == [
+        {"domain": f"d{i}.com", "decision": "allow"} for i in range(3)
+    ]
+    # round-trip 重开:文件即声明,三条规则原序生效。
+    session2 = open_session(ws, ScriptedAdapter([script_stop("x")]), tools=(probe_tool(),))
+    try:
+        assert session2.permissions.policy.network.rules == reference.policy.network.rules
+    finally:
+        session2.close()
+
+
+def test_always_batch_second_invalid_zero_writes_zero_memory(
+    ws: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # brief ②:批中第 2 条非法(read-only + write PathRule)→ 预验全覆盖,
+    # 零落盘零内存变更零 transition(校验先于 transition 的既有纪律)。
+    writes = _counting_writes(monkeypatch)
+    session = open_session(
+        ws,
+        ScriptedAdapter([script_call("c1", "probe"), script_stop("done")]),
+        tools=(probe_tool(),),
+        policy=PermissionPolicy(profile="read-only"),
+    )
+    try:
+        paused = asyncio.run(session.submit("go"))
+        assert paused.status is TurnStatus.PAUSED
+        before = session.permissions
+        updates = [
+            PermissionUpdate(rule=NetworkRule(domain="ok.com", decision="allow"), destination="always"),
+            PermissionUpdate(rule=PathRule(path=str(ws / "sub"), access="write"), destination="always"),
+        ]
+        with pytest.raises(ValueError, match="read-only"):
+            asyncio.run(
+                session.resume(paused.turn_id, approval={"c1": "allow"}, permission_updates=updates)
+            )
+        assert writes == []
+        assert session.permissions is before  # 零内存变更(第一条合法也不生效)
+        assert not permissions_file(ws).exists()
+        assert session.status(paused.turn_id).status == "paused"  # 零 transition
+    finally:
+        session.close()
+
+
+def test_always_batch_persist_io_failure_rolls_back_memory(
+    ws: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # brief ③:内存 apply 成功后落盘失败(IO 注错)→ 回滚到调用前内存 ctx,
+    # 无"内存已放宽、文件没记住"分叉。turn 留在 RUNNING 孤儿(校验序:
+    # transition 先于授权落地),由下次 open_session 的 sweep 收编 interrupted。
+    from praxis.core import session as session_module
+
+    real = session_module._atomic_write_text
+
+    def boom(path: Path, content: str) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(session_module, "_atomic_write_text", boom)
+    session = open_session(
+        ws, ScriptedAdapter([script_call("c1", "probe"), script_stop("done")]), tools=(probe_tool(),)
+    )
+    try:
+        paused = asyncio.run(session.submit("go"))
+        assert paused.status is TurnStatus.PAUSED
+        before = session.permissions
+        with pytest.raises(OSError, match="disk full"):
+            asyncio.run(
+                session.resume(
+                    paused.turn_id,
+                    approval={"c1": "allow"},
+                    permission_updates=[
+                        PermissionUpdate(rule=NetworkRule(domain="ok.com", decision="allow"), destination="always")
+                    ],
+                )
+            )
+        assert session.permissions is before  # 回滚:身份级还原
+        assert not permissions_file(ws).exists()
+        # 会话不砖化:IO 恢复后合法 always 更新照常生效并落盘。
+        monkeypatch.setattr(session_module, "_atomic_write_text", real)
+        session.update_permission(
+            PermissionUpdate(rule=ToolRule(pattern="probe", decision="allow"), destination="always")
+        )
+        assert permissions_file(ws).exists()
+    finally:
+        session.close()
+
+
+def test_update_permission_persist_false_defers_disk(ws: Path) -> None:
+    # 公开面 persist=False:内存生效 + D9 披露照常,落盘由调用方(批尾)负责。
+    session = open_session(ws, ScriptedAdapter([]))
+    try:
+        rule = NetworkRule(domain="ok.com", decision="allow")
+        notice = session.update_permission(
+            PermissionUpdate(rule=rule, destination="always"), persist=False
+        )
+        assert notice is not None and notice.kind == "command_network_blocked"
+        assert session.permissions.policy.network.rules == (rule,)
+        assert session.permissions.always_rules == (rule,)
+        assert not permissions_file(ws).exists()
+    finally:
+        session.close()

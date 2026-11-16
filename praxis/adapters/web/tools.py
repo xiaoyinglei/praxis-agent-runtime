@@ -313,6 +313,9 @@ def create_web_fetch_tools(
             "end_line": end_line,
             # render 面独有:如实上报渲染事实与子资源闸计数(S8)。
             "rendered": True,
+            # T15:预算树 browser 维判据(core.budget.fold_turn_facts 消费
+            # metadata["browser_render"] is True;纯文本面不写此旗标)。
+            "browser_render": True,
             "requests_used": rendered.requests_used,
             "bytes_used": rendered.bytes_used,
             "dom_bytes": rendered.dom_bytes,
@@ -438,7 +441,9 @@ def create_web_fetch_tools(
         "results add metadata: rendered, requests_used, bytes_used, dom_bytes, blocked_ask, "
         "blocked_deny, blocked_other, budget_aborted, budget_stopped, failed_resources, "
         "redirected_subresources, load_timeouts. render_unavailable means browser support is "
-        "not installed; the HTTP text surface keeps working. "
+        "not installed; the HTTP text surface keeps working. Rendered results also carry "
+        "browser_render=true (the turn budget tree counts them against the browser-request "
+        "budget as well as the web-request budget). "
         if renderer_factory is not None
         else " render=true and auto-triggered rendering return render_unavailable on this "
         "installation (browser support not wired); render=false text reads are unaffected. "

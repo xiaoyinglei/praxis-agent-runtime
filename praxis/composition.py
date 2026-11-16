@@ -59,6 +59,7 @@ from praxis.adapters.web.search import (
 from praxis.adapters.web.tools import create_web_fetch_tools
 from praxis.adapters.workspaces.git import GitWorktreeProvisioner
 from praxis.core.agents import SubagentManager
+from praxis.core.budget import WEB_TOOL_NAMES
 from praxis.core.compaction import (
     SUMMARY_MAX_OUTPUT_TOKENS,
     SUMMARY_PROMPT_MAX_CHARS,
@@ -385,6 +386,7 @@ def _default_tools(
     artifact_store: ArtifactStore,
     skills_catalog: SkillCatalog,
     session_holder: list[Session],
+    limits: WebLimits,
 ) -> tuple[tuple[Tool, ...], PublicHttpClient]:
     """T20 默认工具表(15 builtin)与配套 web client。
 
@@ -392,14 +394,14 @@ def _default_tools(
     ``WebLimits`` 与**同一** authorize 闭包;authorize 经 ``session.permissions``
     读取 live 权限(与 T11/T12 同一单源,不缓存策略快照)。``session_holder``
     是延迟绑定:Session 在工具表之后构造,填充后权限更新立即可见(web 工具只
-    在 submit 内被调用)。
+    在 submit 内被调用)。``limits`` 由 build_session 加载一次传入(T15:同一
+    份配置既钳逐请求硬上限,又经 Q8 折进 root Limits 默认——不二次读文件)。
 
     web_search 的 ``config_provider`` 每次调用现读宿主 web.json(live),
     凭据面按 R-T13-1 由 cfg 原子解析。``tools=`` 整体替换时本函数不执行
     ——不构造 web client、不装渲染器,保持替换路径廉价(capability coupling
     先例:没有 web 工具就不需要 web 能力)。
     """
-    limits = load_web_limits()
     authorize = make_web_authorizer(lambda: session_holder[0].permissions)
     client = PublicHttpClient(authorize=authorize, limits=limits)
     tools: tuple[Tool, ...] = (
@@ -572,6 +574,15 @@ def build_session(
     (pricing_unavailable)兜底。core 不 import adapters/config,与
     measure_tokens 注入同纪律。
 
+    阶段4 T15(Q8 默认生效):工具表含 web 工具族(``WEB_TOOL_NAMES``)时,
+    ``budget`` 的 web_requests/browser_requests None 维折入
+    ``WebLimits.turn_requests/browser_requests``(默认 32/64,旧
+    check_web_budget 默认行为 parity);显式维优先,宿主 web.json 可调。
+    折叠后的 limits 经 Session 写进 turn binding,web dispatch gate
+    (core.pipeline)据此准入;子 Session 的 grant 由份额公式从父剩余切出,
+    逐维有界,折叠对子天然 no-op。无 web 工具的替换表不读 web 配置不折叠
+    (T20 capability coupling 保持)。
+
     阶段4 T5(子代理装配,全部尾部默认零扰动):
     - ``db_path``:Store 库文件位置覆盖(缺省 workspace/.praxis/praxis.sqlite)。
       子 Session 与父**同库**(§5.13)——write 子工作区是独立目录时仍指向父库;
@@ -685,6 +696,10 @@ def build_session(
         # live ``session.permissions``。tools 整体替换 ⇒ 两个都不构造。
         session_holder: list[Session] = []
         web_client: PublicHttpClient | None = None
+        # T15(Q8):web_limits 与 web client 同源装配(默认表路径加载一次);
+        # 替换路径仅在工具表含 web 工具族时补加载(capability coupling 保持:
+        # 没有 web 工具就不读 web 配置,T20 钉死)。折叠点在 tool_map 定型后。
+        web_limits: WebLimits | None = None
         if tools is not None:
             tool_seq = tools
         elif parent_tools is not None:
@@ -698,16 +713,18 @@ def build_session(
             wanted = [name for name in parent_tools if name not in AGENT_TOOL_NAMES]
             rebuilt: dict[str, Tool] = {}
             if any(name in _BUILTIN_TOOL_NAMES for name in wanted):
+                web_limits = load_web_limits()
                 default_seq, web_client = _default_tools(
-                    root, sessions, artifact_store, resolved_skills, session_holder
+                    root, sessions, artifact_store, resolved_skills, session_holder, web_limits
                 )
                 rebuilt = {tool.definition.name: tool for tool in default_seq}
             tool_seq = tuple(
                 rebuilt[name] if name in rebuilt else parent_tools[name] for name in wanted
             )
         else:
+            web_limits = load_web_limits()
             tool_seq, web_client = _default_tools(
-                root, sessions, artifact_store, resolved_skills, session_holder
+                root, sessions, artifact_store, resolved_skills, session_holder, web_limits
             )
         tool_map: dict[str, Tool] = {tool.definition.name: tool for tool in tool_seq}
         # T19:MCP 工具在仓库边界并入;任何重名都是装配错误(extra↔builtin 或
@@ -761,6 +778,34 @@ def build_session(
                 lambda: read_memory_state(store)
             )
             memory_session_rules = (ToolRule(pattern="read_memory", decision="allow"),)
+        # T15(Q8):web turn 预算默认兑现——工具表含 web 工具族时,把
+        # WebLimits.turn_requests/browser_requests(默认 32/64,旧
+        # check_web_budget 默认行为 parity)折进 root Limits 的 None 维;
+        # 显式 budget 维优先,宿主 web.json 可调大调小。gate 按工具名判 web
+        # 维(core.pipeline),与工具表来源无关——替换表里的 web_fetch 玩具
+        # 同样受默认配额约束。无 web 工具 ⇒ 不读配置不折叠(T20 capability
+        # coupling 保持)。子 Session 的 grant 逐维有界,折叠天然 no-op。
+        if web_limits is None and any(name in tool_map for name in WEB_TOOL_NAMES):
+            web_limits = load_web_limits()
+        effective_budget = (
+            budget
+            if web_limits is None
+            else Limits(
+                tokens=budget.tokens,
+                cost_micros=budget.cost_micros,
+                steps=budget.steps,
+                web_requests=(
+                    budget.web_requests
+                    if budget.web_requests is not None
+                    else web_limits.turn_requests
+                ),
+                browser_requests=(
+                    budget.browser_requests
+                    if budget.browser_requests is not None
+                    else web_limits.browser_requests
+                ),
+            )
+        )
         # 外部化与回读能力耦合:工具表被整体替换且没有 read_artifact 时,
         # 不注入 artifacts——否则模型只会拿到打不开的指针,比旧字节截断更差。
         effective_artifacts = artifact_store if "read_artifact" in tool_map else None
@@ -838,7 +883,7 @@ def build_session(
             hooks=hook_setup,
             skills_catalog=resolved_skills,
             integrations=effective_integrations,
-            budget=budget,
+            budget=effective_budget,
             unit_costs=effective_unit_costs,
             child_session_factory=_child_session_factory,
             persist_always=persist_always,

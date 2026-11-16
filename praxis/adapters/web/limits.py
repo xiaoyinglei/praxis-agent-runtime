@@ -1,10 +1,13 @@
-"""公共 web 逐请求硬上限与宿主配置加载(Q7 裁决;legacy cli._load_web_limits 语义)。
+"""公共 web 逐请求硬上限、turn 预算默认与宿主配置加载(legacy cli._load_web_limits 语义)。
 
-**有意差异(显式)**:这里**不做 turn/会话级请求计数账本**——旧
-``reserve_resource_unit`` SQLite 原子预扣与 ``web_request_budget_exceeded``
-归阶段 4 预算树(设计 §5.5 的 steps/cost 粒度恰好覆盖它),跨进程原子预扣归
-阶段 5。3B 只保留逐请求硬上限(字节/时间/跳数;候选数上限在 client.py)。
-``WebLimits`` 字段集合由测试钉死,不得悄悄长出 turn_requests 之类字段。
+**T15(Q8)兑现**:``turn_requests``(1..256 默认 32,旧 web_limits.py:9 parity)
+回归字段集——它是 composition 折进 root ``Limits.web_requests`` 默认的来源;
+``browser_requests`` 同时是 root ``Limits.browser_requests`` 的默认来源。
+**账本本身不在这里**:turn 级计数 = core.budget 对 append-only 事实的折叠 +
+进程内 dispatch gate(``web_request_budget_exceeded`` 错误码住在 core.pipeline)。
+旧 ``reserve_resource_unit`` SQLite 原子预扣的跨进程原子性归阶段 5(有意差异,
+T17 对照表钉)。本模块仍只做配置加载与逐请求硬上限(字节/时间/跳数;候选数
+上限在 client.py),不做任何计数。
 
 配置来源(优先级):``PRAXIS_WEB_LIMITS`` env(**值是 JSON 文件路径**,不是
 内联 JSON——旧语义保留,文件 ≤4096 字节)> 显式 path 参数 >
@@ -13,9 +16,10 @@
 
 T14 扩:web.json 的可选 ``"browser"`` 块(``browser_requests`` 1..128 默认 64、
 ``browser_network_bytes`` 1_000_000..32_000_000 默认 8_000_000)——**本次渲染
-调用**的预算,不是 turn 账本(Q7)。``"limits"`` 块仍只含三个传输字段;browser
-键出现在 limits 块里按未知键拒绝(两个块各管各的,不互相串门)。env 文件保持
-legacy 的扁平 limits 形状(只传输字段)。
+调用**的预算,不是 turn 账本(Q7)。``"limits"`` 块含三个传输字段 +
+``turn_requests``(T15);browser 键出现在 limits 块里按未知键拒绝(两个块各管
+各的,不互相串门)。env 文件保持 legacy 的扁平 limits 形状(传输字段 +
+turn_requests,与旧 WebLimits 扁平 dump 同形)。
 """
 
 from __future__ import annotations
@@ -46,17 +50,19 @@ def web_configuration_path() -> Path:
 
 @dataclass(frozen=True, slots=True)
 class WebLimits:
-    """逐请求硬上限;模型参数不能抬高这些上限(T12 schema 钳制在更小区间)。
+    """逐请求硬上限 + turn 预算默认;模型参数不能抬高这些上限(T12 schema 钳制在更小区间)。
 
     范围:max_bytes 4096..32_000_000;timeout_seconds (0, 300];max_redirects 0..10;
-    browser_requests 1..128(T14,逐渲染调用);browser_network_bytes
-    1_000_000..32_000_000(T14,逐渲染调用)。
+    turn_requests 1..256(T15,turn 级 web 请求预算默认,composition Q8 折叠);
+    browser_requests 1..128(T14,逐渲染调用;兼作 turn browser 预算默认);
+    browser_network_bytes 1_000_000..32_000_000(T14,逐渲染调用)。
     类型严格(JSON 浮点 max_bytes 之类直接拒),与旧 pydantic strict 同向。
     """
 
     max_bytes: int = 2_000_000
     timeout_seconds: float = 20.0
     max_redirects: int = 5
+    turn_requests: int = 32
     browser_requests: int = 64
     browser_network_bytes: int = 8_000_000
 
@@ -67,14 +73,17 @@ class WebLimits:
             raise ValueError("web limits timeout_seconds must be a number in (0, 300]")
         if type(self.max_redirects) is not int or not 0 <= self.max_redirects <= 10:
             raise ValueError("web limits max_redirects must be an int in 0..10")
+        if type(self.turn_requests) is not int or not 1 <= self.turn_requests <= 256:
+            raise ValueError("web limits turn_requests must be an int in 1..256")
         if type(self.browser_requests) is not int or not 1 <= self.browser_requests <= 128:
             raise ValueError("web limits browser_requests must be an int in 1..128")
         if type(self.browser_network_bytes) is not int or not 1_000_000 <= self.browser_network_bytes <= 32_000_000:
             raise ValueError("web limits browser_network_bytes must be an int in 1000000..32000000")
 
 
-# 两个配置块各管各的字段集合:limits=传输(T10 冻结),browser=渲染调用(T14)。
-_TRANSPORT_FIELDS = frozenset({"max_bytes", "timeout_seconds", "max_redirects"})
+# 两个配置块各管各的字段集合:limits=传输(T10)+ turn_requests(T15 Q8 默认
+# 来源,旧扁平 WebLimits 形状 parity),browser=渲染调用(T14)。
+_LIMITS_FIELDS = frozenset({"max_bytes", "timeout_seconds", "max_redirects", "turn_requests"})
 _BROWSER_FIELDS = frozenset({"browser_requests", "browser_network_bytes"})
 
 
@@ -93,7 +102,7 @@ def _read_bounded_json(path: Path, max_bytes: int) -> object:
 def _limits_from_mapping(data: object, source: Path) -> WebLimits:
     if not isinstance(data, dict):
         raise ValueError(f"web limits must be a JSON object: {source}")
-    unknown = set(data) - _TRANSPORT_FIELDS
+    unknown = set(data) - _LIMITS_FIELDS
     if unknown:
         raise ValueError(f"web limits has unknown keys {sorted(unknown)}: {source}")
     try:

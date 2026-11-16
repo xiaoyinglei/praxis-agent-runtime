@@ -28,7 +28,12 @@ execute 步骤序(与代码一一对应):
    不重复写)→ transition(PAUSED) → emit ApprovalRequested → 返回 PAUSED;
 5. deny → tool_result(DENIED, error_code ``permission_denied``);
 6. allow → 执行时地板守卫(R5(c):floor_reason 双候选,命中 → DENIED,
-   不写 tool_call、不 dispatch——地板在任何入口都不可批准)→ EXECUTE_PROCESS
+   不写 tool_call、不 dispatch——地板在任何入口都不可批准)→ **T15 web 预算
+   gate**:web 工具族(``WEB_TOOL_NAMES``)dispatch 前 ``budget.admit_web_request``
+   (browser 旗标 = use.effects 含 EXECUTE_PROCESS,即 render 面;与 note_result
+   成对一致),超限 → ERROR/``web_request_budget_exceeded``(旧错误码 parity,
+   不写 tool_call、未 dispatch;拒绝结果 fold 豁免计费)——deny/ask/地板路径
+   都在 gate 之前,不计数;``budget=None`` 零扰动 → EXECUTE_PROCESS
    **先编译沙箱**再写 tool_call item(SandboxRefusal → ERROR/sandbox_refused,
    不写 tool_call,未 dispatch 语义同 invalid_input;read/write 进程内工具不编译);
 7. ``run_with_timeout``(移植旧 executor 超时/取消语义,任务全程被持有;
@@ -39,7 +44,9 @@ execute 步骤序(与代码一一对应):
    (commit/清理;超时/取消路径也执行;finalize 异常归一 tool_error,不炸穿);
 8. 占位符替换 + 超 ``max_model_output_bytes`` 的**写时外部化**(注入
    ``artifacts`` 时:全文进内容寻址 artifact,item 只留头部+指针+摘要;
-   未注入则旧字节截断)→ tool_result item → emit ToolFinished。
+   未注入则旧字节截断)→ tool_result item → **note_result 释放 in-flight**
+   (T15 管道序硬要求:append result 之后才 note,否则折叠与 in-flight 双计)
+   → emit ToolFinished。
    PostToolUse 在工具返回后、``_finalize`` 之前结算:结论只进
    ``metadata["post_tool_hook"]``,绝不改 status/content、绝不阻断。
 
@@ -67,7 +74,7 @@ from pathlib import Path
 from typing import cast
 
 from praxis.core import permission  # 唯一决策入口:经模块属性调用,测试 monkeypatch 此处
-from praxis.core.budget import BudgetTracker
+from praxis.core.budget import WEB_REQUEST_BUDGET_EXCEEDED, WEB_TOOL_NAMES, BudgetTracker
 from praxis.core.compensation import (
     NOT_EXECUTED_TEXTS,
     OUTCOME_UNKNOWN_TEXTS,
@@ -755,6 +762,22 @@ async def execute(call: ToolCall, ctx: ExecCtx) -> ToolResult:
         _append_result_item(ctx, result)
         return result
 
+    # T15 web 预算 gate:dispatch 前唯一准入(deny/ask/地板都在此前返回,不计数)。
+    # browser 旗标取 use.effects 的 EXECUTE_PROCESS——render 面(true/auto 且
+    # renderer 可用)才可能起浏览器;与结尾 note_result 成对一致。auto 未触发
+    # 渲染时按保守占用准入、结果落库后释放(fold 只按 browser_render 旗标计)。
+    # 超限拒绝零 IO:不写 tool_call,fold 对该错误码豁免计费(预算树单点)。
+    web_browser = ToolEffect.EXECUTE_PROCESS in use.effects
+    if ctx.budget is not None and tool.definition.name in WEB_TOOL_NAMES:
+        admission = ctx.budget.admit_web_request(tool.definition.name, browser=web_browser)
+        if not admission.allowed:
+            result = _error_result(
+                call, status=ResultStatus.ERROR, error_code=WEB_REQUEST_BUDGET_EXCEEDED,
+                message=f"this turn's {admission.dimension} budget is exhausted",
+            )
+            _append_result_item(ctx, result)
+            return result
+
     # 沙箱编译先于 tool_call item:拒绝即结果(ERROR/sandbox_refused),未 dispatch。
     # 只对 EXECUTE_PROCESS 编译——read/write 进程内工具不消费沙箱(R9);
     # 不可用已在 decide 第 7 步 deny,此处 compile_sandbox=None 为单测路径。
@@ -808,6 +831,10 @@ async def execute(call: ToolCall, ctx: ExecCtx) -> ToolResult:
         )
     result = _finalize(raw, call=call, tool=tool, artifacts=ctx.artifacts)
     _append_result_item(ctx, result)
+    # T15:结果落库后才释放 in-flight(BudgetTracker 纪律:先 refresh 后 note,
+    # 折叠与 in-flight 不相交)。非 web 工具名 note_result 恒 no-op。
+    if ctx.budget is not None:
+        ctx.budget.note_result(tool.definition.name, browser=web_browser)
     ctx.bus.emit(
         ToolFinished(turn_id=ctx.turn_id, call_id=call.tool_call_id, status=result.status.value)
     )

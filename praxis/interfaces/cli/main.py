@@ -107,6 +107,15 @@ _EXTEND_COST_MICROS_OPT = typer.Option(
 _EXTEND_STEPS_OPT = typer.Option(
     None, "--extend-steps", help="Add tool rounds to the turn's budget and resume (budget_extension item)."
 )
+# T15(T3 minor⑩):web/browser 维出路旗标补齐(与 _BUDGET_EXTEND_FLAGS 同源)。
+_EXTEND_WEB_REQUESTS_OPT = typer.Option(
+    None, "--extend-web-requests", help="Add web requests to the turn's budget and resume (budget_extension item)."
+)
+_EXTEND_BROWSER_REQUESTS_OPT = typer.Option(
+    None,
+    "--extend-browser-requests",
+    help="Add browser renders to the turn's budget and resume (budget_extension item).",
+)
 # 阶段4 T13:memory 开关与 composition 参数一致(默认 False = 历史路径零扰动)。
 _ENABLE_MEMORY_OPT = typer.Option(
     False,
@@ -114,10 +123,13 @@ _ENABLE_MEMORY_OPT = typer.Option(
     help="Enable workspace memory (background extraction driver + read_memory tool).",
 )
 # R-T3-6:耗尽维 → 对应补预算旗标(CLI 文案点名出路;steps 死路关闭)。
+# T15(T3 minor⑩):web_requests/browser_requests 补齐——五维全覆盖。
 _BUDGET_EXTEND_FLAGS: Mapping[str, str] = {
     "tokens": "--extend-tokens",
     "cost_micros": "--extend-cost-micros",
     "steps": "--extend-steps",
+    "web_requests": "--extend-web-requests",
+    "browser_requests": "--extend-browser-requests",
 }
 
 
@@ -252,7 +264,11 @@ def _budget_from_flags(max_tokens: int | None, max_cost_micros: int | None, max_
 
 
 def _extend_from_flags(
-    extend_tokens: int | None, extend_cost_micros: int | None, extend_steps: int | None
+    extend_tokens: int | None,
+    extend_cost_micros: int | None,
+    extend_steps: int | None,
+    extend_web_requests: int | None = None,
+    extend_browser_requests: int | None = None,
 ) -> dict[str, int]:
     """resume --extend-* → Limits 维度增量映射;空映射 = 不补预算。"""
     extend: dict[str, int] = {}
@@ -265,6 +281,12 @@ def _extend_from_flags(
     steps = _nonneg_flag(extend_steps, "--extend-steps")
     if steps is not None:
         extend["steps"] = steps
+    web = _nonneg_flag(extend_web_requests, "--extend-web-requests")
+    if web is not None:
+        extend["web_requests"] = web
+    browser = _nonneg_flag(extend_browser_requests, "--extend-browser-requests")
+    if browser is not None:
+        extend["browser_requests"] = browser
     return extend
 
 
@@ -386,8 +408,9 @@ def _echo_budget_hint(result: TurnResult) -> None:
     """budget_exhausted 暂停的一行文案(T3/R-T3-6):按耗尽维点名对应出路旗标。
 
     ``budget_dimension`` 已知(run/resume 的 live 结果)→ 点名该维与旗标
-    (steps→--extend-steps,不再把 steps 耗尽指向无效的 tokens 出路);
-    未知(status 从 items 重建,维度不落 item)→ 通用文案列全三旗标。
+    (steps→--extend-steps,不再把 steps 耗尽指向无效的 tokens 出路;
+    web/browser 维点名 T15 补齐的对应旗标);未知(status 从 items 重建,
+    维度不落 item)→ 通用文案列全五旗标。
     其余暂停原因(approval_required/outcome_unknown)沿用既有渲染,零变化。
     """
     if result.reason != "budget_exhausted":
@@ -398,7 +421,8 @@ def _echo_budget_hint(result: TurnResult) -> None:
     else:
         typer.echo(
             f"  budget exhausted: praxis resume {result.turn_id} "
-            "--extend-tokens N / --extend-cost-micros N / --extend-steps N"
+            "--extend-tokens N / --extend-cost-micros N / --extend-steps N / "
+            "--extend-web-requests N / --extend-browser-requests N"
         )
 
 
@@ -677,16 +701,21 @@ def resume(
     extend_tokens: int | None = _EXTEND_TOKENS_OPT,
     extend_cost_micros: int | None = _EXTEND_COST_MICROS_OPT,
     extend_steps: int | None = _EXTEND_STEPS_OPT,
+    extend_web_requests: int | None = _EXTEND_WEB_REQUESTS_OPT,
+    extend_browser_requests: int | None = _EXTEND_BROWSER_REQUESTS_OPT,
 ) -> None:
     """续跑 paused/interrupted turn:--confirm 人工确认,--allow/--deny 审批,--reconcile 对账。
 
-    --extend-tokens/--extend-cost-micros/--extend-steps 补预算(budget_extension
-    item)后走同一续跑路径:budget_exhausted 的 PAUSED 无需审批即可续跑(T3;
-    耗尽维与出路旗标由文案点名,R-T3-6)。
+    --extend-tokens/--extend-cost-micros/--extend-steps/--extend-web-requests/
+    --extend-browser-requests 补预算(budget_extension item)后走同一续跑路径:
+    budget_exhausted 的 PAUSED 无需审批即可续跑(T3;耗尽维与出路旗标由文案
+    点名,R-T3-6;web/browser 旗标 T15 补齐)。
     """
     approval_map = _parse_approval(allow, deny)
     reconcile_map = _parse_reconcile(reconcile)
-    extend_map = _extend_from_flags(extend_tokens, extend_cost_micros, extend_steps)
+    extend_map = _extend_from_flags(
+        extend_tokens, extend_cost_micros, extend_steps, extend_web_requests, extend_browser_requests
+    )
     root = _resolve_workspace(workspace)
     if not _mcp_configured(root):
         session = _open_from_options(workspace, model, scripted, thread, policy, mode)

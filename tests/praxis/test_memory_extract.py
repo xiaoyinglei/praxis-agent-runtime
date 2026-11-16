@@ -390,6 +390,7 @@ def test_end_to_end_background_two_stage(workspace: Path) -> None:
             assert len(allocations) == 2
             purposes = []
             for alloc in allocations:
+                # T15(Q8):空工具表无 web 工具 ⇒ web/browser 维不折默认。
                 assert alloc["grant"] == {"tokens": MEMORY_TOKEN_BUDGET, "steps": 1}
                 child_turn = get_turn(session.store, str(alloc["child_root_turn_id"]))
                 assert child_turn is not None

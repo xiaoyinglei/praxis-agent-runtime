@@ -330,6 +330,8 @@ def test_spawn_default_grant_reserves_half_of_parent_remaining(workspace: Path) 
             ]
             assert len(allocations) == 1
             assert allocations[0].turn_id == result.turn_id
+            # T15(Q8):玩具表无 web 工具 ⇒ 不折 web 默认(capability coupling),
+            # grant 的 web/browser 维保持 None(不进 payload)。
             assert allocations[0].payload["grant"] == {"tokens": 500}
             # 同库独立 thread:子根 turn binding 含 budget/parent_turn_id/root_turn_id。
             child_turn = get_turn(parent.store, handle.child_root_turn_id)

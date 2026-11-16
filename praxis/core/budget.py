@@ -46,6 +46,10 @@ _DIMENSIONS: Final[tuple[str, ...]] = (
 # 禁止 import)。T15 的 dispatch gate 复用同一集合。
 WEB_TOOL_NAMES: Final[frozenset[str]] = frozenset({"web_fetch", "web_search"})
 
+# T15:web dispatch gate 超限拒绝的错误码(旧 harness/session.py:1279 parity)。
+# 唯一定义点:管道写拒绝结果、折叠豁免计费都引用它,不另写第二份字符串。
+WEB_REQUEST_BUDGET_EXCEEDED: Final[str] = "web_request_budget_exceeded"
+
 # 一条 web tool_result 证明请求已占用配额的 status 集合。denied / paused /
 # not_executed 都发生在 dispatch 之前，不占请求配额；outcome_unknown 是
 # dispatch 后失联（session 补偿写 unknown），按旧 reserve-before-IO 语义仍计 1
@@ -221,6 +225,11 @@ def fold_turn_facts(items: Sequence[Item], *, unit_costs: CostMicros | None) -> 
     保守记 1(旧 ``agent_runtime/harness/budget_ops.py:284-322`` reserve 语义的
     parity;禁止 import)。有结果时按结果 status 计费,不重复计。
 
+    **web 拒绝豁免(T15)**:``error_code == WEB_REQUEST_BUDGET_EXCEEDED`` 的
+    结果是 dispatch 前预算拒绝(管道 gate 自产,零网络 IO),与 denied /
+    not_executed 同族**不计费**——否则 ``resume --extend-web-requests 1`` 的
+    增量会被拒绝结果本身吃掉,永远续不上(旧 reserve 失败不占配额 parity)。
+
     tokenization ``source="estimated"`` 照单计入:事实来自 provider 的估算帧,
     来源标签不改记账。``unit_costs`` 为 None 时 cost 维只能是 0(有 cost 限额的
     turn 由 ``admit_dispatch`` fail-closed 挡在 dispatch 之前)。
@@ -273,6 +282,8 @@ def fold_turn_facts(items: Sequence[Item], *, unit_costs: CostMicros | None) -> 
                 or tool_name not in WEB_TOOL_NAMES
                 or not isinstance(status, str)
                 or status not in _BILLABLE_WEB_STATUSES
+                # T15:dispatch 前预算拒绝零 IO,不占配额(见 docstring)。
+                or item.payload.get("error_code") == WEB_REQUEST_BUDGET_EXCEEDED
             ):
                 continue
             call_id = item.payload.get("call_id")

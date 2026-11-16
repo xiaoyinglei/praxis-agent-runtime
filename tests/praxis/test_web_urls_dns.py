@@ -305,12 +305,14 @@ def test_validate_public_url_does_no_dns() -> None:
 def test_web_limits_defaults_and_fields() -> None:
     limits = WebLimits()
     assert (limits.max_bytes, limits.timeout_seconds, limits.max_redirects) == (2_000_000, 20.0, 5)
-    # Q7 有意差异显式断言:只有逐请求/逐调用硬上限,没有 turn 级账本字段。
-    # T14 扩 browser 逐调用预算(仍不是 turn 账本)。
+    # T15(Q8)兑现:turn_requests 回归字段集(旧 web_limits.py:9 默认 32,
+    # 1..256)——composition 折进 root Limits 的默认来源;turn 账本本身在
+    # core.budget(事实折叠+进程内 gate),本模块仍只做配置加载与硬上限。
     assert tuple(f.name for f in fields(WebLimits)) == (
-        "max_bytes", "timeout_seconds", "max_redirects", "browser_requests", "browser_network_bytes",
+        "max_bytes", "timeout_seconds", "max_redirects", "turn_requests",
+        "browser_requests", "browser_network_bytes",
     )
-    assert not hasattr(limits, "turn_requests")
+    assert limits.turn_requests == 32
 
 
 def test_web_limits_range_validation() -> None:
@@ -368,9 +370,13 @@ def test_load_web_limits_malformed_names_file(tmp_path: Path, monkeypatch: pytes
     config.write_text(json.dumps({"limits": {"max_bytes": 1}}), encoding="utf-8")
     with pytest.raises(ValueError, match=str(config)):
         load_web_limits(config)
-    config.write_text(json.dumps({"limits": {"turn_requests": 32}}), encoding="utf-8")
+    # browser 键出现在 limits 块仍按未知键拒绝(两块各管各的);
+    # turn_requests 自 T15 起是 limits 块合法键(Q8 默认来源)。
+    config.write_text(json.dumps({"limits": {"browser_requests": 64}}), encoding="utf-8")
     with pytest.raises(ValueError, match=str(config)):
         load_web_limits(config)
+    config.write_text(json.dumps({"limits": {"turn_requests": 32}}), encoding="utf-8")
+    assert load_web_limits(config) == WebLimits(turn_requests=32)
 
 
 def test_load_web_limits_env_is_file_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
