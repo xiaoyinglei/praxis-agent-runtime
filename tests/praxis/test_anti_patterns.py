@@ -844,7 +844,8 @@ def test_real_praxis_tree_clean_under_3b_rules():
 #    protocol/budget.py(T1 实际落点),fold_turn_facts/build_tree 唯一
 #    core/budget.py;MAX_CHILD_FRACTION 定义与乘点只在 protocol/budget.py;
 # ㉓(实际 26)child_allocation/cancel_request payload 拼装唯一走
-#    protocol/budget.py 助手(裸 dict 字面 key 串多处拼装禁止);
+#    protocol/budget.py 助手(裸 dict 字面 key 串与 dict(...) 构造器
+#    关键词形态多处拼装禁止,R-T16-1);
 # ㉔(实际 27)ResultStatus.NOT_EXECUTED 字面构造只在 core/compensation.py
 #    (close_unresolved 唯一清算口;session/turn/pipeline 经 settlement_outcome);
 # ㉕(实际 28)git worktree/git apply 字面只在 adapters/workspaces/。
@@ -989,6 +990,48 @@ def test_turn_binding_with_parent_turn_id_but_no_source_is_not_cancel_assembly(t
         tmp_path,
         "praxis/core/agents.py",
         'binding = {"budget": {}, "parent_turn_id": ptid, "root_turn_id": rid, "depth": 1}\n',
+    )
+    assert scan_praxis_file(f) == []
+
+
+# --- 规则 26(R-T16-1):dict(...) 构造器形态同样是裸拼装,不得旁路 ---
+
+def test_dict_constructor_cancel_payload_outside_protocol_budget_rejected(tmp_path):
+    # 一行风格切换(dict 字面 → dict() 构造器)不得绕过"唯一拼装"保证
+    f = _write(
+        tmp_path,
+        "praxis/core/session.py",
+        'payload = dict(source="user", parent_turn_id=None)\n',
+    )
+    assert any("cancel_request" in v and "protocol/budget.py" in v for v in scan_praxis_file(f))
+
+
+def test_dict_constructor_allocation_payload_outside_protocol_budget_rejected(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/core/evil.py",
+        "payload = dict(allocation_id=aid, child_thread_id=ctid,\n"
+        "               child_root_turn_id=crid, source='model', grant={})\n",
+    )
+    assert any("child_allocation" in v and "protocol/budget.py" in v for v in scan_praxis_file(f))
+
+
+def test_dict_constructor_assembly_allowed_in_protocol_budget(tmp_path):
+    f = _write(
+        tmp_path,
+        "praxis/protocol/budget.py",
+        'def cancel_request_payload(*, source, parent_turn_id):\n'
+        '    return dict(source=source, parent_turn_id=parent_turn_id)\n',
+    )
+    assert scan_praxis_file(f) == []
+
+
+def test_plain_dict_constructor_without_signature_keys_not_flagged(tmp_path):
+    # 普通 dict(...) 与缺特征键的构造器不是 payload 拼装(防误报)
+    f = _write(
+        tmp_path,
+        "praxis/core/evil.py",
+        'x = dict(a=1, b=2)\ny = dict(source="user")\nz = dict(parent_turn_id=ptid)\n',
     )
     assert scan_praxis_file(f) == []
 

@@ -67,9 +67,10 @@ Also scans praxis/ for architecture hard-rule violations (阶段1 CI 硬规则):
      MAX_CHILD_FRACTION/fraction)只允许 protocol/budget.py——retry 抖动的
      random_fraction 不在精确名集,不误报;
  26. child_allocation/cancel_request payload 拼装只允许 protocol/budget.py
-     助手(allocation_payload/cancel_request_payload):dict 字面特征键集
-     (allocation = allocation_id+child_thread_id+child_root_turn_id+source;
-     cancel = source+parent_turn_id)不得在别处拼装。spawn 工具结果 metadata
+     助手(allocation_payload/cancel_request_payload):dict 字面与 dict(...)
+     构造器关键词两种形态的特征键集(R-T16-1;allocation = allocation_id+
+     child_thread_id+child_root_turn_id+source;cancel = source+parent_turn_id)
+     不得在别处拼装——一行风格切换不构成旁路。spawn 工具结果 metadata
      (无 source 键)与 turn binding(无 source 键)不是 item payload 拼装;
  27. ResultStatus.NOT_EXECUTED 字面构造只允许 core/compensation.py
      (close_unresolved 唯一清算口;session/turn/pipeline 消费面经
@@ -79,7 +80,8 @@ Also scans praxis/ for architecture hard-rule violations (阶段1 CI 硬规则):
      integrate 的 action 枚举词 "apply" 不是 git 子命令构造,不触发。
  盲区(文档化,非静默):与规则 8/19/24 同口径——拆分拼接/变量间接/别名
  (``RS = ResultStatus`` 后 ``RS.NOT_EXECUTED``)静态字面量扫描看不到,
-  交给整分支审查台账。
+  交给整分支审查台账。dict(...) 构造器关键词形态**已覆盖**(R-T16-1,
+  非盲区);``dict(**payload)`` 展开无关键词名,仍属变量间接盲区。
 
 ``--praxis-only``:只扫 praxis 硬规则、跳过 rag 存量扫描(CI 门 R5:阶段1 只强制 praxis 规则)。
 
@@ -296,7 +298,8 @@ _BUDGET_FORMULA_SITES: dict[str, tuple[str, ...]] = {
 # 份额乘点操作数精确名(protocol/retry.py 的 random_fraction 抖动不在集内)。
 _CHILD_FRACTION_OPERANDS = frozenset({"MAX_CHILD_FRACTION", "fraction"})
 
-# 规则 26(计划㉓):payload 拼装特征键集(dict 字面量 key 串)。
+# 规则 26(计划㉓):payload 拼装特征键集(dict 字面量 key 串与 dict(...)
+# 构造器关键词名集,R-T16-1——两种裸拼装形态同一判据)。
 # allocation 要求 source 在场:spawn 工具结果 metadata(展示面,无 source)
 # 不是 item payload 拼装;cancel 要求 source+parent_turn_id 共现:turn binding
 # (有 parent_turn_id 无 source)不是取消事实拼装。
@@ -414,6 +417,24 @@ def _host_config_reader_allowed(rel_parts: tuple[str, ...]) -> bool:
     if rel_parts[:2] in _HOST_CONFIG_DIR_PACKAGE_PREFIXES:
         return True
     return rel_parts in _HOST_CONFIG_DIR_FILES
+
+
+def _payload_assembly_violations(keys: set[str], rel_parts: tuple[str, ...], lineno: int) -> list[str]:
+    """规则 26(计划㉓):dict 字面与 dict(...) 构造器关键词形态共用判据(R-T16-1)。"""
+    if rel_parts == _PRAXIS_PROTOCOL_BUDGET_FILE:
+        return []
+    violations: list[str] = []
+    if _ALLOCATION_ASSEMBLY_KEYS <= keys:
+        violations.append(
+            f"line {lineno}: child_allocation payload assembled outside "
+            "protocol/budget.py — 只允许 allocation_payload() 助手(规则 26/计划㉓)"
+        )
+    if _CANCEL_ASSEMBLY_KEYS <= keys:
+        violations.append(
+            f"line {lineno}: cancel_request payload assembled outside "
+            "protocol/budget.py — 只允许 cancel_request_payload() 助手(规则 26/计划㉓)"
+        )
+    return violations
 
 
 def _is_environment_items(node: ast.AST, aliases: set[str]) -> bool:
@@ -892,17 +913,13 @@ def scan_praxis_file(path: Path, praxis_root: Path | None = None) -> list[str]:
                 for key in node.keys
                 if isinstance(key, ast.Constant) and isinstance(key.value, str)
             }
-            if rel_parts != _PRAXIS_PROTOCOL_BUDGET_FILE:
-                if _ALLOCATION_ASSEMBLY_KEYS <= keys:
-                    violations.append(
-                        f"line {node.lineno}: child_allocation payload assembled outside "
-                        "protocol/budget.py — 只允许 allocation_payload() 助手(规则 26/计划㉓)"
-                    )
-                if _CANCEL_ASSEMBLY_KEYS <= keys:
-                    violations.append(
-                        f"line {node.lineno}: cancel_request payload assembled outside "
-                        "protocol/budget.py — 只允许 cancel_request_payload() 助手(规则 26/计划㉓)"
-                    )
+            violations.extend(_payload_assembly_violations(keys, rel_parts, node.lineno))
+        elif isinstance(node, ast.Call):
+            # 规则 26(R-T16-1):dict(...) 构造器关键词形态同样是裸拼装——
+            # 一行风格切换不得绕过"唯一拼装"保证(**展开无关键词名,不计入)。
+            if _call_is(node, "dict"):
+                keys = {kw.arg for kw in node.keywords if kw.arg is not None}
+                violations.extend(_payload_assembly_violations(keys, rel_parts, node.lineno))
         elif isinstance(node, ast.Attribute):
             # 规则 27:NOT_EXECUTED 字面构造只在唯一清算口模块
             if (
