@@ -149,7 +149,7 @@ class _UsageExit3Group(TyperGroup):
 app = typer.Typer(
     cls=_UsageExit3Group,
     name="praxis",
-    help="Praxis workspace agent — minimal console (run/chat/resume/status/log/steer/verify/models/web/mcp).",
+    help="Praxis workspace agent — minimal console (run/chat/resume/cancel/status/log/steer/verify/models/web/mcp).",
     add_completion=False,
     no_args_is_help=True,
 )
@@ -1161,6 +1161,25 @@ def steer(
     try:
         session.steer(text)
         typer.echo("ok: steering appended")
+    finally:
+        session.close()
+
+
+@app.command()
+def cancel(
+    turn_id: str,
+    workspace: Path | None = _WORKSPACE_OPT,
+    thread: str | None = _THREAD_OPT,
+) -> None:
+    """请求取消 turn(append-only,不取执行锁,§5.8):跨进程只落 cancel_request
+    item,执行者步边界收敛 CANCELLED 并全组清算未决调用(T4);exit 0。"""
+    session = _open_read_only(workspace, thread)
+    try:
+        reason = session.request_cancel(turn_id)
+        typer.echo(f"ok: cancel {reason}")
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(EXIT_USAGE) from None
     finally:
         session.close()
 

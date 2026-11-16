@@ -34,6 +34,10 @@ Task 20 扩展:web 宿主配置面 ``WebLimits``/``load_web_limits`` 与 provide
 阶段4 T3 扩展:预算限额面 ``Limits``/``UNLIMITED`` re-export——CLI 的
 ``run --max-*`` 构造 root limits、宿主装配 ``open_session(budget=...)``
 都只经 sdk,不直依 protocol 内部模块。
+阶段4 T4 扩展:唯一清算协议面 ``UnresolvedCall``/``unclosed_windows``/
+``close_unresolved`` re-export——宿主读取未决调用判据只经 sdk;cancel 面
+本身是 ``Session.request_cancel``(Session 已导出),CLI ``praxis cancel``
+跨进程只 append cancel_request item。
 
 ``ConversationBusy``/``ResumeNotConfirmed`` 定义在 core.session 并由这里
 re-export:core 不得 import interfaces(import-linter praxis_core_purity),
@@ -95,6 +99,7 @@ from praxis.composition import (
     resolve_declared_policy,
     validate_model_spec,
 )
+from praxis.core.compensation import UnresolvedCall, close_unresolved, unclosed_windows
 from praxis.core.events import Subscription
 from praxis.core.locks import ThreadBusy
 from praxis.core.permission import apply_update
@@ -179,12 +184,14 @@ __all__ = [
     "TurnResult",
     "TurnStatus",
     "UNLIMITED",
+    "UnresolvedCall",
     "Usage",
     "VerifyReport",
     "WEB_SEARCH_PROVIDER_ENV",
     "WebLimits",
     "apply_update",
     "assemble_model_events",
+    "close_unresolved",
     "connect_mcp_servers",
     "credential_source",
     "decide_mcp_config_trust",
@@ -207,6 +214,7 @@ __all__ = [
     "save_mcp_bearer",
     "save_model_credential",
     "save_web_search_credential",
+    "unclosed_windows",
     "validate_model_spec",
     "web_configuration_path",
     "web_search_credential_source",

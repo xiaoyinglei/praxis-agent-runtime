@@ -9,6 +9,9 @@ execute 步骤序(与代码一一对应):
 1. 未知工具 / 输入校验失败 → 直接写 tool_result(error_code
    ``unknown_tool``/``invalid_input``)返回——已有 result 即非 pending,
    recovery 不会列它,故不写 tool_call item、不发 started/finished;
+1.5. T4 cancel 检查点:本 turn 已有 ``cancel_request(seq > 本调用最新声明
+   窗口)`` → 拒绝新 dispatch(不写任何 item;清算归 turn 收敛的
+   close_unresolved 单点)——幂等重入安全,批准重放绝不绕过 queued 取消;
 2. ``resolve_use`` + ``permission.decide``(经模块属性调用:唯一决策入口);
    注入 hooks 时先在 decide 之前结算 PreToolUse(§5.14):started/settled item
    按 ``hook_invocation_id`` 幂等折叠(审批重入不重复 spawn),非 allowed 的
@@ -62,6 +65,12 @@ from typing import cast
 
 from praxis.core import permission  # 唯一决策入口:经模块属性调用,测试 monkeypatch 此处
 from praxis.core.budget import BudgetTracker
+from praxis.core.compensation import (
+    NOT_EXECUTED_TEXTS,
+    OUTCOME_UNKNOWN_TEXTS,
+    UnresolvedCall,
+    unclosed_windows,
+)
 from praxis.core.events import EventBus
 from praxis.core.skill_state import latest_active_skill_ids
 from praxis.core.statemachine import TurnStatus, transition
@@ -597,6 +606,44 @@ def _pause_for_approval(
 
 
 # ---------------------------------------------------------------------------
+# cancel 检查点(T4:dispatch 前;幂等重入安全)
+# ---------------------------------------------------------------------------
+
+
+def _cancel_refusal(ctx: ExecCtx, items: list[Item], call: ToolCall) -> ToolResult | None:
+    """本 turn 已有 ``cancel_request(seq > 本调用最新声明窗口)`` → 拒绝新 dispatch。
+
+    判据经 compensation.unclosed_windows(不另写窗口匹配):窗口已闭合或取消
+    早于声明 → None(正常路径)。拒绝结果与 close_unresolved 同矩阵
+    (started→outcome_unknown / 未 started→not_executed),但**不写 item**——
+    清算 item 由 turn 收敛时的 close_unresolved 统一落库(唯一清算写者);
+    检查点只挡执行,不产生第二份补偿账。PAUSED 期间 queued 的取消在 resume
+    审批重放时同样被拒——批准绝不绕过取消。
+    """
+    cancel_seq: int | None = max(
+        (item.seq for item in items if item.kind == ItemKind.CANCEL_REQUEST), default=None
+    )
+    if cancel_seq is None:
+        return None
+    target: UnresolvedCall | None = None
+    for unresolved in unclosed_windows(items, ctx.tools):
+        if unresolved.call.call_id == call.tool_call_id:
+            target = unresolved  # 升序扫:最后匹配 = 最新声明窗口
+    if target is None or target.declaration_seq >= cancel_seq:
+        return None
+    if target.started:
+        status, text = ResultStatus.OUTCOME_UNKNOWN, OUTCOME_UNKNOWN_TEXTS["cancelled"]
+    else:
+        status, text = ResultStatus.NOT_EXECUTED, NOT_EXECUTED_TEXTS["cancelled"]
+    return ToolResult(
+        tool_call_id=call.tool_call_id,
+        tool_name=call.tool_name,
+        content=(_text_block(text),),
+        status=status,
+    )
+
+
+# ---------------------------------------------------------------------------
 # 唯一执行入口
 # ---------------------------------------------------------------------------
 
@@ -635,6 +682,12 @@ async def execute(call: ToolCall, ctx: ExecCtx) -> ToolResult:
 
     digest = args_digest(args)
     items = ctx.store.read_turn_items(ctx.turn_id)
+
+    # T4 cancel 检查点:先于 hook/decide/审批——取消中的 turn 不再启动新执行,
+    # 也不写 approval_request/tool_call(收敛与清算归 turn 循环步边界)。
+    refusal = _cancel_refusal(ctx, items, call)
+    if refusal is not None:
+        return refusal
 
     # 步序 2 的 hook 扩展:PreToolUse 在唯一 decide 之前结算;allow 不产生裁决,
     # 因此规则/bypass/地板/沙箱对该调用仍然完全有效(allow 丝毫不豁免)。

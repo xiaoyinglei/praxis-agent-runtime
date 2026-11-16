@@ -11,6 +11,8 @@
    保证回合已 RUNNING——Task 14 的 resume 负责先转换再重入),PAUSED 同步序 5;
 2. 每轮重读 thread items → ``build_context`` 折叠 → ``to_messages`` 投影 →
    前置 system 消息;steering item 在步边界自然进入上下文(它已在日志里);
+   cancel_request 在同一缝读取(T4):本 turn 已有取消事实 → 全组清算收敛
+   CANCELLED,不再请求模型;
 3. ``adapter.build_request`` + 注入的 ``retry_stream``(缺省不重试)收齐
    ``ModelEvent`` → ``assemble_model_events`` → 每次尝试落 ``model_attempt``
    item、最终成功落 model_response item → emit ``ModelOutputDelta`` 与
@@ -24,18 +26,23 @@
    续跑。保护尾豁免逐次 dispatch(R-T3-7):一次性续作旗标消费即复位,
    超阈值预授只给摘要调用——压缩未产出摘要则按普通调用重新准入。与
    max_steps 硬护栏双闸并存、语义不同(R-T3-1);
-4. 无 tool_calls → ``transition(COMPLETED, "model_finished")``;
+4. 无 tool_calls → 终态守卫(T4,B14 对称性):同缝 cancel 收敛 + compensation
+   全组清算(常态零 entries——每轮工具全结算才推进;防御遗留未闭合窗口)→
+   ``transition(COMPLETED, "model_finished")``;
 5. 有 tool_calls → 逐个 ``execute``;任一 PAUSED → 管道已完成 RUNNING→PAUSED
    转换,直接返回并附未批摘要;
 6. ``steps += 1``(初值见步序 0);≥ max_steps →
    ``transition(FAILED, "step_limit_exceeded")``(失控防御,保持 FAILED);
-7. ``CancelledError`` → ``transition(CANCELLED, "cancelled_by_user")``——except
-   路径内只有同步调用,不 await、不上抛:SDK 表面返回结果,任务生命周期归
-   会话层;
+7. ``CancelledError`` → 先 ``close_unresolved`` 全组清算补 entries(B14:取消
+   不再"零补偿 item";B29:同窗口缺结果不早退)再
+   ``transition(CANCELLED, "cancelled_by_user")``——except 路径内只有同步
+   调用,不 await、不上抛:SDK 表面返回结果,任务生命周期归会话层;
 8. ``Exception`` → ``transition(FAILED, "<类型>: <消息>")``。
 
 item 分工:pipeline 写 tool_call/tool_result/approval_request,本模块写
 model_response/model_attempt,状态机写 turn_status——没有第二写入者,不存在双写。
+终态清算的 tool_result 经 compensation.close_unresolved 单点合成(T4:cancel/
+complete 守卫与会话 resume 共用同一协议;pair 已配即幂等,不产生重复账)。
 核心层对总线与订阅者只 emit、永不 await(硬规则 4)。
 """
 
@@ -56,6 +63,7 @@ from praxis.core.compaction import (
     CompactionOutcome,
     maybe_compact,
 )
+from praxis.core.compensation import close_unresolved
 from praxis.core.context import (
     append_skill_catalog,
     build_context,
@@ -427,6 +435,44 @@ def _collect_pending_approvals(deps: TurnDeps, turn_id: str) -> tuple[ApprovalSu
     )
 
 
+def _cancel_requested(items: Sequence[Item], turn_id: str) -> bool:
+    """cancel_request 收敛判据(T4):日志里已有本 turn 的取消事实。
+
+    与 steering 同缝——item 日志是唯一事实源,任何进程 append 都算数;
+    turn_id 严格归属(取消是 per-turn 事实,不是 thread 级广播)。
+    """
+    return any(item.kind == ItemKind.CANCEL_REQUEST and item.turn_id == turn_id for item in items)
+
+
+def _converge_cancelled(
+    deps: TurnDeps, state: TurnState, output: str, unknown_calls: Sequence[str]
+) -> TurnResult:
+    """取消收敛(B14/B29):先 compensation 全组清算补 entries,再 transition。
+
+    同窗口多 call_id 第 1 个缺结果不得早退、跨窗口孤儿声明同样补齐——清算
+    判据与 resume/complete 守卫共用 compensation 单点。全程同步(store 写经
+    写者线程、transition 经 Future 阻塞等待,不是 await),except 路径不上抛。
+    unknown_calls = 执行期收集的未知工具 + 清算 outcome_unknown 清单(去序合并)。
+    """
+    entries, unknown_ids = close_unresolved(
+        deps.store.read_turn_items(state.turn_id), deps.tools, text_for="cancelled"
+    )
+    if entries:
+        deps.store.append_items(state.thread_id, state.turn_id, entries)
+    transition(deps.store, deps.bus, state.turn_id, TurnStatus.CANCELLED, reason="cancelled_by_user")
+    merged = list(unknown_calls)
+    for call_id in unknown_ids:
+        if call_id not in merged:
+            merged.append(call_id)
+    return TurnResult(
+        turn_id=state.turn_id,
+        status=TurnStatus.CANCELLED,
+        output=output,
+        reason="cancelled_by_user",
+        unknown_calls=tuple(merged),
+    )
+
+
 def _budget_paused(
     deps: TurnDeps,
     state: TurnState,
@@ -505,6 +551,10 @@ async def run_turn(
         while True:
             # 步序 2:每轮从 item 日志重建上下文;steering 在步边界自然进入。
             items = deps.store.read_items(state.thread_id)
+            # T4:cancel_request 与 steering 同缝——步边界读到取消事实即收敛
+            # (全组清算 + CANCELLED),不再请求模型。跨进程取消在此生效。
+            if _cancel_requested(items, state.turn_id):
+                return _converge_cancelled(deps, state, last_content, unknown_calls)
             messages = [
                 ModelMessage(role="system", content=deps.system_prompt),
                 # D11 读侧固定链:先按 boundary 折叠,再省略旧工具输出,最后投影。
@@ -627,7 +677,16 @@ async def run_turn(
                 )
             )
             if not resp.tool_calls:
-                # 步序 4:模型无工具调用即自然收尾。
+                # 步序 4:模型无工具调用即自然收尾。T4 终态守卫(B14 对称性):
+                # 与 cancel 同一清算协议——同缝 cancel 收敛(最后一跳流式期间
+                # 到达的取消不被静默丢弃)+ 全组清算遗留未闭合窗口(常态零
+                # entries:每轮工具全结算才推进到下一轮请求)。
+                turn_items = deps.store.read_turn_items(state.turn_id)
+                if _cancel_requested(turn_items, state.turn_id):
+                    return _converge_cancelled(deps, state, resp.content, unknown_calls)
+                guard_entries, _guard_unknown = close_unresolved(turn_items, deps.tools, text_for="cancelled")
+                if guard_entries:
+                    deps.store.append_items(state.thread_id, state.turn_id, guard_entries)
                 transition(
                     deps.store, deps.bus, state.turn_id, TurnStatus.COMPLETED, reason="model_finished"
                 )
@@ -658,18 +717,11 @@ async def run_turn(
                     unknown_calls=tuple(unknown_calls),
                 )
     except asyncio.CancelledError:
-        # 步序 7(B15):取消是独立结局。except 路径内全同步(transition 经写者线程
-        # Future 阻塞等待,不是 await),不上抛——任务生命周期归会话层,SDK 表面拿结果。
-        transition(
-            deps.store, deps.bus, state.turn_id, TurnStatus.CANCELLED, reason="cancelled_by_user"
-        )
-        return TurnResult(
-            turn_id=state.turn_id,
-            status=TurnStatus.CANCELLED,
-            output="",
-            reason="cancelled_by_user",
-            unknown_calls=tuple(unknown_calls),
-        )
+        # 步序 7(B15/B14):取消是独立结局,且不再"零补偿 item"——先全组清算
+        # (B29:同窗口缺结果不早退)再 transition。except 路径内全同步(store 写
+        # 经写者线程、transition 经 Future 阻塞等待,不是 await),不上抛——
+        # 任务生命周期归会话层,SDK 表面拿结果。
+        return _converge_cancelled(deps, state, "", unknown_calls)
     except Exception as exc:  # noqa: BLE001 — turn 级错误边界:全收敛,永不炸穿会话
         # 步序 8(B11):真实异常类型与消息进入 reason;ScriptExhausted 等也走此路。
         reason = f"{type(exc).__name__}: {exc}"

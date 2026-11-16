@@ -5,7 +5,9 @@ Session 是 turn 循环之上的会话门面:它不执行任何东西,只负责"
 
 1. **执行锁 = 执行者身份**:submit/resume 在 run_turn 外围持 thread 执行锁,
    锁被占(ThreadBusy)一律换成公开的 ``ConversationBusy``;steer/approval/
-   reconcile/confirm 只是 append item,永不取锁(§5.8:它们不是执行者)。
+   reconcile/confirm/cancel_request 只是 append item,永不取锁(§5.8:它们
+   不是执行者)。cancel 收敛归执行者(T4):本进程 _active_task 注入取消
+   ("signalled"),否则仅落 item 由执行进程步边界收敛("queued")。
 2. **人工确认守卫**(§5.2:interrupted 只能由人重启):INTERRUPTED turn 必须
    ``confirm=True``,否则 ``ResumeNotConfirmed``;PAUSED turn 必须给**非空**的
    approval(审批)或 reconcile(结果对账)映射——空映射不是决策,同样拒绝;
@@ -55,7 +57,7 @@ import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 from uuid import uuid4
 
 from praxis.core.budget import BudgetTracker
@@ -70,7 +72,7 @@ from praxis.core.events import EventBus, Subscription
 from praxis.core.locks import ThreadBusy, thread_execution_lock
 from praxis.core.permission import apply_update, command_network_verdict, extend_policy
 from praxis.core.pipeline import SandboxCompiler, SandboxFinalizer
-from praxis.core.statemachine import TurnStatus, transition
+from praxis.core.statemachine import TRANSITIONS, TurnStatus, transition
 from praxis.core.turn import (
     ApprovalSummary,
     TurnDeps,
@@ -381,6 +383,10 @@ class Session:
         self._budget = budget
         self._unit_costs = unit_costs
         self._budget_binding_warned = False
+        # T4 cancel 快速路径:_execute 持锁期间登记本进程执行 task 与归属 turn;
+        # request_cancel 命中即注入取消("signalled"),否则仅落 item("queued")。
+        self._active_task: asyncio.Task[Any] | None = None
+        self._active_turn_id: str | None = None
 
     # -- 身份与生命周期 -------------------------------------------------------
 
@@ -758,6 +764,52 @@ class Session:
             self._thread_id, None, [ItemEntry(kind=ItemKind.STEERING, payload={"text": text})]
         )
 
+    # -- cancel(T4:append-only,不取执行锁;收敛归执行者)-------------------
+
+    def request_cancel(self, turn_id: str) -> str:
+        """请求取消一个 turn:落 cancel_request item(source=user),返回收敛路径。
+
+        - ``"signalled"``:本进程正在执行该 turn(_execute 登记的 _active_task)
+          → 已注入 task.cancel(),run_turn 的 CancelledError 分支全组清算后
+          transition(CANCELLED);
+        - ``"queued"``:仅落 item——他进程执行中(执行进程步边界读到收敛),
+          或 turn 处于 PAUSED/INTERRUPTED(下次 resume 时管道检查点拒新 dispatch、
+          步边界收敛;queued 的取消绝不被审批重放绕过)。
+
+        终态 turn(COMPLETED/FAILED/CANCELLED,判据 = TRANSITIONS 无出边)抛
+        ValueError;未知 turn / 非本 thread 同 resume 守卫。本方法不取执行锁、
+        不写 turn 状态——transition 唯一写入点仍在执行者的收敛路径(§5.8)。
+        """
+        turn = get_turn(self._store, turn_id)
+        if turn is None:
+            raise ValueError(f"unknown turn_id: {turn_id!r}")
+        if turn.thread_id != self._thread_id:
+            raise ValueError(
+                f"turn {turn_id!r} belongs to thread {turn.thread_id!r}, not this session's "
+                f"thread {self._thread_id!r} (different thread)"
+            )
+        status = TurnStatus(turn.status)
+        if not TRANSITIONS[status]:
+            raise ValueError(f"turn {turn_id!r} is {status.value}; terminal turns cannot be cancelled")
+        self._store.append_items(
+            self._thread_id,
+            turn_id,
+            [ItemEntry(kind=ItemKind.CANCEL_REQUEST, payload={"source": "user", "parent_turn_id": None})],
+        )
+        # 只对 RUNNING 注入取消:run_turn 已返回 PAUSED/终态但 _execute 尚未
+        # 清除登记的微窗口里,task.cancel() 会把 CancelledError 抛给 submit
+        # 调用方而非收敛成结果——queued 路径(下次 resume 步边界收敛)覆盖它。
+        task = self._active_task
+        if (
+            status is TurnStatus.RUNNING
+            and task is not None
+            and self._active_turn_id == turn_id
+            and not task.done()
+        ):
+            task.cancel()
+            return "signalled"
+        return "queued"
+
     # -- 查询 ------------------------------------------------------------------
 
     def status(self, turn_id: str) -> Turn:
@@ -860,7 +912,15 @@ class Session:
         )
         try:
             with thread_execution_lock(self._workspace, self._thread_id):
-                return await run_turn(deps, TurnState(turn_id, self._thread_id), resume_calls=resume_calls)
+                # T4:登记本进程执行 task——request_cancel 的快速路径判据;
+                # finally 清除,绝不让已完成 task 成为下次取消的误靶。
+                self._active_turn_id = turn_id
+                self._active_task = asyncio.current_task()
+                try:
+                    return await run_turn(deps, TurnState(turn_id, self._thread_id), resume_calls=resume_calls)
+                finally:
+                    self._active_task = None
+                    self._active_turn_id = None
         except ThreadBusy as exc:
             raise ConversationBusy(
                 f"thread {self._thread_id!r} is executing elsewhere; try again later"
