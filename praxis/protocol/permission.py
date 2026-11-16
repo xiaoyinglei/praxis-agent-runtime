@@ -45,6 +45,21 @@ class PermissionNotice:
     text: str
 
 
+@dataclass(frozen=True)
+class ApprovalSummary:
+    """一条待批调用的人类可读摘要(源自 approval_request item,非第二事实源)。
+
+    阶段4 T6 自 core.turn 迁居 protocol:ChildStatus(protocol.agents)的
+    待批摘要形状需要它,而 protocol 不得 import core。core.turn 原样
+    re-export,既有调用方(sdk/Session/测试)零改动。
+    """
+
+    call_id: str
+    tool_name: str
+    args_digest: str
+    effects: tuple[str, ...]
+
+
 @dataclass(frozen=True, slots=True)
 class Decision:
     """一次权限判定的不可变结论。构造一律走 allow/ask/deny 三个 classmethod。"""

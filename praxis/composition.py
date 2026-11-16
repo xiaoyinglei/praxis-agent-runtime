@@ -57,6 +57,7 @@ from praxis.adapters.web.search import (
     load_web_search_config,
 )
 from praxis.adapters.web.tools import create_web_fetch_tools
+from praxis.core.agents import SubagentManager
 from praxis.core.compaction import (
     SUMMARY_MAX_OUTPUT_TOKENS,
     SUMMARY_PROMPT_MAX_CHARS,
@@ -68,6 +69,7 @@ from praxis.core.events import EventBus
 from praxis.core.permission import network_verdict
 from praxis.core.recovery import sweep, sweep_orphan_command_jobs
 from praxis.core.session import AsyncCloser, Session
+from praxis.protocol.agents import AGENT_ORCHESTRATION_NAMES, AGENT_TOOL_NAMES
 from praxis.protocol.budget import UNLIMITED, Limits
 from praxis.protocol.hooks import HookOutcome, HookSetup, HookSpec
 from praxis.protocol.json import JsonValue
@@ -80,13 +82,14 @@ from praxis.protocol.models import (
     WireRequest,
 )
 from praxis.protocol.permission import PermissionContext, PermissionMode
-from praxis.protocol.policy import PermissionPolicy, PolicyVerdict, ToolRule, url_host
+from praxis.protocol.policy import PathRule, PermissionPolicy, PolicyVerdict, ToolRule, url_host
 from praxis.protocol.retry import RetryPolicy
 from praxis.protocol.skills import SkillCatalog
 from praxis.protocol.tools import Tool, ToolEffect, ToolSource
 from praxis.protocol.workspaces import WorkspaceMode
 from praxis.store.artifacts import ArtifactStore
 from praxis.store.log import Store
+from praxis.tools.builtins.agent_tools import create_agent_tools
 from praxis.tools.builtins.artifacts_tool import create_read_artifact_tool
 from praxis.tools.builtins.child_env import child_env
 from praxis.tools.builtins.command import create_bash_tool
@@ -460,6 +463,23 @@ async def connect_mcp_servers(
     )
 
 
+class _SubagentManagerCloser:
+    """T6 ③:manager.aclose 挂 Session 收尾链的延迟绑定 AsyncCloser。
+
+    manager 需要 parent=Session 引用,只能在 Session 构造之后创建;工具表与
+    integrations 却先于 Session 装配——经 holder 闭包延迟委托(与 web
+    authorizer 的 session_holder 同先例)。收尾序上它排在 integrations 最前:
+    先收敛子 driver(子可能闭包父的 web client/MCP 能力),再关共享能力。
+    """
+
+    def __init__(self, holder: list[SubagentManager]) -> None:
+        self._holder = holder
+
+    async def aclose(self) -> None:
+        if self._holder:
+            await self._holder[0].aclose()
+
+
 def build_session(
     workspace: Path,
     adapter: ModelAdapter | None = None,
@@ -480,6 +500,9 @@ def build_session(
     unit_costs: CostMicros | None = None,
     ceilings: Sequence[PermissionPolicy] = (),
     run_sweep: bool = True,
+    enable_subagents: bool = False,
+    subagent_limits: Mapping[str, int] | None = None,
+    persist_always: bool = True,
 ) -> Session:
     """装配一个 Session:唯一组合根。CLI/TUI/host 一律经 sdk.open_session 走到这里。
 
@@ -531,6 +554,19 @@ def build_session(
       内部仍调 build_child_session → build_session(Session 构造唯一点不破);
     - ``run_sweep=False``:跳过打开即清扫(子 Session 构造用——同库已由父
       打开时 sweep 覆盖;见 build_child_session 的锁文件族说明)。
+
+    阶段4 T6(模型工具面,尾部默认零扰动):
+    - ``enable_subagents``(缺省 False,旧 parity):True 时表尾追加 agent
+      五件套(15+5=20;``tools=`` 整体替换路径同样追加,重名边界拒绝),
+      并自动附加四件编排的 **session 域 ToolRule allow**(预算份额+子限额
+      才是闸门;allow 只活在内存,绝不进 always 落盘);integrate 是
+      DESTRUCTIVE,显式审批不可豁免(S5)。SubagentManager 在 Session 之后
+      构造(parent 引用),经 holder 闭包绑定工具面,并经
+      ``_SubagentManagerCloser`` 挂进收尾链(integrations 最前);
+    - ``subagent_limits``:max_concurrent/max_depth/max_total 覆盖(缺省
+      SUBAGENT_LIMITS_DEFAULT;未知键/负值边界拒绝,manager 同纪律);
+    - ``persist_always=False``:always 授权只改内存不落盘(read_only 子
+      共享父工作区,写父 permissions.json 即泄漏——㉖ 收口)。
     """
     if thread_id is not None:
         _validate_thread_id(thread_id)
@@ -624,6 +660,26 @@ def build_session(
                     f"tool name {name!r} from extra tools collides with {origin}"
                 )
             tool_map[name] = extra
+        # T6:agent 五件套(enable_subagents=True)。manager 需要 parent=Session
+        # 引用,只能在 Session 之后构造——工具面经 holder 闭包延迟绑定(与
+        # web authorizer 的 session_holder 同先例)。重名与 extra_tools 同纪律。
+        manager_holder: list[SubagentManager] = []
+        agent_session_rules: tuple[ToolRule, ...] = ()
+        if enable_subagents:
+            for agent_name in sorted(AGENT_TOOL_NAMES):
+                if agent_name in tool_map:
+                    raise ValueError(
+                        f"tool name {agent_name!r} collides with enable_subagents agent tools"
+                    )
+            for agent_tool in create_agent_tools(lambda: manager_holder[0]):
+                tool_map[agent_tool.definition.name] = agent_tool
+            # 四件编排的 session 域 allow:预算份额+子限额才是闸门(有意差异,
+            # 对照表钉死)。session_rules 只活在内存——always 落盘(base ⊕
+            # always_rules)绝不带上它们;显式 policy deny 仍跨源最严胜出。
+            agent_session_rules = tuple(
+                ToolRule(pattern=agent_name, decision="allow")
+                for agent_name in sorted(AGENT_ORCHESTRATION_NAMES)
+            )
         # 外部化与回读能力耦合:工具表被整体替换且没有 read_artifact 时,
         # 不注入 artifacts——否则模型只会拿到打不开的指针,比旧字节截断更差。
         effective_artifacts = artifact_store if "read_artifact" in tool_map else None
@@ -638,13 +694,19 @@ def build_session(
             sandbox=probe_backend(),
             # T5:ceiling 只否决永不授权(read_only 子的收窄经此与父策略取交集)。
             ceilings=tuple(ceilings),
+            # T6:四件编排的 session 域 allow(仅 enable_subagents;内存域)。
+            session_rules=agent_session_rules,
         )
         resolved_thread = thread_id if thread_id is not None else store.create_thread()
         store.ensure_thread(resolved_thread)
         # T20:web client 是 Session 的 integration(aclose 在 command_sessions
         # 之后、store 之前;与 MCP bundle 同一条收尾链)。
-        effective_integrations: tuple[AsyncCloser, ...] = tuple(integrations) + (
-            (web_client,) if web_client is not None else ()
+        # T6 ③:manager 收尾排在 integrations 最前——先收敛子 driver,再关
+        # 子可能闭包引用的共享能力(web client/MCP bundle),最后 store。
+        effective_integrations: tuple[AsyncCloser, ...] = (
+            ((_SubagentManagerCloser(manager_holder),) if enable_subagents else ())
+            + tuple(integrations)
+            + ((web_client,) if web_client is not None else ())
         )
 
         def _child_session_factory(
@@ -693,7 +755,16 @@ def build_session(
             budget=budget,
             unit_costs=effective_unit_costs,
             child_session_factory=_child_session_factory,
+            persist_always=persist_always,
         )
+        # T6:manager 此刻才有 parent 引用;holder 填充后工具面与收尾链同时
+        # 生效(工具只在 submit 内被调用,与 web authorizer 同延迟绑定纪律)。
+        if enable_subagents:
+            manager_holder.append(
+                SubagentManager(parent=session, store=store)
+                if subagent_limits is None
+                else SubagentManager(parent=session, store=store, limits_cfg=subagent_limits)
+            )
         # 延迟绑定完成:此后 web authorize 闭包读到的就是 live 权限上下文
         # (Session.update_permission 替换 _permissions,property 每次现取)。
         session_holder.append(session)
@@ -735,8 +806,17 @@ def build_child_session(
       同特异性取 write,read 规则被吸收;profile 形态才是有效否决;
       (b) 工具规则 deny(纵深防御):对 tool_subset 中声明 WRITE_WORKSPACE/
       DESTRUCTIVE 的工具逐名 ToolRule deny(dispatch 前拒,先于 bypass)。
-      读不受影响:read-only profile 基线授权工作区读。父 ceilings 一并继承。
-      write 子不加收窄(其隔离由 T7 worktree 供给);
+      **R-T5-8 精化(T6):ceiling 只否决写路径**——网络策略显式继承父
+      (默认 NetworkPolicy(ask) 会把子的网络拖到 ask/deny,非预期收窄),
+      父 filesystem 的读授权逐条保留(write 规则降为 read:读范围不变,
+      写由 profile 全否;deny 规则原样),trusted-local 的 "/" 读基线一并
+      继承。子的网络决策/外部读授权因此与父完全一致。
+      父 ceilings 一并继承。write 子不加收窄(其隔离由 T7 worktree 供给);
+    - **㉖ always 落盘隔离(T6)**:read_only 子共享父工作区——子的 always
+      授权若落盘会写父 ``.praxis/permissions.json``(泄漏)。裁决:read_only
+      子 ``persist_always=False``——always 只在子内存生效(子 lifetime),
+      经 ``always_memory_only`` PermissionNotice 如实披露;write 子工作区
+      独立,落盘天然隔离到自己的文件,保持 True;
     - ``workspace_mode`` 是 brief 签名之外的尾部默认参数(read_only 缺省):
       收窄判据需要它,既有签名调用零破坏。
 
@@ -746,9 +826,8 @@ def build_child_session(
     误判空闲而错标 interrupted。独立目录子的全库 sweep 工作区解析(按
     allocation 的 workspace 试锁)属 T7/T9 接线,本任务不开第二套 sweep。
 
-    已知边界(如实,交 T6):read_only 子与父共享 permissions.json——子的
-    always 授权落盘会写同一文件(子自身被 ceiling 否决不变,但父下次打开会
-    读到子的 always 规则)。收口属后续任务,不在本任务重开已拍板语义。
+    T5 留档的 permissions.json always 泄漏面已由本任务(㉖)收口:read_only
+    子 persist_always=False,见 docstring。
     """
     ceilings = list(parent.permissions.ceilings)
     if workspace_mode == "read_only":
@@ -757,9 +836,25 @@ def build_child_session(
             for tool in tool_subset
             if tool.static_effects & _READ_ONLY_DENIED_EFFECTS
         )
+        # R-T5-8:ceiling 只否决写——父的读授权逐条保留(write 降 read,
+        # deny 原样),网络策略显式继承(否则默认 ask 拖窄子的网络决策)。
+        parent_policy = parent.permissions.policy
+        read_preserving = tuple(
+            PathRule(path=rule.path, access="read" if rule.access == "write" else rule.access)
+            for rule in parent_policy.filesystem
+        )
+        if parent_policy.profile == "trusted-local":
+            read_preserving = (PathRule(path="/", access="read"), *read_preserving)
         # R-T5-6:read-only profile 是沙箱写否决的承重层(见 docstring (a));
         # 恒追加——即使工具表没有静态 WRITE 工具,bash 的写路径也必须关闭。
-        ceilings.append(PermissionPolicy(profile="read-only", tools=denied))
+        ceilings.append(
+            PermissionPolicy(
+                profile="read-only",
+                tools=denied,
+                filesystem=read_preserving,
+                network=parent_policy.network,
+            )
+        )
     return build_session(
         workspace,
         parent.adapter,
@@ -772,4 +867,7 @@ def build_child_session(
         ceilings=tuple(ceilings),
         db_path=parent.store.db_path,
         run_sweep=False,
+        # ㉖:read_only 子共享父工作区,always 不落盘(内存生效+披露);
+        # write 子工作区独立,落盘天然隔离。
+        persist_always=workspace_mode != "read_only",
     )

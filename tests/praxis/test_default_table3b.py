@@ -1,5 +1,8 @@
 """Task 20:默认工具表 15 builtin + web 装配 + 渲染探针 + 宿主隔离。
 
+阶段4 T6 口径同步:默认表 15+0(enable_subagents 缺省关,旧 parity 零扰动);
+``enable_subagents=True`` 后 15+5=20(agent 五件套追加在表尾)。
+
 钉住四件事:
 1. 默认表恰好 15 个 builtin(集合),MCP 动态工具不进入(只经 extra_tools);
 2. scripted turn 的 wire tools 里同时有 web_fetch/web_search(不触网),
@@ -68,6 +71,32 @@ def test_default_table_has_exactly_fifteen_builtins(workspace: Path) -> None:
         assert names == _EXPECTED_BUILTINS
         assert len(names) == 15
         assert not any(name.startswith("mcp__") for name in names)
+    finally:
+        session.close()
+
+
+_AGENT_FIVE = {
+    "spawn_subagent",
+    "wait_subagent",
+    "send_to_subagent",
+    "cancel_subagent",
+    "integrate_child_workspace",
+}
+
+
+def test_enable_subagents_adds_exactly_five_to_default_table(workspace: Path) -> None:
+    """T6 口径:默认 15+0;开关后 15+5=20,且五件真的交给模型(wire tools)。"""
+    adapter = ScriptedAdapter([_resp("done")])
+    session = open_session(workspace, adapter, enable_subagents=True)
+    try:
+        names = set(session._tools)  # noqa: SLF001 — 装配契约:集合可断言
+        assert names == _EXPECTED_BUILTINS | _AGENT_FIVE
+        assert len(names) == 20
+        result = asyncio.run(session.submit("hello"))
+        assert result.status is TurnStatus.COMPLETED
+        assert adapter.last_request is not None
+        wire_names = {tool.name for tool in adapter.last_request.tools}
+        assert _AGENT_FIVE <= wire_names
     finally:
         session.close()
 

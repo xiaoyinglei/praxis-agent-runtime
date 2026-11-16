@@ -76,7 +76,6 @@ from praxis.core.permission import apply_update, command_network_verdict, extend
 from praxis.core.pipeline import SandboxCompiler, SandboxFinalizer
 from praxis.core.statemachine import TRANSITIONS, TurnStatus, transition
 from praxis.core.turn import (
-    ApprovalSummary,
     TurnDeps,
     TurnResult,
     TurnState,
@@ -89,6 +88,7 @@ from praxis.protocol.items import Item, ItemKind
 from praxis.protocol.json import JsonValue
 from praxis.protocol.models import CostMicros, ModelAdapter, ModelSettings, ModelToolCall, WireRequest
 from praxis.protocol.permission import (
+    ApprovalSummary,
     PermissionContext,
     PermissionNotice,
     PermissionUpdate,
@@ -120,6 +120,14 @@ _D9_NOTICE_TEXT = (
 )
 # R-T11-2:once 授权只在当前执行批生效(批末由 _execute 清除),披露必须如实标范围。
 _D9_ONCE_SUFFIX = " — this effect lasts only for the current execution batch (once grant)."
+
+# 阶段4 T6(㉖):read_only 子的 always 不落盘(共享父工作区,写父文件即泄漏)——
+# 授权只在子内存生效,披露必须如实标范围(与 D9 同通道;D9 安全披露优先返回)。
+_ALWAYS_MEMORY_ONLY_KIND = "always_memory_only"
+_ALWAYS_MEMORY_ONLY_TEXT = (
+    "this child session's always grant lives in memory only (child lifetime); "
+    "the parent workspace permissions.json is never modified"
+)
 
 
 class ConversationBusy(RuntimeError):  # noqa: N818 — 设计 §5.8/plan 钉死的名字
@@ -348,6 +356,7 @@ class Session:
         budget: Limits = UNLIMITED,
         unit_costs: CostMicros | None = None,
         child_session_factory: ChildSessionFactory | None = None,
+        persist_always: bool = True,
     ) -> None:
         self._store = store
         self._bus = bus
@@ -389,6 +398,10 @@ class Session:
         # 阶段4 T5:子 Session 工厂(composition 注入,内部仍调 build_session——
         # Session 构造唯一点不破)。None = 未装配(单测直构路径),spawn 明确拒绝。
         self._child_session_factory = child_session_factory
+        # 阶段4 T6(㉖):read_only 子共享父工作区——always 落盘会写父
+        # permissions.json(泄漏)。composition 对 read_only 子置 False:
+        # always 授权只在子内存生效(子 lifetime),经 PermissionNotice 披露。
+        self._persist_always = persist_always
         # T4 cancel 快速路径:_execute 持锁期间登记本进程执行 task 与归属 turn;
         # request_cancel 命中即注入取消("signalled"),否则仅落 item("queued")。
         self._active_task: asyncio.Task[Any] | None = None
@@ -509,6 +522,8 @@ class Session:
         折叠(非 live policy——后者还含 session 扩展,直 dump 会静默升级
         session→always),原子写 ``.praxis/permissions.json``——该文件即策略
         声明,composition 下次打开时按"显式参数 > 文件 > 默认"加载。
+        ㉖(T6):``persist_always=False``(read_only 子)时 always 只改内存,
+        绝不写共享的父文件;返回 ``always_memory_only`` 披露(D9 触发时 D9 优先)。
 
         D9 披露(阶段 2 留档② + R-T11-2):NetworkRule 以 session/always 落地后,
         若 live 的 ``command_network_verdict`` 为 deny(任何来源存在域过滤即
@@ -520,14 +535,21 @@ class Session:
         if isinstance(update.rule, NetworkRule) and update.destination == "once":
             once_flips_deny = command_network_verdict(self._permissions) != "deny"
         self._permissions = apply_update(self._permissions, update)
+        memory_only: PermissionNotice | None = None
         if update.destination == "always":
-            self._persist_policy()
+            if self._persist_always:
+                self._persist_policy()
+            else:
+                # ㉖:read_only 子不写父 permissions.json——内存生效+如实披露。
+                memory_only = PermissionNotice(
+                    kind=_ALWAYS_MEMORY_ONLY_KIND, text=_ALWAYS_MEMORY_ONLY_TEXT
+                )
         if isinstance(update.rule, NetworkRule) and command_network_verdict(self._permissions) == "deny":
             if update.destination in ("session", "always"):
                 return PermissionNotice(kind=_D9_NOTICE_KIND, text=_D9_NOTICE_TEXT)
             if update.destination == "once" and once_flips_deny:
                 return PermissionNotice(kind=_D9_NOTICE_KIND, text=_D9_NOTICE_TEXT + _D9_ONCE_SUFFIX)
-        return None
+        return memory_only
 
     def _persist_policy(self) -> None:
         """R13 落盘真值 = base 声明 ⊕ always_rules 顺序折叠;session/once 绝不上盘。

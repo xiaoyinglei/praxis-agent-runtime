@@ -54,7 +54,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 from praxis.core.budget import Admission, BudgetTracker, fold_turn_facts
 from praxis.core.compaction import (
@@ -73,6 +73,7 @@ from praxis.core.context import (
 from praxis.core.events import EventBus
 from praxis.core.pipeline import ExecCtx, SandboxCompiler, SandboxFinalizer, execute
 from praxis.core.statemachine import TurnStatus, transition
+from praxis.protocol.agents import ChildSummary
 from praxis.protocol.events import ModelOutputDelta, ModelResponseReceived, ModelRetried
 from praxis.protocol.hooks import HookSetup
 from praxis.protocol.items import Item, ItemKind
@@ -92,7 +93,7 @@ from praxis.protocol.models import (
     collect_events,
     usage_payload,
 )
-from praxis.protocol.permission import PermissionContext, PermissionNotice
+from praxis.protocol.permission import ApprovalSummary, PermissionContext, PermissionNotice
 from praxis.protocol.retry import (
     AttemptOutcome,
     AttemptRecord,
@@ -104,10 +105,6 @@ from praxis.protocol.skills import SkillCatalog
 from praxis.protocol.tools import ResultStatus, Tool, ToolCall, ToolResult
 from praxis.store.artifacts import ArtifactStore
 from praxis.store.log import ItemEntry, Store
-
-if TYPE_CHECKING:
-    # 仅注解依赖:runtime 不 import agents(agents 依赖本模块,避免循环)。
-    from praxis.core.agents import ChildSummary
 
 _CONTENT_PREVIEW_CHARS = 200
 _UNKNOWN_TOOL_ERROR_CODE = "unknown_tool"
@@ -181,16 +178,6 @@ class TurnState:
 # ---------------------------------------------------------------------------
 # 结果形状(无映射层,B15)
 # ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class ApprovalSummary:
-    """一条待批调用的人类可读摘要(源自 approval_request item,非第二事实源)。"""
-
-    call_id: str
-    tool_name: str
-    args_digest: str
-    effects: tuple[str, ...]
 
 
 @dataclass(frozen=True)

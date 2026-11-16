@@ -34,6 +34,10 @@ Task 20 扩展:web 宿主配置面 ``WebLimits``/``load_web_limits`` 与 provide
 阶段4 T3 扩展:预算限额面 ``Limits``/``UNLIMITED`` re-export——CLI 的
 ``run --max-*`` 构造 root limits、宿主装配 ``open_session(budget=...)``
 都只经 sdk,不直依 protocol 内部模块。
+阶段4 T6 扩展:子代理工具面 re-export——ChildHandle/ChildStatus/ChildSummary/
+ChildGrantError/ChildLimitError/SubagentSurface(protocol.agents 形状)、
+SubagentManager(core 编排面)与 create_agent_tools(五件套工厂,provider
+延迟绑定);宿主装配 ``open_session(enable_subagents=True)`` 即挂五工具。
 阶段4 T4 扩展:唯一清算协议面 ``UnresolvedCall``/``unclosed_windows``/
 ``close_unresolved`` re-export——宿主读取未决调用判据只经 sdk;cancel 面
 本身是 ``Session.request_cancel``(Session 已导出),CLI ``praxis cancel``
@@ -99,6 +103,7 @@ from praxis.composition import (
     resolve_declared_policy,
     validate_model_spec,
 )
+from praxis.core.agents import SubagentManager
 from praxis.core.compensation import UnresolvedCall, close_unresolved, unclosed_windows
 from praxis.core.events import Subscription
 from praxis.core.locks import ThreadBusy
@@ -106,7 +111,15 @@ from praxis.core.permission import apply_update
 from praxis.core.planning import latest_plan
 from praxis.core.session import ConversationBusy, ResumeNotConfirmed, Session
 from praxis.core.statemachine import TurnStatus
-from praxis.core.turn import ApprovalSummary, TurnResult
+from praxis.core.turn import TurnResult
+from praxis.protocol.agents import (
+    ChildGrantError,
+    ChildHandle,
+    ChildLimitError,
+    ChildStatus,
+    ChildSummary,
+    SubagentSurface,
+)
 from praxis.protocol.budget import UNLIMITED, Limits
 from praxis.protocol.items import Item, ItemKind
 from praxis.protocol.models import (
@@ -121,7 +134,7 @@ from praxis.protocol.models import (
     Usage,
     assemble_model_events,
 )
-from praxis.protocol.permission import PermissionMode, PermissionNotice, PermissionUpdate
+from praxis.protocol.permission import ApprovalSummary, PermissionMode, PermissionNotice, PermissionUpdate
 from praxis.protocol.plan import PlanSnapshot
 from praxis.protocol.policy import NetworkRule, PathRule, PermissionPolicy, ToolRule
 from praxis.protocol.skills import SkillCatalog, SkillManifest
@@ -129,6 +142,7 @@ from praxis.protocol.tools import ToolSource
 from praxis.store.artifacts import ArtifactStore
 from praxis.store.turns import Turn
 from praxis.store.verify import VerifyReport
+from praxis.tools.builtins.agent_tools import create_agent_tools
 from praxis.tools.builtins.skills import load_skill_catalog
 
 open_session = build_session
@@ -137,6 +151,11 @@ __all__ = [
     "API_KEY_ENV_NAME",
     "ApprovalSummary",
     "ArtifactStore",
+    "ChildGrantError",
+    "ChildHandle",
+    "ChildLimitError",
+    "ChildStatus",
+    "ChildSummary",
     "ConfigVersionConflict",
     "ConnectionEntry",
     "ConversationBusy",
@@ -176,6 +195,8 @@ __all__ = [
     "SkillCatalog",
     "SkillManifest",
     "StdioServerConfig",
+    "SubagentManager",
+    "SubagentSurface",
     "Subscription",
     "ThreadBusy",
     "ToolRule",
@@ -193,6 +214,7 @@ __all__ = [
     "assemble_model_events",
     "close_unresolved",
     "connect_mcp_servers",
+    "create_agent_tools",
     "credential_source",
     "decide_mcp_config_trust",
     "delete_web_search_credential",

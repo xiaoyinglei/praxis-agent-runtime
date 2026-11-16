@@ -33,6 +33,17 @@ children 注册表 = child_allocation items 折叠(无表列);TurnResult 尾部�
 
 core 纯度:子 Session 工厂经 composition 注入(Session.child_session_factory),
 本模块不 import composition/adapters;provisioner 只认识 protocol 结构签名。
+
+阶段4 T6 收口:
+- 数据形状(ChildHandle/ChildStatus/ChildSummary/ChildGrantError/
+  ChildLimitError/AGENT_TOOL_NAMES)迁居 protocol.agents(工具面协议签名
+  需要它们,tools 不 import core);本模块原样 re-export,既有调用方零改动。
+- R-T5-7:并发/总数 guard 按 **session 全家族**计(旧 check_child_limits
+  parity):折叠父 turn 根血统下所有 child_allocation(跨 turn/跨 thread),
+  不是 per-turn;depth 仍按血统参数。
+- ㉒:driver 收尾 shield——teardown 窗口内再来 cancel 不打断子 Session
+  关闭(Store 写者线程必须收敛);manager.aclose 经 composition 挂进
+  Session 收尾链(integrations)。
 """
 
 from __future__ import annotations
@@ -44,12 +55,21 @@ import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Final, Protocol
 from uuid import uuid4
 
 from praxis.core.budget import build_tree, fold_turn_facts, remaining
 from praxis.core.statemachine import TRANSITIONS, TurnStatus
-from praxis.core.turn import ApprovalSummary, pending_approval_summaries
+from praxis.core.turn import pending_approval_summaries
+from praxis.protocol.agents import (
+    AGENT_TOOL_NAMES,
+    ChildGrantError,
+    ChildHandle,
+    ChildLimitError,
+    ChildStateLabel,
+    ChildStatus,
+    ChildSummary,
+)
 from praxis.protocol.budget import (
     SUBAGENT_LIMITS_DEFAULT,
     Limits,
@@ -61,17 +81,12 @@ from praxis.protocol.json import JsonValue
 from praxis.protocol.tools import Tool
 from praxis.protocol.workspaces import ChildWorkspaceProvisioner, WorkspaceMode
 from praxis.store.log import ItemEntry, Store, append_items_tx
-from praxis.store.turns import create_turn_tx, get_turn
+from praxis.store.turns import create_turn_tx, get_turn, list_turns
 
 if TYPE_CHECKING:
     from praxis.core.session import Session
 
 logger = logging.getLogger(__name__)
-
-# 子代理状态标签(wait/children_summary 共用):completed/failed 都表达
-# "不再消耗",但 failed 保留独立标签供上层区分结局(与 ChildState 的 done
-# 折叠不同——展示面不合并失败)。
-type ChildStateLabel = Literal["running", "done", "paused", "interrupted", "cancelled", "failed"]
 
 _STATUS_TO_LABEL: Final[Mapping[str, ChildStateLabel]] = {
     "running": "running",
@@ -81,72 +96,6 @@ _STATUS_TO_LABEL: Final[Mapping[str, ChildStateLabel]] = {
     "failed": "failed",
     "cancelled": "cancelled",
 }
-
-# T6 模型工具面五件套的名字常量(本任务先行定义:子工具表 = 父表减这五件,
-# depth 结构门——孙代即使谎报 depth 也拿不到 spawn 工具)。
-AGENT_TOOL_NAMES: Final[frozenset[str]] = frozenset(
-    {
-        "spawn_subagent",
-        "wait_subagent",
-        "send_to_subagent",
-        "cancel_subagent",
-        "integrate_child_workspace",
-    }
-)
-
-
-class ChildGrantError(RuntimeError):  # noqa: N818 — 计划钉死的名字
-    """份额公式算出的 grant 在有界维 ≤ 0:父该维已耗尽,拒绝 spawn(B2)。"""
-
-    def __init__(self, reason: str) -> None:
-        self.reason = reason
-        super().__init__(reason)
-
-
-class ChildLimitError(RuntimeError):  # noqa: N818 — 与 ChildGrantError 同族
-    """并发/总数/深度/父终态 guard 拒绝(T6 映射 child_limit_reached 错误码)。"""
-
-    def __init__(self, reason: str) -> None:
-        self.reason = reason
-        super().__init__(reason)
-
-
-@dataclass(frozen=True, slots=True)
-class ChildHandle:
-    """spawn 的返回身份:注册表 item 与子根 turn 的互指键 + 工作区事实。"""
-
-    child_thread_id: str
-    child_root_turn_id: str
-    allocation_id: str
-    workspace: Path
-    workspace_mode: WorkspaceMode
-    grant: Limits
-
-
-@dataclass(frozen=True, slots=True)
-class ChildStatus:
-    """wait 的如实展示面:子的状态/结论/待批/未知调用/已用步数与成本。
-
-    paused/interrupted 可见但不代批(Q3 直面裁决:人类对子 session 各自
-    resume/confirm,父不替子审批)。
-    """
-
-    state: ChildStateLabel
-    conclusion: str
-    pending_approvals: tuple[ApprovalSummary, ...]
-    unknown_calls: tuple[str, ...]
-    steps_used: int
-    cost_used: int
-    workspace: str
-
-
-@dataclass(frozen=True, slots=True)
-class ChildSummary:
-    """TurnResult.children_summary 的一条注记:父 turn 结束时子的状态快照。"""
-
-    child_thread_id: str
-    child_root_turn_id: str
-    state: ChildStateLabel
 
 
 class ChildSessionFactory(Protocol):
@@ -231,6 +180,47 @@ def _child_is_active(store: Store, ref: _AllocationRef) -> bool:
     if turn is None:
         return True
     return bool(TRANSITIONS[TurnStatus(turn.status)])
+
+
+def _family_allocations(store: Store, parent_thread_id: str) -> tuple[_AllocationRef, ...]:
+    """本 session 根血统下的全部 child_allocation(跨 turn/跨 thread;R-T5-7)。
+
+    旧 ``check_child_limits``(subagents.py:41-72)的家族语义 + 控制器裁决的
+    session 全家族口径:全库 allocation 折叠成 child_root_turn → parent_turn
+    边表;以父 thread 的**全部 turn**为种子(顶层 session 的每个 turn 都是
+    家族根——跨 turn spawn 不重置份额),各自上溯到根血统顶端(父自身是子
+    时到达根 session,兄弟同样占份额),再逐层展开家族后代。max_total 计
+    家族全部后代(累计,含已终态),max_concurrent 计其中 active。畸形数据
+    成环时上溯 visited 守卫终止(fail-safe,不 infinite loop)。
+    """
+    edges: dict[str, str] = {}
+    refs: dict[str, _AllocationRef] = {}
+    for thread_id in store.list_threads():
+        for item in store.read_items(thread_id):
+            if item.kind != ItemKind.CHILD_ALLOCATION:
+                continue
+            ref = _parse_ref(item)
+            if ref is None:
+                continue
+            edges[ref.child_root_turn_id] = ref.parent_turn_id
+            refs[ref.child_root_turn_id] = ref
+    roots: set[str] = set()
+    for turn in list_turns(store, thread_id=parent_thread_id):
+        root = turn.turn_id
+        visited = {root}
+        while root in edges:
+            root = edges[root]
+            if root in visited:
+                break
+            visited.add(root)
+        roots.add(root)
+    family = set(roots)
+    while True:
+        expanded = family | {child for child, parent in edges.items() if parent in family}
+        if expanded == family:
+            break
+        family = expanded
+    return tuple(ref for turn_id, ref in refs.items() if turn_id in family and turn_id not in roots)
 
 
 # ---------------------------------------------------------------------------
@@ -381,12 +371,14 @@ class SubagentManager:
             raise ChildLimitError(
                 f"subagent depth limit exceeded (max_depth={self._limits['max_depth']})"
             )
-        refs = _allocation_refs(self._store.read_items(self.parent.thread_id), parent_turn_id)
-        if len(refs) >= self._limits["max_total"]:
+        # R-T5-7:全家族口径(跨 turn)——父逐 turn spawn 仍受同一 max_total/
+        # max_concurrent 约束;per-turn 计数会让每 turn 重置份额(旧 parity 病灶)。
+        family = _family_allocations(self._store, self.parent.thread_id)
+        if len(family) >= self._limits["max_total"]:
             raise ChildLimitError(
                 f"subagent total count limit exceeded (max_total={self._limits['max_total']})"
             )
-        active = sum(1 for ref in refs if _child_is_active(self._store, ref))
+        active = sum(1 for ref in family if _child_is_active(self._store, ref))
         if active >= self._limits["max_concurrent"]:
             raise ChildLimitError(
                 f"subagent concurrent limit exceeded (max_concurrent={self._limits['max_concurrent']})"
@@ -514,16 +506,30 @@ class SubagentManager:
         turn 级失败已由 run_turn 错误边界收敛为 FAILED;这里只兜装配级异常。
         子 Session 的 Store 是独立实例(同库文件),driver 结束即关闭——
         不留写者线程孤儿;wait/send 经 manager 的 store 重建事实。
+
+        ㉒ 收尾竞态承重:teardown 经 shield 独立 task 执行——request_cancel/
+        aclose 读 RUNNING 后子恰终结时,后续 cancel 落在 teardown 窗口也不
+        打断子 Session 关闭(否则 Store 写者线程成孤儿)。driver 在 teardown
+        完成前绝不结束;期间收到的 cancel 记下来,收尾完成后重抛保持 task
+        的 cancelled 结局。manager.aclose 的 gather 因此等到完整收敛。
         """
         try:
             await session.submit(text, turn_id=root_turn_id)
         except Exception:  # noqa: BLE001 — driver 边界:不上抛,只记日志
             logger.exception("child driver for turn %s failed", root_turn_id)
         finally:
-            try:
-                await session.aclose()
-            except Exception:  # noqa: BLE001 — 收尾容忍(与 Session._close_runtime 同语义)
-                logger.warning("child session teardown failed", exc_info=True)
+            closer = asyncio.ensure_future(session.aclose())
+            cancelled = False
+            while not closer.done():
+                try:
+                    await asyncio.shield(closer)
+                except asyncio.CancelledError:
+                    cancelled = True
+                except Exception:  # noqa: BLE001 — 收尾容忍(与 Session._close_runtime 同语义)
+                    logger.warning("child session teardown failed", exc_info=True)
+                    break
+            if cancelled:
+                raise asyncio.CancelledError
 
     # -- wait/send/request_cancel ----------------------------------------------
 
@@ -556,6 +562,10 @@ class SubagentManager:
         与 Session.request_cancel 同语义:本进程 driver 正在执行该子 →
         注入取消("signalled");否则仅落 item("queued",子执行者步边界收敛)。
         终态子抛 ValueError;不取执行锁、不写 turn 状态。
+
+        ㉒ 窄竞态(读 RUNNING 后子恰终结):cancel 可能落在 driver 的
+        teardown 窗口——_drive 的 shield 收尾保证子 Session 关闭不被打断,
+        这里无需取锁复查(复查本身也是 TOCTOU)。
         """
         ref = self._ref_for(child_thread_id)
         turn = get_turn(self._store, ref.child_root_turn_id)
