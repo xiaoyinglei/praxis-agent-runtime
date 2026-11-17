@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +30,7 @@ from typer.testing import CliRunner
 from praxis.adapters.models.scripted import ScriptedAdapter
 from praxis.core import permission
 from praxis.core.events import EventBus
-from praxis.core.memory import JOB_KEY, STATE_KEY, initial_state
+from praxis.core.memory import JOB_KEY, LEASE_KEY, STATE_KEY, initial_state
 from praxis.core.statemachine import TurnStatus, transition
 from praxis.interfaces.cli import app
 from praxis.interfaces.cli import main as cli_main
@@ -210,6 +211,60 @@ def test_status_running_job_with_unclosed_window_is_in_flight(workspace: Path) -
     assert human.exit_code == 0, human.output
     assert "in transit" in human.output
     assert "praxis.sqlite" not in human.output  # 内容在 DB,status 不打印库路径
+
+
+def _seed_lease(workspace: Path, expires_at: float) -> None:
+    store = Store(_db(workspace))
+    try:
+        store.transact(
+            lambda conn: cas_put_metadata(
+                conn, LEASE_KEY, None, json.dumps({"owner": "w", "lease_id": "l", "expires_at": expires_at})
+            )
+        )
+    finally:
+        store.close()
+
+
+def test_status_in_flight_active_lease_says_worker_active(workspace: Path) -> None:
+    """T13-81:租约未过期(worker 可能仍活)→ 不过度声明 takeover。"""
+    _seed_state(workspace, _state())
+    _seed_unclosed_turn(workspace)
+    _seed_job(workspace, {"status": "running", "turn_ids": ["turn-inflight"]})
+    _seed_lease(workspace, time.time() + 300.0)  # 活租约
+
+    data = _status_json(workspace)
+    assert data["job"]["in_flight"] is True
+    assert data["job"]["lease_active"] is True
+    human = _invoke("memory", "status", "--workspace", str(workspace))
+    assert "worker active" in human.output
+    assert "awaiting lease takeover" not in human.output
+
+
+def test_status_in_flight_expired_lease_says_awaiting_takeover(workspace: Path) -> None:
+    """T13-81:租约已过期 → awaiting lease takeover(原行为保留)。"""
+    _seed_state(workspace, _state())
+    _seed_unclosed_turn(workspace)
+    _seed_job(workspace, {"status": "running", "turn_ids": ["turn-inflight"]})
+    _seed_lease(workspace, time.time() - 1.0)  # 过期租约
+
+    data = _status_json(workspace)
+    assert data["job"]["in_flight"] is True
+    assert data["job"]["lease_active"] is False
+    human = _invoke("memory", "status", "--workspace", str(workspace))
+    assert "awaiting lease takeover" in human.output
+    assert "worker active" not in human.output
+
+
+def test_status_in_flight_no_lease_says_awaiting_takeover(workspace: Path) -> None:
+    """T13-81:无租约(进程从未 claim 或已释放)→ awaiting takeover。"""
+    _seed_state(workspace, _state())
+    _seed_unclosed_turn(workspace)
+    _seed_job(workspace, {"status": "running", "turn_ids": ["turn-inflight"]})
+
+    data = _status_json(workspace)
+    assert data["job"]["lease_active"] is False
+    human = _invoke("memory", "status", "--workspace", str(workspace))
+    assert "awaiting lease takeover" in human.output
 
 
 def test_status_running_job_without_unresolved_work_is_not_in_flight(workspace: Path) -> None:

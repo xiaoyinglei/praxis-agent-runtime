@@ -132,6 +132,7 @@ def _status_payload(view: MemoryStatusView) -> dict[str, Any]:
         "job": {
             "status": job.status,
             "in_flight": job.in_flight,
+            "lease_active": job.lease_active,
             "turn_ids": list(job.turn_ids),
             "retry_after": job.retry_after,
             "error_type": job.error_type,
@@ -155,11 +156,12 @@ def _print_status(view: MemoryStatusView) -> None:
     line = f"job: {job.status}"
     if job.status in ("running", "needs_reconciliation"):
         # run_update 只读判定:B4 在途 = 未终态 turn 或未闭合事实窗口。
-        line += (
-            " (in transit — awaiting lease takeover; unresolved maintenance turns)"
-            if job.in_flight
-            else " (no in-flight maintenance work)"
-        )
+        # T13-81:租约未过期 = worker 可能仍活,不过度声明 takeover。
+        if job.in_flight:
+            transit = "worker active" if job.lease_active else "awaiting lease takeover"
+            line += f" (in transit — {transit}; unresolved maintenance turns)"
+        else:
+            line += " (no in-flight maintenance work)"
     typer.echo(line)
     if job.source_thread is not None:
         typer.echo(f"  source: {job.source_thread}")

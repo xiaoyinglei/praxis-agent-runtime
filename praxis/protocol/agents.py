@@ -13,12 +13,13 @@ import core。core.agents 原样 re-export,既有调用方零改动。
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, Literal, Protocol
+from typing import Final, Literal, Protocol, cast
 
 from praxis.protocol.budget import Limits
+from praxis.protocol.json import JsonValue
 from praxis.protocol.permission import ApprovalSummary
 from praxis.protocol.workspaces import ApplyResult, WorkspaceInspection, WorkspaceMode
 
@@ -143,3 +144,79 @@ class SubagentSurface(Protocol):
 
 # 延迟绑定 provider:composition 的 manager_holder 闭包(工具表先于 manager 装配)。
 type SurfaceProvider = Callable[[], SubagentSurface]
+
+
+# ---------------------------------------------------------------------------
+# 子装配身份(R-FINAL-C1:跨 resume 存活的装配事实,钉进子根 turn binding)
+# ---------------------------------------------------------------------------
+
+# binding 里子装配身份的唯一键名(spawn 写端 / resume 读端共用,不另写第二份)。
+CHILD_ASSEMBLY_KEY: Final = "child_assembly"
+
+
+@dataclass(frozen=True, slots=True)
+class ChildAssembly:
+    """子 Session 的装配身份读形(R-FINAL-C1)。
+
+    spawn 时把这些事实钉进子根 turn binding,使跨进程/CLI 的裸 resume 能经
+    build_child_session 等价装配重建子身份——而不只是同实例 resume 才存活:
+    - ``workspace_mode``:read_only 收窄(ceiling/persist_always)的判据;
+    - ``workspace``:子工作区根绝对路径(read_only=父工作区,write=独立 worktree);
+    - ``parent_db_path``:父库文件绝对路径(同库纪律的路由出口——write 子从
+      自身工作区 resume 时 Store 仍指向父库,绝不新建空库);
+    - ``parent_workspace``:父工作区根绝对路径(策略声明来源/发现面)。
+    """
+
+    workspace_mode: WorkspaceMode
+    workspace: str
+    parent_db_path: str
+    parent_workspace: str
+
+
+def child_assembly_payload(
+    *,
+    workspace_mode: WorkspaceMode,
+    workspace: str,
+    parent_db_path: str,
+    parent_workspace: str,
+) -> dict[str, JsonValue]:
+    """子装配身份的唯一拼装助手(spawn 写端;键常量同模块,规则 26 同纪律)。"""
+    return {
+        "workspace_mode": workspace_mode,
+        "workspace": workspace,
+        "parent_db_path": parent_db_path,
+        "parent_workspace": parent_workspace,
+    }
+
+
+def child_assembly_from_binding(binding: Mapping[str, JsonValue]) -> ChildAssembly | None:
+    """从 turn binding 读子装配身份;缺键/畸形一律 None(fail-open 读端)。
+
+    None = 这不是子根 turn(普通 root turn 或历史 turn)——resume 走既有
+    root 装配,零扰动。四字段必须全是非空 str 且 workspace_mode 合法,否则
+    视为畸形 None(绝不拿半份身份重建出一个错装配的子)。
+    """
+    raw = binding.get(CHILD_ASSEMBLY_KEY)
+    if not isinstance(raw, Mapping):
+        return None
+    mode = raw.get("workspace_mode")
+    workspace = raw.get("workspace")
+    parent_db_path = raw.get("parent_db_path")
+    parent_workspace = raw.get("parent_workspace")
+    if (
+        not isinstance(mode, str)
+        or mode not in ("read_only", "write")
+        or not isinstance(workspace, str)
+        or not workspace
+        or not isinstance(parent_db_path, str)
+        or not parent_db_path
+        or not isinstance(parent_workspace, str)
+        or not parent_workspace
+    ):
+        return None
+    return ChildAssembly(
+        workspace_mode=cast("WorkspaceMode", mode),
+        workspace=workspace,
+        parent_db_path=parent_db_path,
+        parent_workspace=parent_workspace,
+    )

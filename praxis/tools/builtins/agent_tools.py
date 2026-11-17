@@ -404,6 +404,9 @@ def create_agent_tools(surface_provider: SurfaceProvider) -> tuple[Tool, ...]:
                     lines.append(
                         f"  {path}  {_sha_display(pre)} -> {_sha_display(post)}"
                     )
+                # M1:symlink 指向披露给审批人(untracked symlink 不进 diff 预览)。
+                for path, target in sorted(inspection.symlink_targets.items()):
+                    lines.append(f"  symlink {path} -> {target}")
                 flag = (
                     f"truncated at {DIFF_PREVIEW_LIMIT_BYTES} bytes"
                     if inspection.diff_truncated
@@ -423,6 +426,7 @@ def create_agent_tools(surface_provider: SurfaceProvider) -> tuple[Tool, ...]:
                         "diff_preview": inspection.diff_preview,
                         "diff_truncated": inspection.diff_truncated,
                         "diff_bytes": inspection.diff_bytes,
+                        "symlink_targets": dict(inspection.symlink_targets),
                     },
                 )
             if action == "apply":

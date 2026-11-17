@@ -63,6 +63,7 @@ from praxis.core.statemachine import TRANSITIONS, TurnStatus
 from praxis.core.turn import pending_approval_summaries
 from praxis.protocol.agents import (
     AGENT_TOOL_NAMES,
+    CHILD_ASSEMBLY_KEY,
     ChildActiveError,
     ChildGrantError,
     ChildHandle,
@@ -70,6 +71,7 @@ from praxis.protocol.agents import (
     ChildStateLabel,
     ChildStatus,
     ChildSummary,
+    child_assembly_payload,
 )
 from praxis.protocol.budget import (
     ALLOCATION_SOURCES,
@@ -493,6 +495,15 @@ class SubagentManager:
             "root_turn_id": child_root_turn_id,
             "depth": depth + 1,
         }
+        # R-FINAL-C1:子装配身份钉进子根 turn binding——跨进程/CLI 裸 resume
+        # 经 build_child_session 等价装配重建子身份(ceiling/persist_always/
+        # db_path 路由)的唯一事实源。绝对路径化:resume 侧不依赖打开时 cwd。
+        binding[CHILD_ASSEMBLY_KEY] = child_assembly_payload(
+            workspace_mode=workspace_mode,
+            workspace=str(Path(child_workspace).resolve()),
+            parent_db_path=str(Path(self.parent.store.db_path).resolve()),
+            parent_workspace=str(Path(self.parent.workspace).resolve()),
+        )
         if source == "memory":
             binding["memory_maintenance"] = True
             binding["maintenance_purpose"] = maintenance_purpose

@@ -137,6 +137,14 @@ _ALWAYS_MEMORY_ONLY_TEXT = (
     "the parent workspace permissions.json is never modified"
 )
 
+# M3:审批暂停的 turn 仅补预算续跑(extend-only)时,待批调用会按清算矩阵转
+# not_executed(方向安全但出乎意料)——如实披露,提示人类改用 approval 决策。
+_EXTEND_SETTLES_PENDING_KIND = "extend_settles_pending"
+_EXTEND_SETTLES_PENDING_TEXT = (
+    "extending budget on an approval-paused turn settles pending approvals as not_executed; "
+    "pass approval (allow/deny) to decide them instead"
+)
+
 
 class ConversationBusy(RuntimeError):  # noqa: N818 — 设计 §5.8/plan 钉死的名字
     """该 thread 的执行锁被另一执行者持有:submit/resume 拒绝排队(§5.8)。"""
@@ -684,6 +692,11 @@ class Session:
             budget_payload = limits_payload(self._budget)
             if budget_payload:
                 binding["budget"] = budget_payload
+            # R-FINAL-I2:memory 启用态钉进 binding——跨进程 resume 经 composition
+            # 读回重建 MemoryDriver(导航 + 终态入队),不依赖 CLI 重传旗标。
+            # 仅 True 写键(默认 False 历史 turn 形状零扰动)。
+            if self._memory is not None:
+                binding["enable_memory"] = True
             create_turn(
                 self._store,
                 turn_id=turn_id,
@@ -758,6 +771,15 @@ class Session:
         # 建议落地先纯代数预验(R11:非法 grant 在 transition 之前抛,零写入)。
         self._validate_permission_updates(permission_updates)
 
+        # M3:extend-only 续跑审批暂停 turn → 待批项将被清算 not_executed,如实披露。
+        extend_settles_notice: PermissionNotice | None = None
+        if status is TurnStatus.PAUSED and extend and not approval and not reconcile:
+            probe = self._store.read_turn_items(turn_id)
+            if pending_approval_summaries(probe, policy_revision=self._permissions.policy.revision):
+                extend_settles_notice = PermissionNotice(
+                    kind=_EXTEND_SETTLES_PENDING_KIND, text=_EXTEND_SETTLES_PENDING_TEXT
+                )
+
         transition(
             self._store,
             self._bus,
@@ -768,6 +790,8 @@ class Session:
         # 授权先于 approval_decision 落笔:decision 必须 stamp 更新后的 revision,
         # 否则重入按 revision 绑定判旧批准作废,刚批准的动作会被 re-ask。
         notices = self._apply_permission_updates(permission_updates)
+        if extend_settles_notice is not None:
+            notices = (extend_settles_notice, *notices)
         # reconcile 先写(对账是给"已有 tool_call 无结果"的调用一个结论);
         # approval 写决策,digest 一律取自匹配的 approval_request item(摘要绑定)。
         if reconcile:

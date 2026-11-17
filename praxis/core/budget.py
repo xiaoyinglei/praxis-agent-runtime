@@ -24,6 +24,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Final, Literal
 
+from praxis.core.compensation import unclosed_windows
+from praxis.core.context import pair_tool_results
 from praxis.protocol.budget import Limits, limits_from_payload
 from praxis.protocol.items import Item, ItemKind
 from praxis.protocol.json import JsonValue
@@ -221,9 +223,9 @@ def fold_turn_facts(items: Sequence[Item], *, unit_costs: CostMicros | None) -> 
     消费面)。
 
     **web 保守面**:web ``tool_call`` 已落库(= reserve-before-IO:dispatch 前
-    写入),但全 turn 找不到同 call_id 的 ``tool_result`` ⇒ dispatch 后中断,
-    保守记 1(旧 ``agent_runtime/harness/budget_ops.py:284-322`` reserve 语义的
-    parity;禁止 import)。有结果时按结果 status 计费,不重复计。
+    写入),但其声明窗口没有配对 ``tool_result`` ⇒ dispatch 后中断,保守记 1
+    (旧 ``agent_runtime/harness/budget_ops.py:284-322`` reserve 语义的 parity;
+    禁止 import)。有结果时按结果 status 计费,不重复计。窗口归属见下条。
 
     **web 拒绝豁免(T15)**:``error_code == WEB_REQUEST_BUDGET_EXCEEDED`` 的
     结果是 dispatch 前预算拒绝(管道 gate 自产,零网络 IO),与 denied /
@@ -233,93 +235,39 @@ def fold_turn_facts(items: Sequence[Item], *, unit_costs: CostMicros | None) -> 
     tokenization ``source="estimated"`` 照单计入:事实来自 provider 的估算帧,
     来源标签不改记账。``unit_costs`` 为 None 时 cost 维只能是 0(有 cost 限额的
     turn 由 ``admit_dispatch`` fail-closed 挡在 dispatch 之前)。
-    """
-    # 第一遍:收集所有 tool_result 的 call_id(任意 status),供 web tool_call 配对。
-    result_call_ids: set[str] = set()
-    for item in items:
-        if item.kind != ItemKind.TOOL_RESULT:
-            continue
-        call_id = item.payload.get("call_id")
-        if isinstance(call_id, str):
-            result_call_ids.add(call_id)
 
+    **web/browser 窗口化(R-FINAL-I1)**:计费按 ``pair_tool_results`` 的声明
+    窗口键 ``(turn_id, 声明 seq, call_id)`` 归属——B31 真实 provider 每轮重编号
+    call_0,跨窗复用同一裸 call_id 不再互相去重(每声明窗口计一次)。未配对
+    tool_call 的保守计数经 ``unclosed_windows``(同一 pair 判据)按窗口计;
+    无声明的遗留 tool_call(旧日志/外部写入)保留裸 call_id 去重的保守面。
+    """
     tokens = 0
     cost_micros = 0
     steps = 0
-    web_requests = 0
-    browser_requests = 0
-    counted_web_calls: set[str] = set()
-    counted_browser_calls: set[str] = set()
-    unpaired_web_calls: set[str] = set()
-
     for item in items:
-        if item.kind in (ItemKind.MODEL_RESPONSE, ItemKind.SUMMARY):
-            component = _usage_component(item.payload)
-            if component is not None:
-                input_tokens, output_tokens, cached_input_tokens = component
-                # input/output 已各自包含 cache/reasoning 子集,总量不重复相加。
-                tokens += input_tokens + output_tokens
-                if unit_costs is not None:
-                    cost_micros += estimate_cost(
-                        Usage(
-                            input_tokens=input_tokens,
-                            output_tokens=output_tokens,
-                            cached_input_tokens=cached_input_tokens,
-                        ),
-                        unit_costs,
-                    )
-            if item.kind == ItemKind.MODEL_RESPONSE:
-                raw_calls = item.payload.get("tool_calls")
-                if isinstance(raw_calls, (list, tuple)) and len(raw_calls) > 0:
-                    steps += 1
+        if item.kind not in (ItemKind.MODEL_RESPONSE, ItemKind.SUMMARY):
             continue
+        component = _usage_component(item.payload)
+        if component is not None:
+            input_tokens, output_tokens, cached_input_tokens = component
+            # input/output 已各自包含 cache/reasoning 子集,总量不重复相加。
+            tokens += input_tokens + output_tokens
+            if unit_costs is not None:
+                cost_micros += estimate_cost(
+                    Usage(
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        cached_input_tokens=cached_input_tokens,
+                    ),
+                    unit_costs,
+                )
+        if item.kind == ItemKind.MODEL_RESPONSE:
+            raw_calls = item.payload.get("tool_calls")
+            if isinstance(raw_calls, (list, tuple)) and len(raw_calls) > 0:
+                steps += 1
 
-        if item.kind == ItemKind.TOOL_RESULT:
-            tool_name = item.payload.get("tool_name")
-            status = item.payload.get("status")
-            if (
-                not isinstance(tool_name, str)
-                or tool_name not in WEB_TOOL_NAMES
-                or not isinstance(status, str)
-                or status not in _BILLABLE_WEB_STATUSES
-                # T15:dispatch 前预算拒绝零 IO,不占配额(见 docstring)。
-                or item.payload.get("error_code") == WEB_REQUEST_BUDGET_EXCEEDED
-            ):
-                continue
-            call_id = item.payload.get("call_id")
-            if isinstance(call_id, str):
-                if call_id in counted_web_calls:
-                    continue
-                counted_web_calls.add(call_id)
-            web_requests += 1
-            metadata = item.payload.get("metadata")
-            if isinstance(metadata, Mapping) and metadata.get("browser_render") is True:
-                if isinstance(call_id, str):
-                    if call_id not in counted_browser_calls:
-                        counted_browser_calls.add(call_id)
-                        browser_requests += 1
-                else:
-                    browser_requests += 1
-            continue
-
-        if item.kind == ItemKind.TOOL_CALL:
-            tool_name = item.payload.get("tool_name")
-            if not isinstance(tool_name, str) or tool_name not in WEB_TOOL_NAMES:
-                continue
-            call_id = item.payload.get("call_id")
-            if not isinstance(call_id, str):
-                # 无 call_id 的 web 调用无法证明有结果:保守计一次。
-                web_requests += 1
-                continue
-            if (
-                call_id in result_call_ids
-                or call_id in counted_web_calls
-                or call_id in unpaired_web_calls
-            ):
-                continue
-            unpaired_web_calls.add(call_id)
-            web_requests += 1
-
+    web_requests, browser_requests = _web_browser_facts(items)
     return UsageFacts(
         tokens=tokens,
         cost_micros=cost_micros,
@@ -327,6 +275,97 @@ def fold_turn_facts(items: Sequence[Item], *, unit_costs: CostMicros | None) -> 
         web_requests=web_requests,
         browser_requests=browser_requests,
     )
+
+
+def _billable_web_result(item: Item) -> bool:
+    """一条 tool_result 是否证明 web 请求已占用配额(T15 预算拒绝豁免同口径)。"""
+    tool_name = item.payload.get("tool_name")
+    status = item.payload.get("status")
+    return (
+        isinstance(tool_name, str)
+        and tool_name in WEB_TOOL_NAMES
+        and isinstance(status, str)
+        and status in _BILLABLE_WEB_STATUSES
+        and item.payload.get("error_code") != WEB_REQUEST_BUDGET_EXCEEDED
+    )
+
+
+def _browser_render(item: Item) -> bool:
+    metadata = item.payload.get("metadata")
+    return isinstance(metadata, Mapping) and metadata.get("browser_render") is True
+
+
+def _web_browser_facts(items: Sequence[Item]) -> tuple[int, int]:
+    """web/browser 两维的窗口化折叠(R-FINAL-I1;唯一判据 pair_tool_results)。
+
+    四个来源,互不重复:
+    1. 已配对声明窗口的最新结果(pair_tool_results.paired)——每窗口计一次;
+    2. 孤儿结果(无声明,旧日志/外部写入)——最新 seq 胜,每 call_id 计一次;
+    3. 无 call_id 的结果(pair 不承认)——逐条保守计(旧 parity);
+    4. 未配对 tool_call 保守面:已声明窗口经 unclosed_windows(started)按窗口计;
+       无声明的遗留 tool_call 按裸 call_id 去重计(有孤儿结果则让位给来源 2)。
+    browser 维只从结果 metadata.browser_render 取(保守面无旗标不计,T2-⑦ 台账)。
+    """
+    paired, orphans = pair_tool_results(items)
+    by_seq = {item.seq: item for item in items}
+    web = 0
+    browser = 0
+    # 1. 已配对窗口:每声明窗口计一次(跨窗复用 call_id 不互相去重)。
+    for _key, (_seq, position) in paired.items():
+        result = items[position]
+        if _billable_web_result(result):
+            web += 1
+            if _browser_render(result):
+                browser += 1
+    # 2. 孤儿结果:最新 seq 胜(pair_tool_results 已去重),每 call_id 计一次。
+    orphan_call_ids: set[str] = set()
+    for _turn_id, seq, orphan_id in orphans:
+        orphan_call_ids.add(orphan_id)
+        orphan_item = by_seq.get(seq)
+        if orphan_item is not None and _billable_web_result(orphan_item):
+            web += 1
+            if _browser_render(orphan_item):
+                browser += 1
+    # 3. 无 call_id 的结果:pair 不承认,逐条保守计(旧 parity)。
+    for item in items:
+        if item.kind != ItemKind.TOOL_RESULT or isinstance(item.payload.get("call_id"), str):
+            continue
+        if _billable_web_result(item):
+            web += 1
+            if _browser_render(item):
+                browser += 1
+    # 4a. 已声明但未闭合且 started 的窗口:保守计一次(unclosed_windows 同 pair 判据)。
+    declared_call_ids: set[str] = set()
+    for item in items:
+        if item.kind != ItemKind.MODEL_RESPONSE:
+            continue
+        raw_calls = item.payload.get("tool_calls")
+        if isinstance(raw_calls, (list, tuple)):
+            for entry in raw_calls:
+                if isinstance(entry, Mapping):
+                    declared_id = entry.get("call_id")
+                    if isinstance(declared_id, str):
+                        declared_call_ids.add(declared_id)
+    for unresolved in unclosed_windows(items, {}):
+        if unresolved.started and unresolved.call.name in WEB_TOOL_NAMES:
+            web += 1
+    # 4b. 无声明的遗留 tool_call:裸 call_id 去重保守计(有孤儿结果则让位)。
+    seen_legacy: set[str] = set()
+    for item in items:
+        if item.kind != ItemKind.TOOL_CALL:
+            continue
+        legacy_name = item.payload.get("tool_name")
+        if not isinstance(legacy_name, str) or legacy_name not in WEB_TOOL_NAMES:
+            continue
+        legacy_id = item.payload.get("call_id")
+        if not isinstance(legacy_id, str):
+            web += 1  # 无 id 无法证明有结果:逐条保守计(旧 parity)。
+            continue
+        if legacy_id in declared_call_ids or legacy_id in orphan_call_ids or legacy_id in seen_legacy:
+            continue
+        seen_legacy.add(legacy_id)
+        web += 1
+    return web, browser
 
 
 # ---------------------------------------------------------------------------

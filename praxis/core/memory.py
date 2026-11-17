@@ -1239,7 +1239,12 @@ class MemoryEntryView:
 
 @dataclass(frozen=True, slots=True)
 class MemoryJobView:
-    """作业行的人类面投影;``in_flight`` = run_update 的只读在途判定。"""
+    """作业行的人类面投影;``in_flight`` = run_update 的只读在途判定。
+
+    ``lease_active``(T13-81)= 租约仍被持有且未过期(worker 可能仍活)——
+    CLI 据此区分"worker active"与"lease expired awaiting takeover",
+    不再对活 worker 过度声明 takeover。
+    """
 
     status: str | None
     in_flight: bool
@@ -1248,6 +1253,7 @@ class MemoryJobView:
     error_type: str | None
     error_message: str | None
     source_thread: str | None
+    lease_active: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1407,12 +1413,35 @@ def _mutate_state(
     return store.transact(_tx)
 
 
-def read_memory_status(store: Store, tools: Mapping[str, Tool]) -> MemoryStatusView:
+def _lease_active(store: Store, now: float) -> bool:
+    """T13-81:租约仍被持有且未过期 ⇒ worker 可能仍活(一行判据)。
+
+    读 LEASE_KEY 的 expires_at 与 now 比较;缺租约/畸形/已过期一律 False
+    (fail-open:展示面不因坏租约失败,过期即"awaiting takeover")。
+    """
+    raw = get_metadata(store, LEASE_KEY)
+    if raw is None:
+        return False
+    try:
+        lease = json.loads(raw)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(lease, dict):
+        return False
+    expires = lease.get("expires_at")
+    return isinstance(expires, (int, float)) and not isinstance(expires, bool) and expires > now
+
+
+def read_memory_status(
+    store: Store, tools: Mapping[str, Tool], *, now: float | None = None
+) -> MemoryStatusView:
     """当前 state + 作业行的只读视图(run_update 只读在途判定)。
 
     ``in_flight`` 复用 ``job_unresolved``(B4:未终态 turn 或未闭合事实窗口);
     作业行状态为 running/needs_reconciliation 时它区分"真在途"与"残留行,
     无未决工作"——CLI 据此如实展示,绝不让用户把 running 误读成活。
+    ``lease_active``(T13-81)区分活 worker 与过期租约。``now`` 注入时钟
+    (测试 lease 过期判据用;缺省 time.time())。
     作业行畸形 fail-open 为空视图(状态展示不因一行坏数据失败)。
     """
     state = read_memory_state(store)
@@ -1446,6 +1475,7 @@ def read_memory_status(store: Store, tools: Mapping[str, Tool]) -> MemoryStatusV
             error_type=_opt_str(job.get("error_type")),
             error_message=_opt_str(job.get("error_message")),
             source_thread=_opt_str(job.get("source_thread")),
+            lease_active=_lease_active(store, time.time() if now is None else now),
         ),
     )
 

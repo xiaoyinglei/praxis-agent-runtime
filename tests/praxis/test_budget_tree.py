@@ -476,6 +476,65 @@ def test_fold_duplicate_unpaired_call_id_counted_once() -> None:
 
 
 # ---------------------------------------------------------------------------
+# R-FINAL-I1:B31 真实 provider 每轮重编号 call_0——跨声明窗口复用 call_id
+# 必须按窗口键 (turn_id, 声明 seq, call_id) 归属计数,不得按裸 call_id 去重。
+# ---------------------------------------------------------------------------
+
+
+def _declares(seq: int, call_id: str, tool_name: str = "web_fetch") -> Item:
+    return _model_response(
+        seq, tool_calls=({"call_id": call_id, "name": tool_name, "arguments": {}},)
+    )
+
+
+def test_fold_b31_cross_window_reused_call_id_counts_each_window() -> None:
+    # 两声明窗口各发一次 web_fetch,模型每轮重编号 call_0 → 两次真实请求计 2。
+    items = [
+        _declares(1, "call_0"),
+        _tool_call(2, call_id="call_0"),
+        _web_result(3, call_id="call_0", status="ok"),
+        _declares(4, "call_0"),
+        _tool_call(5, call_id="call_0"),
+        _web_result(6, call_id="call_0", status="ok"),
+    ]
+    assert fold_turn_facts(items, unit_costs=None).web_requests == 2
+
+
+def test_fold_b31_cross_window_crash_conservative_per_window() -> None:
+    # 窗口 1 完成 + 窗口 2 dispatch 后失联(无结果)→ 完成 1 + 保守 1 = 2。
+    items = [
+        _declares(1, "call_0"),
+        _tool_call(2, call_id="call_0"),
+        _web_result(3, call_id="call_0", status="ok"),
+        _declares(4, "call_0"),
+        _tool_call(5, call_id="call_0"),
+    ]
+    assert fold_turn_facts(items, unit_costs=None).web_requests == 2
+
+
+def test_fold_b31_cross_window_browser_reused_call_id_counts_each_window() -> None:
+    items = [
+        _declares(1, "call_0"),
+        _web_result(2, call_id="call_0", status="ok", metadata={"browser_render": True}),
+        _declares(3, "call_0"),
+        _web_result(4, call_id="call_0", status="ok", metadata={"browser_render": True}),
+    ]
+    facts = fold_turn_facts(items, unit_costs=None)
+    assert (facts.web_requests, facts.browser_requests) == (2, 2)
+
+
+def test_fold_b31_cross_window_non_billable_latest_not_double_counted() -> None:
+    # 窗口 1 ok(计费)+ 窗口 2 denied(未 dispatch 不计)→ 恰 1,不因复用 id 漏计窗口 1。
+    items = [
+        _declares(1, "call_0"),
+        _web_result(2, call_id="call_0", status="ok"),
+        _declares(3, "call_0"),
+        _web_result(4, call_id="call_0", status="denied"),
+    ]
+    assert fold_turn_facts(items, unit_costs=None).web_requests == 1
+
+
+# ---------------------------------------------------------------------------
 # protected_tail / normal_token_remaining:旧 accounting.py 逐字移植
 # ---------------------------------------------------------------------------
 

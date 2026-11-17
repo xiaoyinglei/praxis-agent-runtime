@@ -29,6 +29,7 @@ from praxis.core.memory import (
     STATE_KEY,
     initial_state,
     memory_snapshot,
+    read_memory_status,
 )
 from praxis.core.pipeline import ExecCtx, execute
 from praxis.core.statemachine import TurnStatus
@@ -620,3 +621,59 @@ def test_three_entrypoints_model_cli_resume_navigation_identical(workspace: Path
     payload = _navigation_payload(model_nav)
     assert payload["total_entries"] == 10
     assert len(payload["entries"]) == 10
+
+
+def test_cross_process_resume_rebuilds_memory_navigation_and_enqueue(workspace: Path) -> None:
+    """R-FINAL-I2:run(--enable-memory)→PAUSED→跨进程 resume(不重传旗标)→
+    导航逐字一致 + 终态入队。memory 启用态从 turn binding 经 resume_turn_id
+    重建(C1 同机制),不依赖 CLI 重传 --enable-memory。
+    """
+    state = _state(_ten_entries(), generate_memories=True)
+    _seed_state(workspace, state)
+
+    # run(--enable-memory) → 审批暂停。
+    run_adapter = ScriptedAdapter(
+        [
+            ModelResponse(
+                content="",
+                tool_calls=(ModelToolCall(call_id="c1", name="needs_approval", arguments={}),),
+                usage=_ZERO_USAGE,
+                finish_reason="tool_calls",
+            )
+        ]
+    )
+    run_session = open_session(
+        workspace, run_adapter, enable_memory=True, thread_id="run", extra_tools=[_approval_tool()]
+    )
+    try:
+        paused = asyncio.run(run_session.submit("hi"))
+        assert paused.status is TurnStatus.PAUSED
+        run_request = run_adapter.last_request
+        assert run_request is not None
+        run_nav = _navigation_content(run_request.messages)
+        turn_id = paused.turn_id
+    finally:
+        run_session.close()
+
+    # 跨进程 resume:全新 Session,不传 enable_memory(默认 False)——binding 重建。
+    resume_adapter = ScriptedAdapter([_resp("done")])
+    resume_session = open_session(
+        workspace,
+        resume_adapter,
+        thread_id="run",
+        resume_turn_id=turn_id,
+        extra_tools=[_approval_tool()],
+    )
+    try:
+        assert "read_memory" in resume_session.tools  # memory 启用态跨 resume 重建
+        resumed = asyncio.run(resume_session.resume(turn_id, approval={"c1": "allow"}))
+        assert resumed.status is TurnStatus.COMPLETED
+        resume_request = resume_adapter.last_request
+        assert resume_request is not None
+        resume_nav = _navigation_content(resume_request.messages)
+        assert resume_nav == run_nav  # 导航逐字一致
+        # 终态入队:resume COMPLETED 触发 note_turn_finished → 作业行落库。
+        view = read_memory_status(resume_session.store, resume_session.tools)
+        assert view.job.status is not None
+    finally:
+        resume_session.close()

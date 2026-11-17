@@ -12,7 +12,7 @@ provisioner:共享父工作区,权限收窄在构造期完成)。
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Protocol
 
@@ -44,6 +44,9 @@ class WorkspaceInspection:
     - ``postimages``:子工作区当前侧逐路径 sha256(删除 = None;非普通文件 = "")。
     - ``diff_preview``:tracked diff 的 ≤200_000 字节预览(UTF-8 边界安全);
       ``diff_truncated``/``diff_bytes`` 如实披露截断与全文尺寸。
+    - ``symlink_targets``(M1):变更路径中 symlink 的 readlink 目标文本
+      (path → 目标)。untracked symlink 不进 diff 预览,审批人经此披露看见
+      链接指向(尤其指向父仓外的目标);缺省空映射,既有构造零破坏。
     """
 
     paths: tuple[str, ...]
@@ -52,6 +55,7 @@ class WorkspaceInspection:
     diff_preview: str
     diff_truncated: bool
     diff_bytes: int
+    symlink_targets: Mapping[str, str] = field(default_factory=dict)
 
 
 class ChildWorkspaceProvisioner(Protocol):

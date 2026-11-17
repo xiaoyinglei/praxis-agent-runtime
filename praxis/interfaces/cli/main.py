@@ -25,6 +25,7 @@ import click
 import typer
 from typer.core import TyperGroup
 
+from praxis.interfaces.cli.agent_cli import app as agent_app
 from praxis.interfaces.cli.mcp_cli import app as mcp_app
 from praxis.interfaces.cli.memory_cli import app as memory_app
 from praxis.interfaces.cli.models_cli import app as models_app
@@ -122,6 +123,14 @@ _ENABLE_MEMORY_OPT = typer.Option(
     "--enable-memory",
     help="Enable workspace memory (background extraction driver + read_memory tool).",
 )
+# R-FINAL-C1:resume 的库路由出口——write 子从自身工作区 resume 时指向父库
+# (同库纪律;缺省按 workspace/.praxis/praxis.sqlite 推导)。子装配身份经
+# resume_turn_id 从 binding 重建,--db-path 只解决"库在哪"的发现面。
+_DB_PATH_OPT = typer.Option(
+    None,
+    "--db-path",
+    help="Session database file (resume a child from its own workspace: point at the parent db).",
+)
 # R-T3-6:耗尽维 → 对应补预算旗标(CLI 文案点名出路;steps 死路关闭)。
 # T15(T3 minor⑩):web_requests/browser_requests 补齐——五维全覆盖。
 _BUDGET_EXTEND_FLAGS: Mapping[str, str] = {
@@ -168,7 +177,10 @@ class _UsageExit3Group(TyperGroup):
 app = typer.Typer(
     cls=_UsageExit3Group,
     name="praxis",
-    help="Praxis workspace agent — minimal console (run/chat/resume/cancel/status/log/steer/verify/models/web/mcp).",
+    help=(
+        "Praxis workspace agent — minimal console "
+        "(run/chat/resume/cancel/status/log/steer/verify/models/web/mcp/memory/agent)."
+    ),
     add_completion=False,
     no_args_is_help=True,
 )
@@ -176,6 +188,7 @@ app.add_typer(models_app, name="models")
 app.add_typer(web_app, name="web")
 app.add_typer(mcp_app, name="mcp")
 app.add_typer(memory_app, name="memory")
+app.add_typer(agent_app, name="agent")
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +329,8 @@ def _open_session_guarded(
     integrations: Sequence[Any] = (),
     budget: Limits = UNLIMITED,
     enable_memory: bool = False,
+    db_path: Path | None = None,
+    resume_turn_id: str | None = None,
 ) -> Session:
     """R12:open_session 的 ValueError(损坏的既有状态,如 .praxis/permissions.json
     无法解析)是运行时失败 → 干净错误消息 + EXIT_FAILED(1),绝不裸 traceback(C4)。
@@ -333,6 +348,8 @@ def _open_session_guarded(
             integrations=integrations,
             budget=budget,
             enable_memory=enable_memory,
+            db_path=db_path,
+            resume_turn_id=resume_turn_id,
         )
     except KeyError as exc:
         message = exc.args[0] if exc.args else str(exc)
@@ -352,6 +369,8 @@ def _open_from_options(
     mode: str | None = None,
     budget: Limits = UNLIMITED,
     enable_memory: bool = False,
+    db_path: Path | None = None,
+    resume_turn_id: str | None = None,
 ) -> Session:
     # Task 8:policy/mode 经 sdk 透传给 composition(来源序在 composition 执行;
     # mode 与 policy 正交,C5——这里不折叠、不改写)。
@@ -367,6 +386,8 @@ def _open_from_options(
             thread_id=_resolve_thread(thread),
             budget=budget,
             enable_memory=enable_memory,
+            db_path=db_path,
+            resume_turn_id=resume_turn_id,
         )
     # R-T6-2:CLI 不再直接构造 provider adapter;模型解析与唯一分派都在
     # composition(_adapter_and_spec_from_registry → _adapter_for)。
@@ -379,6 +400,8 @@ def _open_from_options(
         thread_id=_resolve_thread(thread),
         budget=budget,
         enable_memory=enable_memory,
+        db_path=db_path,
+        resume_turn_id=resume_turn_id,
     )
 
 
@@ -538,6 +561,8 @@ def _open_mcp_session(
     thread: str | None,
     budget: Limits = UNLIMITED,
     enable_memory: bool = False,
+    db_path: Path | None = None,
+    resume_turn_id: str | None = None,
 ) -> Session:
     return _open_session_guarded(
         workspace,
@@ -550,6 +575,8 @@ def _open_mcp_session(
         integrations=(bundle,),
         budget=budget,
         enable_memory=enable_memory,
+        db_path=db_path,
+        resume_turn_id=resume_turn_id,
     )
 
 
@@ -703,6 +730,8 @@ def resume(
     extend_steps: int | None = _EXTEND_STEPS_OPT,
     extend_web_requests: int | None = _EXTEND_WEB_REQUESTS_OPT,
     extend_browser_requests: int | None = _EXTEND_BROWSER_REQUESTS_OPT,
+    enable_memory: bool = _ENABLE_MEMORY_OPT,
+    db_path: Path | None = _DB_PATH_OPT,
 ) -> None:
     """续跑 paused/interrupted turn:--confirm 人工确认,--allow/--deny 审批,--reconcile 对账。
 
@@ -710,6 +739,12 @@ def resume(
     --extend-browser-requests 补预算(budget_extension item)后走同一续跑路径:
     budget_exhausted 的 PAUSED 无需审批即可续跑(T3;耗尽维与出路旗标由文案
     点名,R-T3-6;web/browser 旗标 T15 补齐)。
+
+    子 turn 直面续跑(R-FINAL-C1):子装配身份(read_only 写否决/always 隔离/
+    worktree 工具根/父库路由)从 turn binding 经 resume_turn_id 自动重建——
+    read_only 子批准后续跑写仍被拒。write 子从自身工作区 resume 须 --db-path
+    指向父库(同库纪律);从父工作区 resume 则缺省推导即可。--enable-memory
+    与 run 同口径(root turn 的启用态亦从 binding 持久重建,R-FINAL-I2)。
     """
     approval_map = _parse_approval(allow, deny)
     reconcile_map = _parse_reconcile(reconcile)
@@ -718,7 +753,10 @@ def resume(
     )
     root = _resolve_workspace(workspace)
     if not _mcp_configured(root):
-        session = _open_from_options(workspace, model, scripted, thread, policy, mode)
+        session = _open_from_options(
+            workspace, model, scripted, thread, policy, mode,
+            enable_memory=enable_memory, db_path=db_path, resume_turn_id=turn_id,
+        )
         try:
             result = asyncio.run(
                 session.resume(
@@ -753,6 +791,8 @@ def resume(
                 thread=thread,
                 policy=policy,
                 mode=mode,
+                enable_memory=enable_memory,
+                db_path=db_path,
             )
         )
     )
@@ -771,6 +811,8 @@ async def _resume_with_mcp(
     thread: str | None,
     policy: Path | None,
     mode: str | None,
+    enable_memory: bool = False,
+    db_path: Path | None = None,
 ) -> int:
     """与 ``_run_with_mcp`` 同一条单 loop 纪律(connect → resume → aclose)。"""
     snapshot = _policy_snapshot(root, policy)
@@ -787,6 +829,9 @@ async def _resume_with_mcp(
             policy=snapshot,
             mode=mode,
             thread=thread,
+            enable_memory=enable_memory,
+            db_path=db_path,
+            resume_turn_id=turn_id,
         )
         try:
             result = await session.resume(

@@ -24,6 +24,7 @@ from praxis.core.recovery import sweep
 from praxis.core.statemachine import TurnStatus
 from praxis.interfaces.sdk import (
     ConversationBusy,
+    Limits,
     ResumeNotConfirmed,
     ScriptedAdapter,
     open_session,
@@ -449,6 +450,52 @@ def test_resume_approval_allow_executes_once_then_completes(
     assert decisions[0]["policy_revision"] == PermissionPolicy().revision
     assert call_count == 1 and result_count == 1  # 批准重放恰好一次
     assert session.result(paused.turn_id).pending_approvals == ()
+
+
+def test_extend_only_resume_on_approval_pause_discloses_settlement(
+    workspace: Path, open_ws: Callable[..., Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M3:审批暂停 turn 仅补预算续跑 → 待批项清算 not_executed,如实披露
+    (方向安全但出乎意料),提示人类改用 approval 决策。"""
+    monkeypatch.setattr(permission, "decide", lambda *a: Decision.ask("test"))
+    args = {"path": "f.txt", "content": "should not run"}
+    session = open_ws(ScriptedAdapter([_resp("", (("c1", "write", args),)), _resp("all done")]))
+
+    paused = asyncio.run(session.submit("write it"))
+    assert paused.status is TurnStatus.PAUSED and paused.reason == "approval_required"
+
+    done = asyncio.run(session.resume(paused.turn_id, extend={"tokens": 100}))
+    assert done.status is TurnStatus.COMPLETED and done.output == "all done"
+    # 披露:extend_settles_pending notice 在结果里。
+    assert any(n.kind == "extend_settles_pending" for n in done.notices)
+    # 待批 write 被清算 not_executed(从未 dispatch),文件不落盘。
+    assert not (workspace / "f.txt").exists()
+
+    def _check(other: Store) -> list[Any]:
+        return [
+            i.payload
+            for i in other.read_turn_items(paused.turn_id)
+            if i.kind == ItemKind.TOOL_RESULT and i.payload.get("call_id") == "c1"
+        ]
+
+    results = _with_other_store(workspace, _check)
+    assert len(results) == 1 and results[0]["status"] == "not_executed"
+
+
+def test_extend_only_resume_without_pending_approvals_has_no_settlement_notice(
+    workspace: Path, open_ws: Callable[..., Any]
+) -> None:
+    """M3 负形:budget_exhausted 暂停(无待批项)extend-only 续跑 → 无披露。"""
+    session = open_ws(
+        ScriptedAdapter([_resp("", (("c1", "read", {"path": "f.txt"}),)), _resp("done")]),
+        budget=Limits(steps=0),
+    )
+    (workspace / "f.txt").write_text("x", encoding="utf-8")
+    paused = asyncio.run(session.submit("read it"))
+    assert paused.status is TurnStatus.PAUSED and paused.reason == "budget_exhausted"
+    done = asyncio.run(session.resume(paused.turn_id, extend={"steps": 5}))
+    assert done.status is TurnStatus.COMPLETED
+    assert not any(n.kind == "extend_settles_pending" for n in done.notices)
 
 
 def test_second_round_reused_call_id_pending_visible_and_approvable(

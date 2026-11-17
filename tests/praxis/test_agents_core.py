@@ -51,7 +51,8 @@ from praxis.protocol.budget import UNLIMITED, Limits, limits_payload
 from praxis.protocol.items import ItemKind
 from praxis.protocol.json import JsonValue
 from praxis.protocol.models import ModelResponse, ModelToolCall, Usage
-from praxis.protocol.policy import PermissionPolicy, path_access, resolve_policy
+from praxis.protocol.permission import PermissionUpdate
+from praxis.protocol.policy import PermissionPolicy, ToolRule, path_access, resolve_policy
 from praxis.protocol.sandbox import ToolExecContext
 from praxis.protocol.tools import (
     CancellationMode,
@@ -1579,13 +1580,18 @@ def test_paused_child_visible_via_wait_and_approved_directly(workspace: Path) ->
             assert result.children_summary[0].state == "paused"
             # 人类直面子 session:独立打开同库子 thread,直接批准续跑。
             # 共享同一剧本适配器:子的续作响应在剧本末位(消费序确定)。
+            # R-FINAL-C1 升级:经 resume_turn_id 重建子身份——read_only 写否决
+            # ceiling 跨裸 resume 存活(而非仅同实例 resume 才承重)。
             child = open_session(
                 workspace,
                 adapter,
                 thread_id=handle.child_thread_id,
                 db_path=parent.store.db_path,
+                resume_turn_id=handle.child_root_turn_id,
             )
             try:
+                readonly = [c for c in child.permissions.ceilings if c.profile == "read-only"]
+                assert len(readonly) == 1  # 写否决跨 resume 存活
                 call_id = status.pending_approvals[0].call_id
                 resumed = await child.resume(
                     handle.child_root_turn_id, approval={call_id: "allow"}
@@ -1595,6 +1601,223 @@ def test_paused_child_visible_via_wait_and_approved_directly(workspace: Path) ->
             finally:
                 await child.aclose()
             assert (await manager.wait(handle.child_thread_id, timeout=5.0)).state == "done"
+        finally:
+            await manager.aclose()
+            await parent.aclose()
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# R-FINAL-C1:子装配身份跨裸 open_session resume 存活(写否决/always 隔离/
+# worktree 工具根/父库路由)——不只是同实例 resume 才承重。
+# ---------------------------------------------------------------------------
+
+
+def test_read_only_child_write_veto_and_always_isolation_survive_bare_resume(
+    workspace: Path,
+) -> None:
+    """①承重:read_only 子 PAUSED(审批)→ 裸 open_session(workspace=父,
+    thread=子, db_path=父库, resume_turn_id=子) resume → ceiling 仍在:批准后续跑
+    write 仍被拒(静默提权关闭);always 仍不落父盘(㉖ 隔离跨 resume 存活)。
+    """
+    holder: list[SubagentManager] = []
+    results: list[Any] = []
+    executed: list[str] = []
+
+    async def write_run(arguments: Mapping[str, JsonValue], exec_ctx: ToolExecContext) -> ToolResult:
+        executed.append("write")
+        return _ok("write_probe", "written")
+
+    async def scenario() -> None:
+        write_tool = _tool(
+            "write_probe",
+            write_run,
+            effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+            targets=(ToolTarget(kind="path", value=str(workspace / "f.txt")),),
+        )
+        ask_tool = _tool(
+            "ask_probe",
+            lambda a, c: _ok("ask_probe", "approved run"),
+            effects=frozenset({ToolEffect.NETWORK}),
+        )
+        tools = [_spawn_probe(holder, results), write_tool, ask_tool]
+        adapter = ScriptedAdapter(
+            [
+                _resp("", (("s1", "spawn_probe", {}),)),
+                _resp("", (("a1", "ask_probe", {}),)),
+                _resp("parent done"),
+                _resp("", (("w1", "write_probe", {}),)),
+                _resp("child done after approval"),
+            ]
+        )
+        parent = open_session(workspace, adapter, tools=tools, thread_id="parent")
+        manager = SubagentManager(parent=parent, store=parent.store)
+        holder.append(manager)
+        try:
+            result = await parent.submit("go")
+            assert result.status is TurnStatus.COMPLETED
+            handle: ChildHandle = results[0]
+            status: ChildStatus = results[1]
+            assert status.state == "paused"
+            call_id = status.pending_approvals[0].call_id
+            parent_policy_path = workspace / ".praxis" / "permissions.json"
+            parent_policy_before = parent_policy_path.read_bytes() if parent_policy_path.exists() else None
+            # 裸 open_session 形 resume(CLI/Q3 同形):子身份经 resume_turn_id 重建。
+            child = open_session(
+                workspace,
+                adapter,
+                tools=[write_tool, ask_tool],
+                thread_id=handle.child_thread_id,
+                db_path=parent.store.db_path,
+                resume_turn_id=handle.child_root_turn_id,
+            )
+            try:
+                # ceiling 跨 resume 存活:read-only profile 仍在(写否决承重层)。
+                readonly = [c for c in child.permissions.ceilings if c.profile == "read-only"]
+                assert len(readonly) == 1
+                assert path_access(resolve_policy(readonly[0], workspace), workspace / "f.txt", write=True) is False
+                # ㉖ always 隔离跨 resume 存活:always 只在子内存,父文件字节不动。
+                notice = child.update_permission(
+                    PermissionUpdate(rule=ToolRule(pattern="ask_probe", decision="allow"), destination="always")
+                )
+                assert notice is not None and notice.kind == "always_memory_only"
+                parent_policy_after = parent_policy_path.read_bytes() if parent_policy_path.exists() else None
+                assert parent_policy_after == parent_policy_before  # 父文件零创建零修改
+                resumed = await child.resume(handle.child_root_turn_id, approval={call_id: "allow"})
+                assert resumed.status is TurnStatus.COMPLETED
+                assert resumed.output == "child done after approval"
+            finally:
+                await child.aclose()
+            # write 在批准后续跑里仍被 ceiling 拒(dispatch 前),玩具从未执行。
+            child_results = [
+                item
+                for item in parent.store.read_turn_items(handle.child_root_turn_id)
+                if item.kind == ItemKind.TOOL_RESULT and item.payload.get("tool_name") == "write_probe"
+            ]
+            assert len(child_results) == 1
+            assert child_results[0].payload["status"] == "denied"
+            assert executed == []
+            assert not (workspace / "f.txt").exists()
+        finally:
+            await manager.aclose()
+            await parent.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_write_child_resume_from_parent_workspace_binds_worktree_and_parent_db(
+    workspace: Path, tmp_path: Path
+) -> None:
+    """②承重路 A:write 子从父工作区裸 resume → 工具根仍绑子 worktree(隔离
+    旁路关闭)、Store 路由父库(不新建空库)、turn 可续(非 unknown turn_id)。
+    """
+    holder: list[SubagentManager] = []
+    results: list[Any] = []
+    child_ws = tmp_path / "child-workspace"
+    provisioner = _StubProvisioner(child_ws)
+
+    async def scenario() -> None:
+        ask_tool = _tool(
+            "ask_probe",
+            lambda a, c: _ok("ask_probe", "approved run"),
+            effects=frozenset({ToolEffect.NETWORK}),
+        )
+        tools = [_spawn_probe(holder, results, workspace_mode="write"), ask_tool]
+        adapter = ScriptedAdapter(
+            [
+                _resp("", (("s1", "spawn_probe", {}),)),
+                _resp("", (("a1", "ask_probe", {}),)),
+                _resp("parent done"),
+                _resp("child done after approval"),
+            ]
+        )
+        parent = open_session(workspace, adapter, tools=tools, thread_id="parent")
+        manager = SubagentManager(parent=parent, store=parent.store, provisioner=provisioner)
+        holder.append(manager)
+        try:
+            await parent.submit("go")
+            handle: ChildHandle = results[0]
+            assert handle.workspace == child_ws
+            status: ChildStatus = results[1]
+            assert status.state == "paused"
+            call_id = status.pending_approvals[0].call_id
+            # 从父工作区 resume:子身份把工具根重绑回子 worktree、库路由父库。
+            child = open_session(
+                workspace,
+                adapter,
+                tools=[ask_tool],
+                thread_id=handle.child_thread_id,
+                db_path=parent.store.db_path,
+                resume_turn_id=handle.child_root_turn_id,
+            )
+            try:
+                assert child.workspace == child_ws  # 工具根绑子 worktree(非父仓)
+                assert child.store.db_path == parent.store.db_path  # 同库路由
+                assert not (child_ws / ".praxis" / "praxis.sqlite").exists()  # 不新建空库
+                resumed = await child.resume(handle.child_root_turn_id, approval={call_id: "allow"})
+                assert resumed.status is TurnStatus.COMPLETED
+                assert resumed.output == "child done after approval"
+            finally:
+                await child.aclose()
+        finally:
+            await manager.aclose()
+            await parent.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_write_child_resume_from_child_workspace_with_db_path_routes_parent_db(
+    workspace: Path, tmp_path: Path
+) -> None:
+    """②承重路 B(Q3 字面 --workspace 子工作区):write 子从自身工作区 resume
+    经 --db-path 指向父库 → turn 可续(非 unknown turn_id 死路)、库路由父库。
+    """
+    holder: list[SubagentManager] = []
+    results: list[Any] = []
+    child_ws = tmp_path / "child-workspace"
+    provisioner = _StubProvisioner(child_ws)
+
+    async def scenario() -> None:
+        ask_tool = _tool(
+            "ask_probe",
+            lambda a, c: _ok("ask_probe", "approved run"),
+            effects=frozenset({ToolEffect.NETWORK}),
+        )
+        tools = [_spawn_probe(holder, results, workspace_mode="write"), ask_tool]
+        adapter = ScriptedAdapter(
+            [
+                _resp("", (("s1", "spawn_probe", {}),)),
+                _resp("", (("a1", "ask_probe", {}),)),
+                _resp("parent done"),
+                _resp("child done after approval"),
+            ]
+        )
+        parent = open_session(workspace, adapter, tools=tools, thread_id="parent")
+        manager = SubagentManager(parent=parent, store=parent.store, provisioner=provisioner)
+        holder.append(manager)
+        try:
+            await parent.submit("go")
+            handle: ChildHandle = results[0]
+            status: ChildStatus = results[1]
+            call_id = status.pending_approvals[0].call_id
+            # 从子工作区 resume + db_path 父库:binding 身份重建,库不新建空库。
+            child = open_session(
+                child_ws,
+                adapter,
+                tools=[ask_tool],
+                thread_id=handle.child_thread_id,
+                db_path=parent.store.db_path,
+                resume_turn_id=handle.child_root_turn_id,
+            )
+            try:
+                assert child.workspace == child_ws
+                assert child.store.db_path == parent.store.db_path
+                resumed = await child.resume(handle.child_root_turn_id, approval={call_id: "allow"})
+                assert resumed.status is TurnStatus.COMPLETED
+                assert resumed.output == "child done after approval"
+            finally:
+                await child.aclose()
         finally:
             await manager.aclose()
             await parent.aclose()

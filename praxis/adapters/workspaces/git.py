@@ -740,6 +740,13 @@ class GitWorktreeProvisioner:
             path: _worktree_digest(workspace / Path(*PurePosixPath(path).parts))
             for path in touched
         }
+        # M1:symlink 目标披露给审批人——untracked symlink 不进 diff 预览,
+        # 其指向(尤其越出父仓的目标)必须经此可见。读当前子工作区侧 readlink。
+        symlink_targets: dict[str, str] = {}
+        for path in touched:
+            target = workspace / Path(*PurePosixPath(path).parts)
+            if target.is_symlink():
+                symlink_targets[path] = os.fsdecode(os.readlink(target))
         preview, truncated = _diff_preview(tracked_diff)
         return WorkspaceInspection(
             paths=tuple(touched),
@@ -748,6 +755,7 @@ class GitWorktreeProvisioner:
             diff_preview=preview,
             diff_truncated=truncated,
             diff_bytes=len(tracked_diff),
+            symlink_targets=symlink_targets,
         )
 
     # -- apply ---------------------------------------------------------------

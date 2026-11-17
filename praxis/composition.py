@@ -72,7 +72,12 @@ from praxis.core.memory import MemoryDriver, read_memory_state
 from praxis.core.permission import network_verdict
 from praxis.core.recovery import sweep, sweep_orphan_command_jobs
 from praxis.core.session import AsyncCloser, Session
-from praxis.protocol.agents import AGENT_ORCHESTRATION_NAMES, AGENT_TOOL_NAMES
+from praxis.protocol.agents import (
+    AGENT_ORCHESTRATION_NAMES,
+    AGENT_TOOL_NAMES,
+    ChildAssembly,
+    child_assembly_from_binding,
+)
 from praxis.protocol.budget import UNLIMITED, Limits
 from praxis.protocol.hooks import HookOutcome, HookSetup, HookSpec
 from praxis.protocol.json import JsonValue
@@ -92,6 +97,7 @@ from praxis.protocol.tools import Tool, ToolEffect, ToolSource
 from praxis.protocol.workspaces import WorkspaceMode
 from praxis.store.artifacts import ArtifactStore
 from praxis.store.log import Store
+from praxis.store.turns import get_turn
 from praxis.tools.builtins.agent_tools import create_agent_tools
 from praxis.tools.builtins.artifacts_tool import create_read_artifact_tool
 from praxis.tools.builtins.child_env import child_env
@@ -534,6 +540,7 @@ def build_session(
     persist_always: bool = True,
     parent_tools: Mapping[str, Tool] | None = None,
     enable_memory: bool = False,
+    resume_turn_id: str | None = None,
 ) -> Session:
     """装配一个 Session:唯一组合根。CLI/TUI/host 一律经 sdk.open_session 走到这里。
 
@@ -658,6 +665,35 @@ def build_session(
         else SUMMARY_PROMPT_MAX_CHARS
     )
     root = Path(workspace)
+    # R-FINAL-C1 / R-FINAL-I2:resume 入口经 resume_turn_id 读回 turn binding,
+    # 重建跨进程存活的装配身份——子身份(workspace_mode/工作区根/父库路由/
+    # read_only 收窄)与 memory 启用态。spawn 把这些事实钉进 binding(agents.py),
+    # 这里经 build_child_session 等价装配重建(ceiling 共用 _child_ceilings,
+    # Session 构造唯一点不破)。None = 普通 open/run/chat,零扰动。
+    child_assembly: ChildAssembly | None = None
+    resume_maintenance = False
+    if resume_turn_id is not None:
+        candidate_db = db_path if db_path is not None else root / ".praxis" / "praxis.sqlite"
+        # 只在库已存在时探针读:不存在的库不可能有 turn,避免新建空库副作用
+        # (write 子从自身工作区裸 resume 须经 --db-path 指向父库,见 CLI)。
+        if candidate_db.exists():
+            probe = Store(candidate_db)
+            try:
+                resume_turn = get_turn(probe, resume_turn_id)
+            finally:
+                probe.close()
+            if resume_turn is not None:
+                child_assembly = child_assembly_from_binding(resume_turn.binding)
+                resume_maintenance = resume_turn.binding.get("memory_maintenance") is True
+                if child_assembly is None and resume_turn.binding.get("enable_memory") is True:
+                    # R-FINAL-I2:root turn 的 memory 启用态跨 resume 重建。
+                    enable_memory = True
+    if child_assembly is not None:
+        # 子身份重建:工作区根/库路由全部取自 binding(绝对路径,不依赖 cwd);
+        # 子不继承 memory driver(维护子终态不递归入队,Q6)。
+        root = Path(child_assembly.workspace)
+        db_path = Path(child_assembly.parent_db_path)
+        enable_memory = False
     # T5:默认从 Host 配置装配 command hooks(显式 hooks 参数=测试路径,完全
     # 绕过加载)。workspace 传已 resolve 的绝对路径(T3 相对路径角落收口)。
     hook_setup = hooks if hooks is not None else _host_hook_setup(root)
@@ -702,6 +738,9 @@ def build_session(
         web_limits: WebLimits | None = None
         if tools is not None:
             tool_seq = tools
+        elif child_assembly is not None and resume_maintenance:
+            # R-FINAL-C1:memory 维护子 tool-free parity(spawn 时 tool_subset=())。
+            tool_seq = ()
         elif parent_tools is not None:
             # R-T8-1(i):子工具表 = 按**子工作区根**重构的 builtin(经既有
             # _default_tools 工厂:子的 sessions/artifacts/skills/web authorizer
@@ -811,6 +850,20 @@ def build_session(
         effective_artifacts = artifact_store if "read_artifact" in tool_map else None
         effective_policy = resolve_declared_policy(root, policy)
         effective_mode: PermissionMode = mode if mode is not None else effective_policy.approval
+        # R-FINAL-C1:子 resume 经 _child_ceilings 重建 read_only 收窄(与 spawn
+        # 同一构造点)。read_only 子工作区=父工作区 → effective_policy 即父声明
+        # 策略(ceiling 的读保留/网络继承基线);write 子工作区独立 → 加载子自身
+        # 声明(含其 always 落盘)。persist_always 同 spawn 口径(read_only=False)。
+        effective_ceilings = tuple(ceilings)
+        effective_persist_always = persist_always
+        if child_assembly is not None:
+            effective_ceilings = _child_ceilings(
+                parent_policy=effective_policy,
+                parent_ceilings=ceilings,
+                tool_subset=tuple(tool_map.values()),
+                workspace_mode=child_assembly.workspace_mode,
+            )
+            effective_persist_always = child_assembly.workspace_mode != "read_only"
         permissions = PermissionContext(
             workspace=str(root),
             policy=effective_policy,
@@ -819,7 +872,7 @@ def build_session(
             # EXECUTE_PROCESS fail-closed deny(bwrap 延后,D2/D7)。
             sandbox=probe_backend(),
             # T5:ceiling 只否决永不授权(read_only 子的收窄经此与父策略取交集)。
-            ceilings=tuple(ceilings),
+            ceilings=effective_ceilings,
             # T6/T12:编排与 memory 只读工具的 session 域 allow(仅内存域)。
             session_rules=(*agent_session_rules, *memory_session_rules),
         )
@@ -886,7 +939,7 @@ def build_session(
             budget=effective_budget,
             unit_costs=effective_unit_costs,
             child_session_factory=_child_session_factory,
-            persist_always=persist_always,
+            persist_always=effective_persist_always,
             memory=memory_driver,
         )
         # T6:manager 此刻才有 parent 引用;holder 填充后工具面与收尾链同时
@@ -920,6 +973,50 @@ def build_session(
 _READ_ONLY_DENIED_EFFECTS: frozenset[ToolEffect] = frozenset(
     {ToolEffect.WRITE_WORKSPACE, ToolEffect.DESTRUCTIVE}
 )
+
+
+def _child_ceilings(
+    *,
+    parent_policy: PermissionPolicy,
+    parent_ceilings: Sequence[PermissionPolicy],
+    tool_subset: Sequence[Tool],
+    workspace_mode: WorkspaceMode,
+) -> tuple[PermissionPolicy, ...]:
+    """子权限上限的唯一构造点(R-FINAL-C1:spawn 与 resume 共用,无第二套)。
+
+    read_only 子追加一个 ``profile="read-only"`` ceiling(恒追加,与工具表组成
+    无关),承载两层否决:
+    (a) **沙箱写路径否决(承重层,R-T5-6)**:compile_sandbox 的 allow_write
+        逐 ceiling AND ``path_access(write=True)``;read-only profile 在规则
+        匹配之前即拒写 → bash(EXECUTE_PROCESS)的沙箱工作区写路径关闭;
+    (b) 工具规则 deny(纵深防御):对 tool_subset 中声明 WRITE_WORKSPACE/
+        DESTRUCTIVE 的工具逐名 ToolRule deny(dispatch 前拒,先于 bypass)。
+    **R-T5-8**:ceiling 只否决写——父 filesystem 读授权逐条保留(write 降 read,
+    deny 原样),网络策略显式继承,trusted-local 的 "/" 读基线一并继承。
+    write 子不加收窄(隔离由 worktree 供给)。父 ceilings 一并继承。
+    """
+    ceilings = list(parent_ceilings)
+    if workspace_mode == "read_only":
+        denied = tuple(
+            ToolRule(pattern=tool.definition.name, decision="deny")
+            for tool in tool_subset
+            if tool.static_effects & _READ_ONLY_DENIED_EFFECTS
+        )
+        read_preserving = tuple(
+            PathRule(path=rule.path, access="read" if rule.access == "write" else rule.access)
+            for rule in parent_policy.filesystem
+        )
+        if parent_policy.profile == "trusted-local":
+            read_preserving = (PathRule(path="/", access="read"), *read_preserving)
+        ceilings.append(
+            PermissionPolicy(
+                profile="read-only",
+                tools=denied,
+                filesystem=read_preserving,
+                network=parent_policy.network,
+            )
+        )
+    return tuple(ceilings)
 
 
 def build_child_session(
@@ -976,32 +1073,12 @@ def build_child_session(
     T5 留档的 permissions.json always 泄漏面已由本任务(㉖)收口:read_only
     子 persist_always=False,见 docstring。
     """
-    ceilings = list(parent.permissions.ceilings)
-    if workspace_mode == "read_only":
-        denied = tuple(
-            ToolRule(pattern=tool.definition.name, decision="deny")
-            for tool in tool_subset
-            if tool.static_effects & _READ_ONLY_DENIED_EFFECTS
-        )
-        # R-T5-8:ceiling 只否决写——父的读授权逐条保留(write 降 read,
-        # deny 原样),网络策略显式继承(否则默认 ask 拖窄子的网络决策)。
-        parent_policy = parent.permissions.policy
-        read_preserving = tuple(
-            PathRule(path=rule.path, access="read" if rule.access == "write" else rule.access)
-            for rule in parent_policy.filesystem
-        )
-        if parent_policy.profile == "trusted-local":
-            read_preserving = (PathRule(path="/", access="read"), *read_preserving)
-        # R-T5-6:read-only profile 是沙箱写否决的承重层(见 docstring (a));
-        # 恒追加——即使工具表没有静态 WRITE 工具,bash 的写路径也必须关闭。
-        ceilings.append(
-            PermissionPolicy(
-                profile="read-only",
-                tools=denied,
-                filesystem=read_preserving,
-                network=parent_policy.network,
-            )
-        )
+    ceilings = _child_ceilings(
+        parent_policy=parent.permissions.policy,
+        parent_ceilings=parent.permissions.ceilings,
+        tool_subset=tool_subset,
+        workspace_mode=workspace_mode,
+    )
     return build_session(
         workspace,
         parent.adapter,

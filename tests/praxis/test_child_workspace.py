@@ -625,3 +625,38 @@ def test_composition_binds_git_provisioner_with_child_env(
     asyncio.run(scenario())
 
     assert created == [child_env]
+
+
+# ---------------------------------------------------------------------------
+# M1:inspect 对 symlink 条目披露 readlink 目标(审批人可见指向)
+# ---------------------------------------------------------------------------
+
+
+def test_inspect_discloses_untracked_symlink_target(
+    repo: Path, provisioner: GitWorktreeProvisioner, tmp_path: Path
+) -> None:
+    """untracked symlink 不进 diff 预览——其指向(尤其越出父仓)经
+    inspection.symlink_targets 披露给审批人。"""
+    ws = provisioner.prepare(repo, "child-1", "write")
+    outside = tmp_path / "outside-secret"
+    outside.write_text("secret\n", encoding="utf-8")
+    (ws / "escape.txt").symlink_to(outside)  # untracked symlink 指仓外
+    (ws / "inner.txt").symlink_to("a.txt")  # untracked symlink 指仓内
+
+    inspection = provisioner.inspect(ws)
+    assert "escape.txt" in inspection.paths
+    assert inspection.symlink_targets["escape.txt"] == str(outside)
+    assert inspection.symlink_targets["inner.txt"] == "a.txt"
+    # untracked symlink 不在 tracked diff 预览里(披露 gap 正是 M1 要补的)。
+    assert "escape.txt" not in inspection.diff_preview
+
+
+def test_inspect_discloses_tracked_symlink_retarget(
+    repo: Path, provisioner: GitWorktreeProvisioner
+) -> None:
+    _commit_tracked_symlink(repo)
+    ws = provisioner.prepare(repo, "child-1", "write")
+    (ws / "link.txt").unlink()
+    (ws / "link.txt").symlink_to("bin.dat")
+    inspection = provisioner.inspect(ws)
+    assert inspection.symlink_targets["link.txt"] == "bin.dat"
